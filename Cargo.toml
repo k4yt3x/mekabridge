@@ -1,0 +1,64 @@
+[package]
+name = "mekabridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A bridge between the meka agent and third-party messaging platforms"
+repository = "https://github.com/k4yt3x/mekabridge"
+
+[lib]
+name = "mekabridge"
+path = "src/mekabridge.rs"
+
+[[bin]]
+name = "mekabridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+eventsource-stream = "0.2"
+futures = "0.3"
+humantime-serde = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+rand = "0.10"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+rmcp = { version = "3", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+teloxide = { version = "0.17", default-features = false, features = ["rustls", "throttle"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rusqlite = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Pinned to the rmcp release meka links against so the interop test exercises the real version skew
+# between this crate's 3.x server and meka's 2.x client, rather than 3.x talking to itself.
+rmcp2 = { package = "rmcp", version = "2.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile = "3"
+
+[lints.clippy]
+await_holding_lock = "deny"
+expect_used = "warn"
+panic = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"

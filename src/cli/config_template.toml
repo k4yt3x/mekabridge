@@ -1,0 +1,64 @@
+# mekabridge configuration.
+#
+# Start mekabridge before `meka serve` where you can. meka retries a failed MCP connect in the
+# background, so the wrong order recovers on its own, but until it does `[mcp].strict` makes meka
+# refuse every turn.
+
+[meka]
+# Where `meka serve` is listening.
+base_url = "http://127.0.0.1:8080"
+# Bearer token from meka's [[serve.tokens]]. It needs the `sessions:r` and `sessions:w` scopes.
+# Prefer ${ENV_VAR} or `token_file` over an inline literal.
+token = "${MEKA_BRIDGE_TOKEN}"
+# Longest a single turn may run before it is cancelled.
+turn_timeout = "30m"
+
+[session]
+# Working directory for the agent's session. Defaults to meka's own working directory.
+# cwd = "/home/you/assistant"
+
+# "read" or "write". The send tools are read-only as far as your machine is concerned, so at "read"
+# the agent can reply to messages but cannot modify files. Use "write" if you want it to actually
+# change things. Do not use "ask": meka prompts for every tool call at that level, and this bridge
+# cannot answer a prompt, so nothing would run at all.
+permission = "read"
+
+[bridge]
+# Where operator notices go when a message cannot be delivered to the agent at all. Optional, but
+# without it a repeated failure is only visible in the logs.
+# owner_conversation = "telegram:123456789"
+
+# Messages that arrive during a turn are batched into the next one.
+batch_max_messages = 32
+max_queue_depth = 256
+
+[mcp]
+# meka connects here. Add this to meka's config.toml:
+#
+#   [[mcp.servers]]
+#   name = "mekabridge"
+#   transport = "http"
+#   url = "http://127.0.0.1:9100/mcp"
+#   eager_load_tools = ["send_message", "list_conversations"]
+#
+# Without `eager_load_tools`, meka defers MCP tools and the agent pays an extra round trip before
+# every single reply.
+transport = "http"
+bind = "127.0.0.1:9100"
+path = "/mcp"
+# Required if you move `bind` off loopback. Set the same value as meka's `auth_token`.
+# token = "${MEKABRIDGE_MCP_TOKEN}"
+
+[[channels.telegram]]
+id = "telegram"
+# From @BotFather.
+token = "${TELEGRAM_BOT_TOKEN}"
+# Telegram user ids allowed to reach the agent. A bot token is a public entry point, so this is
+# mandatory and starts empty-means-nobody. Message @userinfobot to find your id.
+allowed_users = [123456789]
+# Group and channel ids where every member is allowed. Group ids are negative.
+# allowed_chats = [-1001234567890]
+
+[log]
+level = "info"
+format = "text"

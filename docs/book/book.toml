@@ -1,0 +1,9 @@
+[book]
+title = "mekabridge"
+authors = ["k4yt3x"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"

@@ -1,0 +1,345 @@
+//! Command-line surface and logging setup.
+//!
+//! The daemon is the default subcommand; everything else is an operator tool. Those tools
+//! deliberately need no IPC with a running daemon: they read the SQLite database (WAL allows
+//! concurrent readers) and talk to meka's HTTP API directly, so `mekabridge status` works whether
+//! or not the daemon is up.
+
+pub mod commands;
+
+use std::path::PathBuf;
+
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{
+    config::{Config, LogFormat, default_config_path},
+    error::Result,
+};
+
+/// Default row cap for the listing commands.
+const DEFAULT_LIST_LIMIT: usize = 50;
+
+/// Relay between the meka agent and third-party chat platforms.
+#[derive(Debug, Parser)]
+#[command(name = "mekabridge", version, about, long_about = None)]
+pub struct Cli {
+    /// Path to config.toml. Defaults to the platform config directory.
+    #[arg(
+        short,
+        long,
+        global = true,
+        value_name = "PATH",
+        env = "MEKABRIDGE_CONFIG"
+    )]
+    pub config: Option<PathBuf>,
+
+    /// Increase log verbosity. Repeat for more detail. Overrides `[log].level`.
+    #[arg(short, long, global = true, action = ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Log output format. Overrides `[log].format`.
+    #[arg(long, global = true, value_name = "FORMAT")]
+    pub log_format: Option<LogFormatArg>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Log format selectable from the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogFormatArg {
+    Text,
+    Json,
+}
+
+impl From<LogFormatArg> for LogFormat {
+    fn from(value: LogFormatArg) -> Self {
+        match value {
+            LogFormatArg::Text => Self::Text,
+            LogFormatArg::Json => Self::Json,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run the bridge daemon. This is the default when no subcommand is given.
+    Run,
+
+    /// Check configuration, meka, channels, and the MCP endpoint.
+    Doctor,
+
+    /// Show the session, queue depth, and known conversations.
+    Status,
+
+    /// Inspect the inbound queue.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+
+    /// Inspect the conversations the agent can message.
+    Conversations {
+        #[command(subcommand)]
+        command: ConversationsCommand,
+    },
+
+    /// Inspect or reset the agent's session.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+
+    /// Cancel the turn that is currently running, if any.
+    Cancel,
+
+    /// Inspect or create the configuration file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum QueueCommand {
+    /// List messages waiting to be delivered.
+    List {
+        /// Maximum rows to print.
+        #[arg(long, default_value_t = DEFAULT_LIST_LIMIT)]
+        limit: usize,
+    },
+
+    /// Delete every queued message, including undelivered ones.
+    Clear {
+        /// Confirm the deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConversationsCommand {
+    /// List known conversations, most recently active first.
+    List {
+        /// Restrict to one configured channel.
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Maximum rows to print.
+        #[arg(long, default_value_t = DEFAULT_LIST_LIMIT)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Show the bound session.
+    Show,
+
+    /// Forget the session binding so the next message starts a fresh one.
+    Reset {
+        /// Confirm that the agent's memory of past conversations may be discarded.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the path the config would be loaded from.
+    Path,
+
+    /// Load and validate the config, reporting the first problem found.
+    Validate,
+
+    /// Write a starter config to the default path.
+    Init {
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl Cli {
+    /// Execute the selected subcommand.
+    pub fn run(self) -> Result<()> {
+        let config_path = self.config.clone();
+        match self.command {
+            Some(Command::Config { command }) => match command {
+                ConfigCommand::Path => {
+                    let path = resolve_config_path(config_path.as_deref())?;
+                    println!("{}", path.display());
+                    Ok(())
+                }
+                ConfigCommand::Init { force } => {
+                    let path = resolve_config_path(config_path.as_deref())?;
+                    commands::config_init(&path, force)
+                }
+                ConfigCommand::Validate => {
+                    let config = Config::load(config_path.as_deref())?;
+                    for warning in &config.warnings {
+                        println!("warning: {warning}");
+                    }
+                    println!(
+                        "configuration is valid: {} channel(s), meka at {}",
+                        config.channels.len(),
+                        config.meka.base_url
+                    );
+                    Ok(())
+                }
+            },
+            Some(Command::Run) | None => {
+                let config = Config::load(config_path.as_deref())?;
+                init_logging(&config, self.verbose, self.log_format);
+                for warning in &config.warnings {
+                    tracing::warn!("{}", warning);
+                }
+                block_on(crate::bridge::run(config))
+            }
+            Some(command) => {
+                let config = Config::load(config_path.as_deref())?;
+                block_on(dispatch(command, config))
+            }
+        }
+    }
+}
+
+/// Run the operator subcommands, which are async because they touch SQLite and meka.
+async fn dispatch(command: Command, config: Config) -> Result<()> {
+    match command {
+        Command::Doctor => commands::doctor(&config).await,
+        Command::Status => commands::status(&config).await,
+        Command::Queue { command } => match command {
+            QueueCommand::List { limit } => commands::queue_list(&config, limit).await,
+            QueueCommand::Clear { yes } => commands::queue_clear(&config, yes).await,
+        },
+        Command::Conversations { command } => match command {
+            ConversationsCommand::List { channel, limit } => {
+                commands::conversations_list(&config, channel.as_deref(), limit).await
+            }
+        },
+        Command::Session { command } => match command {
+            SessionCommand::Show => commands::session_show(&config).await,
+            SessionCommand::Reset { yes } => commands::session_reset(&config, yes).await,
+        },
+        Command::Cancel => commands::cancel(&config).await,
+        // Handled before dispatch so they do not need a config or a runtime.
+        Command::Run | Command::Config { .. } => Ok(()),
+    }
+}
+
+fn resolve_config_path(override_path: Option<&std::path::Path>) -> Result<PathBuf> {
+    match override_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_config_path(),
+    }
+}
+
+/// Build a runtime for one command.
+///
+/// Created here rather than with `#[tokio::main]` so `mekabridge config path`, which touches
+/// nothing async, does not pay for a thread pool.
+fn block_on<F: Future<Output = Result<()>>>(future: F) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(future)
+}
+
+/// Build the tracing subscriber.
+///
+/// Precedence is `RUST_LOG`, then `-v` repetitions, then `[log].level`. Logging is initialised
+/// after the config is loaded, so config errors are reported by `main` on stderr instead.
+fn init_logging(config: &Config, verbose: u8, format_override: Option<LogFormatArg>) {
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => {
+            let directive = match verbose {
+                0 => config.log.level.clone(),
+                1 => "mekabridge=debug,info".to_string(),
+                _ => "mekabridge=trace,debug".to_string(),
+            };
+            EnvFilter::new(directive)
+        }
+    };
+    let format = format_override.map_or(config.log.format, LogFormat::from);
+    let registry = tracing_subscriber::registry().with(filter);
+    match format {
+        LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
+        LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::*;
+
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn no_subcommand_runs_the_daemon() {
+        let cli = Cli::try_parse_from(["mekabridge"]).expect("parses");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn the_config_path_can_come_from_the_environment() {
+        // systemd units set this rather than threading a flag through ExecStart.
+        // SAFETY: single-threaded test section.
+        unsafe { std::env::set_var("MEKABRIDGE_CONFIG", "/etc/mekabridge/from-env.toml") };
+        let cli = Cli::try_parse_from(["mekabridge", "status"]).expect("parses");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/etc/mekabridge/from-env.toml"))
+        );
+        unsafe { std::env::remove_var("MEKABRIDGE_CONFIG") };
+    }
+
+    #[test]
+    fn global_flags_work_after_a_subcommand() {
+        let cli = Cli::try_parse_from(["mekabridge", "status", "--config", "/tmp/x.toml", "-vv"])
+            .expect("parses");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/x.toml"))
+        );
+        assert_eq!(cli.verbose, 2);
+        assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn destructive_commands_require_confirmation_flags() {
+        let cli = Cli::try_parse_from(["mekabridge", "queue", "clear"]).expect("parses");
+        match cli.command {
+            Some(Command::Queue {
+                command: QueueCommand::Clear { yes },
+            }) => assert!(!yes, "clear must default to unconfirmed"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["mekabridge", "session", "reset"]).expect("parses");
+        match cli.command {
+            Some(Command::Session {
+                command: SessionCommand::Reset { yes },
+            }) => assert!(!yes, "reset must default to unconfirmed"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_limits_have_a_default() {
+        let cli = Cli::try_parse_from(["mekabridge", "queue", "list"]).expect("parses");
+        match cli.command {
+            Some(Command::Queue {
+                command: QueueCommand::List { limit },
+            }) => assert_eq!(limit, DEFAULT_LIST_LIMIT),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+}

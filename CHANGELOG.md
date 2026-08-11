@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-11
+
 ### Added
 
 - `allow_all`, for a bot anyone may message, such as a public or customer-service bot.
@@ -18,16 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group moderation: restrict, ban, unban, or kick a member, with an optional duration.
 - The agent can promote and demote administrators, pin messages, and set a group's title.
 - The agent can check its own rights in a group before acting, rather than finding out by failing.
-- `admin_tools = false` hides the moderation tools from a bot that should never use them.
-
 - A Security page in the docs, covering the trust model and what each setting does and does not do.
 
 ### Changed
 
+- **Breaking:** moderation tools are offered by default; set `admin_tools = false` to withhold them.
 - The agent can message any chat, including ones that have never messaged it first.
 - A chat the agent messages first now joins the conversation list instead of going unrecorded.
 - `doctor` warns when privacy mode is hiding group messages from the bot.
 - The agent is told how a sender was admitted without being told what to conclude from it.
+
+### Fixed
+
+- `doctor` and the docs described images as riding the turn, which they have not since 0.1.0.
+- Editing a message to empty text blamed length instead of saying it renders to nothing.
+- `mekabridge mute add` accepted a malformed id, silencing nothing while reporting success.
 
 ## [0.1.0] - 2026-08-11
 
@@ -61,5 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/k4yt3x/mekabridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/v0.1.0

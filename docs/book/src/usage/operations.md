@@ -132,11 +132,21 @@ means the agent wrote a reply that had nowhere to go. Since meka 0.37 the bridge
 running session's level with the config on the next turn, so fixing the config and restarting is
 enough; no session reset needed.
 
-**Telegram polls fail with `A network error: error sending request`.** Connectivity to
-`api.telegram.org`, not a bridge fault. A common cause is a host that resolves it to IPv6 while
-having no working IPv6 route: `curl` hides this by falling back to IPv4, but the bot's HTTP client
-may not. Compare `curl -4` and `curl -6` against `https://api.telegram.org/` to confirm, then
-deprioritise IPv6 in `/etc/gai.conf` or fix the route.
+**Telegram polls fail with `A network error: error sending request ... /GetUpdates`.** If the bridge
+carries on working either side of it, this is almost certainly not connectivity. `getUpdates` holds
+the connection open until an update arrives or `[[channels.telegram]].poll_timeout` elapses, so the
+HTTP client has to outlast it. mekabridge sizes the client at `poll_timeout` plus a margin for
+exactly this reason; before 0.2.1 it used teloxide's default of 17 seconds against a 30-second poll,
+and every poll that went 17 seconds without a message was aborted client-side. On an idle bot that is
+most of them.
+
+The tell is the shape rather than the message: a warning every few seconds on a quiet bot, each one
+followed immediately by a successful poll, and messages still arriving normally. A real connectivity
+fault does not recover between one log line and the next.
+
+If it persists on 0.2.1 or later, then look at the network. One cause worth ruling out is a host that
+resolves `api.telegram.org` to IPv6 with no working IPv6 route; compare `curl -4` and `curl -6`
+against `https://api.telegram.org/`, since plain `curl` hides it by falling back.
 
 **Gated tools are denied and the agent cannot reply.** The session is at `permission = "ask"`. Because the bridge declares it cannot answer prompts, gated calls are denied at once rather than stalling, but `send_message` needs `write`, so nothing gets sent. Set `write`, then `mekabridge session reset --yes` if the existing session was created at the wrong level.
 

@@ -125,7 +125,7 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 | `admin_tools` | `true` | Offer the agent the group moderation tools |
 | `parse_mode` | `html` | `html` renders Markdown into Telegram's HTML subset; `none` sends the Markdown verbatim |
 | `link_preview` | `false` | Show a preview card for the first link in a message. Off because the agent usually cites links rather than making one the subject of a message |
-| `poll_timeout` | `30s` | `getUpdates` long-poll timeout |
+| `poll_timeout` | `30s` | `getUpdates` long-poll timeout. The HTTP client is sized from this, so raising it is safe |
 
 At least one of `allowed_users`, `allowed_chats`, or `allow_all` must be set. Startup fails otherwise, because a bot with an empty allowlist would accept messages from anyone who finds it, and that should be a decision rather than an oversight.
 

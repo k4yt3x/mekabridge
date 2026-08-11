@@ -51,6 +51,20 @@ use crate::{
 /// referenced without pasting an entire prior message into the turn.
 const REPLY_EXCERPT_CHARS: usize = 160;
 
+/// How much longer the HTTP client waits than the long poll it is carrying.
+///
+/// `getUpdates` deliberately holds the connection open until either an update arrives or
+/// `poll_timeout` elapses, so the client's own request timeout has to outlast it. teloxide's
+/// default client stops at 17 seconds and does not adjust for the poll timeout: the code that would
+/// add one to the other is commented out behind a FIXME in `teloxide-core`, and its own docs say
+/// the caller is responsible for keeping the client timeout the larger of the two. Left alone, any
+/// poll_timeout above 17s aborts client-side on every quiet poll, which surfaces as a network error
+/// and a reconnect several times a minute on an idle bot.
+///
+/// The margin covers what happens after Telegram's timer fires: writing the empty response back
+/// over a possibly slow link. It is not a retry budget.
+const POLL_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct TelegramChannel {
     id: ChannelId,
     bot: Throttle<Bot>,
@@ -69,7 +83,16 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     pub fn new(id: ChannelId, config: &TelegramConfig) -> Result<Self, ChannelError> {
-        let bot = Bot::new(config.token.expose());
+        // Built rather than taken from `Bot::new`, whose client would abort a long poll before
+        // Telegram answers it. See [`POLL_RESPONSE_MARGIN`].
+        let client = teloxide::net::default_reqwest_settings()
+            .timeout(config.poll_timeout + POLL_RESPONSE_MARGIN)
+            .build()
+            .map_err(|error| ChannelError::Setup {
+                channel: id.as_str().to_string(),
+                message: format!("could not build the Telegram HTTP client: {error}"),
+            })?;
+        let bot = Bot::with_client(config.token.expose(), client);
         Ok(Self {
             id,
             bot: Throttle::new_spawn(bot.clone(), Limits::default()),
@@ -1317,6 +1340,35 @@ mod tests {
             Some(Admission::Chat)
         );
         assert_eq!(channel.admission(Some(222), 222), Some(Admission::Open));
+    }
+
+    #[test]
+    fn the_client_outlasts_the_long_poll_it_carries() {
+        // teloxide's default client stops at 17 seconds and does not extend itself for the poll
+        // timeout, so anything at or above that would abort every quiet poll client-side. The
+        // symptom is a network error and a reconnect every few seconds on an idle bot, which reads
+        // like a connectivity fault rather than a configuration one.
+        const TELOXIDE_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(17);
+        assert!(
+            POLL_RESPONSE_MARGIN > std::time::Duration::ZERO,
+            "the client timeout must exceed the poll timeout, not merely equal it"
+        );
+
+        // Read back through the real config rather than a copy of the default, so raising
+        // `poll_timeout` without raising the client's ceiling fails here.
+        let config = crate::config::Config::from_toml(
+            "[meka]\ntoken = \"t\"\n\n[[channels.telegram]]\nid = \"telegram\"\ntoken = \
+             \"t\"\nallowed_users = [1]\n",
+            std::path::Path::new("/etc/mekabridge/config.toml"),
+        )
+        .expect("minimal config is valid");
+        let crate::config::PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        assert!(
+            telegram.poll_timeout + POLL_RESPONSE_MARGIN > TELOXIDE_DEFAULT_TIMEOUT,
+            "the shipped poll timeout of {:?} plus the margin must clear teloxide's own {:?}",
+            telegram.poll_timeout,
+            TELOXIDE_DEFAULT_TIMEOUT
+        );
     }
 
     #[tokio::test]

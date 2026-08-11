@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use mekabridge::{
     config::{McpConfig, McpTransport},
-    mcp::{ConversationSummary, OutboundSink, SendOptions, SinkError, serve},
+    mcp::{
+        ConversationSummary, DownloadedAttachment, OutboundSink, SendOptions, SinkError,
+        ViewedAttachment, serve,
+    },
 };
 use rmcp2::{
     ServiceExt,
@@ -24,9 +27,13 @@ use rmcp2::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Base64 of a 1x1 PNG.
+const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 #[derive(Default)]
 struct RecordingSink {
     sent: Mutex<Vec<(String, String)>>,
+    reactions: Mutex<Vec<(String, Option<String>)>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -70,6 +77,59 @@ impl OutboundSink for RecordingSink {
         Ok(vec!["2001".to_string()])
     }
 
+    async fn react(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<(), SinkError> {
+        if conversation != "telegram:1" {
+            return Err(SinkError::UnknownConversation(conversation.to_string()));
+        }
+        let mut reactions = self
+            .reactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reactions.push((message_id.to_string(), emoji.map(str::to_string)));
+        Ok(())
+    }
+
+    async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
+        match handle {
+            // A one-pixel PNG, so the assertion is against real image bytes rather than a stub.
+            "417" => Ok(ViewedAttachment::Image {
+                media_type: "image/png".to_string(),
+                data: ONE_PIXEL_PNG.to_string(),
+                note: None,
+            }),
+            // A still frame standing in for a video, which must arrive with its caveat attached.
+            "419" => Ok(ViewedAttachment::Image {
+                media_type: "image/jpeg".to_string(),
+                data: ONE_PIXEL_PNG.to_string(),
+                note: Some(
+                    "This is the preview frame for a video, not the video itself.".to_string(),
+                ),
+            }),
+            "418" => Ok(ViewedAttachment::Description(
+                "This is a document (\"q3.pdf\", application/pdf) and has no image preview. Use \
+                 download_attachment to get the file itself."
+                    .to_string(),
+            )),
+            other => Err(SinkError::UnknownAttachment(other.to_string())),
+        }
+    }
+
+    async fn download_attachment(&self, handle: &str) -> Result<DownloadedAttachment, SinkError> {
+        if handle != "418" {
+            return Err(SinkError::UnknownAttachment(handle.to_string()));
+        }
+        Ok(DownloadedAttachment {
+            path: std::path::PathBuf::from("/var/lib/mekabridge/attachments/q3.pdf"),
+            bytes: 8_400_000,
+            media_type: Some("application/pdf".to_string()),
+        })
+    }
+
     async fn conversations(
         &self,
         _channel: Option<&str>,
@@ -85,10 +145,14 @@ impl OutboundSink for RecordingSink {
 
 /// `CallToolRequestParams` is `#[non_exhaustive]`, so it has to be built through its constructor
 /// rather than with a struct literal.
-fn send_message_params(arguments: serde_json::Value) -> CallToolRequestParams {
-    let mut params = CallToolRequestParams::new("send_message");
+fn tool_params(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
+    let mut params = CallToolRequestParams::new(name);
     params.arguments = arguments.as_object().cloned();
     params
+}
+
+fn send_message_params(arguments: serde_json::Value) -> CallToolRequestParams {
+    tool_params("send_message", arguments)
 }
 
 struct Harness {
@@ -174,10 +238,13 @@ async fn all_tools_are_visible_to_an_older_client() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
+        "download_attachment",
         "get_conversation",
         "list_conversations",
+        "react",
         "send_file",
         "send_message",
+        "view_attachment",
     ]);
 
     for tool in &tools {
@@ -284,6 +351,153 @@ async fn tool_level_errors_arrive_as_results_not_protocol_failures() {
         .filter_map(|block| block.as_text().map(|text| text.text.clone()))
         .collect();
     assert!(text.contains("list_conversations"), "got: {text}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn react_round_trips_across_the_version_gap() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "react",
+            serde_json::json!({
+                "conversation": "telegram:1",
+                "message_id": "4471",
+                "emoji": "👍",
+            }),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+
+    // Cloned out inside its own scope so the guard cannot straddle the await below.
+    let recorded = {
+        let reactions = harness
+            .sink
+            .reactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reactions.clone()
+    };
+    assert_eq!(recorded.as_slice(), [(
+        "4471".to_string(),
+        Some("👍".to_string())
+    )]);
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn view_attachment_returns_a_real_image_block_to_an_older_client() {
+    // The assumption the deferred-attachment design rests on: meka forwards an MCP image block
+    // straight through as a multimodal block, so the agent sees a picture in one tool call. If the
+    // block arrives as text across the version gap, "show me" quietly stops working.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "view_attachment",
+            serde_json::json!({ "attachment": "417" }),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+
+    let image = result
+        .content
+        .iter()
+        .find_map(|block| block.as_image())
+        .expect("the result must carry an image block, not a text description");
+    assert_eq!(image.mime_type, "image/png");
+    assert_eq!(image.data, ONE_PIXEL_PNG);
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_preview_frame_arrives_with_its_caveat_attached() {
+    // A still frame is not the video. The agent has to be told, in the same result, or it will
+    // reasonably conclude it has seen the whole thing.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "view_attachment",
+            serde_json::json!({ "attachment": "419" }),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect();
+    assert!(
+        text.contains("not the video itself"),
+        "the caveat must ride along with the frame, got: {text}"
+    );
+    assert!(
+        result
+            .content
+            .iter()
+            .any(|block| block.as_image().is_some()),
+        "the frame itself must still be shown"
+    );
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn an_unviewable_attachment_comes_back_as_a_description() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "view_attachment",
+            serde_json::json!({ "attachment": "418" }),
+        ))
+        .await
+        .expect("the call must succeed");
+    // Not an error: the agent asked a reasonable question and gets a usable answer plus a next
+    // step.
+    assert_eq!(result.is_error, Some(false));
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect();
+    assert!(text.contains("no image preview"), "got: {text}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn an_unknown_attachment_handle_tells_the_agent_where_to_look() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "download_attachment",
+            serde_json::json!({ "attachment": "9999" }),
+        ))
+        .await
+        .expect("the call itself must succeed");
+    assert_eq!(result.is_error, Some(true));
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect();
+    assert!(text.contains("attachment:"), "got: {text}");
 
     client.cancel().await.expect("clean shutdown");
 }

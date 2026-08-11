@@ -131,7 +131,7 @@ deprioritise IPv6 in `/etc/gai.conf` or fix the route.
 
 **Gated tools are denied and the agent cannot reply.** The session is at `permission = "ask"`. Because the bridge declares it cannot answer prompts, gated calls are denied at once rather than stalling, but `send_message` needs `write`, so nothing gets sent. Set `write`, then `mekabridge session reset --yes` if the existing session was created at the wrong level.
 
-**The agent says it cannot see an image.** Either the provider profile has `vision = false`, in which case the image is only named by path, or the turn's image budget was spent on earlier photos in the same batch. `mekabridge doctor` reports the vision setting.
+**The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the provider profile has `vision = false`; `mekabridge doctor` reports the setting.
 
 **The bot ignores a user.** Their id is not in `allowed_users`. Run with `-v` to see the drop at debug level.
 

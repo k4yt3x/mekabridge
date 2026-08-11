@@ -152,7 +152,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
     }
 
     println!("channels");
-    match ChannelRegistry::build(&config.channels, &config.storage) {
+    match ChannelRegistry::build(&config.channels) {
         Ok(registry) => {
             for channel in registry.iter() {
                 match channel.probe().await {

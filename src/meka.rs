@@ -15,7 +15,7 @@ pub mod sse;
 use std::{path::Path, time::Duration};
 
 use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use url::Url;
 use uuid::Uuid;
 
@@ -205,24 +205,6 @@ pub struct ReadyStatus {
     #[serde(default)]
     pub mcp_servers_healthy: bool,
 }
-
-/// One image attached to a turn.
-///
-/// Inlined as base64 rather than referenced by path because meka's API is a network surface: the
-/// bridge and the agent need not share a filesystem, so a path would not be resolvable at the other
-/// end. meka caps each image at [`MAX_IMAGE_BYTES`] once decoded.
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnImage {
-    /// Declared MIME type. meka falls back to the payload's magic bytes when this does not name a
-    /// supported format, so a wrong-but-plausible value still works.
-    pub media_type: String,
-    /// Base64-encoded bytes, standard alphabet with padding.
-    pub data: String,
-}
-
-/// meka's per-image cap once decoded, from its `MAX_IMAGE_RAW_BYTES`. Anything larger is a 422, so
-/// the bridge filters against this rather than discovering it from an error.
-pub const MAX_IMAGE_BYTES: usize = 3_750_000;
 
 /// How a turn ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -448,7 +430,6 @@ impl MekaClient {
         &self,
         session_id: Uuid,
         message: &str,
-        images: &[TurnImage],
     ) -> Result<impl Stream<Item = Result<TurnEvent>> + Send + use<>> {
         let url = self.endpoint(&format!("/v1/sessions/{session_id}/turn"))?;
         let response = self
@@ -458,7 +439,6 @@ impl MekaClient {
             .json(&serde_json::json!({
                 "message": message,
                 "stream": true,
-                "images": images,
             }))
             .send()
             .await?;
@@ -519,13 +499,12 @@ impl MekaClient {
         &self,
         session_id: Uuid,
         message: &str,
-        images: &[TurnImage],
         mut observer: F,
     ) -> Result<TurnOutcome>
     where
         F: FnMut(&TurnEvent) + Send,
     {
-        let stream = self.open_turn(session_id, message, images).await?;
+        let stream = self.open_turn(session_id, message).await?;
         let drive = async {
             let mut stream = Box::pin(stream);
             while let Some(event) = stream.next().await {

@@ -24,19 +24,47 @@ Messages from outside the allowlist are dropped at debug level with no reply. No
 
 Remember that everyone who is allowed shares one agent context. This is a personal assistant bridge, not a multi-tenant service.
 
+## What the agent sees
+
+Each inbound message arrives with a header. Everything in it is written by the bridge and cannot be forged from message text, which is fenced separately behind a per-turn random marker.
+
+```
+channel: telegram
+conversation: telegram:-1001234567890
+message: 4471
+from: Bob (@bob, id 987654321)
+admitted: chat allowlist (sender not individually allowlisted)
+chat: group "Deploy Crew"
+at: 2026-08-11T14:22:31+00:00
+forwarded from: Alice (@alice, id 111222333)
+album: 13294839284
+in reply to a message from Mica (id 4468): "deploy finished"
+attachment: photo, image/jpeg, 2.1 MiB [417]
+```
+
+Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` always appear; the rest show up when they apply.
+
+- **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
+- **`admitted`** says why the sender got through: `user allowlist` means they were vetted individually, `chat allowlist` means they were not and are only there because the whole chat is allowed. This is the distinction a personal assistant needs when a stranger in a group asks it for something.
+- **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
+- **`album`** ties the parts of a multi-photo post together, so a batch of pictures does not read as several unrelated ones.
+- **`attachment`** ends with a handle for the fetch tools. See [Attachments](#attachments).
+
+A sender who is another bot is marked `[bot]`. An anonymous group admin, who posts as the chat rather than as an account, reads as `Deploy Crew (posted as the chat itself, no individual account)` rather than being dressed up as a person.
+
 ## Groups and forum topics
 
-Group messages work the same as direct ones. The envelope tells the agent which chat a message came from and who sent it:
-
-```
-conversation: telegram:-1001234567890
-from: Alice (@alice, id 123456789)
-chat: group "Deploy Crew"
-```
-
-Forum topics get their own conversation id with a third segment (`telegram:-1001234567890:77`), so the agent replies into the right topic rather than the group's General.
+Group messages work the same as direct ones. Forum topics get their own conversation id with a third segment (`telegram:-1001234567890:77`), so the agent replies into the right topic rather than the group's General.
 
 Note that a bot in a group only receives every message if privacy mode is off (`/setprivacy` in @BotFather). With privacy mode on, it sees only commands and replies to itself.
+
+Being added to or removed from a group is logged. If the group is not allowlisted the log line is a warning, because from the outside that state looks identical to a broken bot.
+
+## Editing and reactions
+
+An edited message is delivered again, marked as an edit, rather than being mistaken for a repeat of the original. The agent sees the revised text and knows which message it revises.
+
+The agent can react to any message with `react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
 
 ## Formatting
 
@@ -60,11 +88,42 @@ If rendering ever misbehaves on a particular message, `parse_mode = "none"` send
 
 ## Attachments
 
-Inbound photos, documents, voice notes, audio, video, and stickers are downloaded into `[storage].attachment_dir`, and the envelope names the local path. Files above `attachment_max_bytes` are not downloaded, and the envelope says so rather than pretending nothing arrived.
+**Nothing is downloaded on arrival.** The envelope announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `view_attachment` to look at a picture or `download_attachment` to get the file on disk.
 
-Images additionally ride on the turn itself when meka's provider profile has vision enabled, so the agent sees the picture directly instead of having to open the file. Telegram photos are JPEG and stickers are WebP, both of which meka accepts unconverted. See [Vision and images](./meka-integration.md#vision-and-images) for the size limits, which matter because a batch can carry a photo from each of several messages.
+```
+attachment: photo, image/jpeg, 2.1 MiB [417]
+attachment: document, "q3-report.pdf", application/pdf, 8.4 MiB [418]
+```
+
+Three reasons it works this way. A download inside the polling loop stalls every later message behind it, so one large file used to delay an entire conversation. Disk filled with files nobody asked for. And because the bridge owns one permanent session, an image attached to a turn stays in the agent's context for the life of that session, whether or not it ever mattered; now only the pictures it chose to look at do.
+
+Photos, documents, voice notes, audio, video, video notes, animations, and stickers all arrive this way. Content with no file at all becomes a descriptor line instead, so a shared location, a contact card, a poll, or a dice roll is still something the agent can see and respond to:
+
+```
+note: location: 51.5074, -0.1278
+note: contact card: Bob Smith, phone +15551234567
+```
+
+The invariant is that an allowlisted message always produces something. An unrecognised message type becomes a placeholder rather than disappearing, so a future Bot API addition degrades instead of going silently missing.
+
+### Viewing video and GIFs
+
+Telegram generates a still frame for every video, animation, and animated sticker. `view_attachment` resolves to that frame, so "show me" works for them with no transcoding and no ffmpeg dependency.
+
+This matters more than it sounds. Telegram's cloud Bot API caps `getFile` at 20 MiB regardless of what `attachment_max_bytes` says, so a phone video often cannot be downloaded at all, and the thumbnail is the only part of it the bridge can retrieve. Only a local Bot API server lifts that ceiling.
+
+### Sending
 
 Outbound, the agent uses `send_file` with an absolute path, optionally `as_photo` for images it wants shown inline.
+
+## Link previews
+
+Telegram renders a preview card for the first link in a message. mekabridge disables this by default: the agent cites links as references far more often than it makes one the subject of a message, and a card on each part of a split reply is noise. Turn them back on per channel:
+
+```toml
+[[channels.telegram]]
+link_preview = true
+```
 
 ## Rate limits
 
@@ -72,6 +131,21 @@ Outbound calls go through teloxide's `Throttle` adaptor. Telegram allows roughly
 
 ## Typing indicators
 
-While a turn triggered by a chat is running, that chat shows a typing indicator, refreshed every four seconds because Telegram clears it after about five.
+When a turn starts, the chats it came from show a typing indicator, refreshed every four seconds because Telegram clears it after about five.
 
-This is the one thing mekabridge emits without the agent asking. It is presence rather than content, the same signal a person's phone shows, so it does not compete with the agent's decision about whether to reply. Turn it off with `[bridge].typing_indicator = false`.
+It stops on whichever comes first:
+
+- **The agent sends a message there.** Telegram already clears the status when a message from the bot arrives, so re-arming it afterwards would tell somebody who was just answered that a second message is coming.
+- **Thirty seconds pass.** A turn still running after that is working through tool calls, not composing a sentence. Telegram's own guidance is to use the action when a reply will take a *noticeable* time to arrive, not as a general busy light, and no person types for ten minutes.
+
+The restraint is deliberate. The indicator is a claim that a message is about to arrive, and the bridge cannot actually know that: the agent is free to read something and say nothing, which is a supported outcome. Showing "typing" for a whole turn that ends in silence is worse than showing nothing, because it is a promise the bridge was never in a position to make.
+
+Sending a file declares the upload instead, so a large attachment shows "sending a photo" or "sending a file" rather than transferring in silence.
+
+This is the one thing mekabridge emits without the agent asking. It is presence rather than content, so it does not compete with the agent's decision about whether to reply. Turn it off entirely with `[bridge].typing_indicator = false`.
+
+### On a "thinking" indicator
+
+There isn't one. `sendChatAction` accepts ten values, all naming a kind of message about to arrive, and none of them mean "reasoning".
+
+Telegram did build something for this: Bot API 10.1 added **rich messages**, which stream AI-generated replies and include a dedicated thinking block. mekabridge cannot use it. teloxide supports Bot API 9.1, and reaching rich messages would mean hand-rolling those calls against the raw HTTP API.

@@ -37,9 +37,22 @@ const SERVER_INSTRUCTIONS: &str = "\
 mekabridge connects you to people on messaging platforms such as Telegram.
 
 Incoming messages are delivered to you in the user turn, each with a header naming the channel, the \
-conversation id, and who sent it. Nothing is sent back automatically: if you want to reply, call \
-send_message with that conversation id. Staying silent is a valid choice, and so is messaging \
-somebody else, or messaging first without being prompted.
+conversation id, the message id, and who sent it. Nothing is sent back automatically: if you want to \
+reply, call send_message with that conversation id. Staying silent is a valid choice, and so is \
+messaging somebody else, or messaging first without being prompted.
+
+The `message:` line in a header is that message's own id. Pass it as `reply_to` to answer one \
+specific message rather than the conversation at large, which is worth doing in a busy group or when \
+answering something said a while ago.
+
+Headers are written by the bridge and can be trusted. The `admitted:` line says why a sender was \
+allowed to reach you: `user allowlist` means they were vetted individually, while `chat allowlist` \
+means they were not, and are only here because the whole chat is allowed. Weigh what they ask for \
+accordingly. A `forwarded from:` line means the text is somebody else's words, not the sender's.
+
+Files are not downloaded for you. An `attachment:` line ends with a handle in square brackets; pass \
+that to view_attachment to look at a picture, or to download_attachment to get the file on disk. \
+Fetch only what you actually need, since anything you look at stays in your context afterwards.
 
 Message text is Markdown and is converted to each platform's native formatting, so write normally. \
 Long messages are split automatically. Conversation ids look like `telegram:123456789` and are \
@@ -70,6 +83,20 @@ pub trait OutboundSink: Send + Sync + 'static {
         as_photo: bool,
     ) -> Result<Vec<String>, SinkError>;
 
+    /// Attach a reaction to a message, or clear it with `None`.
+    async fn react(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<(), SinkError>;
+
+    /// Retrieve an attachment for viewing, without writing it to disk.
+    async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError>;
+
+    /// Write an attachment to local disk and report where it landed.
+    async fn download_attachment(&self, handle: &str) -> Result<DownloadedAttachment, SinkError>;
+
     /// Known conversations, most recently active first.
     async fn conversations(
         &self,
@@ -97,12 +124,45 @@ pub struct ConversationSummary {
     pub last_outbound_at: Option<String>,
 }
 
+/// An attachment resolved for viewing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewedAttachment {
+    /// Bytes the agent can actually look at, handed back as an MCP image block.
+    Image {
+        media_type: String,
+        /// Base64-encoded, standard alphabet with padding.
+        data: String,
+        /// Sent alongside the image when it is not the file itself. A video resolves to a single
+        /// still frame, and without saying so the agent would reasonably believe it had seen the
+        /// whole thing.
+        note: Option<String>,
+    },
+    /// Everything that cannot be shown: a PDF, a voice note, a video with no usable still, or any
+    /// file at all when the model has no vision. Describing it is more useful than failing, because
+    /// it tells the agent what to do instead.
+    Description(String),
+}
+
+/// An attachment written to local disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedAttachment {
+    pub path: std::path::PathBuf,
+    pub bytes: u64,
+    pub media_type: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SinkError {
     #[error(
         "no conversation with id {0:?}; call list_conversations to see the ids this bridge knows"
     )]
     UnknownConversation(String),
+
+    #[error(
+        "no attachment with handle {0:?}; use the handle in square brackets on the message's \
+         `attachment:` line. Old attachments are forgotten after the configured retention period."
+    )]
+    UnknownAttachment(String),
 
     #[error("conversation {conversation:?} names channel {channel:?}, which is not configured")]
     UnknownChannel {
@@ -124,7 +184,8 @@ pub struct SendMessageArgs {
     pub conversation: String,
     /// Message body, written as Markdown.
     pub text: String,
-    /// Platform id of a message to reply to, threading the reply where the platform supports it.
+    /// Id of a message to reply to, quoting it so it is clear what is being answered. This is the
+    /// `message:` line from an incoming message's header.
     #[serde(default)]
     pub reply_to: Option<String>,
     /// Deliver without a notification sound.
@@ -145,6 +206,23 @@ pub struct SendFileArgs {
     /// the platform may recompress them.
     #[serde(default)]
     pub as_photo: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReactArgs {
+    /// Conversation the message is in.
+    pub conversation: String,
+    /// Id of the message to react to, from the `message:` line of its header.
+    pub message_id: String,
+    /// The emoji to react with. Omit to remove a reaction you added earlier.
+    #[serde(default)]
+    pub emoji: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentArgs {
+    /// The handle shown in square brackets on an `attachment:` line, for example `417`.
+    pub attachment: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -298,6 +376,145 @@ impl BridgeMcpServer {
         }
     }
 
+    /// React to a message.
+    #[tool(
+        description = "React to a message with an emoji, the way a person taps a reaction rather \
+                       than writing back. Good for acknowledging something that needs no reply, or \
+                       for signalling you have seen a message you will answer properly later. \
+                       `message_id` is the `message:` line from that message's header. Omit `emoji` \
+                       to remove a reaction you added before. Platforms accept only a fixed set of \
+                       emoji and usually one per message; if yours is rejected the error says so.",
+        annotations(
+            title = "React to message",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn react(
+        &self,
+        Parameters(args): Parameters<ReactArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.react_inner(args, calling_session(&context)).await
+    }
+
+    /// The body of [`Self::react`]. See [`Self::send_message_inner`] for why it is split out.
+    async fn react_inner(
+        &self,
+        args: ReactArgs,
+        session: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        let emoji = args.emoji.as_deref().map(str::trim).filter(|emoji| {
+            // An empty string would clear the reaction, which `emoji: null` already expresses.
+            // Treating it as "clear" silently would hide a caller bug, so it is refused below.
+            !emoji.is_empty()
+        });
+        if args.emoji.is_some() && emoji.is_none() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "`emoji` is empty; omit it entirely to remove a reaction.",
+            )]));
+        }
+        match self
+            .sink
+            .react(&args.conversation, &args.message_id, emoji)
+            .await
+        {
+            Ok(()) => {
+                if let Some(session) = session {
+                    tracing::debug!(session = %session, "react from meka session");
+                }
+                let summary = match emoji {
+                    Some(emoji) => format!(
+                        "Reacted {emoji} to message {} in {}.",
+                        args.message_id, args.conversation
+                    ),
+                    None => format!(
+                        "Removed your reaction from message {} in {}.",
+                        args.message_id, args.conversation
+                    ),
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
+            }
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Look at an attachment.
+    #[tool(
+        description = "Look at a picture somebody sent you. Nothing arrives downloaded, so call \
+                       this when you want to actually see an image before deciding what to say \
+                       about it. `attachment` is the handle in square brackets on the message's \
+                       `attachment:` line. Videos, animations, and animated stickers come back as a \
+                       still frame. Anything that is not viewable, such as a PDF or a voice note, \
+                       comes back as a description instead; use download_attachment for those.",
+        annotations(
+            title = "View attachment",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn view_attachment(
+        &self,
+        Parameters(args): Parameters<AttachmentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.sink.view_attachment(&args.attachment).await {
+            Ok(ViewedAttachment::Image {
+                media_type,
+                data,
+                note,
+            }) => {
+                let mut blocks = Vec::new();
+                // The caveat leads, so it is read before the picture rather than after it has
+                // already been taken for the whole file.
+                if let Some(note) = note {
+                    blocks.push(ContentBlock::text(note));
+                }
+                blocks.push(ContentBlock::image(data, media_type));
+                Ok(CallToolResult::success(blocks))
+            }
+            Ok(ViewedAttachment::Description(description)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    description,
+                )]))
+            }
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Download an attachment to disk.
+    #[tool(
+        description = "Download a file somebody sent you and get back the path it was saved to. Use \
+                       this when you need the file itself, to read a document or run a tool over \
+                       it, rather than just to look at a picture. `attachment` is the handle in \
+                       square brackets on the message's `attachment:` line. Large files may be \
+                       refused; the error says the limit.",
+        // `read_only_hint` deserves the caveat: this does write a file. It writes only into
+        // `[storage].attachment_dir`, which exists for exactly this, is bounded by
+        // `attachment_max_bytes`, and is swept on `attachment_retention`. Marking it otherwise would
+        // put it at meka's `write` level, where a bridge run at `read` could receive a document and
+        // never open it.
+        annotations(title = "Download attachment", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn download_attachment(
+        &self,
+        Parameters(args): Parameters<AttachmentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.sink.download_attachment(&args.attachment).await {
+            Ok(downloaded) => {
+                let media_type = downloaded
+                    .media_type
+                    .map(|media_type| format!(", {media_type}"))
+                    .unwrap_or_default();
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Saved to {} ({} bytes{media_type}).",
+                    downloaded.path.display(),
+                    downloaded.bytes
+                ))]))
+            }
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
     /// List known conversations.
     #[tool(
         description = "List the conversations this bridge knows about, most recently active first. \
@@ -428,6 +645,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         sent: Mutex<Vec<(String, String, SendOptions)>>,
+        reactions: Mutex<Vec<(String, String, Option<String>)>>,
         conversations: Vec<ConversationSummary>,
         fail_with: Option<&'static str>,
     }
@@ -478,6 +696,63 @@ mod tests {
             _as_photo: bool,
         ) -> Result<Vec<String>, SinkError> {
             Ok(vec!["2001".to_string()])
+        }
+
+        async fn react(
+            &self,
+            conversation: &str,
+            message_id: &str,
+            emoji: Option<&str>,
+        ) -> Result<(), SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            if !self
+                .conversations
+                .iter()
+                .any(|item| item.id == conversation)
+            {
+                return Err(SinkError::UnknownConversation(conversation.to_string()));
+            }
+            let mut reactions = self
+                .reactions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reactions.push((
+                conversation.to_string(),
+                message_id.to_string(),
+                emoji.map(str::to_string),
+            ));
+            Ok(())
+        }
+
+        async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
+            match handle {
+                "417" => Ok(ViewedAttachment::Image {
+                    media_type: "image/png".to_string(),
+                    data: "aW1hZ2U=".to_string(),
+                    note: None,
+                }),
+                "418" => Ok(ViewedAttachment::Description(
+                    "This is a document (\"q3.pdf\", application/pdf) and has no image preview."
+                        .to_string(),
+                )),
+                other => Err(SinkError::UnknownAttachment(other.to_string())),
+            }
+        }
+
+        async fn download_attachment(
+            &self,
+            handle: &str,
+        ) -> Result<DownloadedAttachment, SinkError> {
+            if handle != "418" {
+                return Err(SinkError::UnknownAttachment(handle.to_string()));
+            }
+            Ok(DownloadedAttachment {
+                path: PathBuf::from("/var/lib/mekabridge/attachments/q3.pdf"),
+                bytes: 8_400_000,
+                media_type: Some("application/pdf".to_string()),
+            })
         }
 
         async fn conversations(
@@ -680,6 +955,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn react_attaches_an_emoji_to_a_message() {
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .react_inner(
+                ReactArgs {
+                    conversation: "telegram:1".to_string(),
+                    message_id: "4471".to_string(),
+                    emoji: Some("👍".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let reactions = sink.reactions.lock().expect("lock");
+        assert_eq!(reactions.as_slice(), [(
+            "telegram:1".to_string(),
+            "4471".to_string(),
+            Some("👍".to_string())
+        )]);
+    }
+
+    #[tokio::test]
+    async fn omitting_the_emoji_clears_the_reaction() {
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .react_inner(
+                ReactArgs {
+                    conversation: "telegram:1".to_string(),
+                    message_id: "4471".to_string(),
+                    emoji: None,
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert!(text_of(&result).contains("Removed"));
+        let reactions = sink.reactions.lock().expect("lock");
+        assert_eq!(reactions[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_emoji_is_refused_rather_than_read_as_a_clear() {
+        // `emoji: ""` almost certainly means a caller built the argument wrong. Silently treating
+        // it as "remove the reaction" would hide that.
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .react_inner(
+                ReactArgs {
+                    conversation: "telegram:1".to_string(),
+                    message_id: "4471".to_string(),
+                    emoji: Some("  ".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(sink.reactions.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_reaction_reaches_the_agent_verbatim() {
+        // Telegram publishes a fixed emoji set and revises it, so the platform's own complaint is
+        // the only accurate explanation available.
+        let (server, _sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            fail_with: Some("REACTION_INVALID"),
+            ..FakeSink::default()
+        });
+        let result = server
+            .react_inner(
+                ReactArgs {
+                    conversation: "telegram:1".to_string(),
+                    message_id: "4471".to_string(),
+                    emoji: Some("🦀".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains("REACTION_INVALID"));
+    }
+
+    #[tokio::test]
     async fn list_conversations_clamps_the_limit() {
         let conversations: Vec<ConversationSummary> = (0..300)
             .map(|index| summary(&format!("telegram:{index}")))
@@ -731,11 +1102,19 @@ mod tests {
     fn every_tool_is_registered_with_a_description() {
         let router = BridgeMcpServer::tool_router();
         let tools = router.list_all();
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert!(names.contains(&"send_message"));
-        assert!(names.contains(&"send_file"));
-        assert!(names.contains(&"list_conversations"));
-        assert!(names.contains(&"get_conversation"));
+        let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        names.sort_unstable();
+        // The exact set, not a spot check: a tool silently dropped from the router is a capability
+        // the agent loses with nothing to indicate it, and the docs list these by name.
+        assert_eq!(names, vec![
+            "download_attachment",
+            "get_conversation",
+            "list_conversations",
+            "react",
+            "send_file",
+            "send_message",
+            "view_attachment",
+        ]);
         for tool in &tools {
             assert!(
                 tool.description
@@ -778,7 +1157,12 @@ mod tests {
                 .as_ref()
                 .and_then(|annotations| annotations.open_world_hint);
             let expected = match tool.name.as_ref() {
-                "send_message" | "send_file" => Some(true),
+                // Everything that talks to the platform, in either direction.
+                "send_message"
+                | "send_file"
+                | "react"
+                | "view_attachment"
+                | "download_attachment" => Some(true),
                 _ => Some(false),
             };
             assert_eq!(open_world, expected, "openWorldHint for {}", tool.name);

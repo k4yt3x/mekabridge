@@ -8,6 +8,13 @@
 //! Typing indicators are the one thing the bridge emits on its own. That is presence rather than
 //! content, the same signal a person's phone shows while they type, so it does not compete with the
 //! agent's decision about whether to reply at all.
+//!
+//! It is deliberately not held for the whole turn. The indicator is a claim that a message is about
+//! to arrive, and the bridge cannot know that: the agent may work for minutes and then decide to
+//! say nothing, which is a supported outcome. So it opens on submission, stops the moment a reply
+//! actually lands, and lapses after `TYPING_MAX_DURATION` regardless. Overstating is worse than
+//! staying quiet, because a user who watched "typing" for ten minutes and got nothing has been
+//! actively misled.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -16,12 +23,57 @@ use uuid::Uuid;
 
 use crate::{
     channel::{ChannelRegistry, ConversationId},
-    meka::{MekaClient, MekaError, TurnImage, TurnOutcome, sse::TurnEvent},
+    meka::{MekaClient, MekaError, TurnOutcome, sse::TurnEvent},
 };
 
 /// How often the typing indicator is refreshed. Telegram clears it after about five seconds, so the
 /// interval has to sit under that to look continuous.
 const TYPING_REFRESH: Duration = Duration::from_secs(4);
+
+/// How long the indicator may be held before it stops saying anything useful.
+///
+/// A turn that spends minutes on tool calls is working, not composing, and Telegram's own guidance
+/// is to use the action when a reply will take a *noticeable* time to arrive rather than as a
+/// general busy light. Past this the bridge would only be claiming to type for longer than any
+/// person ever would.
+const TYPING_MAX_DURATION: Duration = Duration::from_secs(30);
+
+/// Which conversations the agent has already sent to during the current turn.
+///
+/// Shared with the outbound sink, which is the only thing that knows a message actually went out.
+/// Telegram clears the typing status when a message from the bot arrives, so without this the
+/// refresh loop re-arms it seconds later and the user, having just been answered, waits for a
+/// second message that is never coming.
+#[derive(Debug, Default)]
+pub struct Presence {
+    replied: std::sync::Mutex<std::collections::HashSet<ConversationId>>,
+}
+
+impl Presence {
+    /// Record that a message reached `conversation`.
+    pub fn note_sent(&self, conversation: &ConversationId) {
+        self.replied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(conversation.clone());
+    }
+
+    /// Whether the agent has already sent to `conversation` this turn.
+    pub fn has_replied(&self, conversation: &ConversationId) -> bool {
+        self.replied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(conversation)
+    }
+
+    /// Forget everything, so the next turn starts from silence.
+    pub fn reset(&self) {
+        self.replied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
 
 /// The MCP tool name meka exposes for this bridge's `send_message`, used to tell "the agent
 /// replied" apart from "the agent stayed quiet". meka namespaces MCP tools as
@@ -85,6 +137,8 @@ pub struct TurnRunner {
     meka: MekaClient,
     channels: Arc<ChannelRegistry>,
     typing_enabled: bool,
+    /// Shared with the outbound sink so the indicator can stop once a reply has actually landed.
+    presence: Arc<Presence>,
 }
 
 impl TurnRunner {
@@ -92,25 +146,28 @@ impl TurnRunner {
         meka: MekaClient,
         channels: Arc<ChannelRegistry>,
         typing_enabled: bool,
+        presence: Arc<Presence>,
     ) -> Self {
         Self {
             meka,
             channels,
             typing_enabled,
+            presence,
         }
     }
 
     /// Submit `message` and drive the turn to completion.
     ///
-    /// `conversations` are the ones the batch came from; each gets a typing indicator for the
-    /// duration.
+    /// `conversations` are the ones the batch came from; each gets a typing indicator until the
+    /// agent replies there or the window lapses.
     pub async fn run(
         &self,
         session_id: Uuid,
         message: &str,
-        images: &[TurnImage],
         conversations: &BTreeSet<ConversationId>,
     ) -> Result<TurnReport, MekaError> {
+        // Sends from an earlier turn must not suppress this turn's indicator.
+        self.presence.reset();
         let typing = self.start_typing(conversations);
 
         let mut sends = 0_usize;
@@ -120,7 +177,7 @@ impl TurnRunner {
 
         let result = self
             .meka
-            .run_turn(session_id, message, images, |event| match event {
+            .run_turn(session_id, message, |event| match event {
                 TurnEvent::AssistantText { text } => {
                     text_length += text.chars().count();
                     // Bounded: a long answer would otherwise be held in memory for a log line.
@@ -163,7 +220,8 @@ impl TurnRunner {
         })
     }
 
-    /// Keep a typing indicator alive in each conversation until the returned token is cancelled.
+    /// Keep a typing indicator alive in each conversation until the turn ends, the agent replies
+    /// there, or the indicator has been held long enough to stop meaning anything.
     fn start_typing(&self, conversations: &BTreeSet<ConversationId>) -> CancellationToken {
         let token = CancellationToken::new();
         if !self.typing_enabled {
@@ -178,10 +236,27 @@ impl TurnRunner {
             }
             let channel = Arc::clone(channel);
             let conversation = conversation.clone();
+            let presence = Arc::clone(&self.presence);
             let token = token.child_token();
             tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + TYPING_MAX_DURATION;
                 loop {
-                    if let Err(error) = channel.set_typing(&conversation).await {
+                    // Checked before re-arming rather than after sending, so the burst that follows
+                    // a reply never happens in the first place.
+                    if presence.has_replied(&conversation) {
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::debug!(
+                            conversation = %conversation,
+                            "the turn has run past the typing window; letting the indicator lapse"
+                        );
+                        return;
+                    }
+                    if let Err(error) = channel
+                        .set_activity(&conversation, crate::channel::Activity::Typing)
+                        .await
+                    {
                         // Presence is cosmetic; a chat that will not accept a typing action should
                         // never take down the turn that is actually doing the work.
                         tracing::debug!(
@@ -204,8 +279,232 @@ impl TurnRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
     use super::*;
-    use crate::meka::sse::Usage;
+    use crate::{
+        channel::{
+            Activity, Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity,
+            FetchedFile, InboundEvent, Platform, SendOptions,
+        },
+        meka::sse::Usage,
+    };
+
+    /// Records the activity actions a turn asks for, so the indicator's timing can be asserted.
+    struct SpyChannel {
+        id: ChannelId,
+        activities: Mutex<Vec<Activity>>,
+    }
+
+    impl SpyChannel {
+        fn new() -> Self {
+            Self {
+                id: ChannelId::new("spy"),
+                activities: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn activity_count(&self) -> usize {
+            self.activities
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+    }
+
+    #[async_trait]
+    impl Channel for SpyChannel {
+        fn id(&self) -> &ChannelId {
+            &self.id
+        }
+
+        fn platform(&self) -> Platform {
+            Platform::Telegram
+        }
+
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                typing_indicator: true,
+                files: true,
+                photos: true,
+                reactions: true,
+            }
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _sink: tokio::sync::mpsc::Sender<InboundEvent>,
+            shutdown: CancellationToken,
+        ) -> Result<(), ChannelError> {
+            shutdown.cancelled().await;
+            Ok(())
+        }
+
+        async fn send_text(
+            &self,
+            _conversation: &ConversationId,
+            _markdown: &str,
+            _options: &SendOptions,
+        ) -> Result<Vec<String>, ChannelError> {
+            Ok(vec!["m1".to_string()])
+        }
+
+        async fn send_file(
+            &self,
+            _conversation: &ConversationId,
+            _path: &std::path::Path,
+            _caption: Option<&str>,
+            _as_photo: bool,
+        ) -> Result<Vec<String>, ChannelError> {
+            Ok(vec!["f1".to_string()])
+        }
+
+        async fn fetch(
+            &self,
+            _file_ref: &str,
+            _max_bytes: u64,
+        ) -> Result<FetchedFile, ChannelError> {
+            Ok(FetchedFile {
+                bytes: Vec::new(),
+                media_type: None,
+                extension: None,
+            })
+        }
+
+        async fn react(
+            &self,
+            _conversation: &ConversationId,
+            _message_id: &str,
+            _emoji: Option<&str>,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn set_activity(
+            &self,
+            _conversation: &ConversationId,
+            activity: Activity,
+        ) -> Result<(), ChannelError> {
+            self.activities
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(activity);
+            Ok(())
+        }
+
+        async fn probe(&self) -> Result<ChannelIdentity, ChannelError> {
+            Ok(ChannelIdentity {
+                id: "1".to_string(),
+                display_name: "Spy".to_string(),
+                username: None,
+            })
+        }
+    }
+
+    fn runner_with(channel: Arc<SpyChannel>, presence: Arc<Presence>) -> TurnRunner {
+        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
+            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
+            token: crate::config::secret::Secret::new("test", "test"),
+            connect_timeout: Duration::from_secs(1),
+            turn_timeout: Duration::from_secs(1),
+            max_retries: 0,
+        })
+        .expect("client builds");
+        let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
+            channel as Arc<dyn Channel>
+        ]));
+        TurnRunner::new(meka, channels, true, presence)
+    }
+
+    fn conversations() -> BTreeSet<ConversationId> {
+        let mut set = BTreeSet::new();
+        set.insert(ConversationId::parse("spy:1").expect("valid"));
+        set
+    }
+
+    #[test]
+    fn presence_tracks_which_conversations_were_answered() {
+        let presence = Presence::default();
+        let conversation = ConversationId::parse("spy:1").expect("valid");
+        assert!(!presence.has_replied(&conversation));
+        presence.note_sent(&conversation);
+        assert!(presence.has_replied(&conversation));
+        presence.reset();
+        assert!(
+            !presence.has_replied(&conversation),
+            "a new turn must start from silence, not inherit the last one's sends"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_stops_re_arming_once_the_agent_has_replied() {
+        // The bug this pins: Telegram clears the typing status when the bot's message arrives, so
+        // re-arming afterwards tells a user who was just answered that a second message is coming.
+        let channel = Arc::new(SpyChannel::new());
+        let presence = Arc::new(Presence::default());
+        let runner = runner_with(Arc::clone(&channel), Arc::clone(&presence));
+
+        let token = runner.start_typing(&conversations());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            channel.activity_count(),
+            1,
+            "the opening burst still happens"
+        );
+
+        presence.note_sent(&ConversationId::parse("spy:1").expect("valid"));
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            1,
+            "nothing more may be sent after the reply landed"
+        );
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_lapses_once_the_turn_outlives_the_window() {
+        // A turn grinding through tool calls is working, not composing. Holding the indicator for
+        // its whole duration claims something no person would.
+        let channel = Arc::new(SpyChannel::new());
+        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+
+        let token = runner.start_typing(&conversations());
+        tokio::time::sleep(TYPING_MAX_DURATION * 4).await;
+
+        let sent = channel.activity_count();
+        let ceiling = (TYPING_MAX_DURATION.as_secs() / TYPING_REFRESH.as_secs()) as usize + 1;
+        assert!(
+            sent <= ceiling,
+            "held the indicator for {sent} refreshes, past the {ceiling} the window allows"
+        );
+        assert!(sent > 1, "the window must still cover a normal turn");
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_is_not_emitted_at_all_when_disabled() {
+        let channel = Arc::new(SpyChannel::new());
+        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
+            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
+            token: crate::config::secret::Secret::new("test", "test"),
+            connect_timeout: Duration::from_secs(1),
+            turn_timeout: Duration::from_secs(1),
+            max_retries: 0,
+        })
+        .expect("client builds");
+        let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
+            Arc::clone(&channel) as Arc<dyn Channel>,
+        ]));
+        let runner = TurnRunner::new(meka, channels, false, Arc::new(Presence::default()));
+
+        let token = runner.start_typing(&conversations());
+        tokio::time::sleep(TYPING_REFRESH * 2).await;
+        assert_eq!(channel.activity_count(), 0);
+        token.cancel();
+    }
 
     fn report(sends: usize) -> TurnReport {
         TurnReport {

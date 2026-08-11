@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ChannelConfig, PlatformConfig, StorageConfig};
+use crate::config::{ChannelConfig, PlatformConfig};
 
 /// Supported platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,11 +144,101 @@ impl ChatKind {
 /// Who sent an inbound message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender {
-    /// Platform-native user id.
+    /// Platform-native user id. Empty when the message was posted on behalf of a chat rather than
+    /// by an individual, which is what [`Sender::on_behalf_of_chat`] marks.
     pub id: String,
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// The sender is another bot rather than a person.
+    #[serde(default)]
+    pub is_bot: bool,
+    /// The message was posted as the chat itself, not by an identifiable account. Telegram does
+    /// this for anonymous group admins and for channel posts forwarded into a linked
+    /// discussion group. Without this the display name falls back to the chat title and an
+    /// anonymous post is indistinguishable from a named person.
+    #[serde(default)]
+    pub on_behalf_of_chat: bool,
+}
+
+/// Why an inbound message was allowed to reach the agent.
+///
+/// The two are very different trust positions and the platform layer is the only thing that knows
+/// which applies. Somebody speaking in an allowlisted group has not been vetted individually; the
+/// agent needs that distinction to weigh what they ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Admission {
+    /// The sender's own account is on the channel's user allowlist.
+    User,
+    /// The sender is not individually allowlisted; the chat they spoke in is.
+    Chat,
+}
+
+impl Admission {
+    /// How the envelope describes this admission to the agent.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::User => "user allowlist",
+            Self::Chat => "chat allowlist (sender not individually allowlisted)",
+        }
+    }
+}
+
+/// Where a forwarded message originally came from.
+///
+/// Mirrors the shape every platform converges on without letting a platform type cross the trait
+/// boundary. This matters more than it looks: text someone forwarded from a stranger is not their
+/// own words, and without this the agent reads it as if it were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForwardOrigin {
+    /// An identifiable account.
+    User {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+    /// An account whose privacy settings hide the link back to it.
+    HiddenUser { name: String },
+    /// A group or supergroup.
+    Chat { title: String },
+    /// A channel post, which is addressable by id.
+    Channel {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+}
+
+impl ForwardOrigin {
+    /// How the envelope names this origin.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::User { name, id, username } => {
+                let mut rendered = name.clone();
+                match (username, id) {
+                    (Some(username), Some(id)) => {
+                        rendered.push_str(&format!(" (@{username}, id {id})"));
+                    }
+                    (Some(username), None) => rendered.push_str(&format!(" (@{username})")),
+                    (None, Some(id)) => rendered.push_str(&format!(" (id {id})")),
+                    (None, None) => {}
+                }
+                rendered
+            }
+            Self::HiddenUser { name } => {
+                format!("{name} (account hidden by their privacy settings)")
+            }
+            Self::Chat { title } => format!("the group {title:?}"),
+            Self::Channel { title, message_id } => match message_id {
+                Some(message_id) => format!("the channel {title:?} (message {message_id})"),
+                None => format!("the channel {title:?}"),
+            },
+        }
+    }
 }
 
 /// Context for a message that was sent as a reply to another.
@@ -162,7 +252,7 @@ pub struct ReplyContext {
     pub excerpt: Option<String>,
 }
 
-/// Broad category of a downloaded attachment.
+/// Broad category of an attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
@@ -171,6 +261,10 @@ pub enum AttachmentKind {
     Audio,
     Voice,
     Video,
+    /// A short round video, which Telegram calls a video note.
+    VideoNote,
+    /// A soundless looping clip, delivered as MP4 rather than as a real GIF.
+    Animation,
     Sticker,
 }
 
@@ -182,6 +276,8 @@ impl AttachmentKind {
             Self::Audio => "audio",
             Self::Voice => "voice",
             Self::Video => "video",
+            Self::VideoNote => "video note",
+            Self::Animation => "animation",
             Self::Sticker => "sticker",
         }
     }
@@ -189,9 +285,11 @@ impl AttachmentKind {
 
 /// A file that came in with a message.
 ///
-/// Everything is downloaded to local disk and named by path in the envelope, because that is what a
-/// tool operating on a file needs. Images are additionally attached to the turn itself when meka's
-/// profile has vision enabled and the turn's size budget allows, so the agent can simply look.
+/// Nothing is downloaded on arrival. The envelope announces what arrived and hands the agent a
+/// handle, and the agent fetches only what it decides it needs. Three reasons: a download inside
+/// the polling loop stalls every later message behind it, disk fills with files nobody asked for,
+/// and, because the bridge owns one permanent session, an image attached to a turn stays in the
+/// agent's context for the life of that session whether or not it ever mattered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub kind: AttachmentKind,
@@ -201,18 +299,42 @@ pub struct Attachment {
     pub media_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
-    /// Where the bridge saved it, absent when the download was skipped or failed.
+    /// Platform-native reference used to fetch the file later. Telegram file ids stay valid
+    /// indefinitely for the same bot, which is what makes deferring the download safe.
+    pub file_ref: String,
+    /// Reference to a still frame, set when the file itself is not a viewable image. A video, an
+    /// animation, or an animated sticker resolves to this, so "show me" works without transcoding
+    /// anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<std::path::PathBuf>,
-    /// Why the file is not on disk, when `path` is absent.
+    pub thumb_ref: Option<String>,
+    /// Short id the agent passes to the fetch tools. Assigned when the bridge registers the
+    /// attachment, so it is unset on an attachment fresh from a channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unavailable: Option<String>,
-    /// Set by the bridge when the file was attached to the turn itself rather than only named by
-    /// path. Not persisted with the queued payload: whether a turn can carry an image depends on
-    /// meka's vision setting and the turn's size budget, both of which are decided at delivery
-    /// time, not at receipt.
-    #[serde(skip)]
-    pub inlined: bool,
+    pub handle: Option<String>,
+}
+
+/// A transient "something is coming" signal shown in a chat.
+///
+/// Platforms model this as a declaration of what the user is about to receive rather than as a
+/// general busy light, which is why the variants name message kinds instead of bridge states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// A text message is being composed.
+    Typing,
+    /// A photo is uploading.
+    SendingPhoto,
+    /// A file is uploading.
+    SendingFile,
+}
+
+/// Bytes pulled from a platform on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedFile {
+    pub bytes: Vec<u8>,
+    /// What the platform says this is, which can be better informed than the stored media type.
+    pub media_type: Option<String>,
+    /// Extension the platform's own path carried, used to name the file on disk.
+    pub extension: Option<String>,
 }
 
 /// One message received from a platform.
@@ -221,17 +343,39 @@ pub struct InboundMessage {
     pub channel: ChannelId,
     pub platform: Platform,
     pub conversation: ConversationId,
-    /// Platform-native message id, used both for reply threading and for queue deduplication.
+    /// Queue deduplication key, unique within the conversation.
+    ///
+    /// Usually the platform message id, but not always: an edit carries the *same* message id as
+    /// the message it revises, so an edit derives a distinct key. Use
+    /// [`InboundMessage::message_id`] for anything that addresses the message on the platform.
     pub external_id: String,
+    /// Platform-native message id, which is what a reply or a reaction targets.
+    pub message_id: String,
     pub chat_kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_title: Option<String>,
     pub sender: Sender,
+    /// Why this message was allowed through.
+    pub admission: Admission,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyContext>,
+    /// Set when this is a revision of a message the agent may already have seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
+    /// Set when the message was forwarded from somewhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<ForwardOrigin>,
+    /// Groups the messages of one album together. Platforms deliver an album as several messages
+    /// sharing this id, so without it a batch of photos reads as unrelated pictures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// Non-file content that has no text of its own: a shared location, a contact card, a poll.
+    /// Rendered as a descriptor line so the message is never silently empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -282,6 +426,7 @@ pub struct ChannelCapabilities {
     pub typing_indicator: bool,
     pub files: bool,
     pub photos: bool,
+    pub reactions: bool,
 }
 
 /// Who a channel is logged in as. Used by `mekabridge doctor`.
@@ -350,10 +495,32 @@ pub trait Channel: Send + Sync + 'static {
         as_photo: bool,
     ) -> Result<Vec<String>, ChannelError>;
 
-    /// Show a transient "typing" state. Presence, not content, so this does not count as the bridge
+    /// Retrieve one file the platform holds, identified by an [`Attachment::file_ref`].
+    ///
+    /// Bounded by `max_bytes` so a caller cannot be made to buffer an arbitrarily large file, and
+    /// returning bytes rather than writing to disk because where they end up is the bridge's
+    /// decision, not the platform's.
+    async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError>;
+
+    /// Attach a reaction to one message, or clear it with `None`.
+    ///
+    /// Only ever called because the agent asked. The bridge does not acknowledge messages on its
+    /// own: a reaction is content, and deciding whether to respond at all is the agent's.
+    async fn react(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<(), ChannelError>;
+
+    /// Show a transient activity state. Presence, not content, so this does not count as the bridge
     /// speaking on the agent's behalf. Best effort: failures are logged, never propagated to a
     /// turn.
-    async fn set_typing(&self, conversation: &ConversationId) -> Result<(), ChannelError>;
+    async fn set_activity(
+        &self,
+        conversation: &ConversationId,
+        activity: Activity,
+    ) -> Result<(), ChannelError>;
 
     /// Confirm the credential works and report who the bot is.
     async fn probe(&self) -> Result<ChannelIdentity, ChannelError>;
@@ -366,16 +533,14 @@ pub struct ChannelRegistry {
 
 impl ChannelRegistry {
     /// Construct every configured channel. Adding a platform means adding one arm here.
-    pub fn build(configs: &[ChannelConfig], storage: &StorageConfig) -> Result<Self, ChannelError> {
+    pub fn build(configs: &[ChannelConfig]) -> Result<Self, ChannelError> {
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         for config in configs {
             let id = ChannelId::new(config.id.clone());
             let channel: Arc<dyn Channel> = match &config.platform {
-                PlatformConfig::Telegram(telegram) => Arc::new(telegram::TelegramChannel::new(
-                    id.clone(),
-                    telegram,
-                    storage,
-                )?),
+                PlatformConfig::Telegram(telegram) => {
+                    Arc::new(telegram::TelegramChannel::new(id.clone(), telegram)?)
+                }
             };
             channels.insert(id.as_str().to_string(), channel);
         }
@@ -480,23 +645,35 @@ mod tests {
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:123").expect("valid"),
             external_id: "42".to_string(),
+            message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
             sender: Sender {
                 id: "123".to_string(),
                 display_name: "Alice".to_string(),
                 username: Some("alice".to_string()),
+                is_bot: false,
+                on_behalf_of_chat: false,
             },
+            admission: Admission::User,
             text: "hello".to_string(),
             reply_to: None,
+            edited_at: None,
+            forwarded_from: Some(ForwardOrigin::User {
+                name: "Bob".to_string(),
+                id: Some("999".to_string()),
+                username: Some("bob".to_string()),
+            }),
+            group_id: Some("13294839284".to_string()),
+            notes: Vec::new(),
             attachments: vec![Attachment {
                 kind: AttachmentKind::Photo,
                 file_name: Some("photo.jpg".to_string()),
                 media_type: Some("image/jpeg".to_string()),
                 bytes: Some(2048),
-                path: Some(std::path::PathBuf::from("/var/lib/mekabridge/a.jpg")),
-                unavailable: None,
-                inlined: false,
+                file_ref: "AgACAgEAAx".to_string(),
+                thumb_ref: None,
+                handle: Some("417".to_string()),
             }],
             timestamp: DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z")
                 .expect("literal parses")

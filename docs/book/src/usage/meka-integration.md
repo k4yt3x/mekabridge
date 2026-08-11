@@ -155,23 +155,27 @@ reply at all. `doctor` reports `ask` as a failure for that reason.
 
 ## Vision and images
 
-When the active provider profile has `vision = true`, mekabridge attaches inbound images to the turn
-itself, so the agent simply sees the picture. It checks `vision` on `GET /v1/info` first, because
-attaching to a profile without it is a 422.
+Turns carry no images. Inbound files are announced with a handle and fetched only when the agent asks,
+so an image enters the context because the agent decided to look at it, not because somebody sent it.
 
-Two limits apply, and the bridge respects both rather than discovering them from an error:
+That decision is the one that matters for a permanent session. An image attached to a turn stays in
+the history for the life of that session, so auto-attaching meant a photo dropped in a group weeks ago
+was still costing tokens on every turn today.
 
-- meka caps each image at 3.75 MB decoded.
-- The whole request is bounded by meka's `[serve].max_body_bytes`, 10 MiB by default.
+`view_attachment` returns the image as an MCP image block, and meka forwards those to the provider as
+multimodal content, so the agent sees the picture in the same call. Two of meka's limits apply and the
+bridge screens for both rather than discovering them from a placeholder:
 
-The second one matters more than it looks, because mekabridge batches: a turn can carry a photo from
-each of several messages. The bridge therefore budgets across the turn and falls back to naming a
-file by path once the budget is spent. Nothing is lost when that happens; the agent can still open
-the file, it just costs a tool call. The envelope says which images travelled with the turn and which
-are only on disk.
+- 10 MiB on a base64 image in a tool result.
+- `image/png`, `image/jpeg`, `image/gif`, and `image/webp` only. Anything else meka replaces with a
+  text placeholder, so the bridge returns a description naming the file instead.
 
-With `vision = false`, every attachment is named by path, which is how the bridge worked before meka
-accepted images at all.
+Telegram photos are JPEG, stickers are WebP, and video stills are JPEG, so all of them pass.
+
+When the active profile reports `vision = false` on `GET /v1/info`, `view_attachment` returns a
+description rather than an image. The probe result is cached, since it cannot change without
+restarting meka, and a failed probe is not cached so a transient error does not pin the bridge to
+"no vision" for the life of the process.
 
 ## What the agent is told
 
@@ -183,16 +187,19 @@ On the first turn of a session, the bridge also prepends a short orientation nam
 
 ## Attachments
 
-Inbound files are always downloaded to `[storage].attachment_dir` and named in the envelope, whether
-or not they also ride on the turn:
+Inbound files are announced with a handle and fetched on demand:
 
 ```
-attachment: photo, image/jpeg, 2.1 MiB, attached to this message and saved to /var/lib/mekabridge/attachments/abc.jpg
-attachment: document "dump.sql", 900.0 MiB, not downloaded: exceeds the configured limit
+attachment: photo, image/jpeg, 2.1 MiB [417]
+attachment: document, "dump.sql", 900.0 MiB [418]
 ```
 
-Keeping the path even for an attached image is deliberate: a tool that operates on a file still needs
-somewhere to point at.
+The agent passes the handle to `view_attachment` or `download_attachment`. Handles are minted when the
+message is queued, so they survive a restart, and a redelivered message reuses the handle it was
+already given rather than minting a second one for the same file.
+
+Anything downloaded is recorded, so `[storage].attachment_retention` reclaims it later. Files the agent
+never asked for cost nothing, because they were never fetched.
 
 ## Recovering a dropped turn stream
 

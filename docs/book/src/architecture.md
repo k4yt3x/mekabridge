@@ -81,7 +81,11 @@ pub trait Channel: Send + Sync + 'static {
         -> Result<Vec<String>, ChannelError>;
     async fn send_file(&self, conversation: &ConversationId, path: &Path, caption: Option<&str>,
         as_photo: bool) -> Result<Vec<String>, ChannelError>;
-    async fn set_typing(&self, conversation: &ConversationId) -> Result<(), ChannelError>;
+    async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError>;
+    async fn react(&self, conversation: &ConversationId, message_id: &str, emoji: Option<&str>)
+        -> Result<(), ChannelError>;
+    async fn set_activity(&self, conversation: &ConversationId, activity: Activity)
+        -> Result<(), ChannelError>;
     async fn probe(&self) -> Result<ChannelIdentity, ChannelError>;
 }
 ```
@@ -116,7 +120,7 @@ It is an enum rather than a bare message so a scheduler, waking the agent on a t
 | meka unreachable, 5xx, 429 | The batch is retried up to `[bridge].turn_retries`, then marked failed and the owner is notified |
 | Stream drops after the turn started | The turn keeps running server-side, so the bridge polls `turn_in_flight` and marks the batch delivered rather than resubmitting a duplicate |
 | A turn is already in flight on submit | One of the bridge's own earlier turns is still going; it waits for the session to go idle and resubmits without spending an attempt |
-| A batch carries more image data than one turn can hold | Images are inlined until the budget is spent, and the rest fall back to a path reference |
+| An attachment is too large to view, or the profile has no vision | `view_attachment` returns a description naming the file and pointing at `download_attachment`, rather than failing |
 | meka reports the session is gone | A replacement session is created and the same batch is replayed into it, once |
 | The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the batch is retried rather than silently dropped |
 | Queue full | The message is dropped and counted; the next envelope tells the agent how many it did not see |

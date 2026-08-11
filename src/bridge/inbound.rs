@@ -11,7 +11,6 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use base64::Engine as _;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -23,7 +22,7 @@ use crate::{
     },
     channel::{ChannelRegistry, ConversationId, InboundEvent},
     config::Config,
-    meka::{MAX_IMAGE_BYTES, MekaClient, MekaError, TurnImage, TurnOutcome},
+    meka::{MekaClient, MekaError, TurnOutcome},
     store::{ConversationRecord, EnqueueOutcome, QueuedMessage, Store},
 };
 
@@ -35,19 +34,6 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// enough against a user guessing it inside a single turn.
 const NONCE_BYTES: usize = 3;
 
-/// Ceiling on the base64 size of every image inlined into one turn, combined.
-///
-/// meka caps each individual image at [`MAX_IMAGE_BYTES`] decoded, but the whole request is also
-/// bounded by its `[serve].max_body_bytes`, which defaults to 10 MiB. Because a batch can carry a
-/// photo from each of several messages, the per-image cap alone is not enough: five 3 MB photos
-/// would sail past it and be rejected as one oversized body. That failure would then repeat on
-/// every retry and end with real messages marked undeliverable, so the budget is enforced here and
-/// anything over it falls back to being named by path.
-///
-/// Measured on the encoded form because that is what actually travels, and left well under the
-/// default limit so the envelope text has room.
-const IMAGE_BUDGET_BYTES: usize = 6 * 1024 * 1024;
-
 /// Persist events from every channel into the queue.
 ///
 /// Runs until the sender side closes, which happens when all channels have stopped.
@@ -57,15 +43,17 @@ pub async fn writer(
     mut events: mpsc::Receiver<InboundEvent>,
     wake_drain: Arc<Notify>,
 ) {
-    while let Some(event) = events.recv().await {
+    while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
         if let Err(error) = record_conversation(&store, &event).await {
             tracing::error!(conversation = %conversation, "failed to record conversation: {}", error);
             continue;
         }
-        if let Err(error) = record_attachments(&store, &event).await {
-            // Not fatal to the message, but the file will now never be swept.
-            tracing::error!(conversation = %conversation, "failed to record attachments: {}", error);
+        if let Err(error) = register_attachments(&store, &mut event).await {
+            // Registration is what mints the handles the agent fetches by, so without it the files
+            // are unreachable. The message still goes through: its text is usually the point, and
+            // the envelope says the attachment cannot be fetched rather than pretending otherwise.
+            tracing::error!(conversation = %conversation, "failed to register attachments: {}", error);
         }
 
         let payload = match serde_json::to_string(&event) {
@@ -115,32 +103,35 @@ pub async fn writer(
     tracing::info!("inbound writer stopped: all channels have shut down");
 }
 
-/// Record the files an event brought with it, so the retention sweep can find them later.
+/// Register the files an event brought with it and stamp each with the handle the agent fetches by.
 ///
-/// Done here rather than in the channel that downloaded them: the channel has no store handle, and
-/// giving it one would couple every platform to the database for no other reason. Without this the
-/// sweep has nothing to delete and the attachment directory grows without bound.
-async fn record_attachments(
+/// Done here rather than in the channel: the channel has no store handle, and giving it one would
+/// couple every platform to the database for no other reason. Runs before the payload is
+/// serialized, so the handles travel with the queued event and survive a restart.
+async fn register_attachments(
     store: &Store,
-    event: &InboundEvent,
+    event: &mut InboundEvent,
 ) -> Result<(), crate::store::StoreError> {
     let InboundEvent::Message(message) = event;
-    for (index, attachment) in message.attachments.iter().enumerate() {
-        let Some(path) = &attachment.path else {
-            continue;
-        };
-        store
-            .record_attachment(crate::store::AttachmentRecord {
-                // Stable across a redelivery of the same message, so a replay does not create a
-                // second row pointing at the same file.
+    for (index, attachment) in message.attachments.iter_mut().enumerate() {
+        let handle = store
+            .register_attachment(crate::store::AttachmentRecord {
+                // Stable across a redelivery of the same message, so a replay reuses the handle
+                // already issued rather than minting a second one for the same file.
                 id: format!("{}:{}:{index}", message.conversation, message.external_id),
                 conversation_id: message.conversation.as_str().to_string(),
-                path: path.clone(),
+                channel_id: message.channel.as_str().to_string(),
+                kind: attachment.kind.as_str().to_string(),
+                file_ref: attachment.file_ref.clone(),
+                thumb_ref: attachment.thumb_ref.clone(),
+                file_name: attachment.file_name.clone(),
                 media_type: attachment.media_type.clone(),
                 bytes: attachment.bytes,
+                path: None,
                 created_at: message.timestamp,
             })
             .await?;
+        attachment.handle = Some(handle);
     }
     Ok(())
 }
@@ -170,96 +161,6 @@ async fn record_conversation(
         .await
 }
 
-/// Whether meka will accept image attachments, asked once and remembered.
-async fn vision_enabled(context: &DrainContext) -> bool {
-    if let Some(known) = context.vision.get() {
-        return *known;
-    }
-    match context.meka.info().await {
-        Ok(info) => {
-            tracing::debug!(vision = info.vision, "meka vision capability resolved");
-            // Only a successful answer is cached; a transient failure must not pin this to false
-            // for the life of the process.
-            let _ = context.vision.set(info.vision);
-            info.vision
-        }
-        Err(error) => {
-            tracing::warn!(
-                "could not read meka's vision capability ({}); attaching images by path instead",
-                error
-            );
-            false
-        }
-    }
-}
-
-/// Read the images in a batch and encode as many as the budget allows.
-///
-/// Attachments that are inlined are marked so the envelope can say the bytes are on the turn. The
-/// rest keep their existing path reference, which is a working fallback rather than a failure: the
-/// agent can still open the file, it just costs a tool call.
-async fn collect_images(events: &mut [InboundEvent], vision: bool) -> Vec<TurnImage> {
-    if !vision {
-        return Vec::new();
-    }
-    let mut images = Vec::new();
-    let mut budget_used = 0_usize;
-    for event in events {
-        let InboundEvent::Message(message) = event;
-        for attachment in &mut message.attachments {
-            let Some(path) = attachment.path.clone() else {
-                continue;
-            };
-            if !is_image(attachment) {
-                continue;
-            }
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!("could not read {} to attach it: {}", path.display(), error);
-                    continue;
-                }
-            };
-            if bytes.len() > MAX_IMAGE_BYTES {
-                tracing::debug!(
-                    "{} is {} bytes, over meka's {} byte limit; naming it by path instead",
-                    path.display(),
-                    bytes.len(),
-                    MAX_IMAGE_BYTES
-                );
-                continue;
-            }
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            if budget_used + encoded.len() > IMAGE_BUDGET_BYTES {
-                tracing::info!(
-                    "turn image budget reached; {} and any later images are named by path instead",
-                    path.display()
-                );
-                return images;
-            }
-            budget_used += encoded.len();
-            images.push(TurnImage {
-                media_type: attachment
-                    .media_type
-                    .clone()
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                data: encoded,
-            });
-            attachment.inlined = true;
-        }
-    }
-    images
-}
-
-/// Whether an attachment is something meka can take as an image.
-fn is_image(attachment: &crate::channel::Attachment) -> bool {
-    attachment.kind == crate::channel::AttachmentKind::Photo
-        || attachment
-            .media_type
-            .as_deref()
-            .is_some_and(|media_type| media_type.starts_with("image/"))
-}
-
 /// Everything the drain loop needs.
 pub struct DrainContext {
     pub store: Store,
@@ -267,11 +168,6 @@ pub struct DrainContext {
     pub meka: MekaClient,
     pub channels: Arc<ChannelRegistry>,
     pub runner: TurnRunner,
-    /// Whether meka's active profile accepts image attachments, resolved on first use.
-    ///
-    /// Cached because it cannot change without restarting meka, and queried lazily rather than at
-    /// startup because the bridge deliberately comes up before meka does.
-    pub vision: Arc<tokio::sync::OnceCell<bool>>,
     /// Guards the one-per-process reconciliation of the session's permission level.
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
 }
@@ -378,11 +274,6 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
         None
     };
 
-    // Collected before the envelope is rendered, because inlining marks the attachments and the
-    // envelope reports which ones travelled with the turn.
-    let vision = vision_enabled(context).await;
-    let images = collect_images(&mut events, vision).await;
-
     let nonce = nonce();
     let message = Envelope {
         events: &events,
@@ -395,12 +286,11 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
     tracing::info!(
         messages = events.len(),
         conversations = conversations.len(),
-        images = images.len(),
         session_id = %session_id,
         "submitting a turn"
     );
 
-    let result = submit(context, session_id, &message, &images, &conversations).await;
+    let result = submit(context, session_id, &message, &conversations).await;
 
     // meka forgetting the session (its row was deleted, or the database was replaced) is
     // recoverable exactly once: bind a fresh session and replay the same batch into it.
@@ -429,7 +319,7 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
                         nonce: &nonce,
                     }
                     .render();
-                    submit(context, replacement, &message, &images, &conversations).await
+                    submit(context, replacement, &message, &conversations).await
                 }
                 Err(error) => Err(error),
             }
@@ -539,13 +429,9 @@ async fn submit(
     context: &DrainContext,
     session_id: Uuid,
     message: &str,
-    images: &[TurnImage],
     conversations: &BTreeSet<ConversationId>,
 ) -> Result<crate::bridge::turn::TurnReport, MekaError> {
-    let first = context
-        .runner
-        .run(session_id, message, images, conversations)
-        .await;
+    let first = context.runner.run(session_id, message, conversations).await;
     if !first
         .as_ref()
         .err()
@@ -559,12 +445,7 @@ async fn submit(
         .wait_until_idle(session_id, context.config.meka.turn_timeout)
         .await
     {
-        Ok(true) => {
-            context
-                .runner
-                .run(session_id, message, images, conversations)
-                .await
-        }
+        Ok(true) => context.runner.run(session_id, message, conversations).await,
         Ok(false) => {
             tracing::warn!("the session is still busy after a full turn budget");
             first
@@ -753,18 +634,19 @@ mod tests {
 
     use super::*;
     use crate::channel::{
-        Attachment, AttachmentKind, ChannelId, ChatKind, InboundMessage, Platform, Sender,
+        Admission, Attachment, AttachmentKind, ChannelId, ChatKind, InboundMessage, Platform,
+        Sender,
     };
 
-    fn attachment(path: &std::path::Path, media_type: &str) -> Attachment {
+    fn attachment(file_ref: &str) -> Attachment {
         Attachment {
             kind: AttachmentKind::Photo,
             file_name: None,
-            media_type: Some(media_type.to_string()),
-            bytes: None,
-            path: Some(path.to_path_buf()),
-            unavailable: None,
-            inlined: false,
+            media_type: Some("image/jpeg".to_string()),
+            bytes: Some(2048),
+            file_ref: file_ref.to_string(),
+            thumb_ref: None,
+            handle: None,
         }
     }
 
@@ -774,127 +656,124 @@ mod tests {
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:1").expect("valid"),
             external_id: "1".to_string(),
+            message_id: "1".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
             sender: Sender {
                 id: "1".to_string(),
                 display_name: "Alice".to_string(),
                 username: None,
+                is_bot: false,
+                on_behalf_of_chat: false,
             },
+            admission: Admission::User,
             text: "look".to_string(),
             reply_to: None,
+            edited_at: None,
+            forwarded_from: None,
+            group_id: None,
+            notes: Vec::new(),
             attachments,
             timestamp: Utc::now(),
         })
     }
 
-    fn write_file(directory: &std::path::Path, name: &str, bytes: usize) -> std::path::PathBuf {
-        let path = directory.join(name);
-        std::fs::write(&path, vec![b'x'; bytes]).expect("write");
-        path
-    }
-
-    #[tokio::test]
-    async fn no_images_are_inlined_when_meka_has_no_vision() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = write_file(directory.path(), "a.jpg", 128);
-        let mut events = vec![event_with(vec![attachment(&path, "image/jpeg")])];
-
-        let images = collect_images(&mut events, false).await;
-        assert!(images.is_empty());
-        let InboundEvent::Message(message) = &events[0];
-        assert!(
-            !message.attachments[0].inlined,
-            "without vision the attachment must stay a path reference"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_image_within_the_limits_is_inlined_and_marked() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = write_file(directory.path(), "a.jpg", 1024);
-        let mut events = vec![event_with(vec![attachment(&path, "image/jpeg")])];
-
-        let images = collect_images(&mut events, true).await;
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].media_type, "image/jpeg");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&images[0].data)
-            .expect("round trips");
-        assert_eq!(decoded.len(), 1024);
-        let InboundEvent::Message(message) = &events[0];
-        assert!(message.attachments[0].inlined);
-    }
-
-    #[tokio::test]
-    async fn an_image_over_mekas_per_image_cap_stays_a_path_reference() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = write_file(directory.path(), "big.jpg", MAX_IMAGE_BYTES + 1);
-        let mut events = vec![event_with(vec![attachment(&path, "image/jpeg")])];
-
-        // Sending it anyway would be a 422 that fails the whole batch, so it is filtered here.
-        let images = collect_images(&mut events, true).await;
-        assert!(images.is_empty());
-        let InboundEvent::Message(message) = &events[0];
-        assert!(!message.attachments[0].inlined);
-    }
-
-    #[tokio::test]
-    async fn the_turn_budget_stops_a_batch_from_exceeding_the_body_limit() {
-        // The case the per-image cap alone does not catch: several individually legal photos that
-        // together would blow past meka's max_body_bytes and fail the entire batch.
-        let directory = tempfile::tempdir().expect("tempdir");
-        let each = 2 * 1024 * 1024;
-        let mut events = Vec::new();
-        for index in 0..6 {
-            let path = write_file(directory.path(), &format!("{index}.jpg"), each);
-            events.push(event_with(vec![attachment(&path, "image/jpeg")]));
-        }
-
-        let images = collect_images(&mut events, true).await;
-        let encoded: usize = images.iter().map(|image| image.data.len()).sum();
-        assert!(
-            encoded <= IMAGE_BUDGET_BYTES,
-            "inlined {encoded} bytes, over the {IMAGE_BUDGET_BYTES} byte budget"
-        );
-        assert!(!images.is_empty(), "the budget must not block everything");
-        assert!(images.len() < 6, "the budget must actually bite here");
-
-        // Everything that did not fit keeps a usable path, so no message loses its picture.
-        let inlined = events
-            .iter()
-            .filter(|event| {
-                let InboundEvent::Message(message) = event;
-                message.attachments[0].inlined
+    async fn store() -> Store {
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .upsert_conversation(ConversationRecord {
+                id: "telegram:1".to_string(),
+                channel_id: "telegram".to_string(),
+                platform: "telegram".to_string(),
+                chat: "1".to_string(),
+                thread: None,
+                title: Some("Alice".to_string()),
+                kind: "direct".to_string(),
+                created_at: Utc::now(),
+                last_inbound_at: Some(Utc::now()),
+                last_outbound_at: None,
             })
-            .count();
-        assert_eq!(inlined, images.len());
-        for event in &events {
-            let InboundEvent::Message(message) = event;
-            assert!(message.attachments[0].path.is_some());
-        }
+            .await
+            .expect("conversation");
+        store
     }
 
     #[tokio::test]
-    async fn non_image_attachments_are_never_inlined() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = write_file(directory.path(), "notes.pdf", 128);
-        let mut document = attachment(&path, "application/pdf");
-        document.kind = AttachmentKind::Document;
-        let mut events = vec![event_with(vec![document])];
+    async fn registration_stamps_a_handle_onto_every_attachment() {
+        // The handle is the agent's only way to reach the file, and it has to be on the event
+        // before the payload is serialized or it does not survive a restart.
+        let store = store().await;
+        let mut event = event_with(vec![attachment("AgACx1"), attachment("AgACx2")]);
+        register_attachments(&store, &mut event)
+            .await
+            .expect("registers");
 
-        let images = collect_images(&mut events, true).await;
-        assert!(images.is_empty());
+        let InboundEvent::Message(message) = &event;
+        let handles: Vec<&str> = message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                attachment
+                    .handle
+                    .as_deref()
+                    .expect("every attachment gets a handle")
+            })
+            .collect();
+        assert_eq!(handles.len(), 2);
+        assert_ne!(handles[0], handles[1], "handles must be distinct");
     }
 
     #[tokio::test]
-    async fn a_missing_file_is_skipped_rather_than_failing_the_batch() {
-        let mut events = vec![event_with(vec![attachment(
-            std::path::Path::new("/nonexistent/mekabridge/gone.jpg"),
-            "image/jpeg",
-        )])];
-        let images = collect_images(&mut events, true).await;
-        assert!(images.is_empty());
+    async fn a_redelivered_message_reuses_its_original_handles() {
+        // Telegram replays updates whose offset was never committed. Minting a second handle for
+        // the same file would leave an orphan row the sweep later deletes out from under
+        // the agent.
+        let store = store().await;
+        let mut first = event_with(vec![attachment("AgACx1")]);
+        register_attachments(&store, &mut first)
+            .await
+            .expect("registers");
+        let mut second = event_with(vec![attachment("AgACx1")]);
+        register_attachments(&store, &mut second)
+            .await
+            .expect("registers again");
+
+        let InboundEvent::Message(first) = &first;
+        let InboundEvent::Message(second) = &second;
+        assert_eq!(first.attachments[0].handle, second.attachments[0].handle);
+    }
+
+    #[tokio::test]
+    async fn a_registered_attachment_can_be_looked_up_by_its_handle() {
+        let store = store().await;
+        let mut event = event_with(vec![attachment("AgACx1")]);
+        register_attachments(&store, &mut event)
+            .await
+            .expect("registers");
+
+        let InboundEvent::Message(message) = &event;
+        let handle = message.attachments[0]
+            .handle
+            .as_deref()
+            .expect("handle assigned");
+        let record = store
+            .attachment(handle)
+            .await
+            .expect("query")
+            .expect("the handle resolves");
+        assert_eq!(record.file_ref, "AgACx1");
+        assert_eq!(record.channel_id, "telegram");
+        assert!(record.path.is_none(), "nothing is downloaded on arrival");
+    }
+
+    #[tokio::test]
+    async fn a_message_without_attachments_registers_nothing() {
+        let store = store().await;
+        let mut event = event_with(Vec::new());
+        register_attachments(&store, &mut event)
+            .await
+            .expect("registers");
+        assert!(store.attachment("1").await.expect("query").is_none());
     }
 
     #[test]

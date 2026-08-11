@@ -70,7 +70,7 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
-| `typing_indicator` | `true` | Show a typing state in originating chats while a turn runs |
+| `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and lapses after 30 seconds |
 
 `owner_conversation` is the only place the bridge writes chat content itself, and only to say that it could not deliver something. Without it, a repeated delivery failure is visible only in the logs.
 
@@ -96,9 +96,9 @@ A non-loopback `bind` without a `token` is a `doctor` failure: anyone who can re
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `path` | `<data dir>/mekabridge/mekabridge.db` | SQLite database |
-| `attachment_dir` | `<data dir>/mekabridge/attachments` | Downloaded inbound files |
-| `attachment_max_bytes` | `20971520` (20 MiB) | Files larger than this are not downloaded; the envelope says why. Separate from meka's 3.75 MB per-image cap for attaching an image to a turn |
-| `attachment_retention` | `30d` | How long downloads are kept |
+| `attachment_dir` | `<data dir>/mekabridge/attachments` | Where `download_attachment` writes files |
+| `attachment_max_bytes` | `20971520` (20 MiB) | Ceiling on what `download_attachment` will fetch. Telegram's cloud API caps `getFile` at 20 MiB regardless, so raising this only helps against a local Bot API server |
+| `attachment_retention` | `30d` | How long an attachment stays reachable. Governs both the handle and any file downloaded through it, so past this the agent can no longer fetch a file from an older message |
 
 ## `[log]`
 
@@ -120,6 +120,7 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 | `allowed_users` | `[]` | Telegram user ids allowed to reach the agent |
 | `allowed_chats` | `[]` | Group and channel ids where every member is allowed. Group ids are negative |
 | `parse_mode` | `html` | `html` renders Markdown into Telegram's HTML subset; `none` sends the Markdown verbatim |
+| `link_preview` | `false` | Show a preview card for the first link in a message. Off because the agent usually cites links rather than making one the subject of a message |
 | `poll_timeout` | `30s` | `getUpdates` long-poll timeout |
 
 At least one of `allowed_users` or `allowed_chats` must be non-empty. Startup fails otherwise, because a bot with an empty allowlist accepts messages from anyone who finds it.

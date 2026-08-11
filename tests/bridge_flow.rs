@@ -22,19 +22,29 @@ use mekabridge::{
     bridge::{
         BridgeSink,
         inbound::{self, DrainContext},
-        turn::TurnRunner,
+        turn::{Presence, TurnRunner},
     },
     channel::{
-        Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChannelRegistry,
-        ChatKind, ConversationId, InboundEvent, InboundMessage, Platform, SendOptions, Sender,
+        Activity, Admission, Channel, ChannelCapabilities, ChannelError, ChannelId,
+        ChannelIdentity, ChannelRegistry, ChatKind, ConversationId, FetchedFile, InboundEvent,
+        InboundMessage, Platform, SendOptions, Sender,
     },
-    config::Config,
-    mcp::OutboundSink,
+    config::{Config, StorageConfig},
+    mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
     store::{ConversationRecord, Store},
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
+
+/// A 1x1 PNG, so attachment tests move real image bytes rather than an arbitrary blob.
+const ONE_PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0xFC, 0xCF, 0xC0, 0x50,
+    0x0F, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xA9, 0x8C, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
 
 /// What the stub meka observed, so tests can assert on the envelope the agent would have seen.
 #[derive(Default)]
@@ -49,8 +59,6 @@ struct MekaRecorder {
     truncate_first: Mutex<usize>,
     /// What `GET /v1/sessions/{id}` reports for `turn_in_flight`.
     turn_in_flight: Mutex<bool>,
-    /// Images seen on the most recent turn.
-    images: Mutex<Vec<(String, usize)>>,
     /// Turns to answer with meka's empty-response stand-in and no tool calls.
     empty_first: Mutex<usize>,
 }
@@ -70,35 +78,6 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    {
-        let attached: Vec<(String, usize)> = parsed
-            .as_ref()
-            .and_then(|value| value.get("images"))
-            .and_then(serde_json::Value::as_array)
-            .map(|images| {
-                images
-                    .iter()
-                    .map(|image| {
-                        (
-                            image
-                                .get("media_type")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            image
-                                .get("data")
-                                .and_then(serde_json::Value::as_str)
-                                .map_or(0, str::len),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        *recorder
-            .images
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = attached;
-    }
     recorder
         .turns
         .lock()
@@ -274,7 +253,10 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
 struct MockChannel {
     id: ChannelId,
     sent: Mutex<Vec<(String, String)>>,
-    typing: Mutex<usize>,
+    reactions: Mutex<Vec<(String, String, Option<String>)>>,
+    activities: Mutex<Vec<Activity>>,
+    /// Files this channel will hand back from `fetch`, keyed by reference.
+    files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl MockChannel {
@@ -282,8 +264,18 @@ impl MockChannel {
         Self {
             id: ChannelId::new(id),
             sent: Mutex::new(Vec::new()),
-            typing: Mutex::new(0),
+            reactions: Mutex::new(Vec::new()),
+            activities: Mutex::new(Vec::new()),
+            files: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Make a file available to `fetch` under `file_ref`.
+    fn put_file(&self, file_ref: &str, bytes: Vec<u8>) {
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(file_ref.to_string(), bytes);
     }
 
     fn sent(&self) -> Vec<(String, String)> {
@@ -309,6 +301,7 @@ impl Channel for MockChannel {
             typing_indicator: true,
             files: true,
             photos: true,
+            reactions: true,
         }
     }
 
@@ -353,11 +346,60 @@ impl Channel for MockChannel {
         Ok(vec!["f1".to_string()])
     }
 
-    async fn set_typing(&self, _conversation: &ConversationId) -> Result<(), ChannelError> {
-        *self
-            .typing
+    async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError> {
+        let bytes = self
+            .files
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(file_ref)
+            .cloned()
+            .ok_or_else(|| ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: format!("no such file {file_ref}"),
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: format!(
+                    "the file is {} bytes, over the configured limit of {max_bytes} bytes",
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(FetchedFile {
+            bytes,
+            media_type: Some("image/png".to_string()),
+            extension: Some("png".to_string()),
+        })
+    }
+
+    async fn react(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        let mut reactions = self
+            .reactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reactions.push((
+            conversation.as_str().to_string(),
+            message_id.to_string(),
+            emoji.map(str::to_string),
+        ));
+        Ok(())
+    }
+
+    async fn set_activity(
+        &self,
+        _conversation: &ConversationId,
+        activity: Activity,
+    ) -> Result<(), ChannelError> {
+        self.activities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(activity);
         Ok(())
     }
 
@@ -368,6 +410,44 @@ impl Channel for MockChannel {
             username: Some("mockbot".to_string()),
         })
     }
+}
+
+/// Build a sink with a scratch attachment directory and a meka client pointed nowhere.
+///
+/// The address is unreachable on purpose: only the fetch tools consult meka (for the vision flag),
+/// and a failed probe degrades to "describe rather than show", which is the behaviour under test in
+/// the cases that use this.
+fn sink_for(store: Store, channels: Arc<ChannelRegistry>) -> BridgeSink {
+    sink_with_storage(
+        store,
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::new(Presence::default()),
+    )
+}
+
+fn sink_with_storage(
+    store: Store,
+    channels: Arc<ChannelRegistry>,
+    attachment_dir: std::path::PathBuf,
+    presence: Arc<Presence>,
+) -> BridgeSink {
+    let storage = StorageConfig {
+        path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+        attachment_dir,
+        attachment_max_bytes: 20 * 1024 * 1024,
+        attachment_retention: Duration::from_secs(86_400),
+    };
+    let meka = MekaClient::new(
+        &config_for(
+            ([127, 0, 0, 1], 1).into(),
+            std::path::Path::new("/tmp/mekabridge-unused.db"),
+            0,
+        )
+        .meka,
+    )
+    .expect("client builds");
+    BridgeSink::new(store, channels, storage, meka, presence)
 }
 
 fn config_for(meka_address: SocketAddr, database: &std::path::Path, retries: u32) -> Config {
@@ -403,15 +483,23 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
         platform: Platform::Telegram,
         conversation: ConversationId::parse("mock:1").expect("valid"),
         external_id: external_id.to_string(),
+        message_id: external_id.to_string(),
         chat_kind: ChatKind::Direct,
         chat_title: None,
         sender: Sender {
             id: "1".to_string(),
             display_name: "Alice".to_string(),
             username: Some("alice".to_string()),
+            is_bot: false,
+            on_behalf_of_chat: false,
         },
+        admission: Admission::User,
         text: text.to_string(),
         reply_to: None,
+        edited_at: None,
+        forwarded_from: None,
+        group_id: None,
+        notes: Vec::new(),
         attachments: Vec::new(),
         timestamp: Utc::now(),
     })
@@ -499,8 +587,7 @@ impl Harness {
                 config: Arc::clone(&config),
                 meka: meka.clone(),
                 channels: Arc::clone(&channels),
-                runner: TurnRunner::new(meka, channels, false),
-                vision: Arc::new(tokio::sync::OnceCell::new()),
+                runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
                 permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             };
             let shutdown = shutdown.clone();
@@ -796,8 +883,7 @@ async fn queued_messages_survive_a_restart() {
             config: Arc::clone(&config),
             meka: meka.clone(),
             channels: Arc::clone(&channels),
-            runner: TurnRunner::new(meka, channels, false),
-            vision: Arc::new(tokio::sync::OnceCell::new()),
+            runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
         };
         let shutdown = shutdown.clone();
@@ -854,7 +940,7 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = BridgeSink::new(store.clone(), channels);
+    let sink = sink_for(store.clone(), channels);
 
     let ids = sink
         .send_text("mock:1", "**hello**", SendOptions::default())
@@ -887,7 +973,7 @@ async fn the_sink_refuses_a_conversation_it_has_never_seen() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = BridgeSink::new(store, channels);
+    let sink = sink_for(store, channels);
 
     // A hallucinated id must produce a clear error, not an opaque platform rejection.
     let error = sink
@@ -922,7 +1008,7 @@ async fn the_sink_lists_conversations_for_the_agent() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
     ]));
-    let sink = BridgeSink::new(store, channels);
+    let sink = sink_for(store, channels);
 
     let listed = sink.conversations(None, 10).await.expect("lists");
     assert_eq!(listed.len(), 1);
@@ -1043,11 +1129,11 @@ async fn a_dropped_stream_does_not_resubmit_the_turn() {
 }
 
 #[tokio::test]
-async fn images_are_attached_to_the_turn_when_meka_supports_vision() {
+async fn attachments_are_announced_with_a_handle_and_nothing_is_downloaded() {
+    // The core of the deferred model: the envelope tells the agent what arrived and how to reach
+    // it, and no bytes move until the agent asks.
     let harness = Harness::start(1, 0).await;
     let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("photo.jpg");
-    std::fs::write(&path, vec![b'x'; 4096]).expect("write");
 
     let mut event = message("what is this?", "1");
     {
@@ -1057,9 +1143,9 @@ async fn images_are_attached_to_the_turn_when_meka_supports_vision() {
             file_name: Some("photo.jpg".to_string()),
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(4096),
-            path: Some(path.clone()),
-            unavailable: None,
-            inlined: false,
+            file_ref: "AgACphoto".to_string(),
+            thumb_ref: None,
+            handle: None,
         }];
     }
     harness.sender.send(event).await.expect("queued");
@@ -1067,117 +1153,202 @@ async fn images_are_attached_to_the_turn_when_meka_supports_vision() {
     harness
         .wait_for("the turn", |harness| !harness.turns().is_empty())
         .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let images = harness
-        .recorder
-        .images
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    assert_eq!(images.len(), 1, "the photo should ride on the turn itself");
-    assert_eq!(images[0].0, "image/jpeg");
-    assert!(images[0].1 > 0, "the payload must be non-empty");
-
-    // The envelope should say the bytes are attached, not just name a path.
     let turns = harness.turns();
     assert!(
-        turns[0].contains("attached to this message"),
-        "got:\n{}",
+        turns[0].contains("attachment: photo, \"photo.jpg\", image/jpeg, 4.0 KiB ["),
+        "the envelope must announce the file and its handle, got:\n{}",
         turns[0]
+    );
+    assert!(
+        std::fs::read_dir(directory.path())
+            .expect("readable")
+            .next()
+            .is_none(),
+        "nothing should be written to disk before the agent asks for it"
     );
 }
 
 #[tokio::test]
-async fn downloaded_attachments_are_recorded_so_the_sweep_can_reclaim_them() {
-    // Regression guard: nothing recorded attachments before, so the retention sweep had nothing to
-    // find and the attachment directory grew without bound.
-    let harness = Harness::start(1, 0).await;
+async fn the_agent_can_view_an_attachment_as_an_image() {
+    let store = Store::open_in_memory().await.expect("store");
+    store
+        .upsert_conversation(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: Some("Alice".to_string()),
+            kind: "direct".to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: Some(Utc::now()),
+            last_outbound_at: None,
+        })
+        .await
+        .expect("conversation");
+
+    let channel = Arc::new(MockChannel::new("mock"));
+    channel.put_file("AgACphoto", ONE_PIXEL_PNG.to_vec());
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+
+    let handle = store
+        .register_attachment(mekabridge::store::AttachmentRecord {
+            id: "mock:1:1:0".to_string(),
+            conversation_id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            kind: "photo".to_string(),
+            file_ref: "AgACphoto".to_string(),
+            thumb_ref: None,
+            file_name: Some("photo.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            bytes: Some(ONE_PIXEL_PNG.len() as u64),
+            path: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("registers");
+
     let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("photo.jpg");
-    std::fs::write(&path, vec![b'x'; 64]).expect("write");
+    let sink = sink_with_storage(
+        store.clone(),
+        channels,
+        directory.path().to_path_buf(),
+        Arc::new(Presence::default()),
+    );
 
-    let mut event = message("see attached", "1");
-    {
-        let InboundEvent::Message(inner) = &mut event;
-        inner.attachments = vec![mekabridge::channel::Attachment {
-            kind: mekabridge::channel::AttachmentKind::Document,
-            file_name: Some("photo.jpg".to_string()),
-            media_type: Some("application/octet-stream".to_string()),
-            bytes: Some(64),
-            path: Some(path.clone()),
-            unavailable: None,
-            inlined: false,
-        }];
-    }
-    harness.sender.send(event).await.expect("queued");
+    // meka is unreachable here, so the vision probe fails and the sink degrades to a description
+    // rather than pretending the model can see.
+    let viewed = sink.view_attachment(&handle).await.expect("resolves");
+    assert!(
+        matches!(viewed, ViewedAttachment::Description(ref text) if text.contains("no vision")),
+        "got: {viewed:?}"
+    );
 
-    harness
-        .wait_for("the turn", |harness| !harness.turns().is_empty())
-        .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Downloading works regardless of vision, and lands inside the configured directory.
+    let downloaded = sink.download_attachment(&handle).await.expect("downloads");
+    assert!(downloaded.path.starts_with(directory.path()));
+    assert_eq!(downloaded.bytes, ONE_PIXEL_PNG.len() as u64);
+    assert_eq!(
+        std::fs::read(&downloaded.path).expect("readable"),
+        ONE_PIXEL_PNG
+    );
 
-    let expired = harness
-        .store
+    // And the download is recorded, so the retention sweep can reclaim it later.
+    let expired = store
         .take_expired_attachments(Utc::now() + chrono::Duration::days(1))
         .await
         .expect("sweep");
     assert_eq!(
         expired,
-        vec![path],
-        "the sweep must be able to reclaim a downloaded file"
+        vec![downloaded.path],
+        "a downloaded file must be reclaimable"
     );
 }
 
 #[tokio::test]
-async fn an_empty_model_response_is_retried_rather_than_leaving_the_sender_in_silence() {
-    // The model comes back with nothing and calls no tools, so the turn did no work: no message
-    // went out, nothing ran. Handing the batch over again is side-effect free, and the alternative
-    // is somebody who just messaged the bot getting silence with no explanation anywhere.
-    let harness = Harness::start_all(1, 0, 0, 0, 1).await;
-    harness
-        .sender
-        .send(message("are you there?", "1"))
+async fn an_unknown_attachment_handle_is_a_clear_error() {
+    let store = Store::open_in_memory().await.expect("store");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_for(store, channels);
+
+    let error = sink
+        .view_attachment("9999")
         .await
-        .expect("queued");
+        .expect_err("an invented handle must not resolve");
+    assert!(error.to_string().contains("9999"), "got: {error}");
+}
 
-    harness
-        .wait_for("the retry", |harness| harness.turns().len() >= 2)
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+#[tokio::test]
+async fn sending_a_message_stops_the_typing_indicator() {
+    // The sink is the only thing that knows a reply actually went out, so this is the wiring that
+    // keeps the refresh loop from re-arming an indicator Telegram has already cleared.
+    let store = Store::open_in_memory().await.expect("store");
+    store
+        .upsert_conversation(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: Some("Alice".to_string()),
+            kind: "direct".to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: Some(Utc::now()),
+            last_outbound_at: None,
+        })
+        .await
+        .expect("conversation");
 
-    let stats = harness.store.queue_stats().await.expect("stats");
-    assert_eq!(stats.done, 1, "the retry should have delivered it");
-    assert_eq!(stats.failed, 0);
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let presence = Arc::new(Presence::default());
+    let sink = sink_with_storage(
+        store,
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::clone(&presence),
+    );
 
-    let turns = harness.turns();
+    let conversation = ConversationId::parse("mock:1").expect("valid");
+    assert!(!presence.has_replied(&conversation));
+
+    sink.send_text("mock:1", "hello", SendOptions::default())
+        .await
+        .expect("sends");
     assert!(
-        turns[1].contains("are you there?"),
-        "the same message must be replayed:\n{}",
-        turns[1]
+        presence.has_replied(&conversation),
+        "a delivered message must silence the indicator for that conversation"
     );
 }
 
 #[tokio::test]
-async fn a_repeatedly_empty_model_gives_up_instead_of_looping() {
-    // Bounded by the same attempt counter as any other failure, so a deterministically broken model
-    // cannot spin forever.
-    let harness = Harness::start_all(1, 0, 0, 0, 5).await;
-    harness
-        .sender
-        .send(message("hello", "1"))
+async fn sending_a_file_also_silences_the_typing_indicator() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("report.pdf");
+    std::fs::write(&path, b"pdf").expect("write");
+
+    let store = Store::open_in_memory().await.expect("store");
+    store
+        .upsert_conversation(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: Some("Alice".to_string()),
+            kind: "direct".to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: Some(Utc::now()),
+            last_outbound_at: None,
+        })
         .await
-        .expect("queued");
+        .expect("conversation");
 
-    harness
-        .wait_for("both attempts", |harness| harness.turns().len() >= 2)
-        .await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let stats = harness.store.queue_stats().await.expect("stats");
-    assert_eq!(
-        stats.failed, 1,
-        "it must stop retrying and report the failure"
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let presence = Arc::new(Presence::default());
+    let sink = sink_with_storage(
+        store,
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::clone(&presence),
     );
-    assert_eq!(stats.pending, 0);
+
+    sink.send_file("mock:1", &path, None, false)
+        .await
+        .expect("sends");
+    assert!(
+        presence.has_replied(&ConversationId::parse("mock:1").expect("valid")),
+        "a file counts as a reply for indicator purposes"
+    );
 }

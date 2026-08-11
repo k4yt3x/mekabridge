@@ -12,16 +12,22 @@ pub mod turn;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    bridge::{inbound::DrainContext, turn::TurnRunner},
-    channel::{ChannelRegistry, ConversationId, InboundEvent, SendOptions},
-    config::Config,
+    bridge::{
+        inbound::DrainContext,
+        turn::{Presence, TurnRunner},
+    },
+    channel::{Channel, ChannelRegistry, ConversationId, InboundEvent, SendOptions},
+    config::{Config, StorageConfig},
     error::Result,
-    mcp::{ConversationSummary, OutboundSink, SinkError, serve},
+    mcp::{
+        ConversationSummary, DownloadedAttachment, OutboundSink, SinkError, ViewedAttachment, serve,
+    },
     meka::MekaClient,
     store::Store,
 };
@@ -45,6 +51,19 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// restart: Telegram replays updates whose offset was never committed.
 const DELIVERED_RETENTION: chrono::Duration = chrono::Duration::days(7);
 
+/// Media types meka will pass through to the provider as an image, from its
+/// `ALLOWED_IMAGE_MIME_TYPES`. Anything else is replaced with a text placeholder on its side, so
+/// the bridge screens for it here and returns a useful description instead.
+const VIEWABLE_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// meka's ceiling on a base64 image in an MCP tool result, from its `MAX_MCP_IMAGE_BYTES`.
+const MAX_VIEW_BASE64_BYTES: usize = 10 * 1024 * 1024;
+
+/// Ceiling on the raw bytes fetched for a view, sized so the base64 form stays under
+/// [`MAX_VIEW_BASE64_BYTES`] with room to spare. Independent of `attachment_max_bytes`, which
+/// bounds what may be written to disk rather than what may be shown.
+const MAX_VIEW_BYTES: u64 = 7 * 1024 * 1024;
+
 /// Run the bridge until a shutdown signal arrives.
 pub async fn run(config: Config) -> Result<()> {
     let config = Arc::new(config);
@@ -60,7 +79,7 @@ pub async fn run(config: Config) -> Result<()> {
         );
     }
 
-    let channels = Arc::new(ChannelRegistry::build(&config.channels, &config.storage)?);
+    let channels = Arc::new(ChannelRegistry::build(&config.channels)?);
     let meka = MekaClient::new(&config.meka)?;
 
     // Bind before anything else starts, so a port conflict is a startup failure rather than a meka
@@ -74,7 +93,15 @@ pub async fn run(config: Config) -> Result<()> {
     let wake_drain = Arc::new(Notify::new());
     let (event_sender, event_receiver) = mpsc::channel::<InboundEvent>(EVENT_BUFFER);
 
-    let sink = Arc::new(BridgeSink::new(store.clone(), Arc::clone(&channels)));
+    // Shared so the typing indicator can stop as soon as a reply actually lands.
+    let presence = Arc::new(Presence::default());
+    let sink = Arc::new(BridgeSink::new(
+        store.clone(),
+        Arc::clone(&channels),
+        config.storage.clone(),
+        meka.clone(),
+        Arc::clone(&presence),
+    ));
     let mut tasks = tokio::task::JoinSet::new();
 
     tasks.spawn({
@@ -124,8 +151,8 @@ pub async fn run(config: Config) -> Result<()> {
                 meka.clone(),
                 Arc::clone(&channels),
                 config.bridge.typing_indicator,
+                Arc::clone(&presence),
             ),
-            vision: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
         };
         let wake_drain = Arc::clone(&wake_drain);
@@ -259,12 +286,78 @@ async fn shutdown_signal() {
 pub struct BridgeSink {
     store: Store,
     channels: Arc<ChannelRegistry>,
+    storage: StorageConfig,
+    meka: MekaClient,
+    presence: Arc<Presence>,
+    /// Whether meka's active profile accepts images, resolved on first use.
+    ///
+    /// Cached because it cannot change without restarting meka, and queried lazily rather than at
+    /// startup because the bridge deliberately comes up before meka does.
+    vision: tokio::sync::OnceCell<bool>,
 }
 
 impl BridgeSink {
     /// Build the sink over a store and a channel registry.
-    pub const fn new(store: Store, channels: Arc<ChannelRegistry>) -> Self {
-        Self { store, channels }
+    pub fn new(
+        store: Store,
+        channels: Arc<ChannelRegistry>,
+        storage: StorageConfig,
+        meka: MekaClient,
+        presence: Arc<Presence>,
+    ) -> Self {
+        Self {
+            store,
+            channels,
+            storage,
+            meka,
+            presence,
+            vision: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Whether meka will accept an image block, asked once and remembered.
+    async fn vision_enabled(&self) -> bool {
+        if let Some(known) = self.vision.get() {
+            return *known;
+        }
+        match self.meka.info().await {
+            Ok(info) => {
+                // Only a successful answer is cached; a transient failure must not pin this to
+                // false for the life of the process.
+                let _ = self.vision.set(info.vision);
+                info.vision
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not read meka's vision capability ({}); describing images instead of \
+                     showing them",
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    /// Resolve a handle to its record and the channel that can fetch it.
+    async fn attachment(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<(crate::store::StoredAttachment, Arc<dyn Channel>), SinkError> {
+        let record = self
+            .store
+            .attachment(handle)
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?
+            .ok_or_else(|| SinkError::UnknownAttachment(handle.to_string()))?;
+        let channel = self
+            .channels
+            .get(&record.channel_id)
+            .ok_or_else(|| SinkError::UnknownChannel {
+                conversation: record.conversation_id.clone(),
+                channel: record.channel_id.clone(),
+            })?
+            .clone();
+        Ok((record, channel))
     }
 
     async fn resolve(&self, id: &str) -> std::result::Result<ConversationId, SinkError> {
@@ -288,6 +381,9 @@ impl BridgeSink {
     }
 
     async fn note_sent(&self, conversation: &ConversationId) {
+        // Stops the typing indicator re-arming here. Telegram already cleared it when this message
+        // landed, so setting it again would announce a follow-up that is not coming.
+        self.presence.note_sent(conversation);
         if let Err(error) = self
             .store
             .touch_outbound(conversation.as_str(), Utc::now())
@@ -358,6 +454,195 @@ impl OutboundSink for BridgeSink {
         Ok(sent)
     }
 
+    async fn react(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> std::result::Result<(), SinkError> {
+        let conversation = self.resolve(conversation).await?;
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        if !channel.capabilities().reactions {
+            return Err(SinkError::Delivery(format!(
+                "channel {} does not support reactions",
+                conversation.channel()
+            )));
+        }
+        channel
+            .react(&conversation, message_id, emoji)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        // Deliberately not `note_sent`: a reaction is not a message, and letting it advance
+        // `last_outbound_at` would make a conversation the agent merely acknowledged look like one
+        // it has actually replied in.
+        tracing::info!(
+            conversation = %conversation,
+            message_id = %message_id,
+            emoji = ?emoji,
+            "the agent reacted to a message"
+        );
+        Ok(())
+    }
+
+    async fn view_attachment(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<ViewedAttachment, SinkError> {
+        let (record, channel) = self.attachment(handle).await?;
+
+        if !self.vision_enabled().await {
+            return Ok(ViewedAttachment::Description(format!(
+                "This is a {} ({}). The current model has no vision, so it cannot be shown. Use \
+                 download_attachment to get the file itself.",
+                record.kind,
+                describe_file(&record)
+            )));
+        }
+
+        // A video, animation, or animated sticker is not a viewable image, but the platform already
+        // generated a still for it, so that is what "show me" resolves to. Falling back like this
+        // has to be said out loud: a single frame of a video, or a preview of page one of a PDF, is
+        // not the file, and an agent shown one without comment would reasonably think otherwise.
+        let (file_ref, preview) = match (&record.thumb_ref, is_viewable_image(&record)) {
+            (_, true) => (Some(record.file_ref.clone()), false),
+            (Some(thumb_ref), false) => (Some(thumb_ref.clone()), true),
+            (None, false) => (None, false),
+        };
+        let Some(file_ref) = file_ref else {
+            return Ok(ViewedAttachment::Description(format!(
+                "This is a {} ({}) and has no image preview. Use download_attachment to get the \
+                 file itself.",
+                record.kind,
+                describe_file(&record)
+            )));
+        };
+
+        let fetched = channel
+            .fetch(&file_ref, MAX_VIEW_BYTES)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+
+        let media_type = fetched
+            .media_type
+            .or_else(|| record.media_type.clone())
+            .unwrap_or_else(|| "image/jpeg".to_string());
+        if !VIEWABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
+            return Ok(ViewedAttachment::Description(format!(
+                "This is a {} of type {media_type}, which cannot be shown as an image. Use \
+                 download_attachment to get the file itself.",
+                record.kind
+            )));
+        }
+
+        let data = base64::engine::general_purpose::STANDARD.encode(&fetched.bytes);
+        // Unreachable while `MAX_VIEW_BYTES` stays under three quarters of this, which is the
+        // point: it is the assertion that keeps the two constants honest with each other.
+        // meka replaces an oversized image with a placeholder rather than erroring, so
+        // crossing the line silently would look to the agent like a picture with nothing in
+        // it.
+        if data.len() > MAX_VIEW_BASE64_BYTES {
+            return Ok(ViewedAttachment::Description(format!(
+                "This {} is {} bytes, too large to show inline. Use download_attachment to get the \
+                 file itself.",
+                record.kind,
+                fetched.bytes.len()
+            )));
+        }
+        tracing::info!(handle = %record.handle, preview, "the agent viewed an attachment");
+        Ok(ViewedAttachment::Image {
+            media_type,
+            data,
+            note: preview.then(|| {
+                format!(
+                    "This is the preview frame for a {}, not the {} itself ({}).",
+                    record.kind,
+                    record.kind,
+                    describe_file(&record)
+                )
+            }),
+        })
+    }
+
+    async fn download_attachment(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<DownloadedAttachment, SinkError> {
+        let (record, channel) = self.attachment(handle).await?;
+
+        // Already on disk from an earlier call, so this is free and idempotent.
+        if let Some(path) = &record.path
+            && tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            let bytes = tokio::fs::metadata(path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            return Ok(DownloadedAttachment {
+                path: path.clone(),
+                bytes,
+                media_type: record.media_type,
+            });
+        }
+
+        let fetched = channel
+            .fetch(&record.file_ref, self.storage.attachment_max_bytes)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+
+        tokio::fs::create_dir_all(&self.storage.attachment_dir)
+            .await
+            .map_err(|error| {
+                SinkError::Internal(format!(
+                    "could not create {}: {error}",
+                    self.storage.attachment_dir.display()
+                ))
+            })?;
+
+        // The platform's own extension is what lets a downstream tool recognise the type; the
+        // sanitized reference keeps the name unique and inside the directory.
+        let stem = sanitize_file_stem(&record.file_ref);
+        let extension = fetched.extension.clone().or_else(|| {
+            record
+                .file_name
+                .as_deref()
+                .and_then(|name| std::path::Path::new(name).extension())
+                .and_then(|extension| extension.to_str())
+                .map(str::to_string)
+        });
+        let name = match extension {
+            Some(extension) => format!("{stem}.{extension}"),
+            None => stem,
+        };
+        let path = self.storage.attachment_dir.join(name);
+        tokio::fs::write(&path, &fetched.bytes)
+            .await
+            .map_err(|error| {
+                SinkError::Internal(format!("could not write {}: {error}", path.display()))
+            })?;
+
+        if let Err(error) = self
+            .store
+            .mark_attachment_downloaded(&record.handle, &path)
+            .await
+        {
+            // The file is written and usable; only the retention sweep loses track of it.
+            tracing::error!(
+                handle = %record.handle,
+                "failed to record the download, so this file will not be swept: {}",
+                error
+            );
+        }
+        tracing::info!(handle = %record.handle, path = %path.display(), "the agent downloaded an attachment");
+        Ok(DownloadedAttachment {
+            bytes: fetched.bytes.len() as u64,
+            media_type: fetched.media_type.or(record.media_type),
+            path,
+        })
+    }
+
     async fn conversations(
         &self,
         channel: Option<&str>,
@@ -381,6 +666,49 @@ impl OutboundSink for BridgeSink {
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         Ok(record.map(summarize))
+    }
+}
+
+/// Whether the attachment's own bytes are something a provider can look at directly.
+fn is_viewable_image(record: &crate::store::StoredAttachment) -> bool {
+    record
+        .media_type
+        .as_deref()
+        .is_some_and(|media_type| VIEWABLE_MEDIA_TYPES.contains(&media_type))
+}
+
+/// Short human description of a file, for the cases where it cannot be shown.
+fn describe_file(record: &crate::store::StoredAttachment) -> String {
+    let mut parts = Vec::new();
+    if let Some(name) = &record.file_name {
+        parts.push(format!("{name:?}"));
+    }
+    if let Some(media_type) = &record.media_type {
+        parts.push(media_type.clone());
+    }
+    if let Some(bytes) = record.bytes {
+        parts.push(format!("{bytes} bytes"));
+    }
+    if parts.is_empty() {
+        return "no further details".to_string();
+    }
+    parts.join(", ")
+}
+
+/// Reduce a platform file reference to something safe to use as a filename.
+///
+/// Telegram file ids are base64-ish and really do contain `/` and `-`, so they cannot be used
+/// verbatim as a path component without risking traversal outside the attachment directory.
+fn sanitize_file_stem(file_ref: &str) -> String {
+    let cleaned: String = file_ref
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(48)
+        .collect();
+    if cleaned.is_empty() {
+        format!("attachment-{}", Utc::now().timestamp_millis())
+    } else {
+        cleaned
     }
 }
 

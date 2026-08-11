@@ -58,6 +58,9 @@ token = "${TELEGRAM_BOT_TOKEN}"
 allowed_users = [123456789]
 # Group and channel ids where every member is allowed. Group ids are negative.
 # allowed_chats = [-1001234567890]
+# Show a preview card for links the agent sends. Off by default: the agent usually cites links
+# rather than making one the subject of a message, and a card on each part of a split reply is noise.
+# link_preview = true
 
 [log]
 level = "info"

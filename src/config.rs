@@ -100,7 +100,7 @@ pub enum McpTransport {
 }
 
 /// Where durable state lives.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StorageConfig {
     pub path: PathBuf,
     pub attachment_dir: PathBuf,
@@ -149,6 +149,8 @@ pub struct TelegramConfig {
     /// Additional chat ids (groups, channels) permitted regardless of sender.
     pub allowed_chats: Vec<i64>,
     pub parse_mode: TelegramParseMode,
+    /// Whether a link in an outgoing message gets a preview card.
+    pub link_preview: bool,
     /// `getUpdates` long-poll timeout.
     pub poll_timeout: Duration,
 }
@@ -377,6 +379,8 @@ struct FileTelegram {
     allowed_chats: Vec<i64>,
     #[serde(default = "default_telegram_parse_mode")]
     parse_mode: TelegramParseMode,
+    #[serde(default = "default_link_preview")]
+    link_preview: bool,
     #[serde(default = "default_poll_timeout", with = "humantime_serde")]
     poll_timeout: Duration,
 }
@@ -525,6 +529,7 @@ impl FileConfig {
                     allowed_users: telegram.allowed_users,
                     allowed_chats: telegram.allowed_chats,
                     parse_mode: telegram.parse_mode,
+                    link_preview: telegram.link_preview,
                     poll_timeout: telegram.poll_timeout,
                 }),
             });
@@ -720,6 +725,12 @@ const fn default_log_format() -> LogFormat {
     LogFormat::Text
 }
 
+/// Off by default. The agent cites links as references far more often than it makes one the subject
+/// of a message, and a card on each part of a split answer is noise.
+const fn default_link_preview() -> bool {
+    false
+}
+
 const fn default_telegram_parse_mode() -> TelegramParseMode {
     TelegramParseMode::Html
 }
@@ -762,6 +773,21 @@ allowed_users = [123]
         assert!(config.mcp.token.is_none());
         assert_eq!(config.channels.len(), 1);
         assert_eq!(config.channels[0].id, "telegram");
+
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        assert_eq!(telegram.parse_mode, TelegramParseMode::Html);
+        assert!(
+            !telegram.link_preview,
+            "link previews default off; the template and the docs both say so"
+        );
+    }
+
+    #[test]
+    fn link_previews_can_be_turned_back_on() {
+        let raw = format!("{MINIMAL}link_preview = true\n");
+        let config = parse(&raw).expect("valid");
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        assert!(telegram.link_preview);
     }
 
     #[test]

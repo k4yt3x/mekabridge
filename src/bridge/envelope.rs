@@ -66,9 +66,35 @@ impl Envelope<'_> {
     fn render_message(&self, message: &InboundMessage, out: &mut String) {
         let _ = writeln!(out, "channel: {}", message.channel);
         let _ = writeln!(out, "conversation: {}", message.conversation);
+        // The id a reply or a reaction targets. Without it the agent has no way to address one
+        // specific message, only the conversation as a whole.
+        match message.edited_at {
+            Some(edited_at) => {
+                let _ = writeln!(
+                    out,
+                    "message: {} (edited, revised at {})",
+                    message.message_id,
+                    edited_at.to_rfc3339()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "message: {}", message.message_id);
+            }
+        }
         let _ = writeln!(out, "from: {}", format_sender(message));
+        let _ = writeln!(out, "admitted: {}", message.admission.describe());
         let _ = writeln!(out, "chat: {}", format_chat(message));
         let _ = writeln!(out, "at: {}", message.timestamp.to_rfc3339());
+
+        if let Some(origin) = &message.forwarded_from {
+            // Forwarded text is somebody else's words. Saying so is what stops the agent treating a
+            // stranger's instructions as though the sender had written them.
+            let _ = writeln!(out, "forwarded from: {}", origin.describe());
+        }
+
+        if let Some(group) = &message.group_id {
+            let _ = writeln!(out, "album: {group}");
+        }
 
         if let Some(reply) = &message.reply_to {
             let who = reply.sender_name.as_deref().unwrap_or("someone");
@@ -89,6 +115,10 @@ impl Envelope<'_> {
                     );
                 }
             }
+        }
+
+        for note in &message.notes {
+            let _ = writeln!(out, "note: {note}");
         }
 
         for attachment in &message.attachments {
@@ -112,7 +142,10 @@ pub fn preamble(channels: &[(String, Option<String>)]) -> String {
          people on chat platforms. The messages below arrived while you were idle.\n\nNothing is \
          sent back automatically. To reply, call the mekabridge send_message tool with the \
          conversation id shown in a message's header. Choosing not to reply is fine, and so is \
-         replying to someone else, replying on a different channel, or messaging first later on.",
+         replying to someone else, replying on a different channel, or messaging first later on.\
+         \n\nFiles are not downloaded for you. An attachment line ends with a handle in square \
+         brackets; pass it to view_attachment to see a picture, or download_attachment to get the \
+         file on disk.",
     );
     if !channels.is_empty() {
         out.push_str("\n\nConnected channels: ");
@@ -131,14 +164,26 @@ pub fn preamble(channels: &[(String, Option<String>)]) -> String {
 
 fn format_sender(message: &InboundMessage) -> String {
     let sender = &message.sender;
-    match (&sender.username, sender.id.is_empty()) {
+    if sender.on_behalf_of_chat {
+        // There is no account behind this message. Saying so keeps an anonymous admin from reading
+        // as a named person the agent might otherwise think it recognises.
+        return format!(
+            "{} (posted as the chat itself, no individual account)",
+            sender.display_name
+        );
+    }
+    let mut rendered = match (&sender.username, sender.id.is_empty()) {
         (Some(username), false) => {
             format!("{} (@{}, id {})", sender.display_name, username, sender.id)
         }
         (Some(username), true) => format!("{} (@{})", sender.display_name, username),
         (None, false) => format!("{} (id {})", sender.display_name, sender.id),
         (None, true) => sender.display_name.clone(),
+    };
+    if sender.is_bot {
+        let _ = write!(rendered, " [bot]");
     }
+    rendered
 }
 
 fn format_chat(message: &InboundMessage) -> String {
@@ -160,23 +205,13 @@ fn format_attachment(attachment: &Attachment) -> String {
         parts.push(format_bytes(bytes));
     }
     let mut rendered = parts.join(", ");
-    if attachment.inlined {
-        // The bytes are on this turn, so the agent can simply look. The path is still given: it is
-        // what the agent needs to pass to a tool that takes a file.
-        let _ = write!(rendered, ", attached to this message");
-        if let Some(path) = &attachment.path {
-            let _ = write!(rendered, " and saved to {}", path.display());
+    match &attachment.handle {
+        Some(handle) => {
+            let _ = write!(rendered, " [{handle}]");
         }
-        return rendered;
-    }
-    match (&attachment.path, &attachment.unavailable) {
-        (Some(path), _) => {
-            let _ = write!(rendered, ", saved to {}", path.display());
-        }
-        (None, Some(reason)) => {
-            let _ = write!(rendered, ", {reason}");
-        }
-        (None, None) => rendered.push_str(", not available locally"),
+        // Only reachable if an attachment skipped registration, which would be a bug. Saying so
+        // beats printing a line that looks fetchable and is not.
+        None => rendered.push_str(" (no handle; this file cannot be fetched)"),
     }
     rendered
 }
@@ -212,7 +247,8 @@ mod tests {
 
     use super::*;
     use crate::channel::{
-        AttachmentKind, ChannelId, ChatKind, ConversationId, Platform, ReplyContext, Sender,
+        Admission, AttachmentKind, ChannelId, ChatKind, ConversationId, ForwardOrigin, Platform,
+        ReplyContext, Sender,
     };
 
     fn timestamp() -> DateTime<Utc> {
@@ -227,15 +263,23 @@ mod tests {
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:123456789").expect("valid"),
             external_id: "42".to_string(),
+            message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
             sender: Sender {
                 id: "123456789".to_string(),
                 display_name: "Alice".to_string(),
                 username: Some("alice".to_string()),
+                is_bot: false,
+                on_behalf_of_chat: false,
             },
+            admission: Admission::User,
             text: text.to_string(),
             reply_to: None,
+            edited_at: None,
+            forwarded_from: None,
+            group_id: None,
+            notes: Vec::new(),
             attachments: Vec::new(),
             timestamp: timestamp(),
         }
@@ -374,68 +418,59 @@ mod tests {
     }
 
     #[test]
-    fn attachments_name_their_local_path() {
+    fn attachments_carry_the_handle_the_agent_fetches_by() {
         let mut event = message("look at this");
         event.attachments = vec![Attachment {
             kind: AttachmentKind::Photo,
             file_name: None,
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(2_200_000),
-            path: Some(std::path::PathBuf::from("/var/lib/mekabridge/a.jpg")),
-            unavailable: None,
-            inlined: false,
+            file_ref: "AgACAgEAAx".to_string(),
+            thumb_ref: None,
+            handle: Some("417".to_string()),
         }];
         let rendered = render(vec![event]);
         assert!(
-            rendered.contains(
-                "attachment: photo, image/jpeg, 2.1 MiB, saved to /var/lib/mekabridge/a.jpg"
-            ),
+            rendered.contains("attachment: photo, image/jpeg, 2.1 MiB [417]"),
             "got:\n{rendered}"
         );
     }
 
     #[test]
-    fn undownloaded_attachments_explain_themselves() {
-        let mut event = message("big file");
+    fn a_named_document_shows_its_filename() {
+        let mut event = message("the report");
         event.attachments = vec![Attachment {
             kind: AttachmentKind::Document,
-            file_name: Some("dump.sql".to_string()),
-            media_type: None,
-            bytes: Some(900_000_000),
-            path: None,
-            unavailable: Some("not downloaded: exceeds the configured limit".to_string()),
-            inlined: false,
+            file_name: Some("q3.pdf".to_string()),
+            media_type: Some("application/pdf".to_string()),
+            bytes: Some(8_400_000),
+            file_ref: "BQACAgEAAx".to_string(),
+            thumb_ref: None,
+            handle: Some("418".to_string()),
         }];
         let rendered = render(vec![event]);
         assert!(
-            rendered.contains("exceeds the configured limit"),
+            rendered.contains("attachment: document, \"q3.pdf\", application/pdf, 8.0 MiB [418]"),
             "got:\n{rendered}"
         );
-        assert!(!rendered.contains("saved to"));
     }
 
     #[test]
-    fn an_inlined_image_is_announced_as_attached() {
-        let mut event = message("look at this");
+    fn an_attachment_without_a_handle_says_it_cannot_be_fetched() {
+        // Only reachable if registration failed. Printing a line that looks fetchable and is not
+        // would send the agent into a tool call that can only fail.
+        let mut event = message("look");
         event.attachments = vec![Attachment {
             kind: AttachmentKind::Photo,
             file_name: None,
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(2048),
-            path: Some(std::path::PathBuf::from("/var/lib/mekabridge/a.jpg")),
-            unavailable: None,
-            inlined: true,
+            file_ref: "AgACAgEAAx".to_string(),
+            thumb_ref: None,
+            handle: None,
         }];
         let rendered = render(vec![event]);
-        assert!(
-            rendered.contains("attached to this message"),
-            "got:\n{rendered}"
-        );
-        // The path stays, because a tool that takes a file still needs it.
-        assert!(
-            rendered.contains("/var/lib/mekabridge/a.jpg"),
-            "got:\n{rendered}"
-        );
+        assert!(rendered.contains("cannot be fetched"), "got:\n{rendered}");
     }
 
     #[test]
@@ -448,6 +483,142 @@ mod tests {
             rendered.contains("chat: group \"Deploy Crew\""),
             "got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn the_message_id_is_rendered_so_a_reply_can_target_it() {
+        // Without this line `send_message`'s `reply_to` argument is unusable: the agent has no
+        // other source for a message id.
+        let rendered = render(vec![message("hi")]);
+        assert!(rendered.contains("message: 42"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn an_edit_says_so_rather_than_looking_like_a_repeat() {
+        let mut event = message("actually, tomorrow");
+        event.edited_at = Some(
+            DateTime::parse_from_rfc3339("2026-08-05T14:30:00Z")
+                .expect("literal parses")
+                .with_timezone(&Utc),
+        );
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("message: 42 (edited, revised at 2026-08-05T14:30:00+00:00)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_admission_reason_is_always_stated() {
+        let rendered = render(vec![message("hi")]);
+        assert!(
+            rendered.contains("admitted: user allowlist"),
+            "got:\n{rendered}"
+        );
+
+        let mut event = message("hi");
+        event.admission = Admission::Chat;
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("admitted: chat allowlist (sender not individually allowlisted)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn forwarded_messages_name_who_actually_wrote_them() {
+        let mut event = message("do this immediately");
+        event.forwarded_from = Some(ForwardOrigin::User {
+            name: "Bob".to_string(),
+            id: Some("999".to_string()),
+            username: Some("bob".to_string()),
+        });
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("forwarded from: Bob (@bob, id 999)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_forward_origin_explains_why_it_is_nameless() {
+        let mut event = message("look");
+        event.forwarded_from = Some(ForwardOrigin::HiddenUser {
+            name: "Carol".to_string(),
+        });
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("forwarded from: Carol (account hidden by their privacy settings)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn album_members_are_tied_together() {
+        let mut first = message("two shots");
+        first.group_id = Some("13294839284".to_string());
+        let mut second = message("");
+        second.group_id = Some("13294839284".to_string());
+        let rendered = render(vec![first, second]);
+        assert_eq!(rendered.matches("album: 13294839284").count(), 2);
+    }
+
+    #[test]
+    fn anonymous_posts_are_not_dressed_up_as_a_person() {
+        // Telegram sends no `from` for an anonymous admin. Falling back to the chat title without
+        // saying so would present the group's name as though it were a user the agent knows.
+        let mut event = message("ship it");
+        event.sender = Sender {
+            id: String::new(),
+            display_name: "Deploy Crew".to_string(),
+            username: None,
+            is_bot: false,
+            on_behalf_of_chat: true,
+        };
+        let rendered = render(vec![event]);
+        assert!(
+            rendered
+                .contains("from: Deploy Crew (posted as the chat itself, no individual account)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn bot_senders_are_labelled() {
+        let mut event = message("build finished");
+        event.sender.is_bot = true;
+        let rendered = render(vec![event]);
+        assert!(rendered.contains("[bot]"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn notes_render_for_messages_that_carry_no_text() {
+        let mut event = message("");
+        event.notes = vec!["location: 51.5074, -0.1278".to_string()];
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("note: location: 51.5074, -0.1278"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn metadata_lines_stay_outside_the_fence() {
+        // The whole point of the fence is that headers cannot be forged from user text. Every new
+        // header has to keep landing above it.
+        let mut event = message("hello");
+        event.forwarded_from = Some(ForwardOrigin::Chat {
+            title: "Somewhere".to_string(),
+        });
+        event.group_id = Some("77".to_string());
+        let rendered = render(vec![event]);
+        let fence = rendered.find("<<<7c1e4b").expect("fence opens");
+        for header in ["message: 42", "admitted: ", "forwarded from: ", "album: 77"] {
+            let position = rendered
+                .find(header)
+                .unwrap_or_else(|| panic!("{header:?} missing from:\n{rendered}"));
+            assert!(position < fence, "{header:?} landed inside the fence");
+        }
     }
 
     #[test]

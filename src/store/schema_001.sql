@@ -41,13 +41,33 @@ CREATE TABLE inbound_queue (
 
 CREATE INDEX idx_inbound_queue_state ON inbound_queue (state, seq);
 
+-- Registry of the files a platform holds for the messages this bridge has seen.
+--
+-- Nothing is downloaded on arrival. The bridge records what the platform has and hands the agent a
+-- handle; bytes move only if the agent asks for them, so `path` is the record of a download that has
+-- already happened rather than a requirement.
 CREATE TABLE attachments (
-    id              TEXT PRIMARY KEY,
+    -- Short id the agent quotes to fetch this file. AUTOINCREMENT for the same reason
+    -- `inbound_queue.seq` uses it: the janitor prunes rows, and a reused handle would silently point
+    -- a later fetch at a different file.
+    handle          INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- `<conversation>:<external_id>:<index>`, stable across a redelivery so a replayed message
+    -- reuses the handle already issued instead of minting a second one.
+    id              TEXT NOT NULL UNIQUE,
     conversation_id TEXT NOT NULL,
-    path            TEXT NOT NULL,
+    channel_id      TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    -- Platform-native reference used to fetch the file.
+    file_ref        TEXT NOT NULL,
+    -- Still frame, for media whose primary file is not a viewable image.
+    thumb_ref       TEXT,
+    file_name       TEXT,
     media_type      TEXT,
     bytes           INTEGER,
+    -- Set once the agent has downloaded the file, which is also what the retention sweep unlinks.
+    path            TEXT,
     created_at      TEXT NOT NULL
 );
 
 CREATE INDEX idx_attachments_created ON attachments (created_at);
+CREATE INDEX idx_attachments_conversation ON attachments (conversation_id);

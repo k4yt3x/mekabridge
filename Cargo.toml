@@ -47,10 +47,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 libc = "0.2"
 
 [dev-dependencies]
-# Pinned to the rmcp release meka links against so the interop test exercises the real version skew
-# between this crate's 3.x server and meka's 2.x client, rather than 3.x talking to itself.
 rmcp2 = { package = "rmcp", version = "2.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 await_holding_lock = "deny"

@@ -132,15 +132,42 @@ pub struct QueueStats {
     pub failed: u64,
 }
 
-/// An attachment downloaded from a platform and written to local disk.
+/// An attachment a platform holds, as the bridge records it on arrival.
+///
+/// Nothing is downloaded at this point. `path` is set later, and only if the agent asks for the
+/// file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentRecord {
+    /// `<conversation>:<external_id>:<index>`, stable across a redelivery.
     pub id: String,
     pub conversation_id: String,
-    pub path: PathBuf,
+    pub channel_id: String,
+    pub kind: String,
+    /// Platform-native reference used to fetch the file.
+    pub file_ref: String,
+    pub thumb_ref: Option<String>,
+    pub file_name: Option<String>,
     pub media_type: Option<String>,
     pub bytes: Option<u64>,
+    pub path: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A registered attachment, as read back by handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    pub handle: String,
+    pub id: String,
+    pub conversation_id: String,
+    pub channel_id: String,
+    pub kind: String,
+    pub file_ref: String,
+    pub thumb_ref: Option<String>,
+    pub file_name: Option<String>,
+    pub media_type: Option<String>,
+    pub bytes: Option<u64>,
+    /// Where the file was written, once the agent has downloaded it.
+    pub path: Option<PathBuf>,
 }
 
 /// Handle to the SQLite database. Cheap to clone; all clones share one connection thread.
@@ -693,23 +720,95 @@ impl Store {
         Ok(deleted)
     }
 
-    /// Record a downloaded attachment.
-    pub async fn record_attachment(&self, record: AttachmentRecord) -> Result<()> {
-        self.connection
+    /// Register an attachment and return the handle the agent fetches it by.
+    ///
+    /// Idempotent on `record.id`: a redelivered message returns the handle already issued rather
+    /// than minting a second one for the same file.
+    pub async fn register_attachment(&self, record: AttachmentRecord) -> Result<String> {
+        let handle = self
+            .connection
             .call(move |connection| {
                 connection.execute(
                     "INSERT INTO attachments
-                         (id, conversation_id, path, media_type, bytes, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         (id, conversation_id, channel_id, kind, file_ref, thumb_ref, file_name,
+                          media_type, bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                      ON CONFLICT(id) DO NOTHING",
                     rusqlite::params![
                         record.id,
                         record.conversation_id,
-                        record.path.to_string_lossy().into_owned(),
+                        record.channel_id,
+                        record.kind,
+                        record.file_ref,
+                        record.thumb_ref,
+                        record.file_name,
                         record.media_type,
                         record.bytes.map(|bytes| bytes as i64),
+                        record.path.map(|path| path.to_string_lossy().into_owned()),
                         to_rfc3339(record.created_at),
                     ],
+                )?;
+                // Read back rather than using `last_insert_rowid`, which reports nothing useful
+                // when the conflict clause suppressed the insert.
+                connection.query_row(
+                    "SELECT handle FROM attachments WHERE id = ?1",
+                    [&record.id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await?;
+        Ok(handle.to_string())
+    }
+
+    /// Look up one attachment by the handle the agent quoted.
+    pub async fn attachment(&self, handle: &str) -> Result<Option<StoredAttachment>> {
+        // Parsed rather than compared as text so a handle the agent invented cannot match a row by
+        // some other spelling of the same number.
+        let Ok(handle) = handle.trim().parse::<i64>() else {
+            return Ok(None);
+        };
+        let record = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT handle, id, conversation_id, channel_id, kind, file_ref, thumb_ref,
+                                file_name, media_type, bytes, path
+                         FROM attachments WHERE handle = ?1",
+                        [handle],
+                        |row| {
+                            Ok(StoredAttachment {
+                                handle: row.get::<_, i64>(0)?.to_string(),
+                                id: row.get(1)?,
+                                conversation_id: row.get(2)?,
+                                channel_id: row.get(3)?,
+                                kind: row.get(4)?,
+                                file_ref: row.get(5)?,
+                                thumb_ref: row.get(6)?,
+                                file_name: row.get(7)?,
+                                media_type: row.get(8)?,
+                                bytes: row.get::<_, Option<i64>>(9)?.map(|bytes| bytes as u64),
+                                path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+                            })
+                        },
+                    )
+                    .optional()
+            })
+            .await?;
+        Ok(record)
+    }
+
+    /// Record that an attachment has been written to local disk, so the sweep can unlink it later.
+    pub async fn mark_attachment_downloaded(&self, handle: &str, path: &Path) -> Result<()> {
+        let Ok(handle) = handle.trim().parse::<i64>() else {
+            return Ok(());
+        };
+        let path = path.to_string_lossy().into_owned();
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE attachments SET path = ?2 WHERE handle = ?1",
+                    rusqlite::params![handle, path],
                 )?;
                 Ok(())
             })
@@ -717,8 +816,9 @@ impl Store {
         Ok(())
     }
 
-    /// Delete attachment rows older than `before` and return their paths so the caller can unlink
-    /// the files. Rows go first: a leftover file is recoverable, a leaked row is not observable.
+    /// Delete attachment rows older than `before` and return the paths of any that were downloaded,
+    /// so the caller can unlink them. Rows go first: a leftover file is recoverable, a leaked row
+    /// is not observable.
     pub async fn take_expired_attachments(&self, before: DateTime<Utc>) -> Result<Vec<PathBuf>> {
         let before = to_rfc3339(before);
         let paths = self
@@ -726,8 +826,10 @@ impl Store {
             .call(move |connection| {
                 let transaction = connection.transaction()?;
                 let paths = {
-                    let mut statement = transaction
-                        .prepare("SELECT path FROM attachments WHERE created_at < ?1")?;
+                    let mut statement = transaction.prepare(
+                        "SELECT path FROM attachments
+                         WHERE created_at < ?1 AND path IS NOT NULL",
+                    )?;
                     let rows = statement.query_map([&before], |row| row.get::<_, String>(0))?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
@@ -892,6 +994,24 @@ mod tests {
             .expect("second");
         assert_eq!(second, EnqueueOutcome::Duplicate);
         assert_eq!(store.pending_count().await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edit_is_not_mistaken_for_a_redelivery() {
+        // A platform edit reuses the id of the message it revises. The channel layer derives a
+        // distinct key for that reason; this pins the queue half of the contract, because keying an
+        // edit on the bare message id makes it vanish into the duplicate check.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "meet at 5", now(), 10)
+            .await
+            .expect("original");
+        let edit = store
+            .enqueue("telegram:123", "m1:e1754400000", "meet at 6", now(), 10)
+            .await
+            .expect("edit");
+        assert_eq!(edit, EnqueueOutcome::Queued);
+        assert_eq!(store.pending_count().await.expect("count"), 2);
     }
 
     #[tokio::test]
@@ -1113,31 +1233,129 @@ mod tests {
         assert_eq!(store.pending_count().await.expect("count"), 1);
     }
 
+    fn attachment_record(id: &str, age_days: i64, path: Option<PathBuf>) -> AttachmentRecord {
+        AttachmentRecord {
+            id: id.to_string(),
+            conversation_id: "telegram:123".to_string(),
+            channel_id: "telegram".to_string(),
+            kind: "photo".to_string(),
+            file_ref: format!("ref-{id}"),
+            thumb_ref: None,
+            file_name: None,
+            media_type: Some("image/jpeg".to_string()),
+            bytes: Some(1024),
+            path,
+            created_at: now() - chrono::Duration::days(age_days),
+        }
+    }
+
+    #[tokio::test]
+    async fn registering_an_attachment_returns_a_reusable_handle() {
+        let store = store_with_conversation().await;
+        let first = store
+            .register_attachment(attachment_record("a1", 0, None))
+            .await
+            .expect("register");
+        let again = store
+            .register_attachment(attachment_record("a1", 0, None))
+            .await
+            .expect("register again");
+        assert_eq!(
+            first, again,
+            "the same file must keep its handle on a replay"
+        );
+
+        let other = store
+            .register_attachment(attachment_record("a2", 0, None))
+            .await
+            .expect("register");
+        assert_ne!(first, other);
+    }
+
+    #[tokio::test]
+    async fn an_attachment_resolves_by_handle() {
+        let store = store_with_conversation().await;
+        let handle = store
+            .register_attachment(attachment_record("a1", 0, None))
+            .await
+            .expect("register");
+        let record = store
+            .attachment(&handle)
+            .await
+            .expect("query")
+            .expect("resolves");
+        assert_eq!(record.file_ref, "ref-a1");
+        assert_eq!(record.channel_id, "telegram");
+        assert!(record.path.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_handle_that_is_not_a_number_resolves_to_nothing() {
+        // The agent supplies this string, so a hallucinated value has to fail cleanly rather than
+        // erroring out of the query layer.
+        let store = store_with_conversation().await;
+        assert!(
+            store
+                .attachment("not-a-handle")
+                .await
+                .expect("query")
+                .is_none()
+        );
+        assert!(store.attachment("").await.expect("query").is_none());
+    }
+
+    #[tokio::test]
+    async fn marking_a_download_makes_the_file_sweepable() {
+        let store = store_with_conversation().await;
+        let handle = store
+            .register_attachment(attachment_record("a1", 40, None))
+            .await
+            .expect("register");
+        // Before the download there is no file, so the sweep has nothing to unlink.
+        assert!(
+            store
+                .take_expired_attachments(now() - chrono::Duration::days(30))
+                .await
+                .expect("take")
+                .is_empty()
+        );
+
+        let handle = store
+            .register_attachment(attachment_record("a2", 40, None))
+            .await
+            .expect("register")
+            .to_string()
+            .max(handle);
+        store
+            .mark_attachment_downloaded(&handle, Path::new("/tmp/a2.jpg"))
+            .await
+            .expect("mark");
+        let expired = store
+            .take_expired_attachments(now() - chrono::Duration::days(30))
+            .await
+            .expect("take");
+        assert_eq!(expired, vec![PathBuf::from("/tmp/a2.jpg")]);
+    }
+
     #[tokio::test]
     async fn expired_attachments_are_returned_for_unlinking() {
         let store = store_with_conversation().await;
         store
-            .record_attachment(AttachmentRecord {
-                id: "a1".to_string(),
-                conversation_id: "telegram:123".to_string(),
-                path: PathBuf::from("/tmp/a1.jpg"),
-                media_type: Some("image/jpeg".to_string()),
-                bytes: Some(1024),
-                created_at: now() - chrono::Duration::days(40),
-            })
+            .register_attachment(attachment_record(
+                "a1",
+                40,
+                Some(PathBuf::from("/tmp/a1.jpg")),
+            ))
             .await
-            .expect("record");
+            .expect("register");
         store
-            .record_attachment(AttachmentRecord {
-                id: "a2".to_string(),
-                conversation_id: "telegram:123".to_string(),
-                path: PathBuf::from("/tmp/a2.jpg"),
-                media_type: None,
-                bytes: None,
-                created_at: now(),
-            })
+            .register_attachment(attachment_record(
+                "a2",
+                0,
+                Some(PathBuf::from("/tmp/a2.jpg")),
+            ))
             .await
-            .expect("record");
+            .expect("register");
 
         let expired = store
             .take_expired_attachments(now() - chrono::Duration::days(30))

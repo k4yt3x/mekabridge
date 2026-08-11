@@ -21,8 +21,13 @@ pub struct Envelope<'a> {
     /// Messages shed because the queue was full. Reported so the agent knows its view is
     /// incomplete rather than silently missing traffic.
     pub dropped: u64,
-    /// One-time orientation, present only on the first turn of a session.
-    pub preamble: Option<&'a str>,
+    /// Which account the agent appears as on each connected channel, as `(channel, identity)`.
+    ///
+    /// Stated every turn rather than once at session start. It is the one fact the MCP handshake
+    /// cannot carry, because it comes from a network probe and `get_info` is synchronous, and a
+    /// one-time orientation message would be summarised away by the first compaction and never
+    /// restated. A line per turn is a few tokens and is always current, including after a rename.
+    pub identities: &'a [(String, Option<String>)],
     /// Fence marker for this turn. Supplied by the caller so tests stay deterministic.
     pub nonce: &'a str,
 }
@@ -31,14 +36,12 @@ impl Envelope<'_> {
     /// Render the envelope.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        if let Some(preamble) = self.preamble {
-            out.push_str(preamble.trim_end());
-            out.push_str("\n\n");
-        }
-
         let count = self.events.len();
         let noun = if count == 1 { "message" } else { "messages" };
         let _ = writeln!(out, "[mekabridge] {count} new {noun}.");
+        if let Some(identity) = format_identities(self.identities) {
+            let _ = writeln!(out, "[mekabridge] You are {identity}.");
+        }
         if self.dropped > 0 {
             let dropped_noun = if self.dropped == 1 {
                 "message"
@@ -117,6 +120,16 @@ impl Envelope<'_> {
             }
         }
 
+        if message.arrived_mid_turn {
+            // The agent cannot be interrupted mid-turn, so the alternative to saying this is
+            // letting it believe its last reply had the whole picture when it did not.
+            let _ = writeln!(
+                out,
+                "late: this arrived while you were still working on the previous turn, so \
+                 anything you sent then was written without it"
+            );
+        }
+
         for note in &message.notes {
             let _ = writeln!(out, "note: {note}");
         }
@@ -135,31 +148,22 @@ impl Envelope<'_> {
     }
 }
 
-/// Build the one-time orientation preamble for a fresh session.
-pub fn preamble(channels: &[(String, Option<String>)]) -> String {
-    let mut out = String::from(
-        "[mekabridge] You are connected to mekabridge, which relays messages between you and \
-         people on chat platforms. The messages below arrived while you were idle.\n\nNothing is \
-         sent back automatically. To reply, call the mekabridge send_message tool with the \
-         conversation id shown in a message's header. Choosing not to reply is fine, and so is \
-         replying to someone else, replying on a different channel, or messaging first later on.\
-         \n\nFiles are not downloaded for you. An attachment line ends with a handle in square \
-         brackets; pass it to view_attachment to see a picture, or download_attachment to get the \
-         file on disk.",
-    );
-    if !channels.is_empty() {
-        out.push_str("\n\nConnected channels: ");
-        let rendered: Vec<String> = channels
-            .iter()
-            .map(|(id, identity)| match identity {
-                Some(identity) => format!("{id} (as {identity})"),
-                None => id.clone(),
-            })
-            .collect();
-        out.push_str(&rendered.join(", "));
-        out.push('.');
+/// Name the accounts the agent appears as, or `None` when none could be resolved.
+fn format_identities(identities: &[(String, Option<String>)]) -> Option<String> {
+    let named: Vec<String> = identities
+        .iter()
+        .filter_map(|(channel, identity)| {
+            identity
+                .as_ref()
+                .map(|identity| format!("{identity} on {channel}"))
+        })
+        .collect();
+    if named.is_empty() {
+        // A probe that failed says nothing rather than guessing, since claiming the wrong handle is
+        // worse than the agent not knowing its own.
+        return None;
     }
-    out
+    Some(named.join(", "))
 }
 
 fn format_sender(message: &InboundMessage) -> String {
@@ -280,6 +284,7 @@ mod tests {
             forwarded_from: None,
             group_id: None,
             notes: Vec::new(),
+            arrived_mid_turn: false,
             attachments: Vec::new(),
             timestamp: timestamp(),
         }
@@ -290,7 +295,7 @@ mod tests {
         Envelope {
             events: &events,
             dropped: 0,
-            preamble: None,
+            identities: &[],
             nonce: "7c1e4b",
         }
         .render()
@@ -372,7 +377,7 @@ mod tests {
         let rendered = Envelope {
             events: &events,
             dropped: 3,
-            preamble: None,
+            identities: &[],
             nonce: "abc",
         }
         .render();
@@ -388,7 +393,7 @@ mod tests {
         let rendered = Envelope {
             events: &events,
             dropped: 1,
-            preamble: None,
+            identities: &[],
             nonce: "abc",
         }
         .render();
@@ -592,6 +597,25 @@ mod tests {
     }
 
     #[test]
+    fn a_message_that_landed_mid_turn_says_so() {
+        // The agent cannot be interrupted, so this is the only way it learns that the reply it just
+        // sent was written without this message in front of it.
+        let mut event = message("actually, staging");
+        event.arrived_mid_turn = true;
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("late: this arrived while you were still working"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_carries_no_late_line() {
+        let rendered = render(vec![message("hello")]);
+        assert!(!rendered.contains("late:"), "got:\n{rendered}");
+    }
+
+    #[test]
     fn notes_render_for_messages_that_carry_no_text() {
         let mut event = message("");
         event.notes = vec!["location: 51.5074, -0.1278".to_string()];
@@ -633,26 +657,57 @@ mod tests {
     }
 
     #[test]
-    fn the_preamble_precedes_the_first_batch() {
+    fn the_agent_is_told_which_account_it_appears_as() {
+        // The one fact the MCP handshake cannot carry, so it rides every turn rather than a
+        // one-time orientation that the first compaction would summarise away.
         let events = [InboundEvent::Message(message("hi"))];
-        let preamble_text = preamble(&[("telegram".to_string(), Some("@mybot".to_string()))]);
+        let identities = [("telegram".to_string(), Some("@mybot".to_string()))];
         let rendered = Envelope {
             events: &events,
             dropped: 0,
-            preamble: Some(&preamble_text),
+            identities: &identities,
             nonce: "abc",
         }
         .render();
         assert!(
-            rendered.starts_with("[mekabridge] You are connected"),
+            rendered.contains("[mekabridge] You are @mybot on telegram."),
             "got:\n{rendered}"
         );
-        assert!(rendered.contains("telegram (as @mybot)"));
-        assert!(rendered.contains("send_message"));
-        let preamble_end = rendered
-            .find("[mekabridge] 1 new message")
-            .expect("header present");
-        assert!(preamble_end > 0);
+    }
+
+    #[test]
+    fn several_channels_are_all_named() {
+        let events = [InboundEvent::Message(message("hi"))];
+        let identities = [
+            ("telegram".to_string(), Some("@mybot".to_string())),
+            ("discord".to_string(), Some("Mica#1234".to_string())),
+        ];
+        let rendered = Envelope {
+            events: &events,
+            dropped: 0,
+            identities: &identities,
+            nonce: "abc",
+        }
+        .render();
+        assert!(
+            rendered.contains("You are @mybot on telegram, Mica#1234 on discord."),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_identity_is_left_unsaid_rather_than_guessed() {
+        // Claiming the wrong handle is worse than the agent not knowing its own.
+        let events = [InboundEvent::Message(message("hi"))];
+        let identities = [("telegram".to_string(), None)];
+        let rendered = Envelope {
+            events: &events,
+            dropped: 0,
+            identities: &identities,
+            nonce: "abc",
+        }
+        .render();
+        assert!(!rendered.contains("You are"), "got:\n{rendered}");
     }
 
     #[test]

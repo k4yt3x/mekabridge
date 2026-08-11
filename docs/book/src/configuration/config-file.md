@@ -60,7 +60,7 @@ If you would rather sends be gated behind `write` after all, invert it from meka
 send_message = "write"
 ```
 
-When `recreate_on_missing` fires, the agent's memory of every past conversation is gone. It is logged at warn level, and the replacement session gets the orientation preamble again.
+When `recreate_on_missing` fires, the agent's memory of every past conversation is gone. It is logged at warn level.
 
 ## `[bridge]`
 
@@ -68,6 +68,8 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 |-----|---------|---------|
 | `owner_conversation` | none | Conversation that receives operator notices, e.g. `telegram:123456789` |
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
+| `settle` | `2s` | Quiet period a chat must go through before its messages reach the agent. Without it the first message of a burst starts a turn on its own. `0s` disables debouncing entirely |
+| `settle_max` | `6s` | Ceiling on that wait. In a chat busy enough that messages keep landing inside the settle window, this is what releases every batch, so it is felt as constant latency |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
 | `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and lapses after 30 seconds |

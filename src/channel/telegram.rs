@@ -271,6 +271,7 @@ impl TelegramChannel {
                 .media_group_id()
                 .map(|group| group.0.clone().to_string()),
             notes,
+            arrived_mid_turn: false,
             attachments,
             timestamp: message.date,
         }))

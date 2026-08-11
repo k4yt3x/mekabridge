@@ -61,6 +61,10 @@ struct MekaRecorder {
     turn_in_flight: Mutex<bool>,
     /// Turns to answer with meka's empty-response stand-in and no tool calls.
     empty_first: Mutex<usize>,
+    /// How long a turn takes to answer. The default of zero makes the suite fast; a test that
+    /// needs something to happen *during* a turn sets it, since otherwise the turn is over
+    /// before the test can act.
+    turn_delay: Mutex<Duration>,
 }
 
 async fn create_session() -> impl IntoResponse {
@@ -83,6 +87,14 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(message);
+
+    let delay = *recorder
+        .turn_delay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
 
     let should_forget = {
         let mut remaining = recorder
@@ -463,6 +475,10 @@ batch_max_messages = 32
 max_queue_depth = 64
 turn_retries = {retries}
 typing_indicator = false
+# Scaled down from the shipped 2s/6s so the suite exercises the same logic without sleeping through
+# a real settle window on every test.
+settle = "150ms"
+settle_max = "600ms"
 
 [storage]
 path = "{}"
@@ -500,6 +516,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
         forwarded_from: None,
         group_id: None,
         notes: Vec::new(),
+        arrived_mid_turn: false,
         attachments: Vec::new(),
         timestamp: Utc::now(),
     })
@@ -518,6 +535,17 @@ struct Harness {
 impl Harness {
     async fn start(retries: u32, fail_first: usize) -> Self {
         Self::start_with(retries, fail_first, 0).await
+    }
+
+    /// A harness whose turns take `delay` to answer, for testing what happens mid-turn.
+    async fn start_slow(delay: Duration) -> Self {
+        let harness = Self::start(1, 0).await;
+        *harness
+            .recorder
+            .turn_delay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = delay;
+        harness
     }
 
     async fn start_with(retries: u32, fail_first: usize, forget_first: usize) -> Self {
@@ -588,6 +616,7 @@ impl Harness {
                 meka: meka.clone(),
                 channels: Arc::clone(&channels),
                 runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
+                identities: Arc::new(tokio::sync::OnceCell::new()),
                 permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             };
             let shutdown = shutdown.clone();
@@ -665,9 +694,8 @@ async fn an_inbound_message_becomes_a_turn_carrying_its_routing_header() {
         envelope.contains("from: Alice (@alice, id 1)"),
         "got:\n{envelope}"
     );
-    // The first turn of a session orients the agent.
     assert!(
-        envelope.contains("You are connected to mekabridge"),
+        envelope.contains("[mekabridge] You are @mockbot on mock."),
         "got:\n{envelope}"
     );
 }
@@ -699,7 +727,9 @@ async fn the_queue_is_drained_after_a_successful_turn() {
 }
 
 #[tokio::test]
-async fn the_preamble_is_sent_once_per_session() {
+async fn every_turn_names_the_account_the_agent_appears_as() {
+    // Stated per turn rather than once at session start, because a one-time orientation is an
+    // ordinary user message and the first compaction summarises it away for good.
     let harness = Harness::start(1, 0).await;
     harness
         .sender
@@ -719,12 +749,14 @@ async fn the_preamble_is_sent_once_per_session() {
         .await;
 
     let turns = harness.turns();
-    assert!(turns[0].contains("You are connected to mekabridge"));
-    assert!(
-        !turns[1].contains("You are connected to mekabridge"),
-        "the orientation must not be repeated every turn:\n{}",
-        turns[1]
-    );
+    for (index, turn) in turns.iter().take(2).enumerate() {
+        assert!(
+            turn.contains("[mekabridge] You are @mockbot on mock."),
+            "turn {} must name the bot's own account:\n{}",
+            index + 1,
+            turn
+        );
+    }
 }
 
 #[tokio::test]
@@ -823,10 +855,83 @@ async fn messages_that_arrive_together_are_batched_into_one_turn() {
         .map(|envelope| envelope.matches("--- message").count())
         .sum();
     assert_eq!(total, 5, "every message must be delivered exactly once");
-    assert!(
-        turns.len() < 5,
-        "messages arriving together should share a turn, got {} turns",
+    assert_eq!(
+        turns.len(),
+        1,
+        "five messages sent together belong in one turn, got {} turns",
         turns.len()
+    );
+}
+
+#[tokio::test]
+async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
+    // The case debouncing exists for: somebody types a thought across three messages. Without a
+    // quiet period the first one starts a turn on its own and the agent answers "hey" before it has
+    // read the question.
+    let harness = Harness::start(1, 0).await;
+    for (index, text) in [
+        "hey",
+        "can you check the deploy logs",
+        "actually the staging ones",
+    ]
+    .iter()
+    .enumerate()
+    {
+        harness
+            .sender
+            .send(message(text, &index.to_string()))
+            .await
+            .expect("queued");
+        // Comfortably inside the harness's 150ms settle, the way a person's messages are inside 2s.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    harness
+        .wait_for("a turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let turns = harness.turns();
+    assert_eq!(turns.len(), 1, "got {} turns: {:#?}", turns.len(), turns);
+    assert!(
+        turns[0].contains("hey") && turns[0].contains("actually the staging ones"),
+        "the whole thought must arrive together, got:\n{}",
+        turns[0]
+    );
+}
+
+#[tokio::test]
+async fn a_chat_that_never_goes_quiet_is_released_by_the_ceiling() {
+    // A steady stream keeps resetting the quiet period, so without a ceiling the batch would be
+    // deferred indefinitely and the agent would never hear anything at all.
+    let harness = Harness::start(1, 0).await;
+    let sender = harness.sender.clone();
+    let chatter = tokio::spawn(async move {
+        for index in 0..40 {
+            if sender
+                .send(message(&format!("chatter {index}"), &index.to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    // settle_max is 600ms in the harness, so a turn has to happen well before the stream ends.
+    harness
+        .wait_for("a turn despite the stream", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+    chatter.abort();
+
+    let turns = harness.turns();
+    assert!(
+        turns[0].matches("--- message").count() > 1,
+        "the ceiling should still release a batch rather than one message, got:\n{}",
+        turns[0]
     );
 }
 
@@ -884,6 +989,7 @@ async fn queued_messages_survive_a_restart() {
             meka: meka.clone(),
             channels: Arc::clone(&channels),
             runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
+            identities: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
         };
         let shutdown = shutdown.clone();
@@ -1034,47 +1140,9 @@ async fn a_forgotten_session_is_replaced_and_the_batch_is_replayed() {
 
     let turns = harness.turns();
     assert!(turns[1].contains("still here?"), "got:\n{}", turns[1]);
-    // The replacement session has an empty context, so it has to be oriented again.
-    assert!(
-        turns[1].contains("You are connected to mekabridge"),
-        "a replacement session must get the preamble:\n{}",
-        turns[1]
-    );
     let stats = harness.store.queue_stats().await.expect("stats");
     assert_eq!(stats.done, 1, "the message must end up delivered");
     assert_eq!(stats.failed, 0);
-}
-
-#[tokio::test]
-async fn the_preamble_is_not_repeated_after_a_session_replacement() {
-    // Regression guard: marking the preamble as sent used to key off whether the *first* attempt
-    // needed one, so a replacement session would send it again on the following turn as well.
-    let harness = Harness::start_with(1, 0, 1).await;
-    harness
-        .sender
-        .send(message("first", "1"))
-        .await
-        .expect("queued");
-    harness
-        .wait_for("the replay", |harness| harness.turns().len() >= 2)
-        .await;
-
-    harness
-        .sender
-        .send(message("second", "2"))
-        .await
-        .expect("queued");
-    harness
-        .wait_for("the next turn", |harness| harness.turns().len() >= 3)
-        .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let turns = harness.turns();
-    assert!(
-        !turns[2].contains("You are connected to mekabridge"),
-        "the orientation must not repeat once the replacement session has it:\n{}",
-        turns[2]
-    );
 }
 
 #[tokio::test]
@@ -1350,5 +1418,41 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
     assert!(
         presence.has_replied(&ConversationId::parse("mock:1").expect("valid")),
         "a file counts as a reply for indicator purposes"
+    );
+}
+
+#[tokio::test]
+async fn a_message_arriving_mid_turn_is_flagged_in_the_next_envelope() {
+    // The bridge does not interrupt a running turn, so the follow-up lands in the turn after.
+    // Saying when it arrived is what lets the agent notice its previous reply was premature and
+    // correct itself, rather than answering as though nothing had changed.
+    let harness = Harness::start_slow(Duration::from_millis(700)).await;
+    harness
+        .sender
+        .send(message("check the prod logs", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the first turn", |harness| !harness.turns().is_empty())
+        .await;
+
+    // Sent immediately after the first turn began, the way an amendment actually arrives.
+    harness
+        .sender
+        .send(message("actually, staging", "2"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the second turn", |harness| harness.turns().len() > 1)
+        .await;
+
+    let turns = harness.turns();
+    assert!(turns[1].contains("actually, staging"), "got:\n{}", turns[1]);
+    assert!(
+        turns[1].contains("late: this arrived while you were still working"),
+        "the amendment must be marked as having landed mid-turn, got:\n{}",
+        turns[1]
     );
 }

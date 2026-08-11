@@ -69,6 +69,17 @@ pub struct BridgeConfig {
     pub owner_conversation: Option<String>,
     pub max_queue_depth: usize,
     pub batch_max_messages: usize,
+    /// Quiet period a conversation must go through before its messages are handed to the agent.
+    ///
+    /// Without one, the first fragment of a burst starts a turn on its own and the agent answers
+    /// before it has read the rest of the thought.
+    pub settle: Duration,
+    /// Ceiling on how long [`BridgeConfig::settle`] may defer a message.
+    ///
+    /// Matters more than it looks: in a chat busy enough that messages keep arriving inside the
+    /// settle window, the timer never expires and this becomes the normal release path rather than
+    /// a rare fallback.
+    pub settle_max: Duration,
     /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
     pub turn_retries: u32,
     pub typing_indicator: bool,
@@ -311,6 +322,10 @@ struct FileBridge {
     max_queue_depth: usize,
     #[serde(default = "default_batch_max_messages")]
     batch_max_messages: usize,
+    #[serde(default = "default_settle", with = "humantime_serde")]
+    settle: Duration,
+    #[serde(default = "default_settle_max", with = "humantime_serde")]
+    settle_max: Duration,
     #[serde(default = "default_turn_retries")]
     turn_retries: u32,
     #[serde(default = "default_true")]
@@ -432,6 +447,13 @@ impl FileConfig {
             return Err(BridgeError::config(
                 "[bridge].batch_max_messages must be at least 1",
             ));
+        }
+        if self.bridge.settle_max < self.bridge.settle {
+            return Err(BridgeError::config(format!(
+                "[bridge].settle_max ({:?}) must be at least settle ({:?}), or the ceiling would \
+                 fire before the quiet period ever could",
+                self.bridge.settle_max, self.bridge.settle
+            )));
         }
         if self.bridge.max_queue_depth < self.bridge.batch_max_messages {
             return Err(BridgeError::config(format!(
@@ -557,6 +579,8 @@ impl FileConfig {
                 owner_conversation: self.bridge.owner_conversation,
                 max_queue_depth: self.bridge.max_queue_depth,
                 batch_max_messages: self.bridge.batch_max_messages,
+                settle: self.bridge.settle,
+                settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
                 typing_indicator: self.bridge.typing_indicator,
             },
@@ -621,6 +645,8 @@ impl Default for FileBridge {
             owner_conversation: None,
             max_queue_depth: default_max_queue_depth(),
             batch_max_messages: default_batch_max_messages(),
+            settle: default_settle(),
+            settle_max: default_settle_max(),
             turn_retries: default_turn_retries(),
             typing_indicator: true,
         }
@@ -687,6 +713,18 @@ const fn default_true() -> bool {
 
 const fn default_max_queue_depth() -> usize {
     256
+}
+
+/// Long enough to catch the fragments of one thought typed in quick succession, short enough that a
+/// reply still feels prompt.
+const fn default_settle() -> Duration {
+    Duration::from_secs(2)
+}
+
+/// Deliberately modest. A busy chat releases on this ceiling every time rather than on the quiet
+/// period, so it is felt as constant added latency rather than an occasional delay.
+const fn default_settle_max() -> Duration {
+    Duration::from_secs(6)
 }
 
 const fn default_batch_max_messages() -> usize {
@@ -780,6 +818,34 @@ allowed_users = [123]
             !telegram.link_preview,
             "link previews default off; the template and the docs both say so"
         );
+    }
+
+    #[test]
+    fn settle_defaults_are_modest() {
+        let config = parse(MINIMAL).expect("valid");
+        assert_eq!(config.bridge.settle, Duration::from_secs(2));
+        assert_eq!(
+            config.bridge.settle_max,
+            Duration::from_secs(6),
+            "a busy chat releases on this every time, so it is felt as constant latency"
+        );
+    }
+
+    #[test]
+    fn debouncing_can_be_turned_off_entirely() {
+        // The escape hatch for anyone who would rather have the latency back: zero means hand every
+        // message over the moment it lands, as the bridge did before settling existed.
+        let raw = format!("{MINIMAL}\n[bridge]\nsettle = \"0s\"\n");
+        let config = parse(&raw).expect("zero is a valid setting, not a rejected one");
+        assert!(config.bridge.settle.is_zero());
+    }
+
+    #[test]
+    fn a_ceiling_below_the_quiet_period_is_rejected() {
+        // It would fire before the quiet period could ever elapse, making `settle` dead config.
+        let raw = format!("{MINIMAL}\n[bridge]\nsettle = \"5s\"\nsettle_max = \"1s\"\n");
+        let error = parse(&raw).expect_err("must be rejected");
+        assert!(error.to_string().contains("settle_max"), "got: {error}");
     }
 
     #[test]

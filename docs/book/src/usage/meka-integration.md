@@ -181,9 +181,29 @@ restarting meka, and a failed probe is not cached so a transient error does not 
 
 meka captures an MCP server's `instructions` from the handshake and surfaces them to the agent. mekabridge uses that to explain the model once, rather than repeating it in every tool description:
 
-> mekabridge connects you to people on messaging platforms such as Telegram. Incoming messages are delivered to you in the user turn, each with a header naming the channel, the conversation id, and who sent it. Nothing is sent back automatically: if you want to reply, call send_message with that conversation id.
+> mekabridge connects you to people on messaging platforms such as Telegram. Nothing you write here reaches them. Your turn text, your reasoning, and your tool output are all invisible: the only way to be heard is send_message on a channel.
 
-On the first turn of a session, the bridge also prepends a short orientation naming the connected channels and the bot identity, which the MCP handshake cannot know.
+It goes on to explain each header line, when to send a holding message on a long turn, and how attachments are fetched. Two constraints shape it:
+
+- **meka truncates a server's `instructions` to 2048 characters** at handshake, silently, appending an ellipsis. The value is captured in a `OnceLock` on first connect, so a version that went over would stay cut until meka restarts. `the_instructions_fit_inside_mekas_cap` guards the length; trim a paragraph rather than raising it.
+- **It is re-emitted in full after every compaction**, so its length is paid again each time rather than once per session.
+
+These survive compaction. They are not in the system prompt, which meka asserts deliberately, but
+meka drops `last_rendered_world` at a compaction boundary and re-states the whole world in full on
+the next turn, so the instructions come back on their own.
+
+The one thing the handshake cannot carry is which account the agent appears as, because that comes
+from a network probe and `get_info` is synchronous. It rides the envelope instead:
+
+```
+[mekabridge] 1 new message.
+[mekabridge] You are @MicaAgentBot on telegram.
+```
+
+Stated every turn rather than once at session start. A one-time orientation would be an ordinary user
+message, so the first compaction would fold it into a summary and nothing would ever restate it,
+leaving the agent unable to recognise its own handle when somebody addresses it in a group. A line
+per turn costs a few tokens, is always current, and survives a rename without a restart.
 
 ## Attachments
 

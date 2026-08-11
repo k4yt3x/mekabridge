@@ -44,6 +44,18 @@ Claiming and marking happen in one transaction, so a drain loop racing a restart
 
 Five messages that arrive during a turn become one turn presenting all five. That matches what happens to a person who puts their phone down: they come back to the whole conversation, not one message at a time. It also saves a provider round trip per message, which on a long turn is the difference between one call and five.
 
+Batching only during a turn is not enough, though, because it makes turn duration the control: a slower model batches better, which is backwards. So the drain loop also waits for a chat to go quiet before claiming anything. Somebody typing a thought across three messages gets one turn, rather than being answered after the first fragment.
+
+The waiting is bounded twice. `[bridge].settle` is the quiet period, and `settle_max` caps how long that may defer a message, which matters because in a chat busy enough that messages keep landing inside the settle window the timer never expires and the ceiling becomes the normal release path.
+
+Both are derived from the `received_at` already on each queue row rather than from in-memory state, so the behaviour is identical on the first message after a restart, and a backlog Telegram replays after downtime releases immediately instead of being debounced as though it had just arrived.
+
+## Why turns are not interrupted
+
+A message that lands while a turn is running waits for the next one. The bridge could cancel and resubmit, but the agent may already have replied or run a tool, so the side effects are real and the tokens are spent.
+
+Instead the next envelope marks it. A message whose timestamp falls inside the previous turn's window carries a `late:` line saying the reply already sent could not have accounted for it. The agent then corrects itself in a sentence rather than answering as though nothing had changed.
+
 ## The envelope
 
 The agent's only source of routing information, because meka sends no session identity with a `tools/call`.

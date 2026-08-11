@@ -32,6 +32,16 @@ permission = "read"
 batch_max_messages = 32
 max_queue_depth = 256
 
+# How long a chat must go quiet before its messages are handed to the agent. Without this the first
+# message of a burst starts a turn on its own, and the agent answers "hey" before it has read the
+# question that followed.
+# Set to "0s" to hand every message over the moment it lands.
+settle = "2s"
+# Ceiling on that wait. In a chat busy enough that messages keep landing inside the settle window
+# this is what actually releases each batch, so it reads as constant added latency rather than an
+# occasional delay. Keep it modest.
+settle_max = "6s"
+
 [mcp]
 # meka connects here. Add this to meka's config.toml:
 #

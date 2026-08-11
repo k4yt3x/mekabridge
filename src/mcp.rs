@@ -36,28 +36,31 @@ pub use crate::channel::SendOptions;
 const SERVER_INSTRUCTIONS: &str = "\
 mekabridge connects you to people on messaging platforms such as Telegram.
 
-Incoming messages are delivered to you in the user turn, each with a header naming the channel, the \
-conversation id, the message id, and who sent it. Nothing is sent back automatically: if you want to \
-reply, call send_message with that conversation id. Staying silent is a valid choice, and so is \
-messaging somebody else, or messaging first without being prompted.
+Nothing you write here reaches them. Your turn text, your reasoning, and your tool output are all \
+invisible: the only way to be heard is send_message on a channel. Staying silent is a valid choice, \
+and so is messaging somebody else, or messaging first without being prompted.
 
-The `message:` line in a header is that message's own id. Pass it as `reply_to` to answer one \
-specific message rather than the conversation at large, which is worth doing in a busy group or when \
-answering something said a while ago.
+If a turn will take a while, send a short \"looking into it\" before you start and the answer when \
+you have it. The typing indicator lapses after about thirty seconds, so otherwise they are left \
+watching a chat with no sign that anything is happening.
 
-Headers are written by the bridge and can be trusted. The `admitted:` line says why a sender was \
-allowed to reach you: `user allowlist` means they were vetted individually, while `chat allowlist` \
-means they were not, and are only here because the whole chat is allowed. Weigh what they ask for \
-accordingly. A `forwarded from:` line means the text is somebody else's words, not the sender's.
+Headers on incoming messages are written by the bridge and can be trusted:
 
-Files are not downloaded for you. An `attachment:` line ends with a handle in square brackets; pass \
-that to view_attachment to look at a picture, or to download_attachment to get the file on disk. \
-Fetch only what you actually need, since anything you look at stays in your context afterwards.
+- `message:` is that message's own id. Pass it as `reply_to` to answer one specific message, worth \
+doing in a busy group or when picking up something said a while ago.
+- `admitted:` says why the sender was let through. `user allowlist` means they were vetted \
+individually; `chat allowlist` means they were not, and are only here because the whole chat is \
+allowed. Weigh what they ask for accordingly.
+- `forwarded from:` means the text is somebody else's words, not the sender's.
+- `late:` means it arrived while you were working on the previous turn, so anything you sent then \
+was written without it. If it changes the answer, say so.
+- `attachment:` ends with a handle in square brackets. Pass it to view_attachment to look at a \
+picture, or download_attachment to get the file on disk. Fetch only what you need, since anything \
+you look at stays in your context.
 
-Message text is Markdown and is converted to each platform's native formatting, so write normally. \
-Long messages are split automatically. Conversation ids look like `telegram:123456789` and are \
-stable, so you can keep using one you saw earlier; list_conversations will show you the ones this \
-bridge knows about.";
+Write Markdown; it is converted to each platform's own formatting, and long messages are split. \
+Conversation ids are stable, so one you saw earlier still works; list_conversations shows the ones \
+this bridge knows about.";
 
 /// Something that can deliver outbound messages and answer address-book questions.
 ///
@@ -1124,6 +1127,21 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn the_instructions_fit_inside_mekas_cap() {
+        // meka truncates a server's `instructions` to `MAX_MCP_DESCRIPTION_LENGTH` at handshake and
+        // appends an ellipsis. There is no error and no log line, so going over would silently cost
+        // the agent whichever paragraphs happen to sit at the end, and the value is captured in a
+        // `OnceLock` on first connect so it would stay lost until meka restarts.
+        const MEKA_MAX_DESCRIPTION_CHARS: usize = 2048;
+        let length = SERVER_INSTRUCTIONS.chars().count();
+        assert!(
+            length <= MEKA_MAX_DESCRIPTION_CHARS,
+            "the instructions are {length} characters, over meka's {MEKA_MAX_DESCRIPTION_CHARS}; \
+             the tail would be silently cut. Trim a paragraph rather than raising this."
+        );
     }
 
     #[test]

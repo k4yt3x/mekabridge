@@ -26,9 +26,6 @@ const MIGRATIONS: &[&str] = &[include_str!("store/schema_001.sql")];
 
 /// `meta` key holding the meka session UUID this bridge instance owns.
 const META_SESSION_ID: &str = "session_id";
-/// `meta` key recording that the one-time orientation preamble was delivered for the current
-/// session.
-const META_PREAMBLE_SENT: &str = "preamble_sent";
 /// `meta` key counting inbound messages shed because the queue was full, so the next envelope can
 /// tell the agent that it is not seeing everything.
 const META_DROPPED: &str = "dropped_messages";
@@ -283,28 +280,14 @@ impl Store {
             })
     }
 
-    /// Bind this bridge to `session_id`, clearing the preamble flag so the new session gets its own
-    /// orientation message.
+    /// Bind this bridge to `session_id`.
     pub async fn set_session_id(&self, session_id: Uuid) -> Result<()> {
-        self.meta_set(META_SESSION_ID, session_id.to_string())
-            .await?;
-        self.meta_delete(META_PREAMBLE_SENT).await
+        self.meta_set(META_SESSION_ID, session_id.to_string()).await
     }
 
     /// Forget the session binding. The next turn creates a fresh session.
     pub async fn clear_session_id(&self) -> Result<()> {
-        self.meta_delete(META_SESSION_ID).await?;
-        self.meta_delete(META_PREAMBLE_SENT).await
-    }
-
-    /// Whether the current session has already received the orientation preamble.
-    pub async fn preamble_sent(&self) -> Result<bool> {
-        Ok(self.meta_get(META_PREAMBLE_SENT).await?.is_some())
-    }
-
-    /// Record that the orientation preamble was delivered.
-    pub async fn mark_preamble_sent(&self) -> Result<()> {
-        self.meta_set(META_PREAMBLE_SENT, "1".to_string()).await
+        self.meta_delete(META_SESSION_ID).await
     }
 
     /// When the last turn completed, if one ever has.
@@ -502,6 +485,49 @@ impl Store {
     ///
     /// Claiming and marking happen in one transaction so two drain loops (or a drain loop racing a
     /// restart) cannot hand the same message to two turns.
+    /// Oldest and newest arrival times among the pending rows, or `None` when nothing is waiting.
+    ///
+    /// `min`/`max` over the stored RFC 3339 text rather than over parsed dates. That is sound here
+    /// because every row is written by [`Store::enqueue`] with a fixed `+00:00` offset and
+    /// zero-padded fields, so byte order and chronological order agree, including between a
+    /// timestamp with fractional seconds and one without.
+    ///
+    /// The drain loop debounces on this: the newest tells it whether a burst is still in progress,
+    /// and the oldest bounds how long that may defer delivery. Derived from the queue rather than
+    /// from in-memory state so the behaviour is the same on the first message after a restart.
+    pub async fn pending_window(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+        let window = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT min(received_at), max(received_at)
+                         FROM inbound_queue WHERE state = 'pending'",
+                        [],
+                        |row| {
+                            Ok(row
+                                .get::<_, Option<String>>(0)?
+                                .zip(row.get::<_, Option<String>>(1)?))
+                        },
+                    )
+                    .optional()
+            })
+            .await?
+            .flatten();
+        let Some((oldest, newest)) = window else {
+            return Ok(None);
+        };
+        let parse = |raw: &str| {
+            DateTime::parse_from_rfc3339(raw)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| StoreError::Corrupt {
+                    key: "inbound_queue.received_at".to_string(),
+                    message: format!("{raw:?} is not an RFC 3339 timestamp: {error}"),
+                })
+        };
+        Ok(Some((parse(&oldest)?, parse(&newest)?)))
+    }
+
     pub async fn claim_batch(&self, limit: usize) -> Result<Vec<QueuedMessage>> {
         let limit = limit as i64;
         let batch = self
@@ -934,17 +960,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binding_a_new_session_resets_the_preamble_flag() {
-        let store = Store::open_in_memory().await.expect("opens");
-        store.set_session_id(Uuid::new_v4()).await.expect("write");
-        store.mark_preamble_sent().await.expect("mark");
-        assert!(store.preamble_sent().await.expect("read"));
-        // A replacement session has an empty context, so it must be oriented again.
-        store.set_session_id(Uuid::new_v4()).await.expect("rebind");
-        assert!(!store.preamble_sent().await.expect("read"));
-    }
-
-    #[tokio::test]
     async fn enqueue_then_claim_then_complete() {
         let store = store_with_conversation().await;
         let outcome = store
@@ -994,6 +1009,47 @@ mod tests {
             .expect("second");
         assert_eq!(second, EnqueueOutcome::Duplicate);
         assert_eq!(store.pending_count().await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_pending_window_spans_oldest_to_newest() {
+        let store = store_with_conversation().await;
+        assert!(
+            store.pending_window().await.expect("query").is_none(),
+            "an empty queue has no window to debounce against"
+        );
+
+        let first = now() - chrono::Duration::seconds(30);
+        let last = now();
+        store
+            .enqueue("telegram:123", "m1", "a", first, 10)
+            .await
+            .expect("first");
+        store
+            .enqueue("telegram:123", "m2", "b", last, 10)
+            .await
+            .expect("second");
+
+        let (oldest, newest) = store
+            .pending_window()
+            .await
+            .expect("query")
+            .expect("rows are pending");
+        assert_eq!(oldest.timestamp(), first.timestamp());
+        assert_eq!(newest.timestamp(), last.timestamp());
+    }
+
+    #[tokio::test]
+    async fn claimed_rows_leave_the_pending_window() {
+        // The drain loop debounces on this, so an in-flight batch must not keep holding the window
+        // open and defer the messages behind it.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        store.claim_batch(10).await.expect("claim");
+        assert!(store.pending_window().await.expect("query").is_none());
     }
 
     #[tokio::test]

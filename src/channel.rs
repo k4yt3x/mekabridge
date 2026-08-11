@@ -376,6 +376,15 @@ pub struct InboundMessage {
     /// Rendered as a descriptor line so the message is never silently empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Set at delivery time when this arrived while the previous turn was already running, so
+    /// anything that turn sent was written without it. Deliberately not phrased as "the reply",
+    /// because a turn can fail or legitimately stay silent, and claiming a reply that never
+    /// happened would be worse than saying nothing.
+    ///
+    /// Not persisted with the queued payload: whether a message was late depends on when it is
+    /// eventually delivered, which is not known when it is written.
+    #[serde(skip)]
+    pub arrived_mid_turn: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -666,6 +675,7 @@ mod tests {
             }),
             group_id: Some("13294839284".to_string()),
             notes: Vec::new(),
+            arrived_mid_turn: false,
             attachments: vec![Attachment {
                 kind: AttachmentKind::Photo,
                 file_name: Some("photo.jpg".to_string()),

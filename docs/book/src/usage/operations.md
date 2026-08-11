@@ -139,4 +139,8 @@ deprioritise IPv6 in `/etc/gai.conf` or fix the route.
 
 **Messages arrive in one lump after a delay.** That is batching working as intended: everything that arrived during a turn is delivered together in the next one.
 
+**Every reply feels a couple of seconds slow.** That is `[bridge].settle`, which waits for a chat to go quiet so a burst becomes one turn instead of being answered after the first fragment. Lower it if you would rather have the latency back, but expect the agent to reply mid-thought more often.
+
+**Replies in a busy group are consistently delayed by the same amount.** The chat never goes quiet for a full `settle`, so `settle_max` is releasing every batch rather than acting as an occasional fallback. Lower `settle_max`, or accept it as the price of one turn per burst instead of one per message.
+
 **A file was not downloaded.** It exceeded `attachment_max_bytes`. The envelope says so, and the agent can tell the user.

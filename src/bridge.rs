@@ -153,6 +153,7 @@ pub async fn run(config: Config) -> Result<()> {
                 config.bridge.typing_indicator,
                 Arc::clone(&presence),
             ),
+            identities: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
         };
         let wake_drain = Arc::clone(&wake_drain);

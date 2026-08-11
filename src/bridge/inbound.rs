@@ -16,10 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    bridge::{
-        envelope::{self, Envelope},
-        turn::TurnRunner,
-    },
+    bridge::{envelope::Envelope, turn::TurnRunner},
     channel::{ChannelRegistry, ConversationId, InboundEvent},
     config::Config,
     meka::{MekaClient, MekaError, TurnOutcome},
@@ -168,6 +165,8 @@ pub struct DrainContext {
     pub meka: MekaClient,
     pub channels: Arc<ChannelRegistry>,
     pub runner: TurnRunner,
+    /// The account the agent appears as on each channel, resolved on first use.
+    pub identities: Arc<tokio::sync::OnceCell<ChannelIdentities>>,
     /// Guards the one-per-process reconciliation of the session's permission level.
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
 }
@@ -178,6 +177,9 @@ pub struct DrainContext {
 /// Cutting a turn off mid-flight would leave its batch `in_flight` for the next start to recover,
 /// having already spent the provider tokens.
 pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: CancellationToken) {
+    // When the previous turn ran, so the next batch can say which of its messages landed while the
+    // agent was mid-turn and therefore could not have shaped the reply it sent.
+    let mut last_turn: Option<TurnWindow> = None;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => {
@@ -191,6 +193,17 @@ pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: Canc
         loop {
             if shutdown.is_cancelled() {
                 return;
+            }
+            // Let a burst finish before claiming any of it. Without this the first fragment of a
+            // thought starts a turn on its own and the agent answers before reading the rest.
+            if let Some(delay) = settle_delay(&context).await {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                // Round again rather than claiming straight away: more may have arrived while
+                // waiting, which extends the quiet period afresh.
+                continue;
             }
             let batch = match context
                 .store
@@ -206,13 +219,69 @@ pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: Canc
             if batch.is_empty() {
                 break;
             }
-            deliver(&context, batch).await;
+            last_turn = deliver(&context, batch, last_turn).await;
         }
     }
 }
 
+/// Which account the agent appears as on each channel, as `(channel, identity)`. The identity is
+/// `None` when the platform could not be reached to ask.
+pub type ChannelIdentities = Vec<(String, Option<String>)>;
+
+/// When a turn ran, so the next batch can tell which of its messages arrived while it was running.
+#[derive(Debug, Clone, Copy)]
+struct TurnWindow {
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// How long to hold off before claiming, or `None` to claim now.
+///
+/// Returns `None` both when nothing is waiting and when the wait is over, because the caller treats
+/// those the same: go look at the queue.
+///
+/// Timestamps here are the platform's own send times, not when the row was written, which is what
+/// makes a backlog replayed after a restart release immediately instead of being debounced as
+/// though it had just arrived. The cost is a dependence on the two clocks roughly agreeing; both
+/// directions of skew degrade safely, into either no debounce or one full quiet period.
+async fn settle_delay(context: &DrainContext) -> Option<Duration> {
+    let settle = context.config.bridge.settle;
+    let settle_max = context.config.bridge.settle_max;
+    if settle.is_zero() {
+        return None;
+    }
+
+    let window = match context.store.pending_window().await {
+        Ok(window) => window,
+        Err(error) => {
+            // Delivering promptly beats stalling on a query the next round will retry anyway.
+            tracing::error!("could not read the pending window: {}", error);
+            return None;
+        }
+    };
+    let (oldest, newest) = window?;
+
+    let now = chrono::Utc::now();
+    // Clamped because a platform clock ahead of this host's would otherwise read as negative.
+    let elapsed =
+        |since: chrono::DateTime<chrono::Utc>| (now - since).to_std().unwrap_or(Duration::ZERO);
+    let quiet_for = elapsed(newest);
+    let waited = elapsed(oldest);
+
+    if quiet_for >= settle || waited >= settle_max {
+        return None;
+    }
+    // Whichever expires first: the quiet period, or the ceiling on the oldest message.
+    Some((settle - quiet_for).min(settle_max - waited))
+}
+
 /// Hand one batch to the agent and record what happened to it.
-async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
+async fn deliver(
+    context: &DrainContext,
+    batch: Vec<QueuedMessage>,
+    last_turn: Option<TurnWindow>,
+) -> Option<TurnWindow> {
+    let started_at = chrono::Utc::now();
     let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
 
     let mut events: Vec<InboundEvent> = Vec::with_capacity(batch.len());
@@ -238,7 +307,18 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
         tracing::error!("failed to discard undecodable payloads: {}", error);
     }
     if events.is_empty() {
-        return;
+        return last_turn;
+    }
+
+    // A message whose own timestamp falls inside the previous turn arrived while the agent was
+    // working. Compared against platform time, so clock skew can only cause an under-report, which
+    // reads as an ordinary message rather than a wrong claim.
+    if let Some(window) = last_turn {
+        for event in &mut events {
+            let InboundEvent::Message(message) = event;
+            message.arrived_mid_turn =
+                message.timestamp >= window.started_at && message.timestamp <= window.ended_at;
+        }
     }
 
     let conversations: BTreeSet<ConversationId> = events
@@ -255,30 +335,17 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
         Ok(session_id) => session_id,
         Err(error) => {
             record_failure(context, &sequences, &error.to_string()).await;
-            return;
+            return last_turn;
         }
     };
 
-    // Tracks whether the message actually submitted carried a preamble, which is not the same as
-    // whether one was needed at the start: the session-recreate path below binds a fresh session
-    // and adds a preamble even when the first attempt did not have one.
-    let mut preamble_included = context
-        .store
-        .preamble_sent()
-        .await
-        .map(|sent| !sent)
-        .unwrap_or(true);
-    let preamble_text = if preamble_included {
-        Some(envelope::preamble(&channel_identities(context).await))
-    } else {
-        None
-    };
+    let identities = channel_identities(context).await;
 
     let nonce = nonce();
     let message = Envelope {
         events: &events,
         dropped,
-        preamble: preamble_text.as_deref(),
+        identities: &identities,
         nonce: &nonce,
     }
     .render();
@@ -308,14 +375,10 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
             }
             match ensure_session(context).await {
                 Ok(replacement) => {
-                    // A replacement session has an empty context, so it needs orienting even if the
-                    // one it replaces had already been oriented.
-                    preamble_included = true;
-                    let preamble_text = envelope::preamble(&channel_identities(context).await);
                     let message = Envelope {
                         events: &events,
                         dropped,
-                        preamble: Some(&preamble_text),
+                        identities: &identities,
                         nonce: &nonce,
                     }
                     .render();
@@ -365,9 +428,6 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
             if let Err(error) = context.store.complete_batch(&sequences).await {
                 tracing::error!("failed to mark a delivered batch: {}", error);
             }
-            if preamble_included && let Err(error) = context.store.mark_preamble_sent().await {
-                tracing::error!("failed to record that the preamble was sent: {}", error);
-            }
             if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await {
                 tracing::error!("failed to record the turn timestamp: {}", error);
             }
@@ -391,11 +451,6 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
                     if let Err(error) = context.store.complete_batch(&sequences).await {
                         tracing::error!("failed to mark a delivered batch: {}", error);
                     }
-                    if preamble_included
-                        && let Err(error) = context.store.mark_preamble_sent().await
-                    {
-                        tracing::error!("failed to record that the preamble was sent: {}", error);
-                    }
                     if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await
                     {
                         tracing::error!("failed to record the turn timestamp: {}", error);
@@ -418,6 +473,11 @@ async fn deliver(context: &DrainContext, batch: Vec<QueuedMessage>) {
             record_failure(context, &sequences, &error.to_string()).await;
         }
     }
+
+    Some(TurnWindow {
+        started_at,
+        ended_at: chrono::Utc::now(),
+    })
 }
 
 /// Submit a turn, waiting out a turn that is already running instead of failing on the 409.
@@ -524,9 +584,17 @@ async fn notify_owner(context: &DrainContext, text: &str) {
     }
 }
 
-/// Bot identities for the preamble, so the agent knows which account people see it as.
-async fn channel_identities(context: &DrainContext) -> Vec<(String, Option<String>)> {
+/// Which account the agent appears as on each channel, resolved once and remembered.
+///
+/// Cached because it is a network round trip per channel and the answer effectively never changes;
+/// a rename is picked up on the next restart. A failed probe is not cached, so a channel that was
+/// unreachable at first gets named once it comes back.
+async fn channel_identities(context: &DrainContext) -> ChannelIdentities {
+    if let Some(known) = context.identities.get() {
+        return known.clone();
+    }
     let mut identities = Vec::new();
+    let mut complete = true;
     for channel in context.channels.iter() {
         let label = match channel.probe().await {
             Ok(identity) => identity
@@ -535,10 +603,14 @@ async fn channel_identities(context: &DrainContext) -> Vec<(String, Option<Strin
                 .or(Some(identity.display_name)),
             Err(error) => {
                 tracing::debug!(channel = %channel.id(), "could not probe identity: {}", error);
+                complete = false;
                 None
             }
         };
         identities.push((channel.id().as_str().to_string(), label));
+    }
+    if complete {
+        let _ = context.identities.set(identities.clone());
     }
     identities
 }
@@ -673,6 +745,7 @@ mod tests {
             forwarded_from: None,
             group_id: None,
             notes: Vec::new(),
+            arrived_mid_turn: false,
             attachments,
             timestamp: Utc::now(),
         })

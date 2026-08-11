@@ -4,7 +4,7 @@
 
 - A working `meka serve` with a configured provider. See meka's [HTTP API docs](https://docs.meka.so/usage/http-api.html).
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- Rust 1.90 or newer if building from source.
+- Rust 1.88 or newer if building from source.
 
 ## From source
 

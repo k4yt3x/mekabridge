@@ -2,6 +2,7 @@
 name = "mekabridge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "A bridge between the meka agent and third-party messaging platforms"
 repository = "https://github.com/k4yt3x/mekabridge"

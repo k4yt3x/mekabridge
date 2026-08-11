@@ -197,7 +197,7 @@ from a network probe and `get_info` is synchronous. It rides the envelope instea
 
 ```
 [mekabridge] 1 new message.
-[mekabridge] You are @MicaAgentBot on telegram.
+[mekabridge] You are @examplebot on telegram.
 ```
 
 Stated every turn rather than once at session start. A one-time orientation would be an ordinary user

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-11
+
 ### Added
 
 - Relay between one permanent meka session and chat platforms, Telegram first.
@@ -36,3 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The owner is notified when a message cannot be delivered to the agent at all.
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
+
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/v0.1.0

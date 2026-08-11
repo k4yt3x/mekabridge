@@ -314,6 +314,8 @@ impl Channel for MockChannel {
             files: true,
             photos: true,
             reactions: true,
+            edit: true,
+            admin: true,
         }
     }
 
@@ -420,6 +422,7 @@ impl Channel for MockChannel {
             id: "1".to_string(),
             display_name: "Mock".to_string(),
             username: Some("mockbot".to_string()),
+            reads_all_group_messages: true,
         })
     }
 }
@@ -1070,7 +1073,185 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
 }
 
 #[tokio::test]
-async fn the_sink_refuses_a_conversation_it_has_never_seen() {
+async fn a_muted_conversation_never_reaches_the_agent() {
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_mute("mock:1", None, Some("too noisy"), Utc::now())
+        .await
+        .expect("mute");
+
+    for index in 0..5 {
+        harness
+            .sender
+            .send(message("noise", &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    // Nothing to wait for, so give the writer and drain loop a generous window to misbehave in.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        harness.turns().is_empty(),
+        "a muted chat must not wake the agent: {:?}",
+        harness.turns()
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(
+        stats.pending, 0,
+        "muted messages must not consume queue depth either"
+    );
+    let mute = harness
+        .store
+        .mute("mock:1")
+        .await
+        .expect("read")
+        .expect("still muted");
+    assert_eq!(mute.dropped, 5);
+}
+
+#[tokio::test]
+async fn an_expired_mute_lets_the_next_message_through_and_reports_the_damage() {
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_mute("mock:1", None, None, Utc::now())
+        .await
+        .expect("mute");
+    harness
+        .sender
+        .send(message("while muted", "1"))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(harness.turns().is_empty());
+
+    // Backdate the expiry rather than sleeping through a real one.
+    harness
+        .store
+        .set_mute(
+            "mock:1",
+            Some(Utc::now() - chrono::Duration::seconds(1)),
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    harness
+        .store
+        .note_muted_drop("mock:1")
+        .await
+        .expect("drop count");
+
+    harness
+        .sender
+        .send(message("after the mute", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn after the mute expired", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    let turns = harness.turns();
+    let envelope = turns.first().expect("one turn");
+    assert!(envelope.contains("after the mute"), "got:\n{envelope}");
+    assert!(
+        envelope.contains("1 message was dropped while it was muted"),
+        "the agent has to be told the mute did something, or it cannot judge whether to renew \
+         it:\n{envelope}"
+    );
+    assert!(
+        harness.store.mute("mock:1").await.expect("read").is_none(),
+        "a lapsed mute must be cleared once it has been reported"
+    );
+}
+
+#[tokio::test]
+async fn the_sink_delivers_to_a_conversation_it_has_never_seen() {
+    // Messaging first is the point: an id from the agent's system prompt is as valid as one from an
+    // envelope, and whether the chat is writable is the platform's judgement rather than ours.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&directory.path().join("state.db"))
+        .await
+        .expect("opens");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_for(store.clone(), channels);
+
+    sink.send_text("mock:999", "hello", SendOptions::default())
+        .await
+        .expect("an unseen id is deliverable");
+    assert_eq!(channel.sent(), vec![(
+        "mock:999".to_string(),
+        "hello".to_string()
+    )]);
+
+    // And it joins the address book, or the agent could message somebody and then fail to find them
+    // in `list_conversations` afterwards.
+    let record = store
+        .conversation("mock:999")
+        .await
+        .expect("read")
+        .expect("the send registers the conversation");
+    assert_eq!(record.chat, "999");
+    assert_eq!(
+        record.kind, "unknown",
+        "nothing about the chat's shape is known from a send alone"
+    );
+    assert_eq!(record.title, None);
+    assert!(record.last_outbound_at.is_some());
+    assert!(record.last_inbound_at.is_none());
+}
+
+#[tokio::test]
+async fn an_inbound_message_fills_in_what_a_send_could_not_know() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&directory.path().join("state.db"))
+        .await
+        .expect("opens");
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
+    ]));
+    let sink = sink_for(store.clone(), channels);
+
+    sink.send_text("mock:7", "first contact", SendOptions::default())
+        .await
+        .expect("sends");
+    store
+        .upsert_conversation(ConversationRecord {
+            id: "mock:7".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "7".to_string(),
+            thread: None,
+            title: Some("Deploy Crew".to_string()),
+            kind: "group".to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: Some(Utc::now()),
+            last_outbound_at: None,
+        })
+        .await
+        .expect("inbound");
+
+    // A second send must not drag the now-known title and kind back to their placeholders.
+    sink.send_text("mock:7", "second", SendOptions::default())
+        .await
+        .expect("sends");
+    let record = store
+        .conversation("mock:7")
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(record.title.as_deref(), Some("Deploy Crew"));
+    assert_eq!(record.kind, "group");
+}
+
+#[tokio::test]
+async fn the_sink_still_refuses_ids_it_cannot_route() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = Store::open(&directory.path().join("state.db"))
         .await
@@ -1081,12 +1262,22 @@ async fn the_sink_refuses_a_conversation_it_has_never_seen() {
     ]));
     let sink = sink_for(store, channels);
 
-    // A hallucinated id must produce a clear error, not an opaque platform rejection.
-    let error = sink
-        .send_text("mock:999", "hello", SendOptions::default())
+    // Unrestricted means "any chat", not "any string". These two fail here because no channel could
+    // act on them at all, which is different from a chat the platform will reject.
+    let malformed = sink
+        .send_text("not-an-id", "hello", SendOptions::default())
         .await
-        .expect_err("must refuse");
-    assert!(error.to_string().contains("mock:999"), "got: {error}");
+        .expect_err("a malformed id must be refused");
+    assert!(malformed.to_string().contains("not-an-id"), "{malformed}");
+
+    let unconfigured = sink
+        .send_text("discord:1", "hello", SendOptions::default())
+        .await
+        .expect_err("an unconfigured channel must be refused");
+    assert!(
+        unconfigured.to_string().contains("discord"),
+        "{unconfigured}"
+    );
     assert!(channel.sent().is_empty());
 }
 

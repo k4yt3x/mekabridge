@@ -26,7 +26,8 @@ use crate::{
     config::{Config, StorageConfig},
     error::Result,
     mcp::{
-        ConversationSummary, DownloadedAttachment, OutboundSink, SinkError, ViewedAttachment, serve,
+        ConversationSummary, DownloadedAttachment, OutboundSink, SinkError, ToolSurface,
+        ViewedAttachment, serve,
     },
     meka::MekaClient,
     store::Store,
@@ -104,12 +105,17 @@ pub async fn run(config: Config) -> Result<()> {
     ));
     let mut tasks = tokio::task::JoinSet::new();
 
+    // Derived from the channels rather than read from `[mcp]`, so the tool list follows the same
+    // per-channel setting that decides whether the calls would work at all.
+    let surface = ToolSurface {
+        admin: channels.iter().any(|channel| channel.capabilities().admin),
+    };
     tasks.spawn({
         let config = Arc::clone(&config);
         let shutdown = shutdown.clone();
         let sink = Arc::clone(&sink) as Arc<dyn OutboundSink>;
         async move {
-            if let Err(error) = serve::run(mcp_server, &config.mcp, sink, shutdown).await {
+            if let Err(error) = serve::run(mcp_server, &config.mcp, sink, surface, shutdown).await {
                 tracing::error!("MCP server stopped: {}", error);
             }
         }
@@ -280,10 +286,10 @@ async fn shutdown_signal() {
 
 /// Implements the MCP server's outbound port over the channel registry.
 ///
-/// Sends are validated against the conversation store, so the agent can only reach somebody the
-/// bridge has actually seen. That is not much of a restriction in practice (Telegram bots cannot
-/// open a conversation anyway) but it turns a hallucinated id into a clear tool error instead of an
-/// opaque platform rejection.
+/// Sends are not restricted to conversations the bridge has seen. The agent may write to any id its
+/// channel accepts, including one it was given in its system prompt rather than in an envelope,
+/// which is what lets it message somebody first. A hallucinated id therefore fails at the platform
+/// rather than here, and the platform's own wording is the more useful error anyway.
 pub struct BridgeSink {
     store: Store,
     channels: Arc<ChannelRegistry>,
@@ -361,17 +367,16 @@ impl BridgeSink {
         Ok((record, channel))
     }
 
-    async fn resolve(&self, id: &str) -> std::result::Result<ConversationId, SinkError> {
+    /// Check that an id is well formed and names a configured channel.
+    ///
+    /// Deliberately does not require the conversation to be one the bridge has seen. Whether a chat
+    /// can be written to is the platform's judgement, not ours, and it is the only party that
+    /// knows: Telegram refuses a user who never started the bot but accepts a group the bot
+    /// sits in silently. Asking it and passing the answer back beats a guess made from the
+    /// address book.
+    fn resolve(&self, id: &str) -> std::result::Result<ConversationId, SinkError> {
         let conversation = ConversationId::parse(id)
-            .ok_or_else(|| SinkError::UnknownConversation(id.to_string()))?;
-        let known = self
-            .store
-            .conversation(conversation.as_str())
-            .await
-            .map_err(|error| SinkError::Internal(error.to_string()))?;
-        if known.is_none() {
-            return Err(SinkError::UnknownConversation(id.to_string()));
-        }
+            .ok_or_else(|| SinkError::MalformedConversation(id.to_string()))?;
         if self.channels.get(conversation.channel()).is_none() {
             return Err(SinkError::UnknownChannel {
                 conversation: id.to_string(),
@@ -381,13 +386,51 @@ impl BridgeSink {
         Ok(conversation)
     }
 
-    async fn note_sent(&self, conversation: &ConversationId) {
+    /// Resolve a conversation for a moderation call, refusing a channel that has no such model.
+    ///
+    /// Whether the bot actually holds the right in that particular chat is left to the platform:
+    /// only it knows, the answer changes without warning, and its refusal explains more than
+    /// anything the bridge could infer.
+    fn admin_target(
+        &self,
+        conversation: &str,
+    ) -> std::result::Result<(ConversationId, Arc<dyn Channel>), SinkError> {
+        let conversation = self.resolve(conversation)?;
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?
+            .clone();
+        if !channel.capabilities().admin {
+            return Err(SinkError::Delivery(format!(
+                "channel {} has no moderation tools",
+                conversation.channel()
+            )));
+        }
+        Ok((conversation, channel))
+    }
+
+    async fn note_sent(&self, conversation: &ConversationId, platform: crate::channel::Platform) {
         // Stops the typing indicator re-arming here. Telegram already cleared it when this message
         // landed, so setting it again would announce a follow-up that is not coming.
         self.presence.note_sent(conversation);
+        let now = Utc::now();
         if let Err(error) = self
             .store
-            .touch_outbound(conversation.as_str(), Utc::now())
+            .touch_outbound(crate::store::ConversationRecord {
+                id: conversation.as_str().to_string(),
+                channel_id: conversation.channel().to_string(),
+                platform: platform.as_str().to_string(),
+                chat: conversation.chat().to_string(),
+                thread: conversation.thread().map(str::to_string),
+                // Both unknown when the agent messages first, and both left alone on a conversation
+                // that already exists.
+                title: None,
+                kind: crate::channel::ChatKind::Unknown.as_str().to_string(),
+                created_at: now,
+                last_inbound_at: None,
+                last_outbound_at: Some(now),
+            })
             .await
         {
             tracing::warn!("failed to record an outbound message: {}", error);
@@ -403,7 +446,7 @@ impl OutboundSink for BridgeSink {
         markdown: &str,
         options: SendOptions,
     ) -> std::result::Result<Vec<String>, SinkError> {
-        let conversation = self.resolve(conversation).await?;
+        let conversation = self.resolve(conversation)?;
         let channel = self
             .channels
             .resolve(&conversation)
@@ -412,7 +455,7 @@ impl OutboundSink for BridgeSink {
             .send_text(&conversation, markdown, &options)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        self.note_sent(&conversation).await;
+        self.note_sent(&conversation, channel.platform()).await;
         tracing::info!(
             conversation = %conversation,
             parts = sent.len(),
@@ -428,7 +471,7 @@ impl OutboundSink for BridgeSink {
         caption: Option<&str>,
         as_photo: bool,
     ) -> std::result::Result<Vec<String>, SinkError> {
-        let conversation = self.resolve(conversation).await?;
+        let conversation = self.resolve(conversation)?;
         let channel = self
             .channels
             .resolve(&conversation)
@@ -450,7 +493,7 @@ impl OutboundSink for BridgeSink {
             .send_file(&conversation, path, caption, as_photo)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        self.note_sent(&conversation).await;
+        self.note_sent(&conversation, channel.platform()).await;
         tracing::info!(conversation = %conversation, "the agent sent a file");
         Ok(sent)
     }
@@ -461,7 +504,7 @@ impl OutboundSink for BridgeSink {
         message_id: &str,
         emoji: Option<&str>,
     ) -> std::result::Result<(), SinkError> {
-        let conversation = self.resolve(conversation).await?;
+        let conversation = self.resolve(conversation)?;
         let channel = self
             .channels
             .resolve(&conversation)
@@ -486,6 +529,160 @@ impl OutboundSink for BridgeSink {
             "the agent reacted to a message"
         );
         Ok(())
+    }
+
+    async fn edit_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> std::result::Result<(), SinkError> {
+        let conversation = self.resolve(conversation)?;
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        if !channel.capabilities().edit {
+            return Err(SinkError::Delivery(format!(
+                "channel {} cannot edit messages",
+                conversation.channel()
+            )));
+        }
+        channel
+            .edit_text(&conversation, message_id, markdown)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        // Deliberately not `note_sent`: revising a message is not new activity in the conversation,
+        // and treating it as such would make a chat the agent only corrected itself in look freshly
+        // answered.
+        tracing::info!(
+            conversation = %conversation,
+            message_id = %message_id,
+            "the agent edited a message"
+        );
+        Ok(())
+    }
+
+    async fn delete_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+    ) -> std::result::Result<(), SinkError> {
+        let conversation = self.resolve(conversation)?;
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        channel
+            .delete_message(&conversation, message_id)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        // Warn, not info: a deletion leaves no trace on the platform, so this log line is the only
+        // remaining record that it happened.
+        tracing::warn!(
+            conversation = %conversation,
+            message_id = %message_id,
+            "the agent deleted a message"
+        );
+        Ok(())
+    }
+
+    async fn moderate_member(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        action: crate::channel::MemberAction,
+        until: Option<chrono::DateTime<Utc>>,
+        revoke_messages: bool,
+    ) -> std::result::Result<(), SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .moderate_member(&conversation, user_id, action, until, revoke_messages)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        // Warn for every one of these. They change somebody's standing in a chat, an operator has
+        // no other record that it happened, and the agent can be talked into them by anyone whose
+        // message it reads.
+        tracing::warn!(
+            conversation = %conversation,
+            user_id = %user_id,
+            action = action.as_str(),
+            until = ?until,
+            revoke_messages,
+            "the agent moderated a member"
+        );
+        Ok(())
+    }
+
+    async fn set_member_rights(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        rights: &[crate::channel::MemberRight],
+    ) -> std::result::Result<(), SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .set_member_rights(&conversation, user_id, rights)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        tracing::warn!(
+            conversation = %conversation,
+            user_id = %user_id,
+            rights = ?rights.iter().map(|right| right.as_str()).collect::<Vec<_>>(),
+            "the agent changed a member's rights"
+        );
+        Ok(())
+    }
+
+    async fn pin_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        pin: bool,
+        silent: bool,
+    ) -> std::result::Result<(), SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .pin_message(&conversation, message_id, pin, silent)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        tracing::info!(
+            conversation = %conversation,
+            message_id = %message_id,
+            pin,
+            "the agent changed a pinned message"
+        );
+        Ok(())
+    }
+
+    async fn set_chat(
+        &self,
+        conversation: &str,
+        settings: crate::channel::ChatSettings,
+    ) -> std::result::Result<(), SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .set_chat(&conversation, &settings)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        tracing::warn!(
+            conversation = %conversation,
+            title = ?settings.title,
+            "the agent changed chat settings"
+        );
+        Ok(())
+    }
+
+    async fn member(
+        &self,
+        conversation: &str,
+        user_id: Option<&str>,
+    ) -> std::result::Result<crate::channel::MemberInfo, SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .member(&conversation, user_id)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))
     }
 
     async fn view_attachment(
@@ -644,6 +841,43 @@ impl OutboundSink for BridgeSink {
         })
     }
 
+    async fn mute(
+        &self,
+        conversation: &str,
+        until: Option<chrono::DateTime<Utc>>,
+        reason: Option<&str>,
+    ) -> std::result::Result<(), SinkError> {
+        // Parsed but not checked against the address book: muting a conversation before it has said
+        // anything is a legitimate pre-emptive move, and the row is keyed by id either way.
+        let conversation = self.resolve(conversation)?;
+        self.store
+            .set_mute(conversation.as_str(), until, reason, Utc::now())
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        // Warn rather than info: this is the line an operator greps for when the bot has gone quiet
+        // and nothing else explains it.
+        tracing::warn!(
+            conversation = %conversation,
+            until = ?until,
+            reason = ?reason,
+            "the agent muted a conversation; `mekabridge mute rm` lifts it"
+        );
+        Ok(())
+    }
+
+    async fn unmute(&self, conversation: &str) -> std::result::Result<bool, SinkError> {
+        let conversation = self.resolve(conversation)?;
+        let lifted = self
+            .store
+            .clear_mute(conversation.as_str())
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        if lifted {
+            tracing::info!(conversation = %conversation, "the agent unmuted a conversation");
+        }
+        Ok(lifted)
+    }
+
     async fn conversations(
         &self,
         channel: Option<&str>,
@@ -654,7 +888,21 @@ impl OutboundSink for BridgeSink {
             .list_conversations(channel, limit)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        Ok(records.into_iter().map(summarize).collect())
+        let mutes = self
+            .store
+            .list_mutes()
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        Ok(records
+            .into_iter()
+            .map(|record| {
+                let mute = mutes
+                    .iter()
+                    .find(|mute| mute.conversation_id == record.id)
+                    .and_then(describe_mute);
+                summarize(record, mute)
+            })
+            .collect())
     }
 
     async fn conversation(
@@ -666,7 +914,30 @@ impl OutboundSink for BridgeSink {
             .conversation(id)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        Ok(record.map(summarize))
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let mute = self
+            .store
+            .mute(&record.id)
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?
+            .as_ref()
+            .and_then(describe_mute);
+        Ok(Some(summarize(record, mute)))
+    }
+}
+
+/// How a mute is reported to the agent, or `None` once it has lapsed.
+///
+/// Expiry is resolved here rather than in SQL for the same reason the writer resolves it: a lapsed
+/// row is left in place until the next message clears it, so listing has to ignore one that is only
+/// still there because nothing has arrived since.
+fn describe_mute(mute: &crate::store::MuteRecord) -> Option<String> {
+    match mute.until {
+        Some(until) if until <= Utc::now() => None,
+        Some(until) => Some(until.to_rfc3339()),
+        None => Some("indefinite".to_string()),
     }
 }
 
@@ -713,7 +984,10 @@ fn sanitize_file_stem(file_ref: &str) -> String {
     }
 }
 
-fn summarize(record: crate::store::ConversationRecord) -> ConversationSummary {
+fn summarize(
+    record: crate::store::ConversationRecord,
+    muted_until: Option<String>,
+) -> ConversationSummary {
     ConversationSummary {
         id: record.id,
         channel: record.channel_id,
@@ -722,5 +996,6 @@ fn summarize(record: crate::store::ConversationRecord) -> ConversationSummary {
         kind: record.kind,
         last_inbound_at: record.last_inbound_at.map(|at| at.to_rfc3339()),
         last_outbound_at: record.last_outbound_at.map(|at| at.to_rfc3339()),
+        muted_until,
     }
 }

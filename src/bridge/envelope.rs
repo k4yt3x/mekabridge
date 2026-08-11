@@ -528,6 +528,14 @@ mod tests {
             rendered.contains("admitted: chat allowlist (sender not individually allowlisted)"),
             "got:\n{rendered}"
         );
+
+        let mut event = message("hi");
+        event.admission = Admission::Open;
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("admitted: open channel"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]

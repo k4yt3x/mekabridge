@@ -22,7 +22,10 @@ use uuid::Uuid;
 /// Schema statements applied in order. The index of a statement is its schema version, tracked in
 /// SQLite's `user_version`, so adding a migration means appending to this array and never editing
 /// an existing entry.
-const MIGRATIONS: &[&str] = &[include_str!("store/schema_001.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("store/schema_001.sql"),
+    include_str!("store/schema_002.sql"),
+];
 
 /// `meta` key holding the meka session UUID this bridge instance owns.
 const META_SESSION_ID: &str = "session_id";
@@ -80,11 +83,24 @@ pub struct ConversationRecord {
     pub thread: Option<String>,
     /// Human-readable label: a group title, or a person's display name.
     pub title: Option<String>,
-    /// `direct`, `group`, or `channel`.
+    /// `direct`, `group`, `channel`, or `unknown` for a conversation the agent messaged first,
+    /// where nothing has arrived to say what shape it is.
     pub kind: String,
     pub created_at: DateTime<Utc>,
     pub last_inbound_at: Option<DateTime<Utc>>,
     pub last_outbound_at: Option<DateTime<Utc>>,
+}
+
+/// A conversation the agent has muted, as read back from the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuteRecord {
+    pub conversation_id: String,
+    /// When it lapses, or `None` for indefinite.
+    pub until: Option<DateTime<Utc>>,
+    pub reason: Option<String>,
+    /// Messages discarded since the mute was set.
+    pub dropped: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 /// A message waiting to be handed to the agent.
@@ -415,14 +431,143 @@ impl Store {
         Ok(records)
     }
 
-    /// Stamp a conversation as having just received an outbound message.
-    pub async fn touch_outbound(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
-        let id = id.to_string();
+    /// Stamp a conversation as having just received an outbound message, registering it first if
+    /// the agent messaged somewhere the bridge has never heard from.
+    ///
+    /// Only `last_outbound_at` is honoured from `record` on an existing row; everything else is
+    /// insert-time detail. See [`Store::upsert_conversation`] for the inbound direction, which does
+    /// know the title and kind and is allowed to update them.
+    pub async fn touch_outbound(&self, record: ConversationRecord) -> Result<()> {
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE conversations SET last_outbound_at = ?2 WHERE id = ?1",
-                    rusqlite::params![id, to_rfc3339(at)],
+                    // An insert rather than an update, because the agent may write to a chat that
+                    // has never written to it and this is then the address book's first news of
+                    // the conversation. On conflict only the timestamp moves:
+                    // the `title` and `kind` passed here stand in for a chat
+                    // nothing is known about, so letting them overwrite a real
+                    // title would discard what an inbound message already
+                    // established.
+                    "INSERT INTO conversations
+                         (id, channel_id, platform, chat, thread, title, kind, created_at,
+                          last_inbound_at, last_outbound_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
+                     ON CONFLICT(id) DO UPDATE SET last_outbound_at = excluded.last_outbound_at",
+                    rusqlite::params![
+                        record.id,
+                        record.channel_id,
+                        record.platform,
+                        record.chat,
+                        record.thread,
+                        record.title,
+                        record.kind,
+                        to_rfc3339(record.created_at),
+                        record.last_outbound_at.map(to_rfc3339),
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Silence a conversation until `until`, or indefinitely when it is `None`.
+    ///
+    /// Re-muting an already-muted conversation resets the drop count, so the tally the agent is
+    /// eventually shown belongs to the mute it is being told about rather than to every mute this
+    /// chat has ever had.
+    pub async fn set_mute(
+        &self,
+        conversation_id: &str,
+        until: Option<DateTime<Utc>>,
+        reason: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conversation_id = conversation_id.to_string();
+        let reason = reason.map(str::to_string);
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO mutes (conversation_id, until, reason, dropped, created_at)
+                     VALUES (?1, ?2, ?3, 0, ?4)
+                     ON CONFLICT(conversation_id) DO UPDATE SET
+                         until = excluded.until,
+                         reason = excluded.reason,
+                         dropped = 0,
+                         created_at = excluded.created_at",
+                    rusqlite::params![
+                        conversation_id,
+                        until.map(to_rfc3339),
+                        reason,
+                        to_rfc3339(at),
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Lift a mute. Returns whether one was actually in place.
+    pub async fn clear_mute(&self, conversation_id: &str) -> Result<bool> {
+        let conversation_id = conversation_id.to_string();
+        let removed = self
+            .connection
+            .call(move |connection| {
+                connection.execute("DELETE FROM mutes WHERE conversation_id = ?1", [
+                    conversation_id,
+                ])
+            })
+            .await?;
+        Ok(removed > 0)
+    }
+
+    /// The mute on a conversation, expired or not.
+    ///
+    /// Expiry is the caller's judgement rather than a filter here, because an expired mute is
+    /// exactly what carries the drop count the agent needs to be told about.
+    pub async fn mute(&self, conversation_id: &str) -> Result<Option<MuteRecord>> {
+        let conversation_id = conversation_id.to_string();
+        let record = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT conversation_id, until, reason, dropped, created_at
+                         FROM mutes WHERE conversation_id = ?1",
+                        [conversation_id],
+                        row_to_mute,
+                    )
+                    .optional()
+            })
+            .await?;
+        Ok(record)
+    }
+
+    /// Every mute currently recorded, oldest first.
+    pub async fn list_mutes(&self) -> Result<Vec<MuteRecord>> {
+        let records = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT conversation_id, until, reason, dropped, created_at
+                     FROM mutes ORDER BY created_at",
+                )?;
+                let rows = statement.query_map([], row_to_mute)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(records)
+    }
+
+    /// Count one message discarded because its conversation was muted.
+    pub async fn note_muted_drop(&self, conversation_id: &str) -> Result<()> {
+        let conversation_id = conversation_id.to_string();
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE mutes SET dropped = dropped + 1 WHERE conversation_id = ?1",
+                    [conversation_id],
                 )?;
                 Ok(())
             })
@@ -872,6 +1017,18 @@ fn to_rfc3339(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
+fn row_to_mute(row: &rusqlite::Row<'_>) -> rusqlite::Result<MuteRecord> {
+    let until: Option<String> = row.get(1)?;
+    let created_at: String = row.get(4)?;
+    Ok(MuteRecord {
+        conversation_id: row.get(0)?,
+        until: until.as_deref().map(parse_rfc3339).transpose()?,
+        reason: row.get(2)?,
+        dropped: row.get::<_, i64>(3)?.max(0) as u64,
+        created_at: parse_rfc3339(&created_at)?,
+    })
+}
+
 fn parse_rfc3339(raw: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Error> {
     DateTime::parse_from_rfc3339(raw)
         .map(|value| value.with_timezone(&Utc))
@@ -937,6 +1094,127 @@ mod tests {
             last_inbound_at: Some(now()),
             last_outbound_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_mute_round_trips_with_its_expiry() {
+        let store = Store::open_in_memory().await.expect("opens");
+        let until = now() + chrono::Duration::minutes(30);
+        store
+            .set_mute("telegram:1", Some(until), Some("standup spam"), now())
+            .await
+            .expect("mute");
+        let mute = store
+            .mute("telegram:1")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(mute.until, Some(until));
+        assert_eq!(mute.reason.as_deref(), Some("standup spam"));
+        assert_eq!(mute.dropped, 0);
+        assert!(store.mute("telegram:2").await.expect("read").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_indefinite_mute_has_no_expiry() {
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("mute");
+        let mute = store
+            .mute("telegram:1")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(mute.until, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_mute_reports_whether_one_was_in_place() {
+        let store = Store::open_in_memory().await.expect("opens");
+        assert!(!store.clear_mute("telegram:1").await.expect("clear"));
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("mute");
+        assert!(store.clear_mute("telegram:1").await.expect("clear"));
+        assert!(store.mute("telegram:1").await.expect("read").is_none());
+    }
+
+    #[tokio::test]
+    async fn re_muting_starts_the_drop_count_over() {
+        // The count is reported when the mute lapses, so it has to belong to the mute being
+        // reported rather than to every mute this conversation has ever had.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("mute");
+        store
+            .note_muted_drop("telegram:1")
+            .await
+            .expect("drop count");
+        store
+            .note_muted_drop("telegram:1")
+            .await
+            .expect("drop count");
+        assert_eq!(
+            store
+                .mute("telegram:1")
+                .await
+                .expect("read")
+                .expect("present")
+                .dropped,
+            2
+        );
+
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("re-mute");
+        assert_eq!(
+            store
+                .mute("telegram:1")
+                .await
+                .expect("read")
+                .expect("present")
+                .dropped,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mutes_are_listed_for_the_operator() {
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("mute");
+        store
+            .set_mute(
+                "telegram:2",
+                Some(now() + chrono::Duration::hours(1)),
+                None,
+                now() + chrono::Duration::seconds(1),
+            )
+            .await
+            .expect("mute");
+        let mutes = store.list_mutes().await.expect("list");
+        assert_eq!(mutes.len(), 2);
+        assert_eq!(mutes[0].conversation_id, "telegram:1");
+        assert_eq!(mutes[1].conversation_id, "telegram:2");
+    }
+
+    #[tokio::test]
+    async fn counting_a_drop_on_an_unmuted_conversation_is_harmless() {
+        // The writer only calls this behind a mute lookup, but a race between an operator lifting a
+        // mute and a message arriving must not become an error the message dies of.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .note_muted_drop("telegram:1")
+            .await
+            .expect("no row is not an error");
     }
 
     async fn store_with_conversation() -> Store {
@@ -1426,6 +1704,41 @@ mod tests {
             still_expired.is_empty(),
             "rows must be deleted, not just read"
         );
+    }
+
+    #[tokio::test]
+    async fn a_database_from_an_earlier_release_is_upgraded_in_place() {
+        // The path a real deployment takes on upgrade, which the in-memory tests never exercise
+        // because they build every schema from scratch. A migration that only works on a fresh
+        // database would pass everything else and fail on the first real bridge to restart.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        let connection = tokio_rusqlite::Connection::open(&path)
+            .await
+            .expect("opens");
+        connection
+            .call(|connection| {
+                connection.execute_batch(include_str!("store/schema_001.sql"))?;
+                connection.pragma_update(None, "user_version", 1_i64)?;
+                connection.execute("INSERT INTO meta (key, value) VALUES ('session_id', ?1)", [
+                    Uuid::nil().to_string(),
+                ])?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("build a version 1 database");
+        connection.close().await.expect("closes");
+
+        let store = Store::open(&path).await.expect("upgrades");
+        assert_eq!(
+            store.session_id().await.expect("read"),
+            Some(Uuid::nil()),
+            "an upgrade must carry existing state forward"
+        );
+        store
+            .set_mute("telegram:1", None, None, now())
+            .await
+            .expect("the table added by the upgrade is usable");
     }
 
     #[tokio::test]

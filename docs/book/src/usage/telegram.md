@@ -19,10 +19,11 @@ A bot token is a public entry point: anyone who guesses or discovers the bot's n
 
 - `allowed_users` admits specific people wherever they message from.
 - `allowed_chats` admits a whole group or channel, so every member of it can talk to the agent. Group ids are negative, for example `-1001234567890`.
+- `allow_all` admits everyone, for a public or customer-service bot. On Telegram a private chat id is the user's own id, so this opens direct messages too, not just groups.
 
 Messages from outside the allowlist are dropped at debug level with no reply. Not replying is deliberate: an "unauthorized" response would confirm to a stranger that the bot is live.
 
-Remember that everyone who is allowed shares one agent context. This is a personal assistant bridge, not a multi-tenant service.
+Remember that everyone who is allowed shares one agent context and one memory. See [Security](./security.md) for what that means and what the `admitted` line does and does not promise.
 
 ## What the agent sees
 
@@ -45,7 +46,7 @@ attachment: photo, image/jpeg, 2.1 MiB [417]
 Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` always appear; the rest show up when they apply.
 
 - **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
-- **`admitted`** says why the sender got through: `user allowlist` means they were vetted individually, `chat allowlist` means they were not and are only there because the whole chat is allowed. This is the distinction a personal assistant needs when a stranger in a group asks it for something.
+- **`admitted`** says how the sender got through: `user allowlist` means they were vetted individually, `chat allowlist` means they were not and are only there because the whole chat is allowed, `open channel` means nothing was checked. The bridge reports which; what to make of it belongs in the agent's instructions.
 - **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
 - **`album`** ties the parts of a multi-photo post together, so a batch of pictures does not read as several unrelated ones.
 - **`attachment`** ends with a handle for the fetch tools. See [Attachments](#attachments).
@@ -64,7 +65,26 @@ Being added to or removed from a group is logged. If the group is not allowliste
 
 An edited message is delivered again, marked as an edit, rather than being mistaken for a repeat of the original. The agent sees the revised text and knows which message it revises.
 
+In the other direction the agent can revise its own messages with `edit_message` and retract them with `delete_message`, which is how a person corrects a typo rather than sending a second message about it. Telegram declines to edit a message older than 48 hours.
+
 The agent can react to any message with `react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
+
+## Moderation
+
+With `admin_tools` on (the default) and the bot made an administrator, the agent can moderate a group: restrict, ban, unban, or kick members, promote and demote administrators, pin messages, and set the title.
+
+Telegram enforces all of it. Every call needs the matching admin right in that specific chat, and no bot can act on another administrator, so a group's owner cannot be evicted by their own bot. Rights are per chat, so the bot may moderate one group and not another; `member` with no `user_id` reports what it holds where it is.
+
+Two Telegram behaviours worth knowing:
+
+- A restriction or ban shorter than 30 seconds or longer than 366 days is treated as **permanent**. The bridge refuses those rather than passing them through, since the failure is otherwise silent.
+- `unrestrict` restores the group's own default permissions, read back from the group, rather than granting everything. Somebody reinstated ends up with what everyone else has, not more.
+
+Anonymous admins post as the chat and carry no user id, so they cannot be moderated this way.
+
+## Muting a chat
+
+A group that keeps waking the agent for nothing can be silenced with `mute`, for a duration or indefinitely. Muted messages are dropped as they arrive, before the queue, so they cost nothing; when the mute lapses the agent is told how many it missed. `mekabridge mute list` and `mekabridge mute rm` are the operator's way back if the agent mutes something it should not have.
 
 ## Formatting
 

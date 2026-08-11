@@ -25,12 +25,17 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 eventsource-stream = "0.2"
 futures = "0.3"
+humantime = "2"
 humantime-serde = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 rmcp = { version = "3", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Must resolve to the same version rmcp links, or the `JsonSchema` derived on the channel enums is a
+# different trait from the one the tool macros require. A mismatch is a compile error, not a subtle
+# one, so this needs checking on an rmcp upgrade rather than watching for.
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 teloxide = { version = "0.17", default-features = false, features = ["rustls", "throttle"] }

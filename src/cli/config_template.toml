@@ -68,6 +68,14 @@ token = "${TELEGRAM_BOT_TOKEN}"
 allowed_users = [123456789]
 # Group and channel ids where every member is allowed. Group ids are negative.
 # allowed_chats = [-1001234567890]
+# Accept everyone, for a public or customer-service bot. Note that on Telegram a private chat id is
+# the user's own id, so this admits individuals as well as groups: anybody who finds the bot can
+# spend your provider budget. Leave the allowlists set as well to keep marking people you trust.
+# allow_all = true
+# Offer the agent group moderation (restrict, ban, promote, pin, set the title). On by default,
+# since Telegram refuses any of it unless the bot is an admin with the matching right. Turn it off
+# if the bot is an admin only so that it can read group messages.
+# admin_tools = false
 # Show a preview card for links the agent sends. Off by default: the agent usually cites links
 # rather than making one the subject of a message, and a card on each part of a split reply is noise.
 # link_preview = true

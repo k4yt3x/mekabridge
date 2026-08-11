@@ -85,6 +85,12 @@ pub enum Command {
         command: ConversationsCommand,
     },
 
+    /// Inspect or lift the mutes the agent has set on conversations.
+    Mute {
+        #[command(subcommand)]
+        command: MuteCommand,
+    },
+
     /// Inspect or reset the agent's session.
     Session {
         #[command(subcommand)]
@@ -129,6 +135,36 @@ pub enum ConversationsCommand {
         /// Maximum rows to print.
         #[arg(long, default_value_t = DEFAULT_LIST_LIMIT)]
         limit: usize,
+    },
+}
+
+/// Operator control over mutes.
+///
+/// The agent sets these itself, so this exists as the way back: a conversation muted indefinitely
+/// is otherwise unreachable, including the one an operator would use to ask the agent to undo it.
+#[derive(Debug, Subcommand)]
+pub enum MuteCommand {
+    /// List muted conversations.
+    List,
+
+    /// Mute a conversation.
+    Add {
+        /// Conversation id, for example `telegram:-1001234567890`.
+        conversation: String,
+
+        /// How long, as a duration like `30m` or `7d`. Omit to mute indefinitely.
+        #[arg(long)]
+        duration: Option<String>,
+
+        /// Note recorded alongside the mute.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Lift the mute on a conversation.
+    Rm {
+        /// Conversation id.
+        conversation: String,
     },
 }
 
@@ -218,6 +254,23 @@ async fn dispatch(command: Command, config: Config) -> Result<()> {
             ConversationsCommand::List { channel, limit } => {
                 commands::conversations_list(&config, channel.as_deref(), limit).await
             }
+        },
+        Command::Mute { command } => match command {
+            MuteCommand::List => commands::mute_list(&config).await,
+            MuteCommand::Add {
+                conversation,
+                duration,
+                reason,
+            } => {
+                commands::mute_add(
+                    &config,
+                    &conversation,
+                    duration.as_deref(),
+                    reason.as_deref(),
+                )
+                .await
+            }
+            MuteCommand::Rm { conversation } => commands::mute_rm(&config, &conversation).await,
         },
         Command::Session { command } => match command {
             SessionCommand::Show => commands::session_show(&config).await,

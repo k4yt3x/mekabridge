@@ -188,8 +188,12 @@ pub struct ServerInfo {
     /// an `Option`: a bare `String` fails to deserialize the null and takes `doctor` and the
     /// vision check down with it.
     pub model: Option<String>,
-    /// Whether the active provider profile accepts image attachments on `POST /turn`. Attaching
-    /// one to a profile without vision is a 422, so this is checked before spending the base64.
+    /// Whether the active provider profile can look at images at all.
+    ///
+    /// The bridge attaches nothing to a turn, so this gates `view_attachment` instead: with vision
+    /// off, meka would replace the image block in the tool result with a placeholder, and
+    /// returning a description that names the file is more use to the agent than a picture it
+    /// cannot see.
     pub vision: bool,
 }
 
@@ -426,6 +430,15 @@ impl MekaClient {
     /// The returned stream yields every event meka emits and ends after a terminal one. Errors
     /// before the first event (auth, unknown session, a turn already in flight) surface here rather
     /// than inside the stream, so the caller can distinguish "never started" from "died partway".
+    ///
+    /// The body carries text and nothing else, deliberately. meka's turn API does accept image
+    /// attachments, and an earlier version of this client used them, but images now reach the model
+    /// only when the agent asks for one with `view_attachment`, which returns an MCP image block
+    /// that meka forwards to the provider as multimodal content. The reason is that this bridge
+    /// owns one permanent session: an image attached to a turn stays in that context for the life
+    /// of the session, so pushing every photo anyone sends would fill it with pictures nobody
+    /// ever needed. Reading this and concluding that images cannot reach the model is a mistake
+    /// worth heading off; the pull path is in `mcp.rs` and `bridge.rs`.
     async fn open_turn(
         &self,
         session_id: Uuid,

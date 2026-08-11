@@ -83,7 +83,16 @@ Delivered rows are kept for seven days rather than deleted immediately, because 
 | `meka no longer knows session ...` | The session was deleted in meka; a replacement is created and the agent's memory is gone |
 | `meka asked for permission` | Unexpected: sessions declare they cannot answer prompts, so meka should deny without asking |
 | `lost the turn stream` | The connection to meka dropped; the bridge waits for the turn to finish rather than resubmitting |
-| `turn image budget reached` | A batch carried more image data than fits in one turn; the rest are named by path |
+| `the agent viewed an attachment` | An image was fetched and passed to the model. `preview=true` means it was a still frame, not the file |
+| `the agent downloaded an attachment` | A file was written to `[storage].attachment_dir` |
+| `the agent muted a conversation` | Nothing from that chat reaches the agent until it lapses. `mekabridge mute rm` lifts it |
+| `a mute expired` | A chat is being heard again; the count is what was dropped meanwhile |
+| `the agent moderated a member` | Somebody was restricted, banned, or reinstated in a group |
+| `the agent changed a member's rights` | An administrator was promoted or demoted |
+| `the agent deleted a message` | The message is gone from the platform, so this line is the only record |
+
+The last four are logged at warn deliberately. They change state an operator cannot reconstruct from
+the chat afterwards, and the agent can be talked into them by anyone whose message it reads.
 
 JSON logs with `--log-format json` or `[log].format = "json"`.
 
@@ -133,7 +142,11 @@ deprioritise IPv6 in `/etc/gai.conf` or fix the route.
 
 **The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the provider profile has `vision = false`; `mekabridge doctor` reports the setting.
 
-**The bot ignores a user.** Their id is not in `allowed_users`. Run with `-v` to see the drop at debug level.
+**The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is muted. Run with `-v` to see the drop at debug level, and check `mekabridge mute list`.
+
+**The bot has gone quiet in a group and nothing looks broken.** Either the agent muted it (`mekabridge mute list`, then `mute rm`) or privacy mode is on, in which case the bot only sees messages that mention it or reply to it. `mekabridge doctor` reports privacy mode.
+
+**A moderation call fails.** The bot needs to be an administrator of that specific chat with the matching right. Have the agent call `member` with no `user_id` to see what it actually holds there. Telegram also refuses any action against another administrator.
 
 **The agent replies to the wrong person.** Check the conversation ids in `mekabridge conversations list`. The agent routes by the id in the envelope header, so this usually means it reused a stale id rather than the one in front of it.
 

@@ -159,6 +159,19 @@ pub struct TelegramConfig {
     pub allowed_users: Vec<i64>,
     /// Additional chat ids (groups, channels) permitted regardless of sender.
     pub allowed_chats: Vec<i64>,
+    /// Accept every sender, making both allowlists advisory rather than gates.
+    ///
+    /// Off unless the operator asks for it. What it enables is a bot anyone may message, which is
+    /// the shape a customer-service or public bot needs and the wrong shape for everything else.
+    pub allow_all: bool,
+    /// Offer the agent the moderation tools.
+    ///
+    /// On by default, because Telegram already gates each one on the admin rights the bot actually
+    /// holds in a chat, and a bot that is nobody's administrator can do nothing with them. Turn it
+    /// off to keep them out of the tool list entirely: promoting a bot is also how an operator
+    /// lets it read every message in a group, and somebody who did that for the reading alone
+    /// should not silently acquire an agent that can ban people.
+    pub admin_tools: bool,
     pub parse_mode: TelegramParseMode,
     /// Whether a link in an outgoing message gets a preview card.
     pub link_preview: bool,
@@ -392,6 +405,10 @@ struct FileTelegram {
     allowed_users: Vec<i64>,
     #[serde(default)]
     allowed_chats: Vec<i64>,
+    #[serde(default)]
+    allow_all: bool,
+    #[serde(default = "default_true")]
+    admin_tools: bool,
     #[serde(default = "default_telegram_parse_mode")]
     parse_mode: TelegramParseMode,
     #[serde(default = "default_link_preview")]
@@ -527,10 +544,19 @@ impl FileConfig {
                 )));
             }
             let label = format!("[[channels.telegram]] id = {:?}", telegram.id);
-            if telegram.allowed_users.is_empty() && telegram.allowed_chats.is_empty() {
+            if telegram.allow_all {
+                // Repeated at every startup rather than logged once at the point of change, because
+                // the risk is ongoing and the config that set it may have been written long ago by
+                // somebody else.
+                warnings.push(format!(
+                    "{label} sets `allow_all`, so anyone who finds the bot can reach the agent. On \
+                     Telegram a private chat id is the user's own id, so this admits individuals \
+                     as well as groups."
+                ));
+            } else if telegram.allowed_users.is_empty() && telegram.allowed_chats.is_empty() {
                 return Err(BridgeError::config(format!(
-                    "{label} has an empty allowlist; set `allowed_users` or `allowed_chats` so \
-                     the bot does not accept messages from anyone who finds it"
+                    "{label} has an empty allowlist; set `allowed_users` or `allowed_chats`, or \
+                     `allow_all` if the bot really should accept messages from anyone who finds it"
                 )));
             }
             let token = secret::resolve(
@@ -550,6 +576,8 @@ impl FileConfig {
                     token,
                     allowed_users: telegram.allowed_users,
                     allowed_chats: telegram.allowed_chats,
+                    allow_all: telegram.allow_all,
+                    admin_tools: telegram.admin_tools,
                     parse_mode: telegram.parse_mode,
                     link_preview: telegram.link_preview,
                     poll_timeout: telegram.poll_timeout,
@@ -875,6 +903,44 @@ token = "bot-token"
 "#;
         let error = parse(raw).expect_err("an open bot must be rejected");
         assert!(error.to_string().contains("empty allowlist"));
+    }
+
+    #[test]
+    fn allow_all_replaces_the_allowlist_and_warns() {
+        let raw = r#"
+[meka]
+token = "meka-token"
+
+[[channels.telegram]]
+id = "telegram"
+token = "bot-token"
+allow_all = true
+"#;
+        let config = parse(raw).expect("an explicitly open bot is allowed");
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        assert!(telegram.allow_all);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("allow_all")),
+            "opening a bot to everyone must be said out loud on every startup: {:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn the_empty_allowlist_error_points_at_the_way_out() {
+        let raw = r#"
+[meka]
+token = "meka-token"
+
+[[channels.telegram]]
+id = "telegram"
+token = "bot-token"
+"#;
+        let error = parse(raw).expect_err("an accidentally open bot must be rejected");
+        assert!(error.to_string().contains("allow_all"), "got: {error}");
     }
 
     #[test]

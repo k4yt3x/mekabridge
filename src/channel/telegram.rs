@@ -20,14 +20,17 @@ use teloxide::{
     adaptors::{Throttle, throttle::Limits},
     net::Download,
     payloads::{
-        SendChatActionSetters as _, SendDocumentSetters as _, SendMessageSetters as _,
-        SendPhotoSetters as _, SetMessageReactionSetters as _,
+        BanChatMemberSetters as _, EditMessageTextSetters as _, PinChatMessageSetters as _,
+        PromoteChatMemberSetters as _, RestrictChatMemberSetters as _, SendChatActionSetters as _,
+        SendDocumentSetters as _, SendMessageSetters as _, SendPhotoSetters as _,
+        SetChatDescriptionSetters as _, SetMessageReactionSetters as _,
+        UnbanChatMemberSetters as _, UnpinChatMessageSetters as _,
     },
     prelude::Requester,
     types::{
-        AllowedUpdate, ChatAction, ChatId, FileId, InputFile, LinkPreviewOptions, MediaKind,
-        Message, MessageId, MessageKind, MessageOrigin, ParseMode, ReactionType, Recipient,
-        ReplyParameters, ThreadId, UpdateKind,
+        AllowedUpdate, ChatAction, ChatId, ChatPermissions, FileId, InputFile, LinkPreviewOptions,
+        MediaKind, Message, MessageId, MessageKind, MessageOrigin, ParseMode, ReactionType,
+        Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
     },
     update_listeners::{AsUpdateStream, Polling},
 };
@@ -37,8 +40,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
-        ChannelError, ChannelId, ChannelIdentity, ChatKind, ConversationId, FetchedFile,
-        ForwardOrigin, InboundEvent, InboundMessage, Platform, ReplyContext, SendOptions, Sender,
+        ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
+        FetchedFile, ForwardOrigin, InboundEvent, InboundMessage, MemberAction, MemberInfo,
+        MemberRight, MemberStatus, Platform, ReplyContext, SendOptions, Sender,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -56,6 +60,8 @@ pub struct TelegramChannel {
     downloader: Bot,
     allowed_users: Vec<i64>,
     allowed_chats: Vec<i64>,
+    allow_all: bool,
+    admin_tools: bool,
     parse_mode: TelegramParseMode,
     link_preview: bool,
     poll_timeout: std::time::Duration,
@@ -70,6 +76,8 @@ impl TelegramChannel {
             downloader: bot,
             allowed_users: config.allowed_users.clone(),
             allowed_chats: config.allowed_chats.clone(),
+            allow_all: config.allow_all,
+            admin_tools: config.admin_tools,
             parse_mode: config.parse_mode,
             link_preview: config.link_preview,
             poll_timeout: config.poll_timeout,
@@ -82,15 +90,19 @@ impl TelegramChannel {
     /// update from outside the allowlist is dropped without a reply, because replying would confirm
     /// to a stranger that the bot is live.
     ///
-    /// The user allowlist is checked first so that somebody who is both individually allowed and
-    /// speaking in an allowed chat is reported at the stronger of the two, which is the one the
-    /// agent should weigh.
+    /// The lists are checked in descending order of how much they say about the sender, so somebody
+    /// who qualifies under more than one is reported at the strongest. That ordering is why
+    /// `allow_all` comes last rather than short-circuiting: an open channel can still name the
+    /// people it knows, and "this one was vetted" stays worth saying.
     fn admission(&self, user_id: Option<i64>, chat_id: i64) -> Option<Admission> {
         if user_id.is_some_and(|user_id| self.allowed_users.contains(&user_id)) {
             return Some(Admission::User);
         }
         if self.allowed_chats.contains(&chat_id) {
             return Some(Admission::Chat);
+        }
+        if self.allow_all {
+            return Some(Admission::Open);
         }
         None
     }
@@ -165,6 +177,43 @@ impl TelegramChannel {
             })
             .transpose()?;
         Ok((ChatId(chat), thread))
+    }
+
+    /// Parse a message id the agent supplied.
+    fn message_id(&self, raw: &str) -> Result<MessageId, ChannelError> {
+        raw.trim()
+            .parse::<i32>()
+            .map(MessageId)
+            .map_err(|_| ChannelError::InvalidConversation {
+                id: raw.to_string(),
+                reason: "a Telegram message id is a number, from the `message:` line of a header"
+                    .to_string(),
+            })
+    }
+
+    /// Parse a user id the agent supplied.
+    fn user_id(&self, raw: &str) -> Result<UserId, ChannelError> {
+        raw.trim()
+            .parse::<u64>()
+            .map(UserId)
+            .map_err(|_| ChannelError::InvalidConversation {
+                id: raw.to_string(),
+                reason: "a Telegram user id is a positive number, from the `from:` line of a \
+                         message header. Anonymous admins and channel posts have no user id, so \
+                         they cannot be moderated this way"
+                    .to_string(),
+            })
+    }
+
+    /// Suppress the preview card Telegram would otherwise attach to a link.
+    const fn no_link_preview(&self) -> LinkPreviewOptions {
+        LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: false,
+            prefer_large_media: false,
+            show_above_text: false,
+        }
     }
 
     /// Split agent Markdown into wire-ready message bodies.
@@ -294,6 +343,8 @@ impl Channel for TelegramChannel {
             files: true,
             photos: true,
             reactions: true,
+            edit: true,
+            admin: self.admin_tools,
         }
     }
 
@@ -387,13 +438,7 @@ impl Channel for TelegramChannel {
                 request = request.disable_notification(true);
             }
             if !self.link_preview {
-                request = request.link_preview_options(LinkPreviewOptions {
-                    is_disabled: true,
-                    url: None,
-                    prefer_small_media: false,
-                    prefer_large_media: false,
-                    show_above_text: false,
-                });
+                request = request.link_preview_options(self.no_link_preview());
             }
             // Only the first part quotes the message being replied to; repeating the quote on every
             // part of a long answer is noise.
@@ -519,12 +564,7 @@ impl Channel for TelegramChannel {
         emoji: Option<&str>,
     ) -> Result<(), ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
-        let message_id = message_id.parse::<i32>().map(MessageId).map_err(|_| {
-            ChannelError::InvalidConversation {
-                id: message_id.to_string(),
-                reason: "a Telegram message id is a number".to_string(),
-            }
-        })?;
+        let message_id = self.message_id(message_id)?;
 
         // Telegram publishes a fixed set of reaction emoji and revises it. Sending whatever the
         // agent chose and passing the rejection back is what keeps this from drifting out of date
@@ -540,6 +580,67 @@ impl Channel for TelegramChannel {
         self.bot
             .set_message_reaction(Recipient::Id(chat), message_id)
             .reaction(reactions)
+            .await
+            .map(|_| ())
+            .map_err(|error| self.delivery_error(&error))
+    }
+
+    async fn edit_text(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let message_id = self.message_id(message_id)?;
+        let (bodies, parse_mode) = self.render(markdown, render::MESSAGE_LIMIT);
+
+        // An edit replaces one message, so text that would have been split on the way out has
+        // nowhere to go. Refusing beats silently publishing the first part as the whole revision.
+        // Zero bodies is a separate case: the renderer drops input that produces nothing visible,
+        // and reporting that as "too long" would send the agent looking for length it does not
+        // have.
+        let [body] = bodies.as_slice() else {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: if bodies.is_empty() {
+                    "the replacement text renders to nothing, so there is no message to leave \
+                     behind. Use delete_message to remove it instead."
+                        .to_string()
+                } else {
+                    format!(
+                        "the replacement text is too long for one message ({} parts); an edit \
+                         cannot span several",
+                        bodies.len()
+                    )
+                },
+            });
+        };
+
+        let mut request = self
+            .bot
+            .edit_message_text(Recipient::Id(chat), message_id, body.clone());
+        if let Some(parse_mode) = parse_mode {
+            request = request.parse_mode(parse_mode);
+        }
+        if !self.link_preview {
+            request = request.link_preview_options(self.no_link_preview());
+        }
+        request
+            .await
+            .map(|_| ())
+            .map_err(|error| self.delivery_error(&error))
+    }
+
+    async fn delete_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let message_id = self.message_id(message_id)?;
+        self.bot
+            .delete_message(Recipient::Id(chat), message_id)
             .await
             .map(|_| ())
             .map_err(|error| self.delivery_error(&error))
@@ -563,6 +664,223 @@ impl Channel for TelegramChannel {
             .map_err(|error| self.delivery_error(&error))
     }
 
+    async fn moderate_member(
+        &self,
+        conversation: &ConversationId,
+        user_id: &str,
+        action: MemberAction,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        revoke_messages: bool,
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let user = self.user_id(user_id)?;
+        let until = until
+            .map(|until| clamp_until(self.id.as_str(), until))
+            .transpose()?;
+
+        match action {
+            MemberAction::Restrict => {
+                let mut request = self
+                    .bot
+                    .restrict_chat_member(Recipient::Id(chat), user, ChatPermissions::empty())
+                    // Without this Telegram infers some permissions from others, which makes an
+                    // empty set mean less than it says. Sending exactly what we mean is the point.
+                    .use_independent_chat_permissions(true);
+                if let Some(until) = until {
+                    request = request.until_date(until);
+                }
+                request
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| self.delivery_error(&error))
+            }
+            MemberAction::Unrestrict => {
+                // Lifting a restriction is not "grant everything": that would leave the person with
+                // more than the chat allows anybody else. The chat's own defaults are the only
+                // correct target, so they are read back rather than assumed.
+                let permissions = self
+                    .bot
+                    .get_chat(Recipient::Id(chat))
+                    .await
+                    .map_err(|error| self.delivery_error(&error))?
+                    .permissions()
+                    .unwrap_or_else(ChatPermissions::all);
+                self.bot
+                    .restrict_chat_member(Recipient::Id(chat), user, permissions)
+                    .use_independent_chat_permissions(true)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| self.delivery_error(&error))
+            }
+            MemberAction::Ban => {
+                let mut request = self
+                    .bot
+                    .ban_chat_member(Recipient::Id(chat), user)
+                    .revoke_messages(revoke_messages);
+                if let Some(until) = until {
+                    request = request.until_date(until);
+                }
+                request
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| self.delivery_error(&error))
+            }
+            MemberAction::Unban => self
+                .bot
+                .unban_chat_member(Recipient::Id(chat), user)
+                // Without this, "unbanning" somebody who is currently a member removes them from
+                // the chat, which is the opposite of what was asked for.
+                .only_if_banned(true)
+                .await
+                .map(|_| ())
+                .map_err(|error| self.delivery_error(&error)),
+            MemberAction::Kick => {
+                // Telegram has no kick: it is a ban lifted straight away, which removes the person
+                // while leaving them free to rejoin.
+                self.bot
+                    .ban_chat_member(Recipient::Id(chat), user)
+                    .revoke_messages(revoke_messages)
+                    .await
+                    .map_err(|error| self.delivery_error(&error))?;
+                self.bot
+                    .unban_chat_member(Recipient::Id(chat), user)
+                    .only_if_banned(true)
+                    .await
+                    .map(|_| ())
+                    // The half-finished state has to be named. A bare failure here reads as "the
+                    // kick did not happen", when in fact the person is removed and still banned,
+                    // and the fix is an explicit unban rather than a retry.
+                    .map_err(|error| ChannelError::Delivery {
+                        channel: self.id.as_str().to_string(),
+                        message: format!(
+                            "the user was removed, but lifting the ban afterwards failed \
+                             ({error}), so they are banned rather than kicked. Use the `unban` \
+                             action to let them rejoin."
+                        ),
+                    })
+            }
+        }
+    }
+
+    async fn set_member_rights(
+        &self,
+        conversation: &ConversationId,
+        user_id: &str,
+        rights: &[MemberRight],
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let user = self.user_id(user_id)?;
+        let held = |right: MemberRight| rights.contains(&right);
+        // Every flag is sent on every call, including the false ones. Telegram treats an omitted
+        // flag as "leave alone", so sending only the granted ones would make this add rights and
+        // never remove them, and an empty list would silently do nothing instead of demoting.
+        self.bot
+            .promote_chat_member(Recipient::Id(chat), user)
+            .can_manage_chat(held(MemberRight::ManageChat))
+            .can_delete_messages(held(MemberRight::DeleteMessages))
+            .can_restrict_members(held(MemberRight::RestrictMembers))
+            .can_promote_members(held(MemberRight::PromoteMembers))
+            .can_pin_messages(held(MemberRight::PinMessages))
+            .can_change_info(held(MemberRight::ChangeInfo))
+            .can_invite_users(held(MemberRight::InviteUsers))
+            .can_manage_topics(held(MemberRight::ManageTopics))
+            .can_manage_video_chats(held(MemberRight::ManageVideoChats))
+            .await
+            .map(|_| ())
+            .map_err(|error| self.delivery_error(&error))
+    }
+
+    async fn pin_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        pin: bool,
+        silent: bool,
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let message_id = self.message_id(message_id)?;
+        if pin {
+            self.bot
+                .pin_chat_message(Recipient::Id(chat), message_id)
+                .disable_notification(silent)
+                .await
+                .map(|_| ())
+                .map_err(|error| self.delivery_error(&error))
+        } else {
+            self.bot
+                .unpin_chat_message(Recipient::Id(chat))
+                .message_id(message_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| self.delivery_error(&error))
+        }
+    }
+
+    async fn set_chat(
+        &self,
+        conversation: &ConversationId,
+        settings: &ChatSettings,
+    ) -> Result<(), ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let mut applied = Vec::new();
+        if let Some(title) = &settings.title {
+            self.bot
+                .set_chat_title(Recipient::Id(chat), title.clone())
+                .await
+                .map_err(|error| self.delivery_error(&error))?;
+            applied.push("title");
+        }
+        if let Some(description) = &settings.description {
+            self.bot
+                .set_chat_description(Recipient::Id(chat))
+                .description(description.clone())
+                .await
+                // Telegram has no way to change both at once, so a failure on the second leaves the
+                // first standing. Saying which landed stops the agent retrying the whole thing or
+                // telling somebody nothing changed.
+                .map_err(|error| ChannelError::Delivery {
+                    channel: self.id.as_str().to_string(),
+                    message: match applied.as_slice() {
+                        [] => error.to_string(),
+                        applied => format!(
+                            "the {} was changed, but the description was not ({error})",
+                            applied.join(" and ")
+                        ),
+                    },
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn member(
+        &self,
+        conversation: &ConversationId,
+        user_id: Option<&str>,
+    ) -> Result<MemberInfo, ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let user = match user_id {
+            Some(user_id) => self.user_id(user_id)?,
+            None => {
+                self.bot
+                    .get_me()
+                    .await
+                    .map_err(|error| self.delivery_error(&error))?
+                    .id
+            }
+        };
+        let member = self
+            .bot
+            .get_chat_member(Recipient::Id(chat), user)
+            .await
+            .map_err(|error| self.delivery_error(&error))?;
+        Ok(MemberInfo {
+            user_id: user.0.to_string(),
+            display_name: Some(display_name(&member.user)),
+            status: member_status(&member.kind),
+            rights: member_rights(&member.kind),
+        })
+    }
+
     async fn probe(&self) -> Result<ChannelIdentity, ChannelError> {
         let me = self
             .bot
@@ -576,8 +894,91 @@ impl Channel for TelegramChannel {
             id: me.id.0.to_string(),
             display_name: me.first_name.clone(),
             username: me.username.clone(),
+            reads_all_group_messages: me.can_read_all_group_messages,
         })
     }
+}
+
+/// Telegram's floor and ceiling on how long a restriction or ban may last.
+///
+/// Anything outside this window is treated by the API as *forever*, silently. A thirty-second mute
+/// becoming permanent is the worst failure this surface has, so the bounds are enforced here and
+/// reported rather than left to be discovered.
+const MIN_RESTRICTION: chrono::Duration = chrono::Duration::seconds(30);
+const MAX_RESTRICTION: chrono::Duration = chrono::Duration::days(366);
+
+/// Reject a duration Telegram would quietly turn into a permanent one.
+fn clamp_until(
+    channel: &str,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, ChannelError> {
+    let remaining = until - chrono::Utc::now();
+    if remaining < MIN_RESTRICTION {
+        return Err(ChannelError::Delivery {
+            channel: channel.to_string(),
+            message: format!(
+                "Telegram treats anything under {} seconds as permanent, so this would not expire. \
+                 Use a longer duration, or omit it if you meant it to be permanent.",
+                MIN_RESTRICTION.num_seconds()
+            ),
+        });
+    }
+    if remaining > MAX_RESTRICTION {
+        return Err(ChannelError::Delivery {
+            channel: "telegram".to_string(),
+            message: format!(
+                "Telegram treats anything over {} days as permanent, so this would not expire. Use \
+                 a shorter duration, or omit it if you meant it to be permanent.",
+                MAX_RESTRICTION.num_days()
+            ),
+        });
+    }
+    Ok(until)
+}
+
+/// Translate Telegram's membership model into the platform-neutral one.
+fn member_status(kind: &teloxide::types::ChatMemberKind) -> MemberStatus {
+    use teloxide::types::ChatMemberKind;
+    match kind {
+        ChatMemberKind::Owner(_) => MemberStatus::Owner,
+        ChatMemberKind::Administrator(_) => MemberStatus::Administrator,
+        ChatMemberKind::Member { .. } => MemberStatus::Member,
+        ChatMemberKind::Restricted(_) => MemberStatus::Restricted,
+        ChatMemberKind::Left => MemberStatus::Left,
+        ChatMemberKind::Banned(_) => MemberStatus::Banned,
+    }
+}
+
+/// The privileges a member holds, which is what tells the agent what it may do in a chat.
+fn member_rights(kind: &teloxide::types::ChatMemberKind) -> Vec<MemberRight> {
+    use teloxide::types::ChatMemberKind;
+    // teloxide gives most of these an accessor on the enum that already folds in an owner's
+    // implicit authority. These four exist only as struct fields, so the owner rule has to be
+    // written out for them.
+    let (pin, change_info, invite, topics) = match kind {
+        ChatMemberKind::Owner(_) => (true, true, true, true),
+        ChatMemberKind::Administrator(administrator) => (
+            administrator.can_pin_messages,
+            administrator.can_change_info,
+            administrator.can_invite_users,
+            administrator.can_manage_topics,
+        ),
+        _ => (false, false, false, false),
+    };
+    [
+        (MemberRight::ManageChat, kind.can_manage_chat()),
+        (MemberRight::DeleteMessages, kind.can_delete_messages()),
+        (MemberRight::RestrictMembers, kind.can_restrict_members()),
+        (MemberRight::PromoteMembers, kind.can_promote_members()),
+        (MemberRight::PinMessages, pin),
+        (MemberRight::ChangeInfo, change_info),
+        (MemberRight::InviteUsers, invite),
+        (MemberRight::ManageTopics, topics),
+        (MemberRight::ManageVideoChats, kind.can_manage_video_chats()),
+    ]
+    .into_iter()
+    .filter_map(|(right, held)| held.then_some(right))
+    .collect()
 }
 
 /// Best-effort human name for a Telegram user.
@@ -830,10 +1231,20 @@ mod tests {
     use super::*;
 
     fn channel(allowed_users: Vec<i64>, allowed_chats: Vec<i64>) -> TelegramChannel {
+        configured(allowed_users, allowed_chats, false)
+    }
+
+    fn configured(
+        allowed_users: Vec<i64>,
+        allowed_chats: Vec<i64>,
+        allow_all: bool,
+    ) -> TelegramChannel {
         let config = TelegramConfig {
             token: crate::config::secret::Secret::new("123:fake", "test"),
             allowed_users,
             allowed_chats,
+            allow_all,
+            admin_tools: true,
             parse_mode: TelegramParseMode::Html,
             link_preview: false,
             poll_timeout: std::time::Duration::from_secs(1),
@@ -889,6 +1300,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_open_channel_admits_anyone() {
+        let channel = configured(vec![], vec![], true);
+        assert_eq!(channel.admission(Some(999), 999), Some(Admission::Open));
+        assert_eq!(channel.admission(None, -100123), Some(Admission::Open));
+    }
+
+    #[tokio::test]
+    async fn an_open_channel_still_names_the_people_it_knows() {
+        // Being open does not make everyone equally unknown. Someone on the user list is still
+        // reported as vetted, which is the whole reason the agent is told the admission at all.
+        let channel = configured(vec![111], vec![-1001234], true);
+        assert_eq!(channel.admission(Some(111), 555), Some(Admission::User));
+        assert_eq!(
+            channel.admission(Some(222), -1001234),
+            Some(Admission::Chat)
+        );
+        assert_eq!(channel.admission(Some(222), 222), Some(Admission::Open));
+    }
+
+    #[tokio::test]
     async fn conversation_targets_parse_chat_and_thread() {
         let channel = channel(vec![1], vec![]);
         let conversation = ConversationId::parse("telegram:-1001234:77").expect("valid");
@@ -912,6 +1343,127 @@ mod tests {
         let conversation = ConversationId::parse("telegram:not-a-number").expect("parses");
         let error = channel.target(&conversation).expect_err("must be rejected");
         assert!(error.to_string().contains("Telegram chat id"));
+    }
+
+    #[test]
+    fn a_restriction_telegram_would_make_permanent_is_rejected() {
+        // The trap this closes: Telegram accepts an out-of-range `until_date` and silently treats
+        // it as forever, so a ten-second mute becomes a life sentence with no error anywhere.
+        let now = chrono::Utc::now();
+        let too_short = clamp_until("telegram", now + chrono::Duration::seconds(10))
+            .expect_err("under the floor must be rejected");
+        assert!(too_short.to_string().contains("permanent"), "{too_short}");
+
+        let too_long = clamp_until("telegram", now + chrono::Duration::days(400))
+            .expect_err("over the ceiling must be rejected");
+        assert!(too_long.to_string().contains("permanent"), "{too_long}");
+    }
+
+    #[test]
+    fn a_restriction_inside_telegrams_window_is_accepted() {
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(
+            clamp_until("telegram", until).expect("an hour is in range"),
+            until
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_renders_to_nothing_says_so_rather_than_blaming_length() {
+        // The renderer drops input with nothing visible in it, so zero bodies and several bodies
+        // both fail the single-message check. Reporting the empty case as "too long" would send the
+        // agent hunting for length it does not have.
+        let channel = channel(vec![1], vec![]);
+        let conversation = ConversationId::parse("telegram:1").expect("valid");
+        let error = channel
+            .edit_text(&conversation, "42", "   ")
+            .await
+            .expect_err("an empty revision must be refused");
+        assert!(error.to_string().contains("renders to nothing"), "{error}");
+        assert!(error.to_string().contains("delete_message"), "{error}");
+    }
+
+    #[test]
+    fn a_duration_only_applies_where_it_means_something() {
+        assert!(MemberAction::Restrict.accepts_duration());
+        assert!(MemberAction::Ban.accepts_duration());
+        // Telegram takes `until_date` on neither of these, so accepting one would be a promise the
+        // platform never made.
+        assert!(!MemberAction::Unban.accepts_duration());
+        assert!(!MemberAction::Unrestrict.accepts_duration());
+        assert!(!MemberAction::Kick.accepts_duration());
+    }
+
+    #[test]
+    fn an_owner_holds_every_right_without_them_being_listed() {
+        // Telegram sends an owner with no rights flags at all, because holding everything is
+        // implied. Reading that literally would have the agent believe it cannot moderate a group
+        // it owns.
+        let member: teloxide::types::ChatMember = serde_json::from_value(serde_json::json!({
+            "user": {"id": 42, "is_bot": true, "first_name": "Mica"},
+            "status": "creator",
+            "is_anonymous": false,
+        }))
+        .expect("valid chat member");
+        let rights = member_rights(&member.kind);
+        assert_eq!(member_status(&member.kind), MemberStatus::Owner);
+        for right in [
+            MemberRight::DeleteMessages,
+            MemberRight::RestrictMembers,
+            MemberRight::PinMessages,
+            MemberRight::ChangeInfo,
+            MemberRight::InviteUsers,
+        ] {
+            assert!(rights.contains(&right), "an owner must hold {right:?}");
+        }
+    }
+
+    #[test]
+    fn an_administrator_reports_only_the_rights_it_was_given() {
+        let member: teloxide::types::ChatMember = serde_json::from_value(serde_json::json!({
+            "user": {"id": 42, "is_bot": true, "first_name": "Mica"},
+            "status": "administrator",
+            "can_be_edited": false,
+            "is_anonymous": false,
+            "can_manage_chat": true,
+            "can_delete_messages": true,
+            "can_manage_video_chats": false,
+            "can_restrict_members": true,
+            "can_promote_members": false,
+            "can_change_info": false,
+            "can_invite_users": true,
+            "can_pin_messages": false,
+            "can_manage_topics": false,
+        }))
+        .expect("valid chat member");
+        let rights = member_rights(&member.kind);
+        assert_eq!(member_status(&member.kind), MemberStatus::Administrator);
+        assert!(rights.contains(&MemberRight::RestrictMembers));
+        assert!(rights.contains(&MemberRight::InviteUsers));
+        assert!(!rights.contains(&MemberRight::PinMessages));
+        assert!(!rights.contains(&MemberRight::PromoteMembers));
+    }
+
+    #[test]
+    fn an_ordinary_member_holds_nothing() {
+        let member: teloxide::types::ChatMember = serde_json::from_value(serde_json::json!({
+            "user": {"id": 7, "is_bot": false, "first_name": "Alice"},
+            "status": "member",
+        }))
+        .expect("valid chat member");
+        assert_eq!(member_status(&member.kind), MemberStatus::Member);
+        assert!(member_rights(&member.kind).is_empty());
+    }
+
+    // Constructing a channel spawns the throttle worker, so this needs a runtime even though the
+    // assertion itself is synchronous.
+    #[tokio::test]
+    async fn an_anonymous_sender_cannot_be_moderated() {
+        // Anonymous admins and channel posts arrive with an empty sender id, so the agent has
+        // nothing to pass. The error has to explain that rather than looking like a typo.
+        let channel = channel(vec![1], vec![]);
+        let error = channel.user_id("").expect_err("must be rejected");
+        assert!(error.to_string().contains("Anonymous"), "{error}");
     }
 
     #[test]

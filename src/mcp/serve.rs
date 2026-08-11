@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{McpConfig, McpTransport, secret::Secret},
     error::{BridgeError, Result},
-    mcp::{BridgeMcpServer, OutboundSink},
+    mcp::{BridgeMcpServer, OutboundSink, ToolSurface},
 };
 
 /// A bound but not yet serving MCP endpoint.
@@ -82,14 +82,15 @@ pub async fn run(
     server: McpServer,
     config: &McpConfig,
     sink: Arc<dyn OutboundSink>,
+    surface: ToolSurface,
     shutdown: CancellationToken,
 ) -> Result<()> {
     match server {
         McpServer::Http {
             listener,
             local_addr,
-        } => serve_http(listener, local_addr, config, sink, shutdown).await,
-        McpServer::Stdio => serve_stdio(sink, shutdown).await,
+        } => serve_http(listener, local_addr, config, sink, surface, shutdown).await,
+        McpServer::Stdio => serve_stdio(sink, surface, shutdown).await,
     }
 }
 
@@ -97,14 +98,19 @@ pub async fn run(
 pub async fn serve(
     config: &McpConfig,
     sink: Arc<dyn OutboundSink>,
+    surface: ToolSurface,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let server = bind(config).await?;
-    run(server, config, sink, shutdown).await
+    run(server, config, sink, surface, shutdown).await
 }
 
-async fn serve_stdio(sink: Arc<dyn OutboundSink>, shutdown: CancellationToken) -> Result<()> {
-    let server = BridgeMcpServer::new(sink);
+async fn serve_stdio(
+    sink: Arc<dyn OutboundSink>,
+    surface: ToolSurface,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let server = BridgeMcpServer::new(sink, surface);
     let running = server.serve(stdio()).await.map_err(|error| {
         BridgeError::config(format!("failed to start the stdio MCP server: {error}"))
     })?;
@@ -127,10 +133,11 @@ async fn serve_http(
     local: std::net::SocketAddr,
     config: &McpConfig,
     sink: Arc<dyn OutboundSink>,
+    surface: ToolSurface,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let service = StreamableHttpService::new(
-        move || Ok(BridgeMcpServer::new(Arc::clone(&sink))),
+        move || Ok(BridgeMcpServer::new(Arc::clone(&sink), surface)),
         Arc::new(LocalSessionManager::default()),
         streamable_config(config, &shutdown),
     );

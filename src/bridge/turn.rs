@@ -330,6 +330,8 @@ mod tests {
                 files: true,
                 photos: true,
                 reactions: true,
+                edit: true,
+                admin: true,
             }
         }
 
@@ -399,6 +401,7 @@ mod tests {
                 id: "1".to_string(),
                 display_name: "Spy".to_string(),
                 username: None,
+                reads_all_group_messages: true,
             })
         }
     }

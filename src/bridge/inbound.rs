@@ -42,6 +42,15 @@ pub async fn writer(
 ) {
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
+        match muted(&store, &mut event).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                // Failing open. A store that cannot answer should not also cost people their
+                // messages, and the worst case is a muted chat getting through.
+                tracing::error!(conversation = %conversation, "could not read the mute: {}", error);
+            }
+        }
         if let Err(error) = record_conversation(&store, &event).await {
             tracing::error!(conversation = %conversation, "failed to record conversation: {}", error);
             continue;
@@ -98,6 +107,53 @@ pub async fn writer(
         }
     }
     tracing::info!("inbound writer stopped: all channels have shut down");
+}
+
+/// Whether this event should be discarded because its conversation is muted.
+///
+/// Checked before the conversation is recorded and before attachments are registered, both on
+/// purpose. Advancing `last_inbound_at` for a message the agent never saw would misreport when the
+/// chat was last heard from, and minting handles for files nothing can reach is waste. Nothing is
+/// enqueued either, so a muted chat consumes no queue depth and costs no provider turn.
+///
+/// A lapsed mute is cleared here rather than swept on a timer, and its drop count is handed to the
+/// message that lifted it: a mute whose effect is invisible gives the agent nothing to judge
+/// whether to renew it on.
+async fn muted(store: &Store, event: &mut InboundEvent) -> Result<bool, crate::store::StoreError> {
+    let conversation = event.conversation().clone();
+    let Some(mute) = store.mute(conversation.as_str()).await? else {
+        return Ok(false);
+    };
+
+    let now = chrono::Utc::now();
+    // Bound in the pattern rather than re-read afterwards, so the expiry printed below is the one
+    // that was tested. An indefinite mute has no `until` and so can never reach this branch.
+    if let Some(until) = mute.until.filter(|until| *until <= now) {
+        store.clear_mute(conversation.as_str()).await?;
+        if mute.dropped > 0 {
+            let InboundEvent::Message(message) = event;
+            let noun = if mute.dropped == 1 {
+                "message was"
+            } else {
+                "messages were"
+            };
+            message.notes.push(format!(
+                "you had muted this chat until {}; {} {noun} dropped while it was muted",
+                until.to_rfc3339(),
+                mute.dropped
+            ));
+        }
+        tracing::info!(conversation = %conversation, dropped = mute.dropped, "a mute expired");
+        return Ok(false);
+    }
+
+    store.note_muted_drop(conversation.as_str()).await?;
+    tracing::debug!(
+        conversation = %conversation,
+        until = ?mute.until,
+        "dropping a message from a muted conversation"
+    );
+    Ok(true)
 }
 
 /// Register the files an event brought with it and stamp each with the handle the agent fetches by.

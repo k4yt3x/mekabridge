@@ -24,6 +24,9 @@ With no subcommand, mekabridge runs the daemon.
 | `queue list [--limit N]` | Messages waiting to be delivered |
 | `queue clear --yes` | Delete every queue row, including undelivered ones |
 | `conversations list [--channel X] [--limit N]` | Known conversations, most recently active first |
+| `mute list` | Conversations the agent has silenced, with how many messages each has dropped |
+| `mute add <id> [--duration 30m] [--reason X]` | Silence a conversation. Omit the duration for indefinite |
+| `mute rm <id>` | Lift a mute |
 | `session show` | The bound session and what meka says about it |
 | `session reset --yes` | Forget the binding so the next message starts a fresh session |
 | `cancel` | Cancel the turn currently running |
@@ -39,6 +42,8 @@ The operator commands do not talk to a running daemon. They read the SQLite data
 mekabridge conversations list | grep group
 mekabridge queue list --limit 5
 ```
+
+The `mute` commands exist because the agent sets mutes itself. A conversation muted indefinitely is unreachable from inside the bridge, including the one you would use to ask the agent to undo it, so `mute rm` is the way back.
 
 ## Destructive commands
 

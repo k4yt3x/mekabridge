@@ -66,12 +66,14 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 info.model.as_deref().unwrap_or("(none configured)")
             );
             if info.vision {
-                println!("  ok     vision is on; inbound images ride on the turn itself");
+                println!(
+                    "  ok     vision is on, so view_attachment hands the agent the picture itself"
+                );
             } else {
                 println!(
-                    "  warn   the active provider profile has vision off, so inbound images are \
-                     only named by path. Set `vision = true` under [providers.<name>] to have the \
-                     agent see them."
+                    "  warn   the active profile has vision off, so view_attachment returns a \
+                     description rather than the image and the agent can only reach a file through \
+                     download_attachment. Set `vision = true` under [providers.<name>]."
                 );
                 warnings += 1;
             }
@@ -163,6 +165,27 @@ pub async fn doctor(config: &Config) -> Result<()> {
                                 format!("@{username}")
                             });
                         println!("  ok     {} authenticated as {label}", channel.id());
+                        if !identity.reads_all_group_messages {
+                            // Privacy mode makes a bot in a group see only messages that mention
+                            // it or reply to it. From the outside that is indistinguishable from a
+                            // missing allowlist entry, and it is the single most common reason a
+                            // group-deployed bot appears to be ignoring everyone.
+                            println!(
+                                "  warn   {} has privacy mode on, so in groups it only sees \
+                                 messages that mention it or reply to it. Turn it off with \
+                                 /setprivacy in @BotFather, or make the bot an admin, then remove \
+                                 and re-add it to each group.",
+                                channel.id()
+                            );
+                            warnings += 1;
+                        }
+                        if channel.capabilities().admin {
+                            println!(
+                                "  ok     {} offers the moderation tools; each call still needs \
+                                 the matching admin right in the chat it targets",
+                                channel.id()
+                            );
+                        }
                     }
                     Err(error) => {
                         println!("  fail   {}: {error}", channel.id());
@@ -333,6 +356,84 @@ pub async fn conversations_list(
                 .last_inbound_at
                 .map_or_else(|| "never".to_string(), |at| at.to_rfc3339())
         );
+    }
+    Ok(())
+}
+
+/// List the conversations the agent has silenced.
+pub async fn mute_list(config: &Config) -> Result<()> {
+    let store = Store::open(&config.storage.path).await?;
+    let mutes = store.list_mutes().await?;
+    if mutes.is_empty() {
+        println!("nothing is muted");
+        return Ok(());
+    }
+    let now = Utc::now();
+    for mute in mutes {
+        // A mute is cleared by the next message that arrives, so one that has already lapsed can
+        // still be sitting here. Saying which is which stops it reading as an active mute.
+        let until = match mute.until {
+            Some(until) if until <= now => format!("expired {}", until.to_rfc3339()),
+            Some(until) => format!("until {}", until.to_rfc3339()),
+            None => "indefinite".to_string(),
+        };
+        println!(
+            "  {:<28} {:<34} {} dropped   {}",
+            mute.conversation_id,
+            until,
+            mute.dropped,
+            mute.reason.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+/// Silence a conversation from the command line.
+pub async fn mute_add(
+    config: &Config,
+    conversation: &str,
+    duration: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let until = duration
+        .map(|duration| {
+            let parsed = humantime::parse_duration(duration).map_err(|error| {
+                BridgeError::config(format!("{duration:?} is not a duration: {error}"))
+            })?;
+            chrono::Duration::from_std(parsed)
+                .map_err(|_| BridgeError::config(format!("{duration:?} is too long")))
+        })
+        .transpose()?
+        .map(|duration| Utc::now() + duration);
+
+    // Validated rather than stored as typed. A mute is keyed by exact id, so a mistyped one would
+    // insert a row that silences nothing and report success, which is the worst way to find out.
+    let conversation = crate::channel::ConversationId::parse(conversation).ok_or_else(|| {
+        BridgeError::config(format!(
+            "{conversation:?} is not a conversation id; the form is <channel>:<chat>, as printed by \
+             `mekabridge conversations list`"
+        ))
+    })?;
+    let conversation = conversation.as_str();
+
+    let store = Store::open(&config.storage.path).await?;
+    store
+        .set_mute(conversation, until, reason, Utc::now())
+        .await?;
+    match until {
+        Some(until) => println!("muted {conversation} until {}", until.to_rfc3339()),
+        None => println!("muted {conversation} indefinitely"),
+    }
+    Ok(())
+}
+
+/// Lift a mute, including one the agent set on itself and cannot be asked to undo.
+pub async fn mute_rm(config: &Config, conversation: &str) -> Result<()> {
+    let store = Store::open(&config.storage.path).await?;
+    if store.clear_mute(conversation).await? {
+        println!("unmuted {conversation}");
+    } else {
+        println!("{conversation} was not muted");
     }
     Ok(())
 }

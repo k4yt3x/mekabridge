@@ -17,6 +17,7 @@
 - [meka Integration](./usage/meka-integration.md)
 - [Telegram](./usage/telegram.md)
 - [MCP Tools](./usage/mcp-tools.md)
+- [Security](./usage/security.md)
 - [Operations](./usage/operations.md)
 
 # Reference

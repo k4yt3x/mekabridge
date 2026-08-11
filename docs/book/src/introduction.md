@@ -9,9 +9,13 @@ The design treats the agent as a person with a phone.
 
 One mekabridge instance owns exactly one meka session, permanently. That session is the agent's memory: everyone it has talked to, on every platform, in one continuous context.
 
-## What it is not
+## One session, shared by everyone
 
-This is a personal assistant bridge, not a multi-tenant chatbot host. Everyone who can reach the bot shares one agent context and can ask about anything in it. The allowlist is mandatory for that reason, and it starts empty.
+The session is not per person. Everyone who can reach the bot shares one agent context and one memory, so anything said in one conversation can inform an answer in another, and anyone admitted can ask about anything already in it.
+
+That is a property to design around rather than a limit to work around. A personal assistant wants it. A customer-service bot answering strangers in a public group probably does not, and should be pointed at a meka instance kept for that purpose. The allowlist starts empty for the same reason: what the agent knows is worth as much as what it can do.
+
+The bridge reports facts and supplies capabilities; who counts as trusted, and what they may ask for, belongs in the agent's own instructions. See [Security](./usage/security.md).
 
 ## How the pieces fit
 

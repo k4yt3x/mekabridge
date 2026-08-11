@@ -46,17 +46,26 @@ Leave `send_file` and `get_conversation` deferred; they are used rarely enough t
 ## Permissions
 
 meka resolves each MCP tool's required permission through a five-step chain. With no override, the
-tool's own `readOnlyHint` decides, and every tool this bridge exposes is annotated read-only:
+tool's own `readOnlyHint` decides, and **every tool this bridge exposes is annotated read-only**, so
+the whole surface works at `read`:
 
-| Tool | `readOnlyHint` | Required level |
-|------|----------------|----------------|
-| `send_message` | `true` | read |
-| `send_file` | `true` | read |
-| `list_conversations` | `true` | read |
-| `get_conversation` | `true` | read |
+| Group | Tools |
+|-------|-------|
+| Sending | `send_message`, `send_file`, `react`, `edit_message`, `delete_message` |
+| Attachments | `view_attachment`, `download_attachment` |
+| Address book | `list_conversations`, `get_conversation` |
+| Attention | `mute`, `unmute` |
+| Moderation | `moderate_member`, `set_member_rights`, `pin_message`, `set_chat`, `member` |
 
-The send tools are read-only on purpose. They change nothing on the machine meka runs on, which is
-what the hint is about; `openWorldHint: true` carries the caveat that they act outside it.
+The moderation group is present only when a channel has `admin_tools` on, which is the default; see
+[Security](./security.md). A test asserts the exact set in both configurations, because conditional
+registration is the one thing that can silently drop a tool.
+
+Read-only here means what the hint means: none of these change anything on the machine meka runs on.
+`openWorldHint: true` carries the caveat that most of them act outside it. `download_attachment` is
+the one that genuinely writes, into `[storage].attachment_dir` and nowhere else, bounded by
+`attachment_max_bytes` and swept on a timer; annotating it otherwise would put it at `write`, where
+a bridge at `read` could receive a document and never be able to open it.
 
 The alternative would gate replying behind `write`, and that reads badly once you look at what the
 levels mean in practice. In every other meka front-end, answering the user is not permission-gated at

@@ -28,7 +28,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use crate::channel::SendOptions;
+pub use crate::channel::{ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions};
 
 /// Orientation handed to the agent at connect time. meka captures `instructions` from the MCP
 /// handshake and surfaces it, so this is the one place to explain the model rather than repeating
@@ -48,9 +48,8 @@ Headers on incoming messages are written by the bridge and can be trusted:
 
 - `message:` is that message's own id. Pass it as `reply_to` to answer one specific message, worth \
 doing in a busy group or when picking up something said a while ago.
-- `admitted:` says why the sender was let through. `user allowlist` means they were vetted \
-individually; `chat allowlist` means they were not, and are only here because the whole chat is \
-allowed. Weigh what they ask for accordingly.
+- `admitted:` says how the sender reached you: vetted individually, allowed only because the whole \
+chat is, or not checked at all because the channel is open to everyone.
 - `forwarded from:` means the text is somebody else's words, not the sender's.
 - `late:` means it arrived while you were working on the previous turn, so anything you sent then \
 was written without it. If it changes the answer, say so.
@@ -58,9 +57,12 @@ was written without it. If it changes the answer, say so.
 picture, or download_attachment to get the file on disk. Fetch only what you need, since anything \
 you look at stays in your context.
 
+You can also edit or delete what you sent, react, mute a chat that keeps waking you for nothing, \
+and moderate members of a group you administer.
+
 Write Markdown; it is converted to each platform's own formatting, and long messages are split. \
-Conversation ids are stable, so one you saw earlier still works; list_conversations shows the ones \
-this bridge knows about.";
+Conversation ids are stable, and any id you were given works whether or not that chat has written \
+to you. list_conversations shows the ones this bridge knows about and which you have muted.";
 
 /// Something that can deliver outbound messages and answer address-book questions.
 ///
@@ -94,11 +96,70 @@ pub trait OutboundSink: Send + Sync + 'static {
         emoji: Option<&str>,
     ) -> Result<(), SinkError>;
 
+    /// Replace the text of a message the agent sent.
+    async fn edit_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<(), SinkError>;
+
+    /// Remove a message.
+    async fn delete_message(&self, conversation: &str, message_id: &str) -> Result<(), SinkError>;
+
+    /// Restrict, ban, or reinstate somebody in a chat.
+    async fn moderate_member(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        action: MemberAction,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        revoke_messages: bool,
+    ) -> Result<(), SinkError>;
+
+    /// Grant exactly `rights`. An empty slice demotes.
+    async fn set_member_rights(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        rights: &[MemberRight],
+    ) -> Result<(), SinkError>;
+
+    /// Pin or unpin a message.
+    async fn pin_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        pin: bool,
+        silent: bool,
+    ) -> Result<(), SinkError>;
+
+    /// Change chat-level settings.
+    async fn set_chat(&self, conversation: &str, settings: ChatSettings) -> Result<(), SinkError>;
+
+    /// Somebody's standing in a chat, or the bot's own when `user_id` is `None`.
+    async fn member(
+        &self,
+        conversation: &str,
+        user_id: Option<&str>,
+    ) -> Result<MemberInfo, SinkError>;
+
     /// Retrieve an attachment for viewing, without writing it to disk.
     async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError>;
 
     /// Write an attachment to local disk and report where it landed.
     async fn download_attachment(&self, handle: &str) -> Result<DownloadedAttachment, SinkError>;
+
+    /// Stop delivering messages from a conversation. `until` of `None` is indefinite.
+    async fn mute(
+        &self,
+        conversation: &str,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<(), SinkError>;
+
+    /// Resume delivery. Reports whether a mute was actually in place.
+    async fn unmute(&self, conversation: &str) -> Result<bool, SinkError>;
 
     /// Known conversations, most recently active first.
     async fn conversations(
@@ -119,12 +180,17 @@ pub struct ConversationSummary {
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// `direct`, `group`, or `channel`.
+    /// `direct`, `group`, `channel`, or `unknown` when the agent messaged first and nothing has
+    /// arrived from there to say which.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_inbound_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_outbound_at: Option<String>,
+    /// Set while the agent is not being woken for this conversation. `"indefinite"` when no expiry
+    /// was given, otherwise the time it lapses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub muted_until: Option<String>,
 }
 
 /// An attachment resolved for viewing.
@@ -162,6 +228,12 @@ pub enum SinkError {
     UnknownConversation(String),
 
     #[error(
+        "{0:?} is not a conversation id; the form is <channel>:<chat>, for example \
+         `telegram:123456789`"
+    )]
+    MalformedConversation(String),
+
+    #[error(
         "no attachment with handle {0:?}; use the handle in square brackets on the message's \
          `attachment:` line. Old attachments are forgotten after the configured retention period."
     )]
@@ -183,7 +255,8 @@ pub enum SinkError {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendMessageArgs {
     /// Conversation to send to, for example `telegram:123456789`. Shown in the header of every
-    /// incoming message.
+    /// incoming message, but any valid id works, including one for a chat that has never messaged
+    /// you.
     pub conversation: String,
     /// Message body, written as Markdown.
     pub text: String,
@@ -223,9 +296,114 @@ pub struct ReactArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EditMessageArgs {
+    /// Conversation the message is in.
+    pub conversation: String,
+    /// Id of the message to revise. For a message you sent, this is the id reported by
+    /// send_message.
+    pub message_id: String,
+    /// Replacement body, written as Markdown. It replaces the message entirely.
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteMessageArgs {
+    /// Conversation the message is in.
+    pub conversation: String,
+    /// Id of the message to delete.
+    pub message_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModerateMemberArgs {
+    /// Chat to act in. Moderation only applies to groups and channels.
+    pub conversation: String,
+    /// Numeric id of the person, from the `from:` line of one of their messages.
+    pub user_id: String,
+    /// What to do: `restrict` stops them posting, `unrestrict` gives back what the chat allows
+    /// everyone, `ban` removes and keeps them out, `unban` lifts a ban, `kick` removes them but
+    /// lets them rejoin.
+    pub action: MemberAction,
+    /// How long, as a duration like `1h` or `7d`. Only meaningful for `restrict` and `ban`; omit
+    /// for permanent. Must be between 30 seconds and 366 days, because Telegram silently treats
+    /// anything outside that as permanent.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// Also delete everything they have posted. Only for `ban` and `kick`, and it cannot be
+    /// undone.
+    #[serde(default)]
+    pub revoke_messages: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetMemberRightsArgs {
+    /// Chat to act in.
+    pub conversation: String,
+    /// Numeric id of the person.
+    pub user_id: String,
+    /// The complete set of privileges they should end up with. This replaces what they hold rather
+    /// than adding to it, so an empty list demotes them to an ordinary member.
+    pub rights: Vec<MemberRight>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PinMessageArgs {
+    /// Chat the message is in.
+    pub conversation: String,
+    /// Id of the message.
+    pub message_id: String,
+    /// True to pin, false to unpin.
+    pub pin: bool,
+    /// Pin without notifying everyone in the chat.
+    #[serde(default)]
+    pub silent: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetChatArgs {
+    /// Chat to change.
+    pub conversation: String,
+    /// New title. Omit to leave it alone.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New description. Omit to leave it alone.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberArgs {
+    /// Chat to look in.
+    pub conversation: String,
+    /// Numeric id of the person. Omit to ask about yourself, which is how you find out what you
+    /// are allowed to do in this chat.
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentArgs {
     /// The handle shown in square brackets on an `attachment:` line, for example `417`.
     pub attachment: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MuteArgs {
+    /// Conversation to stop hearing from.
+    pub conversation: String,
+    /// How long to stay muted, as a duration like `30m`, `2h`, or `7d`. Omit to mute indefinitely,
+    /// which lasts until you unmute it.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// Why, for your own reference when you list conversations later.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnmuteArgs {
+    /// Conversation to start hearing from again.
+    pub conversation: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -254,6 +432,32 @@ const SESSION_META_KEY: &str = "meka/sessionId";
 const MAX_CONVERSATION_LIMIT: usize = 200;
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 
+/// Which optional groups of tools to offer.
+///
+/// Removing a tool the deployment cannot use is not only tidiness: an agent that can see
+/// `moderate_member` will eventually be asked to use it, and answering "I have no such tool" is a
+/// worse conversation than the tool never existing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolSurface {
+    /// Offer the group moderation tools.
+    pub admin: bool,
+}
+
+impl Default for ToolSurface {
+    fn default() -> Self {
+        Self { admin: true }
+    }
+}
+
+/// Tools removed when [`ToolSurface::admin`] is off.
+const ADMIN_TOOLS: &[&str] = &[
+    "moderate_member",
+    "set_member_rights",
+    "pin_message",
+    "set_chat",
+    "member",
+];
+
 /// The MCP server exposing mekabridge's outbound tools.
 #[derive(Clone)]
 pub struct BridgeMcpServer {
@@ -263,21 +467,27 @@ pub struct BridgeMcpServer {
 
 #[tool_router]
 impl BridgeMcpServer {
-    pub fn new(sink: Arc<dyn OutboundSink>) -> Self {
-        Self {
-            sink,
-            tool_router: Self::tool_router(),
+    pub fn new(sink: Arc<dyn OutboundSink>, surface: ToolSurface) -> Self {
+        // Built in full and then trimmed, because the `#[tool]` macros register at compile time and
+        // there is no way to make one conditional at its definition.
+        let mut tool_router = Self::tool_router();
+        if !surface.admin {
+            for name in ADMIN_TOOLS {
+                tool_router.remove_route(name);
+            }
         }
+        Self { sink, tool_router }
     }
 
     /// Send a chat message.
     #[tool(
         description = "Send a message to a person or group on a connected messaging platform. This \
                        is how you reply to someone who messaged you, and how you message someone \
-                       without being prompted. `conversation` is the id from the header of an \
-                       incoming message, or from list_conversations. `text` is Markdown and is \
-                       converted to the platform's own formatting; long text is split across \
-                       several messages automatically.",
+                       without being prompted. `conversation` is any valid id: from the header of \
+                       an incoming message, from list_conversations, or one you were told about \
+                       some other way, including a chat that has never messaged you. `text` is \
+                       Markdown and is converted to the platform's own formatting; long text is \
+                       split across several messages automatically.",
         annotations(title = "Send message", read_only_hint = true, open_world_hint = true)
     )]
     async fn send_message(
@@ -442,6 +652,249 @@ impl BridgeMcpServer {
         }
     }
 
+    /// Revise a message already sent.
+    #[tool(
+        description = "Replace the text of a message you already sent, the way a person corrects a \
+                       typo rather than sending a follow-up. The new text replaces the old \
+                       entirely, so include everything you want to keep. `message_id` is the id \
+                       send_message reported. You can only edit your own messages, and platforms \
+                       may refuse an edit to an old one.",
+        annotations(title = "Edit message", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn edit_message(
+        &self,
+        Parameters(args): Parameters<EditMessageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.text.trim().is_empty() {
+            // An empty edit is not a delete on any platform here; it is a rejected request. Saying
+            // which tool does mean it beats letting the agent discover that from an API error.
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "`text` is empty; nothing was changed. Use delete_message to remove a message.",
+            )]));
+        }
+        match self
+            .sink
+            .edit_message(&args.conversation, &args.message_id, &args.text)
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Edited message {} in {}.",
+                args.message_id, args.conversation
+            ))])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Remove a message.
+    #[tool(
+        description = "Delete a message. Use it to retract something you sent, or, where you are a \
+                       moderator, to remove somebody else's. This cannot be undone and the message \
+                       disappears for everyone, so prefer edit_message when you only want to \
+                       correct yourself.",
+        annotations(
+            title = "Delete message",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn delete_message(
+        &self,
+        Parameters(args): Parameters<DeleteMessageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .delete_message(&args.conversation, &args.message_id)
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Deleted message {} in {}.",
+                args.message_id, args.conversation
+            ))])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Restrict, ban, or reinstate somebody.
+    #[tool(
+        description = "Moderate a member of a group you administer: `restrict` stops them posting \
+                       but leaves them in, `unrestrict` gives back whatever the group allows \
+                       everyone, `ban` removes and keeps them out, `unban` lifts a ban, `kick` \
+                       removes them but lets them rejoin. `user_id` is the numeric id from the \
+                       `from:` line of their message. Needs the matching admin right in that group, \
+                       and no bot can act on another administrator.",
+        annotations(
+            title = "Moderate member",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn moderate_member(
+        &self,
+        Parameters(args): Parameters<ModerateMemberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let until = match parse_duration(args.duration.as_deref()) {
+            Ok(until) => until,
+            Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        };
+        // Saying so beats silently ignoring it: an agent that asked for a one-hour unban and got a
+        // permanent one would have no way to tell.
+        if until.is_some() && !args.action.accepts_duration() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "`duration` means nothing for `{}`; it applies to `restrict` and `ban` only.",
+                args.action.as_str()
+            ))]));
+        }
+        match self
+            .sink
+            .moderate_member(
+                &args.conversation,
+                &args.user_id,
+                args.action,
+                until,
+                args.revoke_messages,
+            )
+            .await
+        {
+            Ok(()) => {
+                let window = match until {
+                    Some(until) => format!(" until {}", until.to_rfc3339()),
+                    None => String::new(),
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Applied `{}` to user {} in {}{window}.",
+                    args.action.as_str(),
+                    args.user_id,
+                    args.conversation
+                ))]))
+            }
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Promote, adjust, or demote an administrator.
+    #[tool(
+        description = "Set exactly which admin privileges somebody holds in a group. This replaces \
+                       what they have rather than adding to it, so pass the complete set you want \
+                       them to end up with, and pass an empty list to demote them to an ordinary \
+                       member. You can only grant privileges you hold yourself.",
+        annotations(
+            title = "Set member rights",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn set_member_rights(
+        &self,
+        Parameters(args): Parameters<SetMemberRightsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .set_member_rights(&args.conversation, &args.user_id, &args.rights)
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                if args.rights.is_empty() {
+                    format!(
+                        "Demoted user {} in {} to an ordinary member.",
+                        args.user_id, args.conversation
+                    )
+                } else {
+                    let granted: Vec<&str> =
+                        args.rights.iter().map(|right| right.as_str()).collect();
+                    format!(
+                        "User {} in {} now holds: {}.",
+                        args.user_id,
+                        args.conversation,
+                        granted.join(", ")
+                    )
+                },
+            )])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Pin or unpin a message.
+    #[tool(
+        description = "Pin a message to the top of a chat, or unpin one. Pinning notifies everyone \
+                       unless `silent` is set. Needs the pin-messages admin right.",
+        annotations(title = "Pin message", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn pin_message(
+        &self,
+        Parameters(args): Parameters<PinMessageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .pin_message(&args.conversation, &args.message_id, args.pin, args.silent)
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{} message {} in {}.",
+                if args.pin { "Pinned" } else { "Unpinned" },
+                args.message_id,
+                args.conversation
+            ))])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Change a chat's title or description.
+    #[tool(
+        description = "Change a group's title or description. Omit a field to leave it as it is. \
+                       Needs the change-info admin right.",
+        annotations(
+            title = "Set chat details",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn set_chat(
+        &self,
+        Parameters(args): Parameters<SetChatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let settings = ChatSettings {
+            title: args.title,
+            description: args.description,
+        };
+        if settings.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Nothing to change; set `title`, `description`, or both.",
+            )]));
+        }
+        match self.sink.set_chat(&args.conversation, settings).await {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Updated {}.",
+                args.conversation
+            ))])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Check somebody's standing in a chat, including your own.
+    #[tool(
+        description = "Look up somebody's standing in a chat and which admin privileges they hold. \
+                       Omit `user_id` to ask about yourself, which is how you find out what you \
+                       are allowed to do in a group before trying it.",
+        annotations(
+            title = "Check membership",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn member(
+        &self,
+        Parameters(args): Parameters<MemberArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .member(&args.conversation, args.user_id.as_deref())
+            .await
+        {
+            Ok(member) => Ok(json_result(&member)),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
     /// Look at an attachment.
     #[tool(
         description = "Look at a picture somebody sent you. Nothing arrives downloaded, so call \
@@ -518,11 +971,84 @@ impl BridgeMcpServer {
         }
     }
 
+    /// Stop being woken by a conversation.
+    #[tool(
+        description = "Stop receiving messages from a conversation, so a noisy chat does not \
+                       interrupt you. Messages sent while it is muted are discarded rather than \
+                       held, and you are told how many when the mute lapses. `duration` is \
+                       something like `30m`, `2h`, or `7d`; omit it to mute until you unmute. Use \
+                       this on a group that keeps waking you for nothing, not on someone who is \
+                       simply asking for something you would rather not do.",
+        annotations(
+            title = "Mute conversation",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn mute(
+        &self,
+        Parameters(args): Parameters<MuteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let until = match parse_duration(args.duration.as_deref()) {
+            Ok(until) => until,
+            Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        };
+        match self
+            .sink
+            .mute(&args.conversation, until, args.reason.as_deref())
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                match until {
+                    Some(until) => format!(
+                        "Muted {} until {}. Messages sent before then are discarded, not held.",
+                        args.conversation,
+                        until.to_rfc3339()
+                    ),
+                    None => format!(
+                        "Muted {} indefinitely. Nothing from it will reach you until you unmute \
+                         it.",
+                        args.conversation
+                    ),
+                },
+            )])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Start hearing from a conversation again.
+    #[tool(
+        description = "Lift a mute so a conversation can reach you again. Messages sent while it \
+                       was muted are gone; this only affects what arrives from now on.",
+        annotations(
+            title = "Unmute conversation",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn unmute(
+        &self,
+        Parameters(args): Parameters<UnmuteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.sink.unmute(&args.conversation).await {
+            Ok(true) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Unmuted {}.",
+                args.conversation
+            ))])),
+            Ok(false) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{} was not muted; nothing changed.",
+                args.conversation
+            ))])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
     /// List known conversations.
     #[tool(
         description = "List the conversations this bridge knows about, most recently active first. \
                        Use it to find a conversation id when you want to message someone whose id \
-                       is not in front of you.",
+                       is not in front of you, and to see which conversations you currently have \
+                       muted.",
         annotations(
             title = "List conversations",
             read_only_hint = true,
@@ -544,8 +1070,9 @@ impl BridgeMcpServer {
         {
             Ok(conversations) if conversations.is_empty() => {
                 Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "No conversations yet. A conversation appears once someone has messaged the \
-                     bot at least once.",
+                    "No conversations yet. One appears here once somebody has messaged the bot, or \
+                     once you have messaged them. You can still send to an id you know without \
+                     it being listed.",
                 )]))
             }
             Ok(conversations) => Ok(json_result(&conversations)),
@@ -603,6 +1130,32 @@ fn calling_session(context: &RequestContext<RoleServer>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Resolve a humantime duration argument into an absolute expiry.
+///
+/// `Ok(None)` means the caller omitted it, which every tool taking one reads as "no expiry". That
+/// is why an unparseable or empty value is an error rather than a fall back to `None`: a mistyped
+/// half-hour silently becoming permanent is the worst outcome any of these tools has, and it is
+/// invisible from both ends.
+fn parse_duration(
+    raw: Option<&str>,
+) -> std::result::Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err("`duration` is empty; omit it entirely for no expiry.".to_string());
+    }
+    let parsed = humantime::parse_duration(raw).map_err(|error| {
+        format!(
+            "`duration` {raw:?} is not a duration ({error}); write it like `30m`, `2h`, or `7d`."
+        )
+    })?;
+    let parsed = chrono::Duration::from_std(parsed).map_err(|_| {
+        format!("`duration` {raw:?} is too long to represent; omit it for no expiry.")
+    })?;
+    Ok(Some(chrono::Utc::now() + parsed))
+}
+
 /// Render a successful send.
 fn sent_result(conversation: &str, message_ids: &[String]) -> CallToolResult {
     let summary = match message_ids.len() {
@@ -644,11 +1197,34 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::channel::ConversationId;
+
+    /// A recorded `mute` call: conversation, expiry, reason.
+    type RecordedMute = (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    );
+
+    /// A recorded `moderate_member` call: conversation, user, action, expiry.
+    type RecordedModeration = (
+        String,
+        String,
+        MemberAction,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
 
     #[derive(Default)]
     struct FakeSink {
         sent: Mutex<Vec<(String, String, SendOptions)>>,
         reactions: Mutex<Vec<(String, String, Option<String>)>>,
+        edits: Mutex<Vec<(String, String, String)>>,
+        deletes: Mutex<Vec<(String, String)>>,
+        mutes: Mutex<Vec<RecordedMute>>,
+        moderations: Mutex<Vec<RecordedModeration>>,
+        promotions: Mutex<Vec<(String, Vec<MemberRight>)>>,
+        pins: Mutex<Vec<(String, bool)>>,
+        chat_settings: Mutex<Vec<ChatSettings>>,
         conversations: Vec<ConversationSummary>,
         fail_with: Option<&'static str>,
     }
@@ -662,6 +1238,7 @@ mod tests {
             kind: "direct".to_string(),
             last_inbound_at: Some("2026-08-05T12:00:00Z".to_string()),
             last_outbound_at: None,
+            muted_until: None,
         }
     }
 
@@ -676,12 +1253,10 @@ mod tests {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            if !self
-                .conversations
-                .iter()
-                .any(|item| item.id == conversation)
-            {
-                return Err(SinkError::UnknownConversation(conversation.to_string()));
+            // Deliberately not checked against `conversations`: the real sink sends to any id its
+            // channel accepts, seen before or not, and leaves the verdict to the platform.
+            if ConversationId::parse(conversation).is_none() {
+                return Err(SinkError::MalformedConversation(conversation.to_string()));
             }
             let mut sent = self
                 .sent
@@ -710,13 +1285,6 @@ mod tests {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            if !self
-                .conversations
-                .iter()
-                .any(|item| item.id == conversation)
-            {
-                return Err(SinkError::UnknownConversation(conversation.to_string()));
-            }
             let mut reactions = self
                 .reactions
                 .lock()
@@ -727,6 +1295,117 @@ mod tests {
                 emoji.map(str::to_string),
             ));
             Ok(())
+        }
+
+        async fn edit_message(
+            &self,
+            conversation: &str,
+            message_id: &str,
+            markdown: &str,
+        ) -> Result<(), SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            let mut edits = self
+                .edits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            edits.push((
+                conversation.to_string(),
+                message_id.to_string(),
+                markdown.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn delete_message(
+            &self,
+            conversation: &str,
+            message_id: &str,
+        ) -> Result<(), SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            let mut deletes = self
+                .deletes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            deletes.push((conversation.to_string(), message_id.to_string()));
+            Ok(())
+        }
+
+        async fn moderate_member(
+            &self,
+            conversation: &str,
+            user_id: &str,
+            action: MemberAction,
+            until: Option<chrono::DateTime<chrono::Utc>>,
+            _revoke_messages: bool,
+        ) -> Result<(), SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            let mut moderations = self
+                .moderations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            moderations.push((conversation.to_string(), user_id.to_string(), action, until));
+            Ok(())
+        }
+
+        async fn set_member_rights(
+            &self,
+            _conversation: &str,
+            user_id: &str,
+            rights: &[MemberRight],
+        ) -> Result<(), SinkError> {
+            let mut promotions = self
+                .promotions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            promotions.push((user_id.to_string(), rights.to_vec()));
+            Ok(())
+        }
+
+        async fn pin_message(
+            &self,
+            _conversation: &str,
+            message_id: &str,
+            pin: bool,
+            _silent: bool,
+        ) -> Result<(), SinkError> {
+            let mut pins = self
+                .pins
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pins.push((message_id.to_string(), pin));
+            Ok(())
+        }
+
+        async fn set_chat(
+            &self,
+            _conversation: &str,
+            settings: ChatSettings,
+        ) -> Result<(), SinkError> {
+            let mut chats = self
+                .chat_settings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            chats.push(settings);
+            Ok(())
+        }
+
+        async fn member(
+            &self,
+            _conversation: &str,
+            user_id: Option<&str>,
+        ) -> Result<MemberInfo, SinkError> {
+            Ok(MemberInfo {
+                user_id: user_id.unwrap_or("42").to_string(),
+                display_name: Some("Bot".to_string()),
+                status: crate::channel::MemberStatus::Administrator,
+                rights: vec![MemberRight::RestrictMembers, MemberRight::DeleteMessages],
+            })
         }
 
         async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
@@ -758,6 +1437,33 @@ mod tests {
             })
         }
 
+        async fn mute(
+            &self,
+            conversation: &str,
+            until: Option<chrono::DateTime<chrono::Utc>>,
+            reason: Option<&str>,
+        ) -> Result<(), SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            let mut mutes = self
+                .mutes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            mutes.push((conversation.to_string(), until, reason.map(str::to_string)));
+            Ok(())
+        }
+
+        async fn unmute(&self, conversation: &str) -> Result<bool, SinkError> {
+            let mut mutes = self
+                .mutes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = mutes.len();
+            mutes.retain(|(muted, ..)| muted != conversation);
+            Ok(mutes.len() != before)
+        }
+
         async fn conversations(
             &self,
             channel: Option<&str>,
@@ -784,7 +1490,10 @@ mod tests {
     fn server_with(sink: FakeSink) -> (BridgeMcpServer, Arc<FakeSink>) {
         let sink = Arc::new(sink);
         (
-            BridgeMcpServer::new(Arc::clone(&sink) as Arc<dyn OutboundSink>),
+            BridgeMcpServer::new(
+                Arc::clone(&sink) as Arc<dyn OutboundSink>,
+                ToolSurface::default(),
+            ),
             sink,
         )
     }
@@ -849,10 +1558,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_conversation_is_a_tool_error_with_a_recovery_hint() {
-        // A tool-level error rather than a protocol error, so the agent actually sees the text and
-        // can go look the id up instead of getting an opaque failure.
-        let (server, _sink) = server_with(FakeSink {
+    async fn a_conversation_the_bridge_has_never_seen_is_still_deliverable() {
+        // Sending first is a supported move, so an id that is merely unfamiliar must not be
+        // second-guessed here. Only the platform knows whether the chat is writable.
+        let (server, sink) = server_with(FakeSink {
             conversations: vec![summary("telegram:1")],
             ..FakeSink::default()
         });
@@ -868,10 +1577,32 @@ mod tests {
             )
             .await
             .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(sink.sent.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_conversation_id_is_a_tool_error_with_a_recovery_hint() {
+        // A tool-level error rather than a protocol error, so the agent actually sees the text and
+        // can fix the id instead of getting an opaque failure.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .send_message_inner(
+                SendMessageArgs {
+                    conversation: "not-an-id".to_string(),
+                    text: "hello".to_string(),
+                    reply_to: None,
+                    silent: false,
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
-        assert!(text.contains("telegram:999"));
-        assert!(text.contains("list_conversations"));
+        assert!(text.contains("not-an-id"));
+        assert!(text.contains("<channel>:<chat>"), "got: {text}");
+        assert!(sink.sent.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
@@ -1054,6 +1785,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editing_replaces_the_text_of_a_message() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .edit_message(Parameters(EditMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_id: "4471".to_string(),
+                text: "actually, **tomorrow**".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(sink.edits.lock().expect("lock").as_slice(), [(
+            "telegram:1".to_string(),
+            "4471".to_string(),
+            "actually, **tomorrow**".to_string()
+        )]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_edit_is_refused_rather_than_read_as_a_deletion() {
+        // Clearing a message is not how any platform here spells "delete", so an empty body would
+        // either fail at the API or leave a blank message standing.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .edit_message(Parameters(EditMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_id: "4471".to_string(),
+                text: "   ".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains("delete_message"));
+        assert!(sink.edits.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_removes_a_message() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .delete_message(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_id: "4471".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(sink.deletes.lock().expect("lock").as_slice(), [(
+            "telegram:1".to_string(),
+            "4471".to_string()
+        )]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_reaches_the_agent_verbatim() {
+        // Telegram refuses an edit to a message older than 48 hours, among other cases. Its own
+        // wording is the only accurate explanation available.
+        let (server, _sink) = server_with(FakeSink {
+            fail_with: Some("message can't be edited"),
+            ..FakeSink::default()
+        });
+        let result = server
+            .edit_message(Parameters(EditMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_id: "4471".to_string(),
+                text: "too late".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains("can't be edited"));
+    }
+
+    #[tokio::test]
+    async fn muting_with_a_duration_sets_an_expiry() {
+        let (server, sink) = server_with(FakeSink::default());
+        let before = chrono::Utc::now();
+        let result = server
+            .mute(Parameters(MuteArgs {
+                conversation: "telegram:1".to_string(),
+                duration: Some("30m".to_string()),
+                reason: Some("standup spam".to_string()),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let mutes = sink.mutes.lock().expect("lock");
+        let until = mutes[0].1.expect("an expiry was set");
+        let elapsed = until - before;
+        assert!(
+            elapsed >= chrono::Duration::minutes(29) && elapsed <= chrono::Duration::minutes(31),
+            "expected roughly 30 minutes, got {elapsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn muting_without_a_duration_is_indefinite() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .mute(Parameters(MuteArgs {
+                conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).contains("indefinitely"));
+        assert_eq!(sink.mutes.lock().expect("lock")[0].1, None);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_duration_is_refused_rather_than_treated_as_forever() {
+        // Reading a bad duration as "no expiry" would turn a mistyped half-hour into a permanent
+        // silence that only an operator can lift.
+        let (server, sink) = server_with(FakeSink::default());
+        for duration in ["half an hour", "  "] {
+            let result = server
+                .mute(Parameters(MuteArgs {
+                    conversation: "telegram:1".to_string(),
+                    duration: Some(duration.to_string()),
+                    reason: None,
+                }))
+                .await
+                .expect("tool runs");
+            assert_eq!(result.is_error, Some(true), "for {duration:?}");
+        }
+        assert!(sink.mutes.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmuting_says_so_when_nothing_was_muted() {
+        // Reporting success for a no-op would let the agent believe it had fixed something.
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .unmute(Parameters(UnmuteArgs {
+                conversation: "telegram:1".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert!(text_of(&result).contains("was not muted"));
+    }
+
+    #[tokio::test]
+    async fn moderating_passes_the_action_and_expiry_through() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .moderate_member(Parameters(ModerateMemberArgs {
+                conversation: "telegram:-100".to_string(),
+                user_id: "999".to_string(),
+                action: MemberAction::Restrict,
+                duration: Some("1h".to_string()),
+                revoke_messages: false,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let moderations = sink.moderations.lock().expect("lock");
+        assert_eq!(moderations[0].1, "999");
+        assert_eq!(moderations[0].2, MemberAction::Restrict);
+        assert!(moderations[0].3.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_duration_on_an_action_that_ignores_it_is_refused() {
+        // Telegram would accept and discard it, leaving an agent that asked for a one-hour unban
+        // believing it had got one.
+        let (server, sink) = server_with(FakeSink::default());
+        for action in [
+            MemberAction::Unban,
+            MemberAction::Kick,
+            MemberAction::Unrestrict,
+        ] {
+            let result = server
+                .moderate_member(Parameters(ModerateMemberArgs {
+                    conversation: "telegram:-100".to_string(),
+                    user_id: "999".to_string(),
+                    action,
+                    duration: Some("1h".to_string()),
+                    revoke_messages: false,
+                }))
+                .await
+                .expect("tool runs");
+            assert_eq!(result.is_error, Some(true), "for {}", action.as_str());
+            assert!(text_of(&result).contains(action.as_str()));
+        }
+        assert!(sink.moderations.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_rights_list_reads_as_a_demotion() {
+        // The list is a replacement rather than an addition, so "no rights" is meaningful input and
+        // must not be mistaken for a missing argument.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .set_member_rights(Parameters(SetMemberRightsArgs {
+                conversation: "telegram:-100".to_string(),
+                user_id: "999".to_string(),
+                rights: Vec::new(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert!(text_of(&result).contains("Demoted"));
+        assert_eq!(sink.promotions.lock().expect("lock")[0].1, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn granting_rights_reports_what_was_granted() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .set_member_rights(Parameters(SetMemberRightsArgs {
+                conversation: "telegram:-100".to_string(),
+                user_id: "999".to_string(),
+                rights: vec![MemberRight::DeleteMessages, MemberRight::PinMessages],
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).contains("delete_messages, pin_messages"));
+        assert_eq!(sink.promotions.lock().expect("lock")[0].1.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn setting_nothing_on_a_chat_is_refused() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .set_chat(Parameters(SetChatArgs {
+                conversation: "telegram:-100".to_string(),
+                title: None,
+                description: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(sink.chat_settings.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn checking_your_own_membership_needs_no_user_id() {
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .member(Parameters(MemberArgs {
+                conversation: "telegram:-100".to_string(),
+                user_id: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text_of(&result)).expect("json object");
+        assert_eq!(parsed["status"], "administrator");
+        assert!(
+            parsed["rights"]
+                .as_array()
+                .is_some_and(|rights| rights.contains(&serde_json::json!("restrict_members")))
+        );
+    }
+
+    #[test]
+    fn turning_off_admin_tools_removes_exactly_the_admin_tools() {
+        let full = BridgeMcpServer::new(
+            Arc::new(FakeSink::default()) as Arc<dyn OutboundSink>,
+            ToolSurface::default(),
+        );
+        let trimmed = BridgeMcpServer::new(
+            Arc::new(FakeSink::default()) as Arc<dyn OutboundSink>,
+            ToolSurface { admin: false },
+        );
+        let names = |server: &BridgeMcpServer| -> Vec<String> {
+            server
+                .tool_router
+                .list_all()
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect()
+        };
+        let full_names = names(&full);
+        let trimmed_names = names(&trimmed);
+        // Every name in `ADMIN_TOOLS` has to match a real tool, or the trimming silently does
+        // nothing and the surface stays open when the operator asked for it closed.
+        for name in ADMIN_TOOLS {
+            assert!(
+                full_names.iter().any(|tool| tool == name),
+                "{name} is listed for removal but is not a registered tool"
+            );
+            assert!(
+                !trimmed_names.iter().any(|tool| tool == name),
+                "{name} survived the trim"
+            );
+        }
+        assert_eq!(full_names.len() - trimmed_names.len(), ADMIN_TOOLS.len());
+    }
+
+    #[tokio::test]
     async fn list_conversations_clamps_the_limit() {
         let conversations: Vec<ConversationSummary> = (0..300)
             .map(|index| summary(&format!("telegram:{index}")))
@@ -1110,12 +2135,21 @@ mod tests {
         // The exact set, not a spot check: a tool silently dropped from the router is a capability
         // the agent loses with nothing to indicate it, and the docs list these by name.
         assert_eq!(names, vec![
+            "delete_message",
             "download_attachment",
+            "edit_message",
             "get_conversation",
             "list_conversations",
+            "member",
+            "moderate_member",
+            "mute",
+            "pin_message",
             "react",
             "send_file",
             "send_message",
+            "set_chat",
+            "set_member_rights",
+            "unmute",
             "view_attachment",
         ]);
         for tool in &tools {
@@ -1175,10 +2209,20 @@ mod tests {
                 .as_ref()
                 .and_then(|annotations| annotations.open_world_hint);
             let expected = match tool.name.as_ref() {
-                // Everything that talks to the platform, in either direction.
+                // Everything that talks to the platform, in either direction. `mute` and `unmute`
+                // are not here on purpose: they change what this bridge delivers to the agent and
+                // touch nothing outside the machine. `member` is, because it reads live state from
+                // the platform even though it changes nothing.
                 "send_message"
                 | "send_file"
                 | "react"
+                | "edit_message"
+                | "delete_message"
+                | "moderate_member"
+                | "set_member_rights"
+                | "pin_message"
+                | "set_chat"
+                | "member"
                 | "view_attachment"
                 | "download_attachment" => Some(true),
                 _ => Some(false),

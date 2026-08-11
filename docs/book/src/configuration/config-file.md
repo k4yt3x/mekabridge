@@ -121,11 +121,17 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 | `token` / `token_file` | *(required)* | Bot token from @BotFather |
 | `allowed_users` | `[]` | Telegram user ids allowed to reach the agent |
 | `allowed_chats` | `[]` | Group and channel ids where every member is allowed. Group ids are negative |
+| `allow_all` | `false` | Accept everyone, for a public or customer-service bot |
+| `admin_tools` | `true` | Offer the agent the group moderation tools |
 | `parse_mode` | `html` | `html` renders Markdown into Telegram's HTML subset; `none` sends the Markdown verbatim |
 | `link_preview` | `false` | Show a preview card for the first link in a message. Off because the agent usually cites links rather than making one the subject of a message |
 | `poll_timeout` | `30s` | `getUpdates` long-poll timeout |
 
-At least one of `allowed_users` or `allowed_chats` must be non-empty. Startup fails otherwise, because a bot with an empty allowlist accepts messages from anyone who finds it.
+At least one of `allowed_users`, `allowed_chats`, or `allow_all` must be set. Startup fails otherwise, because a bot with an empty allowlist would accept messages from anyone who finds it, and that should be a decision rather than an oversight.
+
+`allow_all` warns on every startup. On Telegram a private chat id *is* the user's own id, so it admits individuals as well as groups, and every message it lets through costs a provider turn. Setting `allowed_users` alongside it still does something useful: those people are reported to the agent as individually vetted rather than merely admitted.
+
+`admin_tools` is on because Telegram refuses every moderation call unless the bot is an administrator with the matching right, so on a bot that administers nothing they are inert. Turn it off when the bot is an administrator for some other reason, such as reading all group messages. See [Security](../usage/security.md).
 
 ## A complete example
 

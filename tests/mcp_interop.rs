@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mekabridge::{
+    channel::MemberStatus,
     config::{McpConfig, McpTransport},
     mcp::{
-        ConversationSummary, DownloadedAttachment, OutboundSink, SendOptions, SinkError,
-        ViewedAttachment, serve,
+        ChatSettings, ConversationSummary, DownloadedAttachment, MemberAction, MemberInfo,
+        MemberRight, OutboundSink, SendOptions, SinkError, ToolSurface, ViewedAttachment, serve,
     },
 };
 use rmcp2::{
@@ -34,6 +35,11 @@ const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
 struct RecordingSink {
     sent: Mutex<Vec<(String, String)>>,
     reactions: Mutex<Vec<(String, Option<String>)>>,
+    edits: Mutex<Vec<(String, String, String)>>,
+    deletes: Mutex<Vec<String>>,
+    #[allow(clippy::type_complexity)]
+    moderations: Mutex<Vec<(String, MemberAction, Option<chrono::DateTime<chrono::Utc>>)>>,
+    mutes: Mutex<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -45,6 +51,7 @@ fn summary(id: &str) -> ConversationSummary {
         kind: "direct".to_string(),
         last_inbound_at: Some("2026-08-05T12:00:00Z".to_string()),
         last_outbound_at: None,
+        muted_until: None,
     }
 }
 
@@ -141,6 +148,113 @@ impl OutboundSink for RecordingSink {
     async fn conversation(&self, id: &str) -> Result<Option<ConversationSummary>, SinkError> {
         Ok((id == "telegram:1").then(|| summary(id)))
     }
+
+    async fn edit_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<(), SinkError> {
+        let mut edits = self
+            .edits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        edits.push((
+            conversation.to_string(),
+            message_id.to_string(),
+            markdown.to_string(),
+        ));
+        Ok(())
+    }
+
+    async fn delete_message(&self, _conversation: &str, message_id: &str) -> Result<(), SinkError> {
+        let mut deletes = self
+            .deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        deletes.push(message_id.to_string());
+        Ok(())
+    }
+
+    async fn moderate_member(
+        &self,
+        _conversation: &str,
+        user_id: &str,
+        action: MemberAction,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        _revoke_messages: bool,
+    ) -> Result<(), SinkError> {
+        let mut moderations = self
+            .moderations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        moderations.push((user_id.to_string(), action, until));
+        Ok(())
+    }
+
+    async fn set_member_rights(
+        &self,
+        _conversation: &str,
+        _user_id: &str,
+        _rights: &[MemberRight],
+    ) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn pin_message(
+        &self,
+        _conversation: &str,
+        _message_id: &str,
+        _pin: bool,
+        _silent: bool,
+    ) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn set_chat(
+        &self,
+        _conversation: &str,
+        _settings: ChatSettings,
+    ) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn member(
+        &self,
+        _conversation: &str,
+        user_id: Option<&str>,
+    ) -> Result<MemberInfo, SinkError> {
+        Ok(MemberInfo {
+            user_id: user_id.unwrap_or("7").to_string(),
+            display_name: Some("Bot".to_string()),
+            status: MemberStatus::Administrator,
+            rights: vec![MemberRight::RestrictMembers],
+        })
+    }
+
+    async fn mute(
+        &self,
+        conversation: &str,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        _reason: Option<&str>,
+    ) -> Result<(), SinkError> {
+        let mut mutes = self
+            .mutes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mutes.push((conversation.to_string(), until));
+        Ok(())
+    }
+
+    async fn unmute(&self, conversation: &str) -> Result<bool, SinkError> {
+        let mut mutes = self
+            .mutes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = mutes.len();
+        mutes.retain(|(muted, _)| muted != conversation);
+        Ok(mutes.len() != before)
+    }
 }
 
 /// `CallToolRequestParams` is `#[non_exhaustive]`, so it has to be built through its constructor
@@ -167,8 +281,13 @@ impl Drop for Harness {
     }
 }
 
-/// Start the MCP server on an ephemeral loopback port.
+/// Start the MCP server on an ephemeral loopback port with the full tool surface.
 async fn start() -> Harness {
+    start_with(ToolSurface::default()).await
+}
+
+/// Start with a chosen tool surface, so the conditional registration can be checked both ways.
+async fn start_with(surface: ToolSurface) -> Harness {
     let config = McpConfig {
         transport: McpTransport::Http,
         // Port 0 lets the OS pick, so concurrent test binaries cannot collide.
@@ -187,7 +306,7 @@ async fn start() -> Harness {
         let sink = Arc::clone(&sink);
         let shutdown = shutdown.clone();
         async move {
-            let result = serve::run(server, &config, sink, shutdown).await;
+            let result = serve::run(server, &config, sink, surface, shutdown).await;
             if let Err(error) = result {
                 eprintln!("mcp server stopped: {error}");
             }
@@ -230,6 +349,33 @@ async fn handshake_succeeds_across_the_version_gap() {
 }
 
 #[tokio::test]
+async fn turning_off_admin_tools_removes_exactly_those() {
+    // Conditional registration is the one thing here that can silently drop a tool, so both halves
+    // are pinned: the moderation tools go, and nothing else does.
+    let harness = start_with(ToolSurface { admin: false }).await;
+    let client = connect(&harness).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list works");
+    let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec![
+        "delete_message",
+        "download_attachment",
+        "edit_message",
+        "get_conversation",
+        "list_conversations",
+        "mute",
+        "react",
+        "send_file",
+        "send_message",
+        "unmute",
+        "view_attachment",
+    ]);
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
 async fn all_tools_are_visible_to_an_older_client() {
     let harness = start().await;
     let client = connect(&harness).await;
@@ -238,12 +384,21 @@ async fn all_tools_are_visible_to_an_older_client() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
+        "delete_message",
         "download_attachment",
+        "edit_message",
         "get_conversation",
         "list_conversations",
+        "member",
+        "moderate_member",
+        "mute",
+        "pin_message",
         "react",
         "send_file",
         "send_message",
+        "set_chat",
+        "set_member_rights",
+        "unmute",
         "view_attachment",
     ]);
 
@@ -519,7 +674,7 @@ async fn bearer_token_gates_the_endpoint() {
         let shutdown = shutdown.clone();
         async move {
             let sink: Arc<dyn OutboundSink> = Arc::new(RecordingSink::default());
-            let _ = serve::run(server, &config, sink, shutdown).await;
+            let _ = serve::run(server, &config, sink, ToolSurface::default(), shutdown).await;
         }
     });
 

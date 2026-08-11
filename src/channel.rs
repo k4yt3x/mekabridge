@@ -129,6 +129,10 @@ pub enum ChatKind {
     Direct,
     Group,
     Channel,
+    /// The bridge has only ever sent here, never received, so the platform has told it nothing
+    /// about the shape of the chat. Reported rather than guessed: an id the agent was given in its
+    /// system prompt is as likely to be a group as a person.
+    Unknown,
 }
 
 impl ChatKind {
@@ -137,6 +141,7 @@ impl ChatKind {
             Self::Direct => "direct",
             Self::Group => "group",
             Self::Channel => "channel",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -163,9 +168,10 @@ pub struct Sender {
 
 /// Why an inbound message was allowed to reach the agent.
 ///
-/// The two are very different trust positions and the platform layer is the only thing that knows
-/// which applies. Somebody speaking in an allowlisted group has not been vetted individually; the
-/// agent needs that distinction to weigh what they ask for.
+/// These are three different trust positions and the platform layer is the only thing that knows
+/// which applies. Somebody speaking in an allowlisted group has not been vetted individually, and
+/// somebody reaching an open channel has not been vetted at all. The bridge reports which; what to
+/// do about it is the operator's policy, expressed in the agent's own instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Admission {
@@ -173,6 +179,8 @@ pub enum Admission {
     User,
     /// The sender is not individually allowlisted; the chat they spoke in is.
     Chat,
+    /// The channel accepts everyone, so nothing was checked.
+    Open,
 }
 
 impl Admission {
@@ -181,6 +189,7 @@ impl Admission {
         match self {
             Self::User => "user allowlist",
             Self::Chat => "chat allowlist (sender not individually allowlisted)",
+            Self::Open => "open channel (anyone may message this bot; sender not vetted)",
         }
     }
 }
@@ -420,6 +429,126 @@ impl InboundEvent {
     }
 }
 
+/// What [`Channel::moderate_member`] should do to somebody.
+///
+/// Four verbs rather than a permissions model, because a permissions model is where platforms stop
+/// agreeing with each other and because these are the actions a moderator actually reaches for.
+// `JsonSchema` here and on `MemberRight` because both are named directly in MCP tool arguments, and
+// a schema enum is what stops the agent inventing a verb the bridge has never heard of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberAction {
+    /// Stop them posting while leaving them in the chat.
+    Restrict,
+    /// Give back whatever the chat allows ordinary members, which is not the same as giving back
+    /// everything.
+    Unrestrict,
+    /// Remove them and keep them out.
+    Ban,
+    /// Lift a ban. Does not bring them back; it only stops them being turned away.
+    Unban,
+    /// Remove them but let them return, which platforms express as a ban lifted immediately.
+    Kick,
+}
+
+impl MemberAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Restrict => "restrict",
+            Self::Unrestrict => "unrestrict",
+            Self::Ban => "ban",
+            Self::Unban => "unban",
+            Self::Kick => "kick",
+        }
+    }
+
+    /// Whether a duration means anything for this action.
+    pub const fn accepts_duration(self) -> bool {
+        matches!(self, Self::Restrict | Self::Ban)
+    }
+}
+
+/// One privilege an administrator may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRight {
+    ManageChat,
+    DeleteMessages,
+    RestrictMembers,
+    PromoteMembers,
+    PinMessages,
+    ChangeInfo,
+    InviteUsers,
+    ManageTopics,
+    ManageVideoChats,
+}
+
+impl MemberRight {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ManageChat => "manage_chat",
+            Self::DeleteMessages => "delete_messages",
+            Self::RestrictMembers => "restrict_members",
+            Self::PromoteMembers => "promote_members",
+            Self::PinMessages => "pin_messages",
+            Self::ChangeInfo => "change_info",
+            Self::InviteUsers => "invite_users",
+            Self::ManageTopics => "manage_topics",
+            Self::ManageVideoChats => "manage_video_chats",
+        }
+    }
+}
+
+/// Where somebody stands in a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberStatus {
+    Owner,
+    Administrator,
+    Member,
+    Restricted,
+    Left,
+    Banned,
+}
+
+impl MemberStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Administrator => "administrator",
+            Self::Member => "member",
+            Self::Restricted => "restricted",
+            Self::Left => "left",
+            Self::Banned => "banned",
+        }
+    }
+}
+
+/// Somebody's standing and privileges in one chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberInfo {
+    pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub status: MemberStatus,
+    /// Empty for anyone who is not an administrator.
+    pub rights: Vec<MemberRight>,
+}
+
+/// Chat-level settings a moderator can change. `None` leaves a field alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatSettings {
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+impl ChatSettings {
+    /// Whether this would change anything at all.
+    pub const fn is_empty(&self) -> bool {
+        self.title.is_none() && self.description.is_none()
+    }
+}
+
 /// Per-send knobs every platform can approximate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SendOptions {
@@ -436,6 +565,12 @@ pub struct ChannelCapabilities {
     pub files: bool,
     pub photos: bool,
     pub reactions: bool,
+    /// The bot can revise and retract its own messages after sending them.
+    pub edit: bool,
+    /// The platform exposes moderation, so the admin tools are worth offering. Whether any given
+    /// call succeeds is still the platform's decision, based on what rights the bot holds in that
+    /// particular chat.
+    pub admin: bool,
 }
 
 /// Who a channel is logged in as. Used by `mekabridge doctor`.
@@ -444,6 +579,11 @@ pub struct ChannelIdentity {
     pub id: String,
     pub display_name: String,
     pub username: Option<String>,
+    /// Whether the bot receives every message in a group, rather than only those addressed to it.
+    ///
+    /// Telegram calls this privacy mode and has it on by default, which makes a bot in a group see
+    /// almost nothing. Platforms with no such notion should report `true`.
+    pub reads_all_group_messages: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -521,6 +661,116 @@ pub trait Channel: Send + Sync + 'static {
         message_id: &str,
         emoji: Option<&str>,
     ) -> Result<(), ChannelError>;
+
+    /// Replace the text of a message the bot sent.
+    ///
+    /// Defaulted to [`ChannelError::Unsupported`] here, as are the moderation methods below. A new
+    /// platform should compile without having to reimplement a model it may not share, and
+    /// [`ChannelCapabilities`] is how callers find out before trying.
+    async fn edit_text(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, message_id, markdown);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "editing messages",
+        })
+    }
+
+    /// Delete a message. Deleting somebody else's usually needs moderator rights.
+    async fn delete_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, message_id);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "deleting messages",
+        })
+    }
+
+    /// Restrict, ban, or reinstate somebody in a chat.
+    ///
+    /// `until` applies only to the actions [`MemberAction::accepts_duration`] admits. Platforms set
+    /// their own floor and ceiling on it and may round or ignore what falls outside, so an
+    /// implementation that cannot honour a duration exactly should say what it did rather than
+    /// pretend.
+    async fn moderate_member(
+        &self,
+        conversation: &ConversationId,
+        user_id: &str,
+        action: MemberAction,
+        until: Option<DateTime<Utc>>,
+        revoke_messages: bool,
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, user_id, action, until, revoke_messages);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "moderating members",
+        })
+    }
+
+    /// Grant exactly `rights`, which promotes, adjusts, or (when empty) demotes.
+    async fn set_member_rights(
+        &self,
+        conversation: &ConversationId,
+        user_id: &str,
+        rights: &[MemberRight],
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, user_id, rights);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "changing member rights",
+        })
+    }
+
+    /// Pin or unpin a message.
+    async fn pin_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        pin: bool,
+        silent: bool,
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, message_id, pin, silent);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "pinning messages",
+        })
+    }
+
+    /// Change chat-level settings.
+    async fn set_chat(
+        &self,
+        conversation: &ConversationId,
+        settings: &ChatSettings,
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, settings);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "changing chat settings",
+        })
+    }
+
+    /// Look up somebody's standing in a chat, or the bot's own when `user_id` is `None`.
+    ///
+    /// The `None` case is the useful one: it lets a caller ask what it is allowed to do here rather
+    /// than finding out by attempting it.
+    async fn member(
+        &self,
+        conversation: &ConversationId,
+        user_id: Option<&str>,
+    ) -> Result<MemberInfo, ChannelError> {
+        let _ = (conversation, user_id);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "reading chat membership",
+        })
+    }
 
     /// Show a transient activity state. Presence, not content, so this does not count as the bridge
     /// speaking on the agent's behalf. Best effort: failures are logged, never propagated to a

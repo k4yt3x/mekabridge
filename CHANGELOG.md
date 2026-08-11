@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `allow_all`, for a bot anyone may message, such as a public or customer-service bot.
+- The agent can mute a noisy chat, for a while or indefinitely, and unmute it later.
+- Muted chats are shown in the conversation list, and the agent is told what it missed on expiry.
+- `mekabridge mute list|add|rm`, so an operator can lift a mute the agent set on itself.
+- The agent can edit a message it sent, correcting itself in place instead of sending a follow-up.
+- The agent can delete a message, its own anywhere or anyone's in a group it moderates.
+- Group moderation: restrict, ban, unban, or kick a member, with an optional duration.
+- The agent can promote and demote administrators, pin messages, and set a group's title.
+- The agent can check its own rights in a group before acting, rather than finding out by failing.
+- `admin_tools = false` hides the moderation tools from a bot that should never use them.
+
+- A Security page in the docs, covering the trust model and what each setting does and does not do.
+
+### Changed
+
+- The agent can message any chat, including ones that have never messaged it first.
+- A chat the agent messages first now joins the conversation list instead of going unrecorded.
+- `doctor` warns when privacy mode is hiding group messages from the bot.
+- The agent is told how a sender was admitted without being told what to conclude from it.
+
 ## [0.1.0] - 2026-08-11
 
 ### Added

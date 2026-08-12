@@ -366,6 +366,17 @@ pub struct InboundMessage {
     pub sender: Sender,
     /// Why this message was allowed through.
     pub admission: Admission,
+    /// Whether this message was aimed at the agent rather than merely said in front of it.
+    ///
+    /// What counts is the platform's own notion, not a guess from the text: a mention it marked as
+    /// one, a reply to something the agent sent, or a chat where there is nobody else it could be
+    /// for. This is what wakes a conversation the agent is only half listening to, so a connector
+    /// that guesses generously turns a mention-only chat back into every message.
+    ///
+    /// `#[serde(default)]` because messages queued by an earlier release have no such field, and
+    /// they are decoded after an upgrade.
+    #[serde(default)]
+    pub addressed: bool,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyContext>,
@@ -915,6 +926,7 @@ mod tests {
                 on_behalf_of_chat: false,
             },
             admission: Admission::User,
+            addressed: false,
             text: "hello".to_string(),
             reply_to: None,
             edited_at: None,

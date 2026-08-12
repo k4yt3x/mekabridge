@@ -14,7 +14,7 @@ use crate::{
     config::{Config, McpTransport},
     error::{BridgeError, Result},
     meka::MekaClient,
-    store::Store,
+    store::{Policy, Store},
 };
 
 /// Starter config written by `mekabridge config init`.
@@ -35,6 +35,14 @@ pub async fn doctor(config: &Config) -> Result<()> {
         warnings += 1;
     }
 
+    println!("attention");
+    println!(
+        "  ok     default policy: direct {}, group {}, channel {}",
+        config.bridge.default_policy.direct.as_str(),
+        config.bridge.default_policy.group.as_str(),
+        config.bridge.default_policy.channel.as_str()
+    );
+
     println!("storage");
     match Store::open(&config.storage.path).await {
         Ok(store) => {
@@ -47,6 +55,42 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 Err(error) => {
                     println!("  fail   could not read queue stats: {error}");
                     failures += 1;
+                }
+            }
+            match store.list_policies().await {
+                Ok(policies) if policies.is_empty() => {
+                    println!("  ok     no conversation overrides the default");
+                }
+                Ok(policies) => println!(
+                    "  ok     {} conversation(s) have a policy of their own; `mekabridge policy \
+                     list` shows them",
+                    policies.len()
+                ),
+                Err(error) => {
+                    println!("  fail   could not read conversation policies: {error}");
+                    failures += 1;
+                }
+            }
+            if config.storage.history_retention.is_zero() {
+                // Not a failure: some deployments deliberately keep no chat log. It does change
+                // what a muted conversation can offer the agent, so it is stated
+                // rather than left to be discovered when read_history comes back
+                // empty.
+                println!(
+                    "  warn   history is off, so nothing a muted conversation withholds can be \
+                     read back later. Set [storage].history_retention to record it."
+                );
+                warnings += 1;
+            } else {
+                match store.message_count().await {
+                    Ok(count) => println!(
+                        "  ok     history: {count} message(s) recorded, kept for {}",
+                        humantime::format_duration(config.storage.history_retention)
+                    ),
+                    Err(error) => {
+                        println!("  fail   could not read the message history: {error}");
+                        failures += 1;
+                    }
                 }
             }
         }
@@ -166,15 +210,17 @@ pub async fn doctor(config: &Config) -> Result<()> {
                             });
                         println!("  ok     {} authenticated as {label}", channel.id());
                         if !identity.reads_all_group_messages {
-                            // Privacy mode makes a bot in a group see only messages that mention
-                            // it or reply to it. From the outside that is indistinguishable from a
-                            // missing allowlist entry, and it is the single most common reason a
-                            // group-deployed bot appears to be ignoring everyone.
+                            // Privacy mode makes Telegram itself withhold everything that is not a
+                            // mention or a reply, which is what the `mute` policy does except that
+                            // nothing is recorded. Leaving it on therefore does not save a turn, it
+                            // only empties the history the agent would otherwise read when a
+                            // mention arrives halfway through a discussion.
                             println!(
-                                "  warn   {} has privacy mode on, so in groups it only sees \
-                                 messages that mention it or reply to it. Turn it off with \
-                                 /setprivacy in @BotFather, or make the bot an admin, then remove \
-                                 and re-add it to each group.",
+                                "  warn   {} has privacy mode on, so Telegram withholds group \
+                                 messages that do not mention it. The `mute` policy already limits \
+                                 what wakes the agent, and privacy mode on top of it means \
+                                 read_history has nothing to show. Turn it off with /setprivacy in \
+                                 @BotFather, then remove and re-add the bot to each group.",
                                 channel.id()
                             );
                             warnings += 1;
@@ -360,38 +406,66 @@ pub async fn conversations_list(
     Ok(())
 }
 
-/// List the conversations the agent has silenced.
-pub async fn mute_list(config: &Config) -> Result<()> {
+/// Trim a timestamp to whole seconds for display.
+///
+/// `to_rfc3339` keeps the nanoseconds SQLite round-trips, which is right in a payload and wrong in
+/// a column: nine extra digits push every field after it out of line.
+fn short_time(at: chrono::DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// List the conversations somebody has ruled on explicitly.
+pub async fn policy_list(config: &Config) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
-    let mutes = store.list_mutes().await?;
-    if mutes.is_empty() {
-        println!("nothing is muted");
+    let policies = store.list_policies().await?;
+    println!(
+        "default: direct {}, group {}, channel {}",
+        config.bridge.default_policy.direct.as_str(),
+        config.bridge.default_policy.group.as_str(),
+        config.bridge.default_policy.channel.as_str()
+    );
+    if policies.is_empty() {
+        println!("no conversation has a policy of its own");
         return Ok(());
     }
+    let unseen = store.unseen_counts().await?;
     let now = Utc::now();
-    for mute in mutes {
-        // A mute is cleared by the next message that arrives, so one that has already lapsed can
-        // still be sitting here. Saying which is which stops it reading as an active mute.
-        let until = match mute.until {
-            Some(until) if until <= now => format!("expired {}", until.to_rfc3339()),
-            Some(until) => format!("until {}", until.to_rfc3339()),
+    for policy in policies {
+        // A lapsed policy is cleared by the next message from that chat, so one that has already
+        // run out can still be sitting here. Saying which is which stops it reading as being in
+        // force.
+        let until = match policy.until {
+            Some(until) if until <= now => format!("expired {}", short_time(until)),
+            Some(until) => format!("until {}", short_time(until)),
             None => "indefinite".to_string(),
         };
+        // Two different tallies, so they are labelled rather than run together: what a block threw
+        // away is gone, what a mute withheld is still readable.
+        let withheld = match policy.policy {
+            Policy::Block => format!("{} discarded", policy.dropped),
+            Policy::Mute => format!(
+                "{} unseen",
+                unseen.get(&policy.conversation_id).copied().unwrap_or(0)
+            ),
+            Policy::Active => "-".to_string(),
+        };
         println!(
-            "  {:<28} {:<34} {} dropped   {}",
-            mute.conversation_id,
+            "  {:<28} {:<8} {:<34} {:<14} {}",
+            policy.conversation_id,
+            policy.policy.as_str(),
             until,
-            mute.dropped,
-            mute.reason.as_deref().unwrap_or("-")
+            withheld,
+            policy.reason.as_deref().unwrap_or("-")
         );
     }
     Ok(())
 }
 
-/// Silence a conversation from the command line.
-pub async fn mute_add(
+/// Rule on a conversation from the command line.
+pub async fn policy_set(
     config: &Config,
     conversation: &str,
+    policy: Policy,
     duration: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
@@ -406,8 +480,8 @@ pub async fn mute_add(
         .transpose()?
         .map(|duration| Utc::now() + duration);
 
-    // Validated rather than stored as typed. A mute is keyed by exact id, so a mistyped one would
-    // insert a row that silences nothing and report success, which is the worst way to find out.
+    // Validated rather than stored as typed. A policy is keyed by exact id, so a mistyped one would
+    // insert a row that governs nothing and report success, which is the worst way to find out.
     let conversation = crate::channel::ConversationId::parse(conversation).ok_or_else(|| {
         BridgeError::config(format!(
             "{conversation:?} is not a conversation id; the form is <channel>:<chat>, as printed by \
@@ -418,23 +492,65 @@ pub async fn mute_add(
 
     let store = Store::open(&config.storage.path).await?;
     store
-        .set_mute(conversation, until, reason, Utc::now())
+        .set_policy(conversation, policy, until, reason, Utc::now())
         .await?;
     match until {
-        Some(until) => println!("muted {conversation} until {}", until.to_rfc3339()),
-        None => println!("muted {conversation} indefinitely"),
+        Some(until) => println!(
+            "{conversation} set to {} until {}",
+            policy.as_str(),
+            short_time(until)
+        ),
+        None => println!("{conversation} set to {}", policy.as_str()),
     }
     Ok(())
 }
 
-/// Lift a mute, including one the agent set on itself and cannot be asked to undo.
-pub async fn mute_rm(config: &Config, conversation: &str) -> Result<()> {
+/// Remove a conversation's own policy, including one the agent set on itself and cannot be asked to
+/// undo.
+///
+/// Distinct from `policy set active`: this returns the conversation to the configured default,
+/// which for a group is normally `mute`, whereas setting it active overrides that default.
+pub async fn policy_clear(config: &Config, conversation: &str) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
-    if store.clear_mute(conversation).await? {
-        println!("unmuted {conversation}");
+    if store.clear_policy(conversation).await? {
+        println!("{conversation} now follows the configured default");
     } else {
-        println!("{conversation} was not muted");
+        println!("{conversation} had no policy of its own");
     }
+    Ok(())
+}
+
+/// Print what a conversation has said, for checking what history actually holds.
+pub async fn history_show(
+    config: &Config,
+    conversation: &str,
+    limit: usize,
+    search: Option<&str>,
+) -> Result<()> {
+    let store = Store::open(&config.storage.path).await?;
+    let messages = match search {
+        Some(query) => {
+            store
+                .search_messages(query, Some(conversation), limit)
+                .await?
+        }
+        None => store.history(conversation, limit, None).await?,
+    };
+    if messages.is_empty() {
+        println!("nothing recorded");
+        return Ok(());
+    }
+    for message in messages {
+        let marker = if message.addressed { "@" } else { " " };
+        let seen = if message.seen { " " } else { "*" };
+        println!(
+            "{seen}{marker} {}  {:<20} {}",
+            short_time(message.timestamp),
+            message.sender_name,
+            message.text.replace('\n', " ")
+        );
+    }
+    println!("\n* not yet shown to the agent, @ addressed to it");
     Ok(())
 }
 

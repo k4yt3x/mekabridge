@@ -42,6 +42,32 @@ settle = "2s"
 # occasional delay. Keep it modest.
 settle_max = "6s"
 
+# How long a conversation goes on waking the agent for everything after the agent's own last message
+# there. Without it, answering a mention and then being asked a follow-up without a second mention
+# leaves the exchange dead halfway through. Measured from the agent's send, so a chat it stops
+# answering goes quiet again on its own.
+mute_followup = "5m"
+
+# Messages of missed context printed alongside a mention in a muted chat. A bare "what do you think
+# about that?" is meaningless on its own, and a tool call to fetch the antecedent costs a whole model
+# round trip. Set to 0 to make the agent ask instead.
+mute_context = 5
+
+# What reaches the agent from a conversation nobody has ruled on, by kind of chat:
+#
+#   active  every message wakes the agent
+#   mute    everything is recorded, but only a mention or a reply wakes the agent
+#   block   nothing is delivered and nothing is kept
+#
+# Groups default to mentions only, which is how a person configures a busy room on their own phone.
+# A one-to-one chat has nobody else in it, so mute there would silence the agent against the only
+# person talking to it. The agent can override any single conversation with the mute and block tools,
+# and an operator with `mekabridge policy set`.
+[bridge.default_policy]
+direct = "active"
+group = "mute"
+channel = "mute"
+
 [mcp]
 # meka connects here. Add this to meka's config.toml:
 #
@@ -58,6 +84,13 @@ bind = "127.0.0.1:9100"
 path = "/mcp"
 # Required if you move `bind` off loopback. Set the same value as meka's `auth_token`.
 # token = "${MEKABRIDGE_MCP_TOKEN}"
+
+[storage]
+# How long a recorded message stays readable through read_history and search_history. Set to "0s" to
+# record nothing at all, which is the switch for a deployment that does not want a chat log on disk;
+# delivery is unaffected either way. Matches the attachment retention, so a message and the picture
+# attached to it fall out of reach together.
+history_retention = "30d"
 
 [[channels.telegram]]
 id = "telegram"
@@ -79,6 +112,11 @@ allowed_users = [123456789]
 # Show a preview card for links the agent sends. Off by default: the agent usually cites links
 # rather than making one the subject of a message, and a card on each part of a split reply is noise.
 # link_preview = true
+# Turn Telegram's privacy mode off (/setprivacy in @BotFather, then re-add the bot to each group).
+# With it on, Telegram withholds every group message that does not mention the bot, so a muted
+# conversation has nothing to record and read_history comes back empty exactly when the agent needs
+# it. The `mute` policy above is the better way to limit what wakes the agent, because it keeps
+# what it withholds.
 
 [log]
 level = "info"

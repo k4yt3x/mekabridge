@@ -85,8 +85,8 @@ Delivered rows are kept for seven days rather than deleted immediately, because 
 | `lost the turn stream` | The connection to meka dropped; the bridge waits for the turn to finish rather than resubmitting |
 | `the agent viewed an attachment` | An image was fetched and passed to the model. `preview=true` means it was a still frame, not the file |
 | `the agent downloaded an attachment` | A file was written to `[storage].attachment_dir` |
-| `the agent muted a conversation` | Nothing from that chat reaches the agent until it lapses. `mekabridge mute rm` lifts it |
-| `a mute expired` | A chat is being heard again; the count is what was dropped meanwhile |
+| `the agent turned a conversation down` | Muted or blocked. `mekabridge policy clear` undoes it |
+| `a conversation policy expired` | A chat is back on its default; the count is what a block discarded meanwhile |
 | `the agent moderated a member` | Somebody was restricted, banned, or reinstated in a group |
 | `the agent changed a member's rights` | An administrator was promoted or demoted |
 | `the agent deleted a message` | The message is gone from the platform, so this line is the only record |
@@ -111,7 +111,9 @@ For a deeper check, `mekabridge doctor` exits non-zero when something would actu
 
 Everything durable is in the SQLite database at `[storage].path`. Back it up with `sqlite3 state.db ".backup out.db"` rather than copying the file, since WAL mode means a plain copy can catch a torn state.
 
-The database holds the session binding, the conversation address book, and the queue. It does not hold conversation history; that lives inside meka's own session database.
+The database holds the session binding, the conversation address book, the queue, and, since 0.3.0, a record of every message from every conversation the agent is not blocking. It does not hold the agent's side of the conversation or its reasoning; that lives inside meka's own session database.
+
+That last part is what `read_history` and `search_history` read, and it makes the file as sensitive as the chats in it. `[storage].history_retention` bounds how far back it goes, and `"0s"` turns it off. See [Security](./security.md).
 
 ## Troubleshooting
 
@@ -152,9 +154,13 @@ against `https://api.telegram.org/`, since plain `curl` hides it by falling back
 
 **The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the provider profile has `vision = false`; `mekabridge doctor` reports the setting.
 
-**The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is muted. Run with `-v` to see the drop at debug level, and check `mekabridge mute list`.
+**The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is blocked. Run with `-v` to see the drop at debug level, and check `mekabridge policy list`.
 
-**The bot has gone quiet in a group and nothing looks broken.** Either the agent muted it (`mekabridge mute list`, then `mute rm`) or privacy mode is on, in which case the bot only sees messages that mention it or reply to it. `mekabridge doctor` reports privacy mode.
+**The bot has gone quiet in a group and nothing looks broken.** Most likely it is working as configured: groups default to `mute`, so the agent is woken only when somebody mentions it or replies to it. `mekabridge policy list` shows the defaults and any conversation ruled on individually, and `mekabridge history <id>` shows what is being recorded but withheld. If you want it woken by everything there, `mekabridge policy set <id> active`.
+
+The other two causes are the agent having muted or blocked the chat itself (same `policy list`, then `policy clear`), and Telegram privacy mode, which withholds the messages before the bridge ever sees them. `mekabridge doctor` reports privacy mode.
+
+**The agent answers a mention without the context around it.** Check `[bridge].mute_context`, which is how many preceding messages are printed alongside a mention in a muted chat. At `0` the agent has to call `read_history` itself. Check also that `[storage].history_retention` is not `0s`, which records nothing at all, and that Telegram privacy mode is off, which would mean there was nothing to record.
 
 **A moderation call fails.** The bot needs to be an administrator of that specific chat with the matching right. Have the agent call `member` with no `user_id` to see what it actually holds there. Telegram also refuses any action against another administrator.
 

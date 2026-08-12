@@ -81,26 +81,51 @@ Remove a message.
 
 The agent's own messages anywhere, and anyone's in a group where it is an administrator with the delete right. This cannot be undone and the message disappears for everyone, so it is logged at warn: that log line is the only remaining record.
 
-## `mute` and `unmute`
+## `mute`, `unmute`, `block`, and `unblock`
 
-Stop being woken by a conversation.
+How much of a conversation reaches the agent. All four take the same arguments; `unmute` and `unblock` take only `conversation`.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `conversation` | string | Chat to silence |
-| `duration` | string, optional | `30m`, `2h`, `7d`. Omit for indefinite |
+| `conversation` | string | Chat to rule on |
+| `duration` | string, optional | `30m`, `2h`, `7d`. Omit to leave it until changed |
 | `reason` | string, optional | Recorded alongside, shown when listing |
 
-This is attention management, not access control: a chat that keeps waking the agent for nothing costs a provider turn every time. Muted messages are discarded at the point they arrive, before anything is queued, so they consume no queue depth and no tokens. They are not held for later.
+**`mute`** turns a conversation down to mentions only. The agent is still woken when somebody mentions it or replies to it, and for `mute_followup` after it has spoken there. Everything else is received and **recorded**, so `read_history` and `search_history` reach it, and the next thing that does wake the conversation says how much accumulated.
 
-When a mute lapses, the first message through carries a note saying how many were dropped, so the agent can judge whether to renew it. Active mutes appear in `list_conversations` as `muted_until`.
+**`block`** stops a conversation reaching the agent at all. Nothing is delivered and nothing is kept, so unlike a mute there is no way to read afterwards what was said; the agent is only told how many messages went. It is the heavier of the two and belongs on a chat there is no reason to read later.
 
-A mute the agent set can only be lifted by the agent or by an operator. That matters if it mutes the conversation you would use to ask it to stop:
+Both are attention management, not access control. An allowlist decides who may speak to the agent; these decide what it is worth being woken for. Neither consumes queue depth or a provider turn.
+
+Muting a one-to-one chat is refused: every message there is addressed to the agent, so it would change nothing, and reporting success for a no-op is worse than saying so.
+
+`unmute` and `unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `mekabridge policy clear`.
+
+A decision the agent made can only be undone by the agent or by an operator. That matters if it silences the conversation you would use to ask it to stop:
 
 ```console
-$ mekabridge mute list
-$ mekabridge mute rm telegram:-1001234567890
+$ mekabridge policy list
+$ mekabridge policy clear telegram:-1001234567890
 ```
+
+## `read_history` and `search_history`
+
+Read back what was said, including messages the agent was never woken for.
+
+| Argument | Type | Meaning |
+|----------|------|---------|
+| `conversation` | string | Chat to read. Optional for `search_history`, which spans all of them without it |
+| `query` | string | `search_history` only. `a OR b`, `a NOT b`, and `"quoted phrases"` work |
+| `limit` | number, optional | Default 20, capped at 100 |
+| `before` | number, optional | `read_history` only. The `cursor` of the oldest message you were given, to page further back |
+
+This is what makes `mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
+
+Both read only what the bridge recorded. That means nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
+
+Attachment handles come back with each message, so a picture found in history can go straight to `view_attachment` while it is still within `attachment_retention`.
+
+Each message also carries a `cursor`, which is what `before` takes. It is deliberately not a timestamp: Telegram stamps to the second, so a burst shares one, and paging on a timestamp would drop the siblings of the message paged from without anything saying so.
 
 ## `moderate_member`
 
@@ -180,6 +205,8 @@ Known conversations, most recently active first.
 
 This is not garnish. In a session that runs for months, compaction eventually summarises away the older parts of the context. `list_conversations` is how the agent re-derives its address book instead of scrolling back through history that may no longer be there.
 
+Each entry carries `policy` (the one actually in force, whether from an explicit decision or the configured default), `policy_until` when somebody ruled on it explicitly, and `unseen` for how much a muted conversation is holding.
+
 ## `get_conversation`
 
 One conversation by id, with its title, kind, and last activity.
@@ -200,7 +227,7 @@ Every tool is annotated `readOnlyHint: true`. meka derives a tool's required per
 
 `download_attachment` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
 
-Everything that reaches the platform also carries `openWorldHint: true`, which is the accurate caveat: those change nothing locally, but they do act on the outside world. `mute` and `unmute` do not, since they only change what this bridge delivers.
+Everything that reaches the platform also carries `openWorldHint: true`, which is the accurate caveat: those change nothing locally, but they do act on the outside world. The policy and history tools do not, since they only change or read what this bridge itself holds.
 
 See [Security](./security.md) for gating individual tools and for what the moderation group can reach.
 

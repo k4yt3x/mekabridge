@@ -57,7 +57,7 @@ A sender who is another bot is marked `[bot]`. An anonymous group admin, who pos
 
 Group messages work the same as direct ones. Forum topics get their own conversation id with a third segment (`telegram:-1001234567890:77`), so the agent replies into the right topic rather than the group's General.
 
-Note that a bot in a group only receives every message if privacy mode is off (`/setprivacy` in @BotFather). With privacy mode on, it sees only commands and replies to itself.
+**Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `read_history` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `mekabridge doctor` warns while privacy mode is on.
 
 Being added to or removed from a group is logged. If the group is not allowlisted the log line is a warning, because from the outside that state looks identical to a broken bot.
 
@@ -82,9 +82,28 @@ Two Telegram behaviours worth knowing:
 
 Anonymous admins post as the chat and carry no user id, so they cannot be moderated this way.
 
-## Muting a chat
+## What wakes the agent in a group
 
-A group that keeps waking the agent for nothing can be silenced with `mute`, for a duration or indefinitely. Muted messages are dropped as they arrive, before the queue, so they cost nothing; when the mute lapses the agent is told how many it missed. `mekabridge mute list` and `mekabridge mute rm` are the operator's way back if the agent mutes something it should not have.
+Groups default to `mute`, meaning the agent is woken only by a message addressed to it. Everything else said there is still received and recorded, so it can read the surrounding discussion when it needs to. See [`[bridge.default_policy]`](../configuration/config-file.md).
+
+"Addressed to it" is Telegram's own notion, not a guess from the text. Four things count:
+
+| Signal | Matched by |
+|---|---|
+| A `text_mention` entity, which carries a whole `User` | user id |
+| A reply to a message the bot sent | user id |
+| `via_bot`, from the bot's inline mode | user id |
+| A `mention` entity (`@yourbot`) or `/command@yourbot` | username, case-insensitively |
+
+Only spans Telegram itself marked as entities are read, so the bot's name appearing as ordinary words does not count. A bare `/command` does not either: in a group with several bots it is ambiguous, and Telegram's own privacy mode only forwards it on the strength of which bot spoke last.
+
+Every message in a private chat is addressed to the agent, since there is nobody else it could be for. That is also why muting a private chat is refused, and why direct messages default to `active`.
+
+The bot's username is read once at startup, so renaming it in @BotFather needs a restart before mentions are recognised again.
+
+## Muting and blocking a chat
+
+`mute` turns a chat down to mentions only; `block` stops it reaching the agent at all and keeps nothing. Both can carry a duration. `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
 
 ## Formatting
 

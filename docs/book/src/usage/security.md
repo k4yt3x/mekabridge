@@ -18,7 +18,7 @@ Messages from outside are dropped at debug level with no reply. Not replying is 
 
 Each inbound message carries an `admitted:` line saying which rule let it through, and they are not equivalent claims. `user allowlist` means that account was vetted individually. `chat allowlist` means it was not, and is only here because somebody put the bot in a room it belongs to. `open channel` means nothing was checked.
 
-**`allow_all` admits individuals, not just groups.** On Telegram a private chat id *is* the user's id, so opening a channel opens direct messages too. Every turn costs provider tokens, so an open bot is also an open invitation to spend your budget; `mute` is the agent's lever for that, and it is reactive rather than preventive.
+**`allow_all` admits individuals, not just groups.** On Telegram a private chat id *is* the user's id, so opening a channel opens direct messages too. Every turn costs provider tokens, so an open bot is also an open invitation to spend your budget. `[bridge.default_policy]` is the preventive lever, since it applies before anybody has said anything; the agent's own `mute` and `block` are reactive.
 
 ### What the allowlist does not do
 
@@ -40,15 +40,15 @@ Anyone who can message the bot can put words in front of the model, and forwarde
 
 What neither prevents is an admitted sender persuading the agent to do something. The tools that matter here are the ones with effects you cannot undo from the chat:
 
-- **`mute`** can be aimed at any chat, including yours. A permanently muted owner conversation is unreachable from inside the bridge.
+- **`mute`** and **`block`** can be aimed at any chat, including yours. A conversation blocked indefinitely is unreachable from inside the bridge, and a blocked one keeps nothing, so what was said while it was blocked cannot be recovered afterwards.
 - **`moderate_member`** and **`set_member_rights`** change somebody's standing in a group.
 - **`delete_message`** removes a message for everyone.
 
 Each of these logs at warn, which is often the only surviving record. Recovery is out of band:
 
 ```console
-$ mekabridge mute list          # what the agent has silenced, and how much it dropped
-$ mekabridge mute rm telegram:-1001234567890
+$ mekabridge policy list        # the defaults, and every conversation ruled on individually
+$ mekabridge policy clear telegram:-1001234567890
 ```
 
 Telegram supplies one guardrail free: a bot administrator cannot ban, restrict, or demote another administrator, so the owner of a group cannot be evicted by their own bot.
@@ -77,7 +77,22 @@ Note that this only helps if the session is *not* at `write`, and running at `wr
 
 ## Privacy mode
 
-A Telegram bot in a group sees only messages that mention it or reply to it, unless privacy mode is off (`/setprivacy` in @BotFather) or the bot is an administrator. This is on by default and looks exactly like a broken allowlist from the outside. `mekabridge doctor` reports it.
+A Telegram bot in a group sees only messages that mention it or reply to it, unless privacy mode is off (`/setprivacy` in @BotFather) or the bot is an administrator. It is on by default and looks exactly like a broken allowlist from the outside. `mekabridge doctor` reports it.
+
+Since 0.3.0 the recommended setting is **off**. Privacy mode and the `mute` policy limit what wakes the agent in the same way, but privacy mode does it by never delivering the message at all, so nothing is recorded and `read_history` comes back empty exactly when the agent is trying to work out what a mention referred to. `mute` withholds the turn and keeps the message.
+
+## What the bridge stores
+
+Since 0.3.0 the database holds a record of every message from every conversation the agent is not blocking, including the ones it was never woken for. That is what `read_history` and `search_history` read, and what makes a mention in a muted group answerable.
+
+It is a real change in what sits on disk. Before, the database held the queue, the address book, and attachment metadata; delivered queue payloads were already kept for seven days, so a partial log existed, but it is now a chat log by design.
+
+```toml
+[storage]
+history_retention = "0s"   # record nothing
+```
+
+Delivery is unaffected either way. What changes is that a muted conversation has nothing to show the agent when it wakes, so `mute` becomes closer to a quieter `block`. The database also carries no separate protection: it is as sensitive as the conversations in it, and `send_file` can read it (see below).
 
 ## What the agent can reach on your machine
 

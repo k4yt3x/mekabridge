@@ -73,10 +73,40 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
 | `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and lapses after 30 seconds |
+| `mute_followup` | `5m` | How long a muted conversation goes on waking the agent for everything after the agent's own last message there |
+| `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
 
 `owner_conversation` is the only place the bridge writes chat content itself, and only to say that it could not deliver something. Without it, a repeated delivery failure is visible only in the logs.
 
 When the queue is full, further messages are dropped and counted, and the next envelope tells the agent how many it did not see. Nothing is discarded silently.
+
+`mute_followup` is measured from the agent's own outbound message and is deliberately not extended by inbound traffic. Without it, answering a mention and then being asked a follow-up without a second mention leaves the exchange dead halfway through; extended by inbound traffic instead, a busy chat would never leave the window once the agent had spoken in it once.
+
+`mute_context` trades a few lines of envelope against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `read_history` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
+
+## `[bridge.default_policy]`
+
+What reaches the agent from a conversation nobody has ruled on, by kind of chat.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `direct` | `active` | One-to-one chats |
+| `group` | `mute` | Groups and supergroups |
+| `channel` | `mute` | Broadcast channels |
+
+The three policies:
+
+- **`active`**: every message wakes the agent and costs a provider turn.
+- **`mute`**: everything is received and recorded, but only a message addressed to the agent wakes it. The rest is readable with `read_history` and `search_history`, and the agent is told how much it missed.
+- **`block`**: nothing is delivered and nothing is kept.
+
+These are the same three states Telegram and Discord offer in their own notification settings, which is deliberate: an agent reading a tool called `mute` should already know what it does.
+
+Groups default to `mute` because a bot with privacy mode off receives every message said in every group it is in, and in a busy one almost none of it concerns the agent. A one-to-one chat has nobody else in it, so `mute` there would be a no-op at best; the bridge refuses it and points at `block`.
+
+A conversation with an explicit decision keeps it, so changing these defaults moves only the conversations nobody has ruled on. `mekabridge policy list` shows both.
+
+Setting a default to `block` is allowed but warns on every startup: a bridge that answers nobody is hard to tell from a broken one.
 
 ## `[mcp]`
 
@@ -101,6 +131,13 @@ A non-loopback `bind` without a `token` is a `doctor` failure: anyone who can re
 | `attachment_dir` | `<data dir>/mekabridge/attachments` | Where `download_attachment` writes files |
 | `attachment_max_bytes` | `20971520` (20 MiB) | Ceiling on what `download_attachment` will fetch. Telegram's cloud API caps `getFile` at 20 MiB regardless, so raising this only helps against a local Bot API server |
 | `attachment_retention` | `30d` | How long an attachment stays reachable. Governs both the handle and any file downloaded through it, so past this the agent can no longer fetch a file from an older message |
+| `history_retention` | `30d` | How long a recorded message stays readable through `read_history` and `search_history`. `0s` records nothing at all |
+
+Every message the bridge is not blocking is recorded, not only the ones from muted conversations. A history that works in some chats and not others is a worse tool than one that behaves the same everywhere, and an agent whose session has been compacted has as much use for scroll-back in a chat it was listening to as in one it was not.
+
+That means the database holds the content of conversations the agent never read. Smaller a change than it sounds, since delivered queue payloads were already kept for seven days, but it goes from being a queue to being a chat log. `history_retention = "0s"` turns it off entirely; delivery is unaffected either way, and a muted conversation simply has nothing to show when it wakes the agent. See [Security](../usage/security.md).
+
+The default matches `attachment_retention` so a message and the picture attached to it fall out of reach together, rather than leaving the agent a description of a file it can no longer open.
 
 ## `[log]`
 
@@ -150,6 +187,11 @@ owner_conversation = "telegram:123456789"
 batch_max_messages = 32
 turn_retries = 1
 
+[bridge.default_policy]
+direct = "active"
+group = "mute"
+channel = "mute"
+
 [mcp]
 transport = "http"
 bind = "127.0.0.1:9100"
@@ -160,6 +202,7 @@ token_file = "/etc/mekabridge/mcp.token"
 path = "/var/lib/mekabridge/state.db"
 attachment_dir = "/var/lib/mekabridge/attachments"
 attachment_retention = "14d"
+history_retention = "14d"
 
 [log]
 level = "info"

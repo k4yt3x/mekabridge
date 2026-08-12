@@ -22,15 +22,15 @@ use crate::{
         inbound::DrainContext,
         turn::{Presence, TurnRunner},
     },
-    channel::{Channel, ChannelRegistry, ConversationId, InboundEvent, SendOptions},
-    config::{Config, StorageConfig},
+    channel::{Channel, ChannelRegistry, ChatKind, ConversationId, InboundEvent, SendOptions},
+    config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
     mcp::{
-        ConversationSummary, DownloadedAttachment, OutboundSink, SinkError, ToolSurface,
-        ViewedAttachment, serve,
+        ConversationSummary, DownloadedAttachment, HistoryEntry, OutboundSink, SinkError,
+        ToolSurface, ViewedAttachment, serve,
     },
     meka::MekaClient,
-    store::Store,
+    store::{Policy, Store},
 };
 
 /// Buffer between the channel pollers and the durable writer.
@@ -80,6 +80,16 @@ pub async fn run(config: Config) -> Result<()> {
         );
     }
 
+    // Stated every startup rather than only when it is unusual. This is what decides whether a
+    // group wakes the agent at all, and the symptom of getting it wrong is a bot that looks broken
+    // rather than one that reports an error.
+    tracing::info!(
+        direct = config.bridge.default_policy.direct.as_str(),
+        group = config.bridge.default_policy.group.as_str(),
+        channel = config.bridge.default_policy.channel.as_str(),
+        "attention defaults for conversations with no policy of their own"
+    );
+
     let channels = Arc::new(ChannelRegistry::build(&config.channels)?);
     let meka = MekaClient::new(&config.meka)?;
 
@@ -100,6 +110,7 @@ pub async fn run(config: Config) -> Result<()> {
         store.clone(),
         Arc::clone(&channels),
         config.storage.clone(),
+        config.bridge.default_policy,
         meka.clone(),
         Arc::clone(&presence),
     ));
@@ -244,6 +255,23 @@ async fn janitor(store: Store, config: Arc<Config>, shutdown: CancellationToken)
             Ok(count) => tracing::debug!(count, "pruned delivered queue rows"),
             Err(error) => tracing::error!("queue prune failed: {}", error),
         }
+
+        // Zero means nothing is being recorded, so there is nothing to sweep. Skipped rather than
+        // swept with a zero window, which would delete anything a previous configuration left
+        // behind the moment somebody turned history off. Removing it is the operator's call, not a
+        // side effect of changing a setting.
+        if !config.storage.history_retention.is_zero() {
+            match chrono::Duration::from_std(config.storage.history_retention) {
+                Ok(retention) => match store.prune_messages(Utc::now() - retention).await {
+                    Ok(0) => {}
+                    Ok(count) => tracing::debug!(count, "pruned recorded messages"),
+                    Err(error) => tracing::error!("history prune failed: {}", error),
+                },
+                Err(error) => {
+                    tracing::error!("[storage].history_retention is out of range: {}", error);
+                }
+            }
+        }
     }
 }
 
@@ -294,6 +322,9 @@ pub struct BridgeSink {
     store: Store,
     channels: Arc<ChannelRegistry>,
     storage: StorageConfig,
+    /// What a conversation with no explicit decision follows, so a listing can report the policy
+    /// actually in force rather than only the ones somebody wrote down.
+    default_policy: DefaultPolicy,
     meka: MekaClient,
     presence: Arc<Presence>,
     /// Whether meka's active profile accepts images, resolved on first use.
@@ -309,6 +340,7 @@ impl BridgeSink {
         store: Store,
         channels: Arc<ChannelRegistry>,
         storage: StorageConfig,
+        default_policy: DefaultPolicy,
         meka: MekaClient,
         presence: Arc<Presence>,
     ) -> Self {
@@ -316,6 +348,7 @@ impl BridgeSink {
             store,
             channels,
             storage,
+            default_policy,
             meka,
             presence,
             vision: tokio::sync::OnceCell::new(),
@@ -841,41 +874,112 @@ impl OutboundSink for BridgeSink {
         })
     }
 
-    async fn mute(
+    async fn set_policy(
         &self,
         conversation: &str,
+        policy: Policy,
         until: Option<chrono::DateTime<Utc>>,
         reason: Option<&str>,
-    ) -> std::result::Result<(), SinkError> {
-        // Parsed but not checked against the address book: muting a conversation before it has said
-        // anything is a legitimate pre-emptive move, and the row is keyed by id either way.
+    ) -> std::result::Result<Option<Policy>, SinkError> {
+        // Parsed but not required to be in the address book: ruling on a conversation before it has
+        // said anything is a legitimate pre-emptive move, and the row is keyed by id either way.
         let conversation = self.resolve(conversation)?;
-        self.store
-            .set_mute(conversation.as_str(), until, reason, Utc::now())
+        let existing = self
+            .store
+            .policy(conversation.as_str())
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        // Warn rather than info: this is the line an operator greps for when the bot has gone quiet
-        // and nothing else explains it.
-        tracing::warn!(
-            conversation = %conversation,
-            until = ?until,
-            reason = ?reason,
-            "the agent muted a conversation; `mekabridge mute rm` lifts it"
-        );
-        Ok(())
+
+        // Refused rather than accepted and quietly done nothing. In a one-to-one chat every message
+        // is addressed to the agent, so mention-only would deliver exactly what it delivers now,
+        // and the agent would believe it had turned something down.
+        if policy == Policy::Mute {
+            let kind = self
+                .store
+                .conversation(conversation.as_str())
+                .await
+                .map_err(|error| SinkError::Internal(error.to_string()))?
+                .map(|record| record.kind);
+            if kind.as_deref() == Some(ChatKind::Direct.as_str()) {
+                return Err(SinkError::Delivery(format!(
+                    "{conversation} is a one-to-one chat, where every message is addressed to you, \
+                     so muting it would change nothing. Use block if you want it to stop reaching \
+                     you."
+                )));
+            }
+        }
+
+        self.store
+            .set_policy(conversation.as_str(), policy, until, reason, Utc::now())
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+
+        // Warn rather than info for the two that withhold something: this is the line an operator
+        // greps for when the bot has gone quiet and nothing else explains it.
+        match policy {
+            Policy::Active => {
+                tracing::info!(
+                    conversation = %conversation,
+                    "the agent set a conversation back to waking it for everything"
+                );
+            }
+            Policy::Mute | Policy::Block => tracing::warn!(
+                conversation = %conversation,
+                policy = policy.as_str(),
+                until = ?until,
+                reason = ?reason,
+                "the agent turned a conversation down; `mekabridge policy clear` undoes it"
+            ),
+        }
+        Ok(existing.map(|record| record.policy))
     }
 
-    async fn unmute(&self, conversation: &str) -> std::result::Result<bool, SinkError> {
+    async fn read_history(
+        &self,
+        conversation: &str,
+        limit: usize,
+        before: Option<i64>,
+    ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
         let conversation = self.resolve(conversation)?;
-        let lifted = self
+        let records = self
             .store
-            .clear_mute(conversation.as_str())
+            .history(conversation.as_str(), limit, before)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        if lifted {
-            tracing::info!(conversation = %conversation, "the agent unmuted a conversation");
-        }
-        Ok(lifted)
+        Ok(records.into_iter().map(history_entry).collect())
+    }
+
+    async fn search_history(
+        &self,
+        query: &str,
+        conversation: Option<&str>,
+        limit: usize,
+    ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
+        let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
+        let records = self
+            .store
+            .search_messages(
+                query,
+                conversation.as_ref().map(ConversationId::as_str),
+                limit,
+            )
+            .await
+            // FTS5 rejects a malformed query rather than matching nothing, and its complaint names
+            // the offending token, so it reaches the agent instead of becoming "no results". Only
+            // that case gets the advice: attaching "try plain words" to a disk error would send the
+            // agent rewriting a query that was never the problem.
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("fts5") {
+                    SinkError::Delivery(format!(
+                        "{message}. Search for plain words, or use `a OR b`, `a NOT b`, or a \
+                         \"quoted phrase\"."
+                    ))
+                } else {
+                    SinkError::Internal(message)
+                }
+            })?;
+        Ok(records.into_iter().map(history_entry).collect())
     }
 
     async fn conversations(
@@ -888,19 +992,25 @@ impl OutboundSink for BridgeSink {
             .list_conversations(channel, limit)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        let mutes = self
+        let policies = self
             .store
-            .list_mutes()
+            .list_policies()
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        let unseen = self
+            .store
+            .unseen_counts()
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         Ok(records
             .into_iter()
             .map(|record| {
-                let mute = mutes
+                let policy = policies
                     .iter()
-                    .find(|mute| mute.conversation_id == record.id)
-                    .and_then(describe_mute);
-                summarize(record, mute)
+                    .find(|policy| policy.conversation_id == record.id)
+                    .cloned();
+                let unseen = unseen.get(&record.id).copied().unwrap_or_default();
+                self.summarize(record, policy, unseen)
             })
             .collect())
     }
@@ -917,27 +1027,36 @@ impl OutboundSink for BridgeSink {
         let Some(record) = record else {
             return Ok(None);
         };
-        let mute = self
+        let policy = self
             .store
-            .mute(&record.id)
+            .policy(&record.id)
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        let unseen = self
+            .store
+            .unseen_counts()
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?
-            .as_ref()
-            .and_then(describe_mute);
-        Ok(Some(summarize(record, mute)))
+            .get(&record.id)
+            .copied()
+            .unwrap_or_default();
+        Ok(Some(self.summarize(record, policy, unseen)))
     }
 }
 
-/// How a mute is reported to the agent, or `None` once it has lapsed.
-///
-/// Expiry is resolved here rather than in SQL for the same reason the writer resolves it: a lapsed
-/// row is left in place until the next message clears it, so listing has to ignore one that is only
-/// still there because nothing has arrived since.
-fn describe_mute(mute: &crate::store::MuteRecord) -> Option<String> {
-    match mute.until {
-        Some(until) if until <= Utc::now() => None,
-        Some(until) => Some(until.to_rfc3339()),
-        None => Some("indefinite".to_string()),
+/// Translate a stored message into what the history tools hand back.
+fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
+    HistoryEntry {
+        conversation: record.conversation_id,
+        message_id: record.message_id,
+        sender: record.sender_name,
+        sender_id: record.sender_id,
+        text: record.text,
+        notes: record.notes,
+        attachments: record.attachments,
+        addressed: record.addressed,
+        timestamp: record.timestamp.to_rfc3339(),
+        cursor: record.id,
     }
 }
 
@@ -984,18 +1103,44 @@ fn sanitize_file_stem(file_ref: &str) -> String {
     }
 }
 
-fn summarize(
-    record: crate::store::ConversationRecord,
-    muted_until: Option<String>,
-) -> ConversationSummary {
-    ConversationSummary {
-        id: record.id,
-        channel: record.channel_id,
-        platform: record.platform,
-        title: record.title,
-        kind: record.kind,
-        last_inbound_at: record.last_inbound_at.map(|at| at.to_rfc3339()),
-        last_outbound_at: record.last_outbound_at.map(|at| at.to_rfc3339()),
-        muted_until,
+impl BridgeSink {
+    /// Render one conversation, resolving what its policy actually is.
+    ///
+    /// A lapsed record is treated as gone here rather than reported: it stays in the table until
+    /// the next message from that chat clears it, so listing has to ignore one that is only
+    /// still there because nothing has arrived since. What is left is the configured default
+    /// for the chat's kind, which is also the answer for a conversation nobody has ruled on.
+    fn summarize(
+        &self,
+        record: crate::store::ConversationRecord,
+        policy: Option<crate::store::PolicyRecord>,
+        unseen: u64,
+    ) -> ConversationSummary {
+        let live = policy.filter(|policy| !policy.expired(Utc::now()));
+        let kind = match record.kind.as_str() {
+            "direct" => ChatKind::Direct,
+            "group" => ChatKind::Group,
+            "channel" => ChatKind::Channel,
+            _ => ChatKind::Unknown,
+        };
+        let effective = live.as_ref().map_or_else(
+            || self.default_policy.for_kind(kind),
+            |policy| policy.policy,
+        );
+        ConversationSummary {
+            id: record.id,
+            channel: record.channel_id,
+            platform: record.platform,
+            title: record.title,
+            kind: record.kind,
+            last_inbound_at: record.last_inbound_at.map(|at| at.to_rfc3339()),
+            last_outbound_at: record.last_outbound_at.map(|at| at.to_rfc3339()),
+            policy: effective.as_str().to_string(),
+            policy_until: live.map(|policy| match policy.until {
+                Some(until) => until.to_rfc3339(),
+                None => "indefinite".to_string(),
+            }),
+            unseen,
+        }
     }
 }

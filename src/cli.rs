@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     config::{Config, LogFormat, default_config_path},
     error::Result,
+    store::Policy,
 };
 
 /// Default row cap for the listing commands.
@@ -85,10 +86,24 @@ pub enum Command {
         command: ConversationsCommand,
     },
 
-    /// Inspect or lift the mutes the agent has set on conversations.
-    Mute {
+    /// Inspect or override how much of a conversation reaches the agent.
+    Policy {
         #[command(subcommand)]
-        command: MuteCommand,
+        command: PolicyCommand,
+    },
+
+    /// Read back what a conversation has said, including what the agent was never woken for.
+    History {
+        /// Conversation id, for example `telegram:-1001234567890`.
+        conversation: String,
+
+        /// Maximum messages to print.
+        #[arg(long, default_value_t = DEFAULT_LIST_LIMIT)]
+        limit: usize,
+
+        /// Only show messages matching these words.
+        #[arg(long)]
+        search: Option<String>,
     },
 
     /// Inspect or reset the agent's session.
@@ -138,31 +153,62 @@ pub enum ConversationsCommand {
     },
 }
 
-/// Operator control over mutes.
+/// How much of a conversation reaches the agent, selectable from the command line.
 ///
-/// The agent sets these itself, so this exists as the way back: a conversation muted indefinitely
-/// is otherwise unreachable, including the one an operator would use to ask the agent to undo it.
+/// Mirrors `store::Policy` rather than deriving `ValueEnum` on it, so the store stays free of a
+/// dependency on the argument parser. `LogFormatArg` does the same for `[log].format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PolicyArg {
+    /// Wake the agent for every message.
+    Active,
+    /// Record everything, but only wake the agent when it is mentioned or replied to.
+    Mute,
+    /// Deliver nothing and keep nothing.
+    Block,
+}
+
+impl From<PolicyArg> for Policy {
+    fn from(value: PolicyArg) -> Self {
+        match value {
+            PolicyArg::Active => Self::Active,
+            PolicyArg::Mute => Self::Mute,
+            PolicyArg::Block => Self::Block,
+        }
+    }
+}
+
+/// Operator control over attention policies.
+///
+/// The agent sets these itself, so this exists as the way back: a conversation it muted or blocked
+/// indefinitely is otherwise unreachable, including the one an operator would use to ask it to undo
+/// them.
 #[derive(Debug, Subcommand)]
-pub enum MuteCommand {
-    /// List muted conversations.
+pub enum PolicyCommand {
+    /// List the configured defaults and every conversation with a policy of its own.
     List,
 
-    /// Mute a conversation.
-    Add {
+    /// Give one conversation a policy, overriding the default for its kind.
+    Set {
         /// Conversation id, for example `telegram:-1001234567890`.
         conversation: String,
 
-        /// How long, as a duration like `30m` or `7d`. Omit to mute indefinitely.
+        /// What should reach the agent from it.
+        policy: PolicyArg,
+
+        /// How long, as a duration like `30m` or `7d`. Omit to leave it until it is changed.
         #[arg(long)]
         duration: Option<String>,
 
-        /// Note recorded alongside the mute.
+        /// Note recorded alongside the policy.
         #[arg(long)]
         reason: Option<String>,
     },
 
-    /// Lift the mute on a conversation.
-    Rm {
+    /// Drop a conversation's own policy so it follows the configured default again.
+    ///
+    /// Not the same as setting it to `active`: for a group the default is normally `mute`, so this
+    /// returns it to mention-only rather than making it wake the agent for everything.
+    Clear {
         /// Conversation id.
         conversation: String,
     },
@@ -255,23 +301,32 @@ async fn dispatch(command: Command, config: Config) -> Result<()> {
                 commands::conversations_list(&config, channel.as_deref(), limit).await
             }
         },
-        Command::Mute { command } => match command {
-            MuteCommand::List => commands::mute_list(&config).await,
-            MuteCommand::Add {
+        Command::Policy { command } => match command {
+            PolicyCommand::List => commands::policy_list(&config).await,
+            PolicyCommand::Set {
                 conversation,
+                policy,
                 duration,
                 reason,
             } => {
-                commands::mute_add(
+                commands::policy_set(
                     &config,
                     &conversation,
+                    policy.into(),
                     duration.as_deref(),
                     reason.as_deref(),
                 )
                 .await
             }
-            MuteCommand::Rm { conversation } => commands::mute_rm(&config, &conversation).await,
+            PolicyCommand::Clear { conversation } => {
+                commands::policy_clear(&config, &conversation).await
+            }
         },
+        Command::History {
+            conversation,
+            limit,
+            search,
+        } => commands::history_show(&config, &conversation, limit, search.as_deref()).await,
         Command::Session { command } => match command {
             SessionCommand::Show => commands::session_show(&config).await,
             SessionCommand::Reset { yes } => commands::session_reset(&config, yes).await,

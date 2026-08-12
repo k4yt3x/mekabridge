@@ -29,10 +29,10 @@ use mekabridge::{
         ChannelIdentity, ChannelRegistry, ChatKind, ConversationId, FetchedFile, InboundEvent,
         InboundMessage, Platform, SendOptions, Sender,
     },
-    config::{Config, StorageConfig},
+    config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
-    store::{ConversationRecord, Store},
+    store::{ConversationRecord, Policy, Store},
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -452,6 +452,7 @@ fn sink_with_storage(
         attachment_dir,
         attachment_max_bytes: 20 * 1024 * 1024,
         attachment_retention: Duration::from_secs(86_400),
+        history_retention: Duration::from_secs(86_400),
     };
     let meka = MekaClient::new(
         &config_for(
@@ -462,7 +463,18 @@ fn sink_with_storage(
         .meka,
     )
     .expect("client builds");
-    BridgeSink::new(store, channels, storage, meka, presence)
+    BridgeSink::new(
+        store,
+        channels,
+        storage,
+        DefaultPolicy {
+            direct: Policy::Active,
+            group: Policy::Mute,
+            channel: Policy::Mute,
+        },
+        meka,
+        presence,
+    )
 }
 
 fn config_for(meka_address: SocketAddr, database: &std::path::Path, retries: u32) -> Config {
@@ -513,6 +525,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
             on_behalf_of_chat: false,
         },
         admission: Admission::User,
+        addressed: false,
         text: text.to_string(),
         reply_to: None,
         edited_at: None,
@@ -1072,14 +1085,113 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
     );
 }
 
+/// A message that names the agent, which is what wakes a muted conversation.
+fn mention(text: &str, external_id: &str) -> InboundEvent {
+    let mut event = message(text, external_id);
+    let InboundEvent::Message(inner) = &mut event;
+    inner.addressed = true;
+    event
+}
+
+/// A message in a group nobody has ruled on, which is the shape an upgrade inherits.
+fn group_message(text: &str, external_id: &str, addressed: bool) -> InboundEvent {
+    let mut event = message(text, external_id);
+    let InboundEvent::Message(inner) = &mut event;
+    inner.conversation = ConversationId::parse("mock:-100").expect("valid");
+    inner.chat_kind = ChatKind::Group;
+    inner.chat_title = Some("Ops".to_string());
+    inner.addressed = addressed;
+    event
+}
+
 #[tokio::test]
-async fn a_muted_conversation_never_reaches_the_agent() {
+async fn a_group_nobody_has_ruled_on_follows_the_configured_default() {
+    // The behaviour every pre-existing group inherits on upgrade. There is no row for it in
+    // `conversation_policy` and nothing backfills one, so it falls to
+    // `[bridge.default_policy].group` the first time somebody speaks. Getting this wrong would
+    // either keep costing a turn per message, which is the problem this release exists to fix,
+    // or silence a group that was never meant to be quiet.
+    let harness = Harness::start(1, 0).await;
+    assert!(
+        harness
+            .store
+            .policy("mock:-100")
+            .await
+            .expect("read")
+            .is_none(),
+        "the premise: nothing has ruled on this group"
+    );
+
+    for index in 0..3 {
+        harness
+            .sender
+            .send(group_message(
+                &format!("chatter {index}"),
+                &index.to_string(),
+                false,
+            ))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.turns().is_empty(),
+        "a group defaults to mentions only, so ordinary talk must not cost a turn: {:?}",
+        harness.turns()
+    );
+    assert_eq!(
+        harness
+            .store
+            .history("mock:-100", 10, None)
+            .await
+            .expect("read")
+            .len(),
+        3,
+        "withheld, not discarded: the default is mute rather than block"
+    );
+
+    harness
+        .sender
+        .send(group_message("@bot are you there?", "9", true))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn a mention woke", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+    let envelope = harness.turns()[0].clone();
+    assert!(envelope.contains("are you there?"), "got:\n{envelope}");
+    assert!(
+        envelope.contains("3 messages you have not seen"),
+        "got:\n{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_chat_nobody_has_ruled_on_still_wakes_the_agent_for_everything() {
+    // The other half of the default. A one-to-one chat has nobody else in it, so applying the group
+    // default there would silence the agent against the only person talking to it.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .sender
+        .send(message("just checking in", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+    assert!(harness.turns()[0].contains("just checking in"));
+}
+
+#[tokio::test]
+async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_mute("mock:1", None, Some("too noisy"), Utc::now())
+        .set_policy("mock:1", Policy::Block, None, Some("too noisy"), Utc::now())
         .await
-        .expect("mute");
+        .expect("block");
 
     for index in 0..5 {
         harness
@@ -1093,78 +1205,295 @@ async fn a_muted_conversation_never_reaches_the_agent() {
 
     assert!(
         harness.turns().is_empty(),
-        "a muted chat must not wake the agent: {:?}",
+        "a blocked chat must not wake the agent: {:?}",
         harness.turns()
     );
     let stats = harness.store.queue_stats().await.expect("stats");
     assert_eq!(
         stats.pending, 0,
-        "muted messages must not consume queue depth either"
+        "blocked messages must not consume queue depth either"
     );
-    let mute = harness
-        .store
-        .mute("mock:1")
-        .await
-        .expect("read")
-        .expect("still muted");
-    assert_eq!(mute.dropped, 5);
+    assert!(
+        harness
+            .store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .is_empty(),
+        "block keeps nothing, which is the whole difference from mute"
+    );
+    let policies = harness.store.list_policies().await.expect("list");
+    assert_eq!(policies[0].dropped, 5);
 }
 
 #[tokio::test]
-async fn an_expired_mute_lets_the_next_message_through_and_reports_the_damage() {
+async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_mute("mock:1", None, None, Utc::now())
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
+
+    for index in 0..3 {
+        harness
+            .sender
+            .send(message(&format!("chatter {index}"), &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.turns().is_empty(),
+        "ordinary talk in a muted chat must not cost a turn: {:?}",
+        harness.turns()
+    );
+    assert_eq!(
+        harness
+            .store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .len(),
+        3,
+        "withheld is not discarded: the agent has to be able to read it later"
+    );
+
     harness
         .sender
-        .send(message("while muted", "1"))
-        .await
-        .expect("queued");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(harness.turns().is_empty());
-
-    // Backdate the expiry rather than sleeping through a real one.
-    harness
-        .store
-        .set_mute(
-            "mock:1",
-            Some(Utc::now() - chrono::Duration::seconds(1)),
-            None,
-            Utc::now(),
-        )
-        .await
-        .expect("mute");
-    harness
-        .store
-        .note_muted_drop("mock:1")
-        .await
-        .expect("drop count");
-
-    harness
-        .sender
-        .send(message("after the mute", "2"))
+        .send(mention("@bot what do you think about that?", "9"))
         .await
         .expect("queued");
     harness
-        .wait_for("the turn after the mute expired", |harness| {
+        .wait_for("the turn a mention woke", |harness| {
             !harness.turns().is_empty()
         })
         .await;
 
     let turns = harness.turns();
     let envelope = turns.first().expect("one turn");
-    assert!(envelope.contains("after the mute"), "got:\n{envelope}");
+    assert_eq!(turns.len(), 1, "only the mention should have woken it");
+    assert!(envelope.contains("what do you think"), "got:\n{envelope}");
     assert!(
-        envelope.contains("1 message was dropped while it was muted"),
-        "the agent has to be told the mute did something, or it cannot judge whether to renew \
+        envelope.contains("3 messages you have not seen"),
+        "the count of what was withheld has to be stated:\n{envelope}"
+    );
+    assert!(
+        envelope.contains("chatter 2"),
+        "the lookback is what makes a bare mention answerable:\n{envelope}"
+    );
+    assert!(
+        envelope.contains("read_history"),
+        "the agent has to be told how to reach the rest:\n{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn a_muted_conversation_keeps_answering_for_a_while_after_the_agent_speaks() {
+    // Without this an exchange dies mid-sentence: the agent answers a mention, the person replies
+    // without mentioning it again, and it never sees the reply.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+
+    // What `note_sent` does after the agent's own message lands.
+    harness
+        .store
+        .touch_outbound(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: None,
+            kind: ChatKind::Unknown.as_str().to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: None,
+            last_outbound_at: Some(Utc::now()),
+        })
+        .await
+        .expect("outbound");
+
+    harness
+        .sender
+        .send(message("no, I meant the other one", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the follow-up turn", |harness| !harness.turns().is_empty())
+        .await;
+    assert!(
+        harness.turns()[0].contains("the other one"),
+        "a reply inside the window must land without a second mention"
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_window_that_has_closed_stops_waking_the_agent() {
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+    // Backdated well past the configured window rather than sleeping through a real one.
+    harness
+        .store
+        .touch_outbound(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: None,
+            kind: ChatKind::Unknown.as_str().to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: None,
+            last_outbound_at: Some(Utc::now() - chrono::Duration::hours(2)),
+        })
+        .await
+        .expect("outbound");
+
+    harness
+        .sender
+        .send(message("unrelated chatter", "1"))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.turns().is_empty(),
+        "a chat the agent stopped answering has to go quiet again: {:?}",
+        harness.turns()
+    );
+}
+
+#[tokio::test]
+async fn unmuting_reports_the_backlog_once_and_then_stops() {
+    // The trap: `unseen` is only ever cleared by the turn that reports it, so a conversation that
+    // stops being muted with a backlog behind it would keep that count for the rest of its life and
+    // `list_conversations` would go on quoting it.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+    for index in 0..4 {
+        harness
+            .sender
+            .send(message(&format!("while muted {index}"), &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(harness.turns().is_empty());
+
+    harness
+        .store
+        .set_policy("mock:1", Policy::Active, None, None, Utc::now())
+        .await
+        .expect("unmute");
+    harness
+        .sender
+        .send(message("now listening again", "9"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the first turn after unmuting", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    let envelope = harness.turns()[0].clone();
+    assert!(
+        envelope.contains("4 messages in mock:1 were recorded"),
+        "the backlog has to be reported once:\n{envelope}"
+    );
+    assert!(
+        !envelope.contains("only woken for mentions"),
+        "it is not muted any more:\n{envelope}"
+    );
+
+    harness
+        .sender
+        .send(message("and again", "10"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the second turn", |harness| harness.turns().len() > 1)
+        .await;
+    assert!(
+        !harness.turns()[1].contains("were recorded"),
+        "the backlog must be cleared by the turn that reported it: {:?}",
+        harness.turns()[1]
+    );
+}
+
+#[tokio::test]
+async fn an_expired_block_lets_the_next_message_through_and_reports_the_damage() {
+    let harness = Harness::start(1, 0).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Block, None, None, Utc::now())
+        .await
+        .expect("block");
+    harness
+        .sender
+        .send(message("while blocked", "1"))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(harness.turns().is_empty());
+
+    // Backdate the expiry rather than sleeping through a real one. Re-ruling resets the tally, so
+    // the drop is counted afterwards.
+    harness
+        .store
+        .set_policy(
+            "mock:1",
+            Policy::Block,
+            Some(Utc::now() - chrono::Duration::seconds(1)),
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("block");
+    harness
+        .store
+        .note_blocked_drop("mock:1")
+        .await
+        .expect("drop count");
+
+    harness
+        .sender
+        .send(message("after the block", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn after the block expired", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    let turns = harness.turns();
+    let envelope = turns.first().expect("one turn");
+    assert!(envelope.contains("after the block"), "got:\n{envelope}");
+    assert!(
+        envelope.contains("1 message was discarded while it was blocked"),
+        "the agent has to be told the block did something, or it cannot judge whether to renew \
          it:\n{envelope}"
     );
     assert!(
-        harness.store.mute("mock:1").await.expect("read").is_none(),
-        "a lapsed mute must be cleared once it has been reported"
+        harness
+            .store
+            .policy("mock:1")
+            .await
+            .expect("read")
+            .is_none(),
+        "a lapsed policy must be cleared once it has been reported"
     );
 }
 

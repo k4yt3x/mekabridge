@@ -17,8 +17,9 @@ use mekabridge::{
     channel::MemberStatus,
     config::{McpConfig, McpTransport},
     mcp::{
-        ChatSettings, ConversationSummary, DownloadedAttachment, MemberAction, MemberInfo,
-        MemberRight, OutboundSink, SendOptions, SinkError, ToolSurface, ViewedAttachment, serve,
+        ChatSettings, ConversationSummary, DownloadedAttachment, HistoryEntry, MemberAction,
+        MemberInfo, MemberRight, OutboundSink, Policy, SendOptions, SinkError, ToolSurface,
+        ViewedAttachment, serve,
     },
 };
 use rmcp2::{
@@ -39,7 +40,8 @@ struct RecordingSink {
     deletes: Mutex<Vec<String>>,
     #[allow(clippy::type_complexity)]
     moderations: Mutex<Vec<(String, MemberAction, Option<chrono::DateTime<chrono::Utc>>)>>,
-    mutes: Mutex<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>>,
+    #[allow(clippy::type_complexity)]
+    policies: Mutex<Vec<(String, Policy, Option<chrono::DateTime<chrono::Utc>>)>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -51,7 +53,9 @@ fn summary(id: &str) -> ConversationSummary {
         kind: "direct".to_string(),
         last_inbound_at: Some("2026-08-05T12:00:00Z".to_string()),
         last_outbound_at: None,
-        muted_until: None,
+        policy: "active".to_string(),
+        policy_until: None,
+        unseen: 0,
     }
 }
 
@@ -232,28 +236,53 @@ impl OutboundSink for RecordingSink {
         })
     }
 
-    async fn mute(
+    async fn set_policy(
         &self,
         conversation: &str,
+        policy: Policy,
         until: Option<chrono::DateTime<chrono::Utc>>,
         _reason: Option<&str>,
-    ) -> Result<(), SinkError> {
-        let mut mutes = self
-            .mutes
+    ) -> Result<Option<Policy>, SinkError> {
+        let mut policies = self
+            .policies
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        mutes.push((conversation.to_string(), until));
-        Ok(())
+        let previous = policies
+            .iter()
+            .find(|(ruled, ..)| ruled == conversation)
+            .map(|(_, policy, _)| *policy);
+        policies.retain(|(ruled, ..)| ruled != conversation);
+        policies.push((conversation.to_string(), policy, until));
+        Ok(previous)
     }
 
-    async fn unmute(&self, conversation: &str) -> Result<bool, SinkError> {
-        let mut mutes = self
-            .mutes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = mutes.len();
-        mutes.retain(|(muted, _)| muted != conversation);
-        Ok(mutes.len() != before)
+    async fn read_history(
+        &self,
+        conversation: &str,
+        _limit: usize,
+        _before: Option<i64>,
+    ) -> Result<Vec<HistoryEntry>, SinkError> {
+        Ok(vec![HistoryEntry {
+            conversation: conversation.to_string(),
+            message_id: "41".to_string(),
+            sender: "Alice".to_string(),
+            sender_id: Some("111".to_string()),
+            text: "the deploy is stuck".to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            timestamp: "2026-08-11T09:30:00+00:00".to_string(),
+            cursor: 41,
+        }])
+    }
+
+    async fn search_history(
+        &self,
+        _query: &str,
+        _conversation: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<HistoryEntry>, SinkError> {
+        Ok(Vec::new())
     }
 }
 
@@ -359,6 +388,7 @@ async fn turning_off_admin_tools_removes_exactly_those() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
+        "block",
         "delete_message",
         "download_attachment",
         "edit_message",
@@ -366,8 +396,11 @@ async fn turning_off_admin_tools_removes_exactly_those() {
         "list_conversations",
         "mute",
         "react",
+        "read_history",
+        "search_history",
         "send_file",
         "send_message",
+        "unblock",
         "unmute",
         "view_attachment",
     ]);
@@ -384,6 +417,7 @@ async fn all_tools_are_visible_to_an_older_client() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
+        "block",
         "delete_message",
         "download_attachment",
         "edit_message",
@@ -394,10 +428,13 @@ async fn all_tools_are_visible_to_an_older_client() {
         "mute",
         "pin_message",
         "react",
+        "read_history",
+        "search_history",
         "send_file",
         "send_message",
         "set_chat",
         "set_member_rights",
+        "unblock",
         "unmute",
         "view_attachment",
     ]);
@@ -454,6 +491,96 @@ async fn input_schemas_survive_negotiation() {
         .unwrap_or_default();
     assert!(required.contains(&"conversation"), "schema: {schema}");
     assert!(required.contains(&"text"), "schema: {schema}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn the_history_cursor_survives_the_version_gap() {
+    // `before` is a number, and every other tool argument this bridge takes is a string. Serde and
+    // schemars agree locally, but meka's client is a major version behind and it is the one that
+    // validates arguments in production, so the numeric form is exercised over a real socket.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list works");
+    let read = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "read_history")
+        .expect("read_history is advertised");
+    let schema = serde_json::to_value(&*read.input_schema).expect("schema serializes");
+    assert_eq!(
+        schema["properties"]["before"]["type"],
+        serde_json::json!(["integer", "null"]),
+        "an older client has to see the cursor as a number: {schema}"
+    );
+
+    let result = client
+        .call_tool(tool_params(
+            "read_history",
+            serde_json::json!({"conversation": "telegram:1", "before": 8212, "limit": 5}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+
+    // And the cursor has to come back out, or there is nothing to page with.
+    let text = result
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|text| text.text.clone()))
+        .expect("a text block");
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("the result is JSON");
+    assert_eq!(parsed[0]["cursor"], 41, "got: {text}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn the_policy_tools_round_trip_across_the_version_gap() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    for (tool, expected) in [("mute", Policy::Mute), ("block", Policy::Block)] {
+        let result = client
+            .call_tool(tool_params(
+                tool,
+                serde_json::json!({"conversation": "telegram:1", "duration": "2h"}),
+            ))
+            .await
+            .expect("the call must succeed");
+        assert_eq!(result.is_error, Some(false), "for {tool}");
+
+        let recorded = {
+            let policies = harness
+                .sink
+                .policies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            policies.clone()
+        };
+        assert_eq!(recorded.len(), 1, "each decision replaces the last");
+        assert_eq!(recorded[0].1, expected, "for {tool}");
+        assert!(recorded[0].2.is_some(), "the duration must survive: {tool}");
+    }
+
+    let result = client
+        .call_tool(tool_params(
+            "unblock",
+            serde_json::json!({"conversation": "telegram:1"}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+    let recorded = {
+        let policies = harness
+            .sink
+            .policies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        policies.clone()
+    };
+    assert_eq!(recorded[0].1, Policy::Active);
 
     client.cancel().await.expect("clean shutdown");
 }

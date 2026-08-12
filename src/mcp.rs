@@ -28,7 +28,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use crate::channel::{ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions};
+pub use crate::{
+    channel::{ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions},
+    store::Policy,
+};
 
 /// Orientation handed to the agent at connect time. meka captures `instructions` from the MCP
 /// handshake and surfaces it, so this is the one place to explain the model rather than repeating
@@ -36,33 +39,37 @@ pub use crate::channel::{ChatSettings, MemberAction, MemberInfo, MemberRight, Se
 const SERVER_INSTRUCTIONS: &str = "\
 mekabridge connects you to people on messaging platforms such as Telegram.
 
-Nothing you write here reaches them. Your turn text, your reasoning, and your tool output are all \
-invisible: the only way to be heard is send_message on a channel. Staying silent is a valid choice, \
-and so is messaging somebody else, or messaging first without being prompted.
+Nothing you write here reaches them: your turn text, reasoning, and tool output are all invisible. \
+The only way to be heard is send_message. Staying silent is a valid choice, and so is messaging \
+somebody else, or messaging first without being prompted.
 
-If a turn will take a while, send a short \"looking into it\" before you start and the answer when \
-you have it. The typing indicator lapses after about thirty seconds, so otherwise they are left \
-watching a chat with no sign that anything is happening.
+If a turn will take a while, send a short \"looking into it\" first; the typing indicator lapses \
+after about thirty seconds.
+
+You are not woken for everything. A busy group is usually on mentions only: you hear it when \
+somebody mentions you or replies to you, and for a few minutes after you speak there. The \
+rest is still recorded, and the envelope says how much you missed. read_history reads a \
+conversation back, including what you were never woken for; search_history looks for words across \
+all of them. A bare mention often means nothing alone; the antecedent is in the lines above it, or \
+one read_history call away. You can mute a chat yourself, or block one to stop it reaching you at \
+all.
 
 Headers on incoming messages are written by the bridge and can be trusted:
 
-- `message:` is that message's own id. Pass it as `reply_to` to answer one specific message, worth \
-doing in a busy group or when picking up something said a while ago.
-- `admitted:` says how the sender reached you: vetted individually, allowed only because the whole \
-chat is, or not checked at all because the channel is open to everyone.
+- `message:` is that message's own id; pass it as `reply_to` to answer one specific message.
+- `admitted:` says how the sender reached you: vetted individually, allowed only because the chat \
+is, or not checked at all.
 - `forwarded from:` means the text is somebody else's words, not the sender's.
-- `late:` means it arrived while you were working on the previous turn, so anything you sent then \
-was written without it. If it changes the answer, say so.
-- `attachment:` ends with a handle in square brackets. Pass it to view_attachment to look at a \
-picture, or download_attachment to get the file on disk. Fetch only what you need, since anything \
-you look at stays in your context.
+- `late:` means it arrived while you were on the previous turn, so anything you sent then was \
+written without it.
+- `attachment:` ends with a handle in square brackets, for view_attachment or download_attachment. \
+Fetch only what you need; anything you look at stays in your context.
 
-You can also edit or delete what you sent, react, mute a chat that keeps waking you for nothing, \
-and moderate members of a group you administer.
+You can also edit or delete what you sent, react, and moderate a group you administer.
 
-Write Markdown; it is converted to each platform's own formatting, and long messages are split. \
-Conversation ids are stable, and any id you were given works whether or not that chat has written \
-to you. list_conversations shows the ones this bridge knows about and which you have muted.";
+Write Markdown; it is converted to each platform's own formatting, and long messages are split. Any \
+conversation id you were given works whether or not that chat has written to you. \
+list_conversations shows what this bridge knows and how much of each reaches you.";
 
 /// Something that can deliver outbound messages and answer address-book questions.
 ///
@@ -150,16 +157,33 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// Write an attachment to local disk and report where it landed.
     async fn download_attachment(&self, handle: &str) -> Result<DownloadedAttachment, SinkError>;
 
-    /// Stop delivering messages from a conversation. `until` of `None` is indefinite.
-    async fn mute(
+    /// Rule on how much of a conversation reaches the agent. `until` of `None` is indefinite.
+    ///
+    /// Reports the decision that was in place before, or `None` when the conversation was following
+    /// the configured default. That is what lets `unmute` say whether it changed anything.
+    async fn set_policy(
         &self,
         conversation: &str,
+        policy: Policy,
         until: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
-    ) -> Result<(), SinkError>;
+    ) -> Result<Option<Policy>, SinkError>;
 
-    /// Resume delivery. Reports whether a mute was actually in place.
-    async fn unmute(&self, conversation: &str) -> Result<bool, SinkError>;
+    /// Read a conversation back, oldest first, ending before the cursor when one is given.
+    async fn read_history(
+        &self,
+        conversation: &str,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Vec<HistoryEntry>, SinkError>;
+
+    /// Search recorded messages, best matches first. `conversation` narrows to one chat.
+    async fn search_history(
+        &self,
+        query: &str,
+        conversation: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, SinkError>;
 
     /// Known conversations, most recently active first.
     async fn conversations(
@@ -187,10 +211,46 @@ pub struct ConversationSummary {
     pub last_inbound_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_outbound_at: Option<String>,
-    /// Set while the agent is not being woken for this conversation. `"indefinite"` when no expiry
-    /// was given, otherwise the time it lapses.
+    /// How much of this conversation reaches the agent: `active`, `mute`, or `block`.
+    pub policy: String,
+    /// Set when the policy came from an explicit decision rather than from the configured default
+    /// for this kind of chat. `"indefinite"` when no expiry was given, otherwise the time it
+    /// lapses.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub muted_until: Option<String>,
+    pub policy_until: Option<String>,
+    /// Messages recorded here that the agent has not been shown. Only ever non-zero under `mute`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unseen: u64,
+}
+
+const fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
+/// One recorded message, as the history tools hand it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryEntry {
+    /// Which conversation it was said in. Present even on a single-conversation read, because a
+    /// search spans several.
+    pub conversation: String,
+    /// Platform message id, so this can be replied to, reacted to, or quoted.
+    pub message_id: String,
+    pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    pub text: String,
+    /// Descriptor for content with no text of its own, such as a shared location or a poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Handles for files this message brought, usable with view_attachment and download_attachment
+    /// while they are still within the retention period.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+    /// Whether this one was aimed at the agent.
+    pub addressed: bool,
+    pub timestamp: String,
+    /// Opaque marker for paging. Pass the oldest one back as `before` to read further back.
+    pub cursor: i64,
 }
 
 /// An attachment resolved for viewing.
@@ -250,6 +310,32 @@ pub enum SinkError {
 
     #[error("{0}")]
     Internal(String),
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadHistoryArgs {
+    /// Conversation to read, for example `telegram:-1001234567890`.
+    pub conversation: String,
+    /// How many messages to return, most recent first. Defaults to 20.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Read further back instead of the most recent: pass the `cursor` of the oldest message you
+    /// were given. It is a marker, not a time, because several messages routinely share one
+    /// timestamp and paging on that would skip them.
+    #[serde(default)]
+    pub before: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchHistoryArgs {
+    /// Words to look for. `a OR b`, `a NOT b`, and "quoted phrases" work.
+    pub query: String,
+    /// Restrict the search to one conversation. Omit to search every conversation.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// How many matches to return, best first. Defaults to 20.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -388,11 +474,13 @@ pub struct AttachmentArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+/// Shared by `mute` and `block`, so the wording here stays neutral between them. The tool's own
+/// description says which of the two is being asked for.
 pub struct MuteArgs {
-    /// Conversation to stop hearing from.
+    /// Conversation to turn down.
     pub conversation: String,
-    /// How long to stay muted, as a duration like `30m`, `2h`, or `7d`. Omit to mute indefinitely,
-    /// which lasts until you unmute it.
+    /// How long this lasts, as a duration like `30m`, `2h`, or `7d`. Omit to leave it in place
+    /// until you undo it.
     #[serde(default)]
     pub duration: Option<String>,
     /// Why, for your own reference when you list conversations later.
@@ -431,6 +519,11 @@ const SESSION_META_KEY: &str = "meka/sessionId";
 /// cannot push a huge blob into the agent's context.
 const MAX_CONVERSATION_LIMIT: usize = 200;
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
+
+/// Same guard for the history tools, and tighter, because these return whole messages rather than
+/// one-line summaries and every one of them lands in the agent's context.
+const MAX_HISTORY_LIMIT: usize = 100;
+const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 /// Which optional groups of tools to offer.
 ///
@@ -477,6 +570,69 @@ impl BridgeMcpServer {
             }
         }
         Self { sink, tool_router }
+    }
+
+    /// Shared body of mute, unmute, block, and unblock.
+    ///
+    /// Four tools rather than one with a level argument, because a tool list is the only place the
+    /// agent learns what it can do and named verbs read better there than an enum. They differ only
+    /// in the policy they set, so the wording of the result is decided here in one place.
+    async fn rule(
+        &self,
+        policy: Policy,
+        conversation: &str,
+        duration: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let until = match parse_duration(duration) {
+            Ok(until) => until,
+            Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        };
+        let previous = match self
+            .sink
+            .set_policy(conversation, policy, until, reason)
+            .await
+        {
+            Ok(previous) => previous,
+            Err(error) => return Ok(sink_failure(&error)),
+        };
+
+        let lapses = match until {
+            Some(until) => format!(" until {}", until.to_rfc3339()),
+            None => String::new(),
+        };
+        let message = match policy {
+            Policy::Mute => format!(
+                "Muted {conversation}{lapses}. You will still be woken when somebody mentions you \
+                 or replies to you there, and everything else is recorded for read_history."
+            ),
+            Policy::Block => format!(
+                "Blocked {conversation}{lapses}. Nothing from it will reach you, and nothing said \
+                 meanwhile is kept."
+            ),
+            // Both undo tools land here, so the answer says what changed rather than which verb was
+            // used. Saying nothing changed when the conversation was already active is worth the
+            // extra branch: it is the difference between "I lifted it" and "there was nothing to
+            // lift".
+            Policy::Active => match previous {
+                Some(Policy::Mute) => {
+                    format!("{conversation} is no longer muted; you will be woken for everything.")
+                }
+                Some(Policy::Block) => {
+                    format!(
+                        "{conversation} is no longer blocked; you will be woken for everything."
+                    )
+                }
+                Some(Policy::Active) => {
+                    format!("{conversation} was already set to wake you for everything.")
+                }
+                None => format!(
+                    "{conversation} had no setting of its own and now wakes you for everything, \
+                     which may differ from the default for this kind of chat."
+                ),
+            },
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 
     /// Send a chat message.
@@ -971,14 +1127,16 @@ impl BridgeMcpServer {
         }
     }
 
-    /// Stop being woken by a conversation.
+    /// Stop being woken by everything a conversation says.
     #[tool(
-        description = "Stop receiving messages from a conversation, so a noisy chat does not \
-                       interrupt you. Messages sent while it is muted are discarded rather than \
-                       held, and you are told how many when the mute lapses. `duration` is \
-                       something like `30m`, `2h`, or `7d`; omit it to mute until you unmute. Use \
-                       this on a group that keeps waking you for nothing, not on someone who is \
-                       simply asking for something you would rather not do.",
+        description = "Turn a conversation down to mentions only, the way you would mute a busy \
+                       group on your own phone. You are still woken when somebody mentions you or \
+                       replies to you, and for a few minutes after you have spoken there so a \
+                       back-and-forth is not cut off. Everything else is recorded rather than \
+                       discarded: read_history and search_history reach it, and you are told how \
+                       much you missed when something does wake you. `duration` is something like \
+                       `2h` or `7d`; omit it to leave it muted until you unmute. Use block instead \
+                       if you want a chat to stop reaching you at all.",
         annotations(
             title = "Mute conversation",
             read_only_hint = true,
@@ -989,37 +1147,19 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<MuteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let until = match parse_duration(args.duration.as_deref()) {
-            Ok(until) => until,
-            Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
-        };
-        match self
-            .sink
-            .mute(&args.conversation, until, args.reason.as_deref())
-            .await
-        {
-            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                match until {
-                    Some(until) => format!(
-                        "Muted {} until {}. Messages sent before then are discarded, not held.",
-                        args.conversation,
-                        until.to_rfc3339()
-                    ),
-                    None => format!(
-                        "Muted {} indefinitely. Nothing from it will reach you until you unmute \
-                         it.",
-                        args.conversation
-                    ),
-                },
-            )])),
-            Err(error) => Ok(sink_failure(&error)),
-        }
+        self.rule(
+            Policy::Mute,
+            &args.conversation,
+            args.duration.as_deref(),
+            args.reason.as_deref(),
+        )
+        .await
     }
 
-    /// Start hearing from a conversation again.
+    /// Start being woken by a conversation again.
     #[tool(
-        description = "Lift a mute so a conversation can reach you again. Messages sent while it \
-                       was muted are gone; this only affects what arrives from now on.",
+        description = "Hear everything from a conversation again, undoing a mute. Anything said \
+                       while it was muted was recorded and is still readable with read_history.",
         annotations(
             title = "Unmute conversation",
             read_only_hint = true,
@@ -1030,15 +1170,126 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<UnmuteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.sink.unmute(&args.conversation).await {
-            Ok(true) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Unmuted {}.",
-                args.conversation
-            ))])),
-            Ok(false) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "{} was not muted; nothing changed.",
-                args.conversation
-            ))])),
+        self.rule(Policy::Active, &args.conversation, None, None)
+            .await
+    }
+
+    /// Stop hearing a conversation at all.
+    #[tool(
+        description = "Stop a conversation reaching you at all. Nothing from it is delivered and \
+                       nothing is kept, so unlike mute there is no way to read afterwards what was \
+                       said while it was blocked; you are only told how many messages went. \
+                       `duration` is something like `2h` or `7d`; omit it to block until you \
+                       unblock. This is the heavier of the two: prefer mute for a chat that is \
+                       merely noisy, and keep this for one there is no reason to read later.",
+        annotations(
+            title = "Block conversation",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn block(
+        &self,
+        Parameters(args): Parameters<MuteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.rule(
+            Policy::Block,
+            &args.conversation,
+            args.duration.as_deref(),
+            args.reason.as_deref(),
+        )
+        .await
+    }
+
+    /// Start hearing a blocked conversation again.
+    #[tool(
+        description = "Lift a block so a conversation can reach you again. What was said while it \
+                       was blocked is gone; this only affects what arrives from now on.",
+        annotations(
+            title = "Unblock conversation",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn unblock(
+        &self,
+        Parameters(args): Parameters<UnmuteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.rule(Policy::Active, &args.conversation, None, None)
+            .await
+    }
+
+    /// Read a conversation back.
+    #[tool(
+        description = "Read recent messages from a conversation, oldest first, including ones you \
+                       were never woken for. This is how you catch up on a muted chat: somebody \
+                       mentions you halfway through a discussion, and this is the discussion. It \
+                       reads what this bridge recorded, so it does not go back before the bridge \
+                       was installed or past the configured retention, and it holds nothing from a \
+                       chat you have blocked. Pass the oldest `cursor` you were given back as \
+                       `before` to page further back.",
+        annotations(title = "Read history", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn read_history(
+        &self,
+        Parameters(args): Parameters<ReadHistoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args
+            .limit
+            .map_or(DEFAULT_HISTORY_LIMIT, |limit| limit as usize)
+            .clamp(1, MAX_HISTORY_LIMIT);
+        match self
+            .sink
+            .read_history(&args.conversation, limit, args.before)
+            .await
+        {
+            Ok(entries) if entries.is_empty() => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Nothing recorded for {}. Either nothing has been said there since this bridge \
+                     started, it is older than the retention period, or the conversation is \
+                     blocked and nothing from it is kept.",
+                    args.conversation
+                ))]))
+            }
+            Ok(entries) => Ok(json_result(&entries)),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Search what was said.
+    #[tool(
+        description = "Search recorded messages for words, across every conversation or within \
+                       one. Use it to find something you were told a while ago, or to check what a \
+                       chat was discussing before it mentioned you. Matching is on whole words; \
+                       `a OR b`, `a NOT b`, and \"quoted phrases\" work. Same limits as \
+                       read_history: only what this bridge recorded, and nothing from a blocked \
+                       chat.",
+        annotations(
+            title = "Search history",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn search_history(
+        &self,
+        Parameters(args): Parameters<SearchHistoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args
+            .limit
+            .map_or(DEFAULT_HISTORY_LIMIT, |limit| limit as usize)
+            .clamp(1, MAX_HISTORY_LIMIT);
+        match self
+            .sink
+            .search_history(&args.query, args.conversation.as_deref(), limit)
+            .await
+        {
+            Ok(entries) if entries.is_empty() => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Nothing recorded matches {:?}.",
+                    args.query
+                ))]))
+            }
+            Ok(entries) => Ok(json_result(&entries)),
             Err(error) => Ok(sink_failure(&error)),
         }
     }
@@ -1199,9 +1450,10 @@ mod tests {
     use super::*;
     use crate::channel::ConversationId;
 
-    /// A recorded `mute` call: conversation, expiry, reason.
-    type RecordedMute = (
+    /// A recorded policy decision: conversation, policy, expiry, reason.
+    type RecordedPolicy = (
         String,
+        Policy,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
     );
@@ -1220,7 +1472,8 @@ mod tests {
         reactions: Mutex<Vec<(String, String, Option<String>)>>,
         edits: Mutex<Vec<(String, String, String)>>,
         deletes: Mutex<Vec<(String, String)>>,
-        mutes: Mutex<Vec<RecordedMute>>,
+        policies: Mutex<Vec<RecordedPolicy>>,
+        history: Vec<HistoryEntry>,
         moderations: Mutex<Vec<RecordedModeration>>,
         promotions: Mutex<Vec<(String, Vec<MemberRight>)>>,
         pins: Mutex<Vec<(String, bool)>>,
@@ -1238,7 +1491,9 @@ mod tests {
             kind: "direct".to_string(),
             last_inbound_at: Some("2026-08-05T12:00:00Z".to_string()),
             last_outbound_at: None,
-            muted_until: None,
+            policy: "active".to_string(),
+            policy_until: None,
+            unseen: 0,
         }
     }
 
@@ -1437,31 +1692,71 @@ mod tests {
             })
         }
 
-        async fn mute(
+        async fn set_policy(
             &self,
             conversation: &str,
+            policy: Policy,
             until: Option<chrono::DateTime<chrono::Utc>>,
             reason: Option<&str>,
-        ) -> Result<(), SinkError> {
+        ) -> Result<Option<Policy>, SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            let mut mutes = self
-                .mutes
+            let mut policies = self
+                .policies
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            mutes.push((conversation.to_string(), until, reason.map(str::to_string)));
-            Ok(())
+            let previous = policies
+                .iter()
+                .find(|(ruled, ..)| ruled == conversation)
+                .map(|(_, policy, ..)| *policy);
+            policies.retain(|(ruled, ..)| ruled != conversation);
+            policies.push((
+                conversation.to_string(),
+                policy,
+                until,
+                reason.map(str::to_string),
+            ));
+            Ok(previous)
         }
 
-        async fn unmute(&self, conversation: &str) -> Result<bool, SinkError> {
-            let mut mutes = self
-                .mutes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let before = mutes.len();
-            mutes.retain(|(muted, ..)| muted != conversation);
-            Ok(mutes.len() != before)
+        async fn read_history(
+            &self,
+            conversation: &str,
+            limit: usize,
+            _before: Option<i64>,
+        ) -> Result<Vec<HistoryEntry>, SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            Ok(self
+                .history
+                .iter()
+                .filter(|entry| entry.conversation == conversation)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn search_history(
+            &self,
+            query: &str,
+            conversation: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<HistoryEntry>, SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            Ok(self
+                .history
+                .iter()
+                .filter(|entry| {
+                    conversation.is_none_or(|wanted| entry.conversation == wanted)
+                        && entry.text.contains(query)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
         }
 
         async fn conversations(
@@ -1871,8 +2166,9 @@ mod tests {
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
-        let mutes = sink.mutes.lock().expect("lock");
-        let until = mutes[0].1.expect("an expiry was set");
+        let policies = sink.policies.lock().expect("lock");
+        assert_eq!(policies[0].1, Policy::Mute);
+        let until = policies[0].2.expect("an expiry was set");
         let elapsed = until - before;
         assert!(
             elapsed >= chrono::Duration::minutes(29) && elapsed <= chrono::Duration::minutes(31),
@@ -1891,8 +2187,11 @@ mod tests {
             }))
             .await
             .expect("tool runs");
-        assert!(text_of(&result).contains("indefinitely"));
-        assert_eq!(sink.mutes.lock().expect("lock")[0].1, None);
+        assert!(
+            !text_of(&result).contains("until"),
+            "no expiry should be printed"
+        );
+        assert_eq!(sink.policies.lock().expect("lock")[0].2, None);
     }
 
     #[tokio::test]
@@ -1911,12 +2210,14 @@ mod tests {
                 .expect("tool runs");
             assert_eq!(result.is_error, Some(true), "for {duration:?}");
         }
-        assert!(sink.mutes.lock().expect("lock").is_empty());
+        assert!(sink.policies.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
-    async fn unmuting_says_so_when_nothing_was_muted() {
-        // Reporting success for a no-op would let the agent believe it had fixed something.
+    async fn unmuting_says_so_when_there_was_nothing_to_lift() {
+        // Reporting a lift for a no-op would let the agent believe it had fixed something. The
+        // wording also has to admit that the conversation now overrides its default rather than
+        // merely returning to it, because those are different states.
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
             .unmute(Parameters(UnmuteArgs {
@@ -1925,7 +2226,104 @@ mod tests {
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
-        assert!(text_of(&result).contains("was not muted"));
+        let text = text_of(&result);
+        assert!(text.contains("had no setting of its own"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn unmuting_a_muted_conversation_reports_what_it_lifted() {
+        let (server, _sink) = server_with(FakeSink::default());
+        server
+            .mute(Parameters(MuteArgs {
+                conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
+            }))
+            .await
+            .expect("tool runs");
+        let result = server
+            .unmute(Parameters(UnmuteArgs {
+                conversation: "telegram:1".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).contains("no longer muted"));
+    }
+
+    #[tokio::test]
+    async fn blocking_and_muting_are_different_decisions() {
+        // The whole point of the split: one keeps what it withholds and the other does not, and the
+        // agent picks between them on that basis.
+        let (server, sink) = server_with(FakeSink::default());
+        server
+            .block(Parameters(MuteArgs {
+                conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(sink.policies.lock().expect("lock")[0].1, Policy::Block);
+
+        let result = server
+            .unblock(Parameters(UnmuteArgs {
+                conversation: "telegram:1".to_string(),
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).contains("no longer blocked"));
+        assert_eq!(sink.policies.lock().expect("lock")[0].1, Policy::Active);
+    }
+
+    #[tokio::test]
+    async fn reading_history_hands_back_what_was_recorded() {
+        let (server, _sink) = server_with(FakeSink {
+            history: vec![HistoryEntry {
+                conversation: "telegram:-100".to_string(),
+                message_id: "41".to_string(),
+                sender: "Alice".to_string(),
+                sender_id: Some("111".to_string()),
+                text: "the deploy is stuck".to_string(),
+                notes: None,
+                attachments: vec!["7".to_string()],
+                addressed: false,
+                timestamp: "2026-08-11T09:30:00+00:00".to_string(),
+                cursor: 7,
+            }],
+            ..FakeSink::default()
+        });
+        let result = server
+            .read_history(Parameters(ReadHistoryArgs {
+                conversation: "telegram:-100".to_string(),
+                limit: None,
+                before: None,
+            }))
+            .await
+            .expect("tool runs");
+        let text = text_of(&result);
+        assert!(text.contains("the deploy is stuck"), "got: {text}");
+        assert!(
+            text.contains("\"7\""),
+            "an attachment handle has to survive, or a picture found in history cannot be \
+             opened: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_history_says_why_it_might_be_empty() {
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .read_history(Parameters(ReadHistoryArgs {
+                conversation: "telegram:-100".to_string(),
+                limit: None,
+                before: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let text = text_of(&result);
+        assert!(text.contains("retention"), "got: {text}");
+        assert!(text.contains("blocked"), "got: {text}");
     }
 
     #[tokio::test]
@@ -2127,6 +2525,65 @@ mod tests {
     }
 
     #[test]
+    fn the_paging_cursor_is_declared_as_a_number() {
+        // The agent only ever sees the schema, so a regression to the string form this used to take
+        // would not fail anywhere: it would hand back a timestamp, the tool would refuse it, and
+        // the agent would conclude the history simply ends.
+        let router = BridgeMcpServer::tool_router();
+        let tools = router.list_all();
+        let read_history = tools
+            .iter()
+            .find(|tool| tool.name == "read_history")
+            .expect("read_history is registered");
+        let schema = serde_json::to_value(&read_history.input_schema).expect("schema serializes");
+        let before = &schema["properties"]["before"];
+        assert_eq!(
+            before["type"],
+            serde_json::json!(["integer", "null"]),
+            "got: {before}"
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .is_some_and(|required| !required.contains(&serde_json::json!("before"))),
+            "paging is optional: {schema}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_history_result_carries_the_cursor_the_agent_pages_by() {
+        // The schema covers the way in; this covers the way out. Without the cursor in the payload
+        // there is nothing to pass back, so paging would be undocumented rather than merely
+        // awkward.
+        let (server, _sink) = server_with(FakeSink {
+            history: vec![HistoryEntry {
+                conversation: "telegram:-100".to_string(),
+                message_id: "41".to_string(),
+                sender: "Alice".to_string(),
+                sender_id: None,
+                text: "the deploy is stuck".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                timestamp: "2026-08-11T09:30:00+00:00".to_string(),
+                cursor: 8_212,
+            }],
+            ..FakeSink::default()
+        });
+        let result = server
+            .read_history(Parameters(ReadHistoryArgs {
+                conversation: "telegram:-100".to_string(),
+                limit: None,
+                before: None,
+            }))
+            .await
+            .expect("tool runs");
+        let text = text_of(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("the result is JSON");
+        assert_eq!(parsed[0]["cursor"], 8_212, "got: {text}");
+    }
+
+    #[test]
     fn every_tool_is_registered_with_a_description() {
         let router = BridgeMcpServer::tool_router();
         let tools = router.list_all();
@@ -2135,6 +2592,7 @@ mod tests {
         // The exact set, not a spot check: a tool silently dropped from the router is a capability
         // the agent loses with nothing to indicate it, and the docs list these by name.
         assert_eq!(names, vec![
+            "block",
             "delete_message",
             "download_attachment",
             "edit_message",
@@ -2145,10 +2603,13 @@ mod tests {
             "mute",
             "pin_message",
             "react",
+            "read_history",
+            "search_history",
             "send_file",
             "send_message",
             "set_chat",
             "set_member_rights",
+            "unblock",
             "unmute",
             "view_attachment",
         ]);

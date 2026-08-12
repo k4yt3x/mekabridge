@@ -19,12 +19,19 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
+    channel::ChatKind,
     config::secret::Secret,
     error::{BridgeError, Result},
+    store::Policy,
 };
 
 /// Directory name used under the platform config and data directories.
 const APP_DIR: &str = "mekabridge";
+
+/// Ceiling on `[bridge].mute_context`. The lookback is charged to every turn a muted conversation
+/// wakes, so a generous setting quietly turns "only wake me for mentions" back into "send me the
+/// whole chat".
+const MAX_MUTE_CONTEXT: usize = 50;
 
 /// Validated configuration.
 #[derive(Debug)]
@@ -83,6 +90,48 @@ pub struct BridgeConfig {
     /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
     pub turn_retries: u32,
     pub typing_indicator: bool,
+    /// What happens to a conversation nobody has ruled on, decided by its chat kind.
+    pub default_policy: DefaultPolicy,
+    /// How long after the agent's own message a muted conversation goes on waking it for
+    /// everything.
+    ///
+    /// Without this, answering a mention and then being asked a follow-up without a second mention
+    /// leaves the conversation dead mid-sentence. Measured from the agent's last outbound message
+    /// and deliberately not extended by inbound traffic, or a busy chat would never leave the
+    /// window once the agent had spoken in it once.
+    pub mute_followup: Duration,
+    /// Messages of missed context rendered into the envelope when a muted conversation wakes.
+    ///
+    /// A mention in a busy chat is usually meaningless on its own, and a tool round trip to
+    /// recover what it referred to costs a whole model call. `0` withholds them and leaves the
+    /// agent to ask.
+    pub mute_context: usize,
+}
+
+/// Policy for a conversation with no explicit decision recorded, by chat kind.
+///
+/// Split by kind because the honest answer differs: in a one-to-one chat every message is addressed
+/// to the agent, so mention-only would silence it entirely, while in a group of five thousand
+/// almost nothing is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultPolicy {
+    pub direct: Policy,
+    pub group: Policy,
+    pub channel: Policy,
+}
+
+impl DefaultPolicy {
+    /// The policy a conversation of this shape gets when nobody has ruled on it.
+    pub const fn for_kind(self, kind: ChatKind) -> Policy {
+        match kind {
+            ChatKind::Direct => self.direct,
+            ChatKind::Group => self.group,
+            ChatKind::Channel => self.channel,
+            // A conversation the agent messaged first, which nothing has ever arrived in. Its shape
+            // is unknown, so it is heard in full until something says otherwise.
+            ChatKind::Unknown => Policy::Active,
+        }
+    }
 }
 
 /// How meka reaches this bridge's MCP server.
@@ -117,6 +166,12 @@ pub struct StorageConfig {
     pub attachment_dir: PathBuf,
     pub attachment_max_bytes: u64,
     pub attachment_retention: Duration,
+    /// How long a recorded message stays readable through the history tools.
+    ///
+    /// Zero records nothing at all, which is the switch for a deployment that does not want a chat
+    /// log on disk. Delivery is unaffected either way: this governs what the agent can go back
+    /// for, not what reaches it.
+    pub history_retention: Duration,
 }
 
 /// Logging setup.
@@ -343,6 +398,23 @@ struct FileBridge {
     turn_retries: u32,
     #[serde(default = "default_true")]
     typing_indicator: bool,
+    #[serde(default)]
+    default_policy: FileDefaultPolicy,
+    #[serde(default = "default_mute_followup", with = "humantime_serde")]
+    mute_followup: Duration,
+    #[serde(default = "default_mute_context")]
+    mute_context: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileDefaultPolicy {
+    #[serde(default = "default_direct_policy")]
+    direct: Policy,
+    #[serde(default = "default_group_policy")]
+    group: Policy,
+    #[serde(default = "default_group_policy")]
+    channel: Policy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,6 +447,8 @@ struct FileStorage {
     attachment_max_bytes: u64,
     #[serde(default = "default_attachment_retention", with = "humantime_serde")]
     attachment_retention: Duration,
+    #[serde(default = "default_history_retention", with = "humantime_serde")]
+    history_retention: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +552,29 @@ impl FileConfig {
                 self.bridge.max_queue_depth, self.bridge.batch_max_messages
             )));
         }
+        if self.bridge.mute_context > MAX_MUTE_CONTEXT {
+            return Err(BridgeError::config(format!(
+                "[bridge].mute_context is {} but may be at most {MAX_MUTE_CONTEXT}; a larger \
+                 lookback would put more of a chat into every turn than the mention that woke it",
+                self.bridge.mute_context
+            )));
+        }
+        // Not rejected, because "only the conversations I name" is a coherent posture, but said out
+        // loud: a bridge that blocks by default answers nobody, and that is indistinguishable from
+        // one that is broken.
+        for (kind, policy) in [
+            ("direct", self.bridge.default_policy.direct),
+            ("group", self.bridge.default_policy.group),
+            ("channel", self.bridge.default_policy.channel),
+        ] {
+            if policy == Policy::Block {
+                warnings.push(format!(
+                    "[bridge].default_policy.{kind} is `block`, so nothing from a {kind} \
+                     conversation reaches the agent unless that conversation has been given a \
+                     policy of its own"
+                ));
+            }
+        }
 
         let mcp_token = match (&self.mcp.token, &self.mcp.token_file) {
             (None, None) => None,
@@ -531,6 +628,7 @@ impl FileConfig {
             attachment_dir,
             attachment_max_bytes: self.storage.attachment_max_bytes,
             attachment_retention: self.storage.attachment_retention,
+            history_retention: self.storage.history_retention,
         };
 
         let mut channels = Vec::new();
@@ -611,6 +709,13 @@ impl FileConfig {
                 settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
                 typing_indicator: self.bridge.typing_indicator,
+                default_policy: DefaultPolicy {
+                    direct: self.bridge.default_policy.direct,
+                    group: self.bridge.default_policy.group,
+                    channel: self.bridge.default_policy.channel,
+                },
+                mute_followup: self.bridge.mute_followup,
+                mute_context: self.bridge.mute_context,
             },
             mcp,
             storage,
@@ -663,6 +768,7 @@ impl Default for FileStorage {
             attachment_dir: None,
             attachment_max_bytes: default_attachment_max_bytes(),
             attachment_retention: default_attachment_retention(),
+            history_retention: default_history_retention(),
         }
     }
 }
@@ -677,6 +783,19 @@ impl Default for FileBridge {
             settle_max: default_settle_max(),
             turn_retries: default_turn_retries(),
             typing_indicator: true,
+            default_policy: FileDefaultPolicy::default(),
+            mute_followup: default_mute_followup(),
+            mute_context: default_mute_context(),
+        }
+    }
+}
+
+impl Default for FileDefaultPolicy {
+    fn default() -> Self {
+        Self {
+            direct: default_direct_policy(),
+            group: default_group_policy(),
+            channel: default_group_policy(),
         }
     }
 }
@@ -783,6 +902,37 @@ const fn default_attachment_retention() -> Duration {
     Duration::from_secs(30 * 24 * 60 * 60)
 }
 
+/// Matches [`default_attachment_retention`], so a message and the picture attached to it fall out
+/// of reach together rather than leaving the agent a description of a file it can no longer open.
+const fn default_history_retention() -> Duration {
+    Duration::from_secs(30 * 24 * 60 * 60)
+}
+
+/// In a one-to-one chat every message is addressed to the agent, so anything but `active` would
+/// silence it against the only person talking to it.
+const fn default_direct_policy() -> Policy {
+    Policy::Active
+}
+
+/// Groups and channels default to mention-only, which is how a person configures a busy room on
+/// their own phone. The agent still receives and records everything said there; it is woken for
+/// what is addressed to it, and can read the rest when it needs to.
+const fn default_group_policy() -> Policy {
+    Policy::Mute
+}
+
+/// Long enough to carry an exchange that has already started, short enough that a chat the agent
+/// stopped answering goes quiet again on its own.
+const fn default_mute_followup() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+/// Enough to make sense of "what do you think about that?" without paying a tool round trip for the
+/// antecedent, which costs a whole model call.
+const fn default_mute_context() -> usize {
+    5
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -846,6 +996,93 @@ allowed_users = [123]
             !telegram.link_preview,
             "link previews default off; the template and the docs both say so"
         );
+    }
+
+    #[test]
+    fn groups_default_to_mentions_only_and_direct_chats_to_everything() {
+        // The shipped answer to "the bot receives every message in every group". A one-to-one chat
+        // has nobody else in it, so mention-only there would silence the agent entirely.
+        let config = parse(MINIMAL).expect("valid");
+        assert_eq!(config.bridge.default_policy.direct, Policy::Active);
+        assert_eq!(config.bridge.default_policy.group, Policy::Mute);
+        assert_eq!(config.bridge.default_policy.channel, Policy::Mute);
+        assert_eq!(
+            config.bridge.default_policy.for_kind(ChatKind::Unknown),
+            Policy::Active,
+            "a chat the agent messaged first has an unknown shape, so it is heard in full"
+        );
+    }
+
+    #[test]
+    fn an_existing_bridge_section_still_gets_the_new_defaults() {
+        // The shape every config written before 0.3.0 has: `[bridge]` is present and populated, and
+        // `default_policy` is not mentioned at all. A derived `Default` on `FileBridge` would give
+        // `active` for every kind here, which is the failure the hand-written impls exist to
+        // prevent, and it would silently leave an upgraded deployment paying a turn per group
+        // message.
+        let raw = format!(
+            "{MINIMAL}\n[bridge]\nbatch_max_messages = 32\nsettle = \"2s\"\ntyping_indicator = \
+             true\n"
+        );
+        let config = parse(&raw).expect("valid");
+        assert_eq!(config.bridge.default_policy.group, Policy::Mute);
+        assert_eq!(config.bridge.default_policy.channel, Policy::Mute);
+        assert_eq!(config.bridge.default_policy.direct, Policy::Active);
+        assert_eq!(config.bridge.mute_followup, Duration::from_secs(300));
+        assert_eq!(config.bridge.mute_context, 5);
+    }
+
+    #[test]
+    fn the_default_policy_can_be_set_per_chat_kind() {
+        let raw = format!("{MINIMAL}\n[bridge.default_policy]\ngroup = \"active\"\n");
+        let config = parse(&raw).expect("valid");
+        assert_eq!(config.bridge.default_policy.group, Policy::Active);
+        assert_eq!(
+            config.bridge.default_policy.channel,
+            Policy::Mute,
+            "the kinds are independent; setting one must not move another"
+        );
+    }
+
+    #[test]
+    fn blocking_by_default_is_allowed_but_said_out_loud() {
+        // A coherent posture, but a bridge that answers nobody is indistinguishable from a broken
+        // one, so it does not get to be silent about it.
+        let raw = format!("{MINIMAL}\n[bridge.default_policy]\ngroup = \"block\"\n");
+        let config = parse(&raw).expect("valid");
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("default_policy.group")),
+            "got: {:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn an_oversized_mute_context_is_rejected() {
+        // The lookback is charged to every turn a muted chat wakes, so a generous setting quietly
+        // turns mention-only back into every message.
+        let raw = format!("{MINIMAL}\n[bridge]\nmute_context = 500\n");
+        let error = parse(&raw).expect_err("must be rejected");
+        assert!(error.to_string().contains("mute_context"), "got: {error}");
+    }
+
+    #[test]
+    fn mute_defaults_carry_an_exchange_without_a_second_mention() {
+        let config = parse(MINIMAL).expect("valid");
+        assert_eq!(config.bridge.mute_followup, Duration::from_secs(300));
+        assert_eq!(config.bridge.mute_context, 5);
+    }
+
+    #[test]
+    fn history_can_be_turned_off_entirely() {
+        // The switch for a deployment that does not want a chat log on disk. Zero has to be a valid
+        // setting rather than a rejected one.
+        let raw = format!("{MINIMAL}\n[storage]\nhistory_retention = \"0s\"\n");
+        let config = parse(&raw).expect("zero is a valid setting");
+        assert!(config.storage.history_retention.is_zero());
     }
 
     #[test]

@@ -16,11 +16,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    bridge::{envelope::Envelope, turn::TurnRunner},
+    bridge::{
+        envelope::{Envelope, MissedContext, MissedMessage},
+        turn::TurnRunner,
+    },
     channel::{ChannelRegistry, ConversationId, InboundEvent},
     config::Config,
     meka::{MekaClient, MekaError, TurnOutcome},
-    store::{ConversationRecord, EnqueueOutcome, QueuedMessage, Store},
+    store::{ConversationRecord, EnqueueOutcome, Policy, PolicyRecord, QueuedMessage, Store},
 };
 
 /// Safety-net poll interval. The writer notifies the drain loop directly, so this only covers rows
@@ -42,15 +45,24 @@ pub async fn writer(
 ) {
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
-        match muted(&store, &mut event).await {
-            Ok(true) => continue,
-            Ok(false) => {}
+        let disposition = match gate(&store, &config, &mut event).await {
+            Ok(disposition) => disposition,
             Err(error) => {
                 // Failing open. A store that cannot answer should not also cost people their
-                // messages, and the worst case is a muted chat getting through.
-                tracing::error!(conversation = %conversation, "could not read the mute: {}", error);
+                // messages, and the worst case is a chat being heard that would rather not have
+                // been.
+                tracing::error!(
+                    conversation = %conversation,
+                    "could not read the conversation's policy: {}",
+                    error
+                );
+                Disposition::Deliver
             }
+        };
+        if disposition == Disposition::Discard {
+            continue;
         }
+
         if let Err(error) = record_conversation(&store, &event).await {
             tracing::error!(conversation = %conversation, "failed to record conversation: {}", error);
             continue;
@@ -62,98 +74,312 @@ pub async fn writer(
             tracing::error!(conversation = %conversation, "failed to register attachments: {}", error);
         }
 
-        let payload = match serde_json::to_string(&event) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(conversation = %conversation, "failed to encode event: {}", error);
-                continue;
-            }
-        };
+        // A withheld message stops before the queue. It is recorded, so the agent can read it when
+        // something finally does wake this conversation, but it consumes no queue depth and costs
+        // no provider turn.
+        if disposition == Disposition::Deliver {
+            let payload = match serde_json::to_string(&event) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::error!(conversation = %conversation, "failed to encode event: {}", error);
+                    continue;
+                }
+            };
 
-        let outcome = store
-            .enqueue(
-                conversation.as_str(),
-                event.external_id(),
-                &payload,
-                event.timestamp(),
-                config.bridge.max_queue_depth,
-            )
-            .await;
+            let outcome = store
+                .enqueue(
+                    conversation.as_str(),
+                    event.external_id(),
+                    &payload,
+                    event.timestamp(),
+                    config.bridge.max_queue_depth,
+                )
+                .await;
 
-        match outcome {
-            Ok(EnqueueOutcome::Queued) => wake_drain.notify_one(),
-            Ok(EnqueueOutcome::Duplicate) => {
-                tracing::debug!(
-                    conversation = %conversation,
-                    external_id = event.external_id(),
-                    "ignoring a redelivered message"
-                );
-            }
-            Ok(EnqueueOutcome::Dropped) => {
-                // Counted rather than silently discarded: the next envelope tells the agent its
-                // view of the conversation is incomplete.
-                tracing::warn!(
-                    conversation = %conversation,
-                    "inbound queue is full at {} messages; dropping",
-                    config.bridge.max_queue_depth
-                );
-                if let Err(error) = store.note_dropped(1).await {
-                    tracing::error!("failed to record a dropped message: {}", error);
+            match outcome {
+                Ok(EnqueueOutcome::Queued) => wake_drain.notify_one(),
+                Ok(EnqueueOutcome::Duplicate) => {
+                    tracing::debug!(
+                        conversation = %conversation,
+                        external_id = event.external_id(),
+                        "ignoring a redelivered message"
+                    );
+                }
+                Ok(EnqueueOutcome::Dropped) => {
+                    // Counted rather than silently discarded: the next envelope tells the agent its
+                    // view of the conversation is incomplete.
+                    tracing::warn!(
+                        conversation = %conversation,
+                        "inbound queue is full at {} messages; dropping",
+                        config.bridge.max_queue_depth
+                    );
+                    if let Err(error) = store.note_dropped(1).await {
+                        tracing::error!("failed to record a dropped message: {}", error);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(conversation = %conversation, "failed to enqueue: {}", error);
                 }
             }
-            Err(error) => {
-                tracing::error!(conversation = %conversation, "failed to enqueue: {}", error);
-            }
+        }
+
+        // Keyed on the gate's decision rather than on what the queue did with it. `seen` means the
+        // agent has been accounted for this message somehow, and every outcome above qualifies: it
+        // was queued, or it duplicates one already queued, or it was shed and counted into the
+        // notice the next envelope carries. Only a withheld message is genuinely owed to the agent.
+        if let Err(error) =
+            record_message(&store, &config, &event, disposition == Disposition::Deliver).await
+        {
+            tracing::error!(conversation = %conversation, "failed to record a message: {}", error);
         }
     }
     tracing::info!("inbound writer stopped: all channels have shut down");
 }
 
-/// Whether this event should be discarded because its conversation is muted.
+/// What the gate decided should happen to one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Queue it, so the agent is woken.
+    Deliver,
+    /// Record it without queueing it. The agent reaches it through the history tools, or through
+    /// the context printed alongside whatever eventually does wake this conversation.
+    Withhold,
+    /// Keep nothing.
+    Discard,
+}
+
+/// Decide what happens to one message, and annotate it when a lapsed policy is being lifted.
 ///
-/// Checked before the conversation is recorded and before attachments are registered, both on
-/// purpose. Advancing `last_inbound_at` for a message the agent never saw would misreport when the
-/// chat was last heard from, and minting handles for files nothing can reach is waste. Nothing is
-/// enqueued either, so a muted chat consumes no queue depth and costs no provider turn.
+/// Resolution order is the explicit decision first and the configured default second. A
+/// conversation nobody has ruled on has no record at all, which is why changing
+/// `[bridge].default_policy` moves every such conversation at once while leaving the ones somebody
+/// ruled on where they were put.
 ///
-/// A lapsed mute is cleared here rather than swept on a timer, and its drop count is handed to the
-/// message that lifted it: a mute whose effect is invisible gives the agent nothing to judge
+/// A lapsed record is cleared here rather than swept on a timer, and what it did is handed to the
+/// message that lifted it: a policy whose effect is invisible gives the agent nothing to judge
 /// whether to renew it on.
-async fn muted(store: &Store, event: &mut InboundEvent) -> Result<bool, crate::store::StoreError> {
+async fn gate(
+    store: &Store,
+    config: &Config,
+    event: &mut InboundEvent,
+) -> Result<Disposition, crate::store::StoreError> {
     let conversation = event.conversation().clone();
-    let Some(mute) = store.mute(conversation.as_str()).await? else {
-        return Ok(false);
+    let now = chrono::Utc::now();
+    let record = store.policy(conversation.as_str()).await?;
+
+    let InboundEvent::Message(message) = event;
+    let policy = match record {
+        Some(record) if record.expired(now) => {
+            // Read back uncounted through `expire_policy` rather than reused from above: the record
+            // in hand came through a cache that deliberately does not see drop counts, and the
+            // count is the whole of what the agent is being told.
+            if let Some(lapsed) = store.expire_policy(conversation.as_str()).await? {
+                announce_expiry(message, &lapsed);
+                tracing::info!(
+                    conversation = %conversation,
+                    policy = lapsed.policy.as_str(),
+                    dropped = lapsed.dropped,
+                    "a conversation policy expired"
+                );
+            }
+            config.bridge.default_policy.for_kind(message.chat_kind)
+        }
+        Some(record) => record.policy,
+        None => config.bridge.default_policy.for_kind(message.chat_kind),
     };
 
-    let now = chrono::Utc::now();
-    // Bound in the pattern rather than re-read afterwards, so the expiry printed below is the one
-    // that was tested. An indefinite mute has no `until` and so can never reach this branch.
-    if let Some(until) = mute.until.filter(|until| *until <= now) {
-        store.clear_mute(conversation.as_str()).await?;
-        if mute.dropped > 0 {
-            let InboundEvent::Message(message) = event;
-            let noun = if mute.dropped == 1 {
+    match policy {
+        Policy::Active => Ok(Disposition::Deliver),
+        Policy::Block => {
+            store.note_blocked_drop(conversation.as_str()).await?;
+            tracing::debug!(
+                conversation = %conversation,
+                "discarding a message from a blocked conversation"
+            );
+            Ok(Disposition::Discard)
+        }
+        Policy::Mute if message.addressed => Ok(Disposition::Deliver),
+        Policy::Mute => {
+            // An exchange the agent is already in carries on without a second mention, which is
+            // what stops "@bot what do you think?" followed by "no, the other one"
+            // dying halfway through. Measured from the agent's own last message and
+            // deliberately not extended by inbound traffic, so a chat it has stopped
+            // answering goes quiet again on its own.
+            let following_up = store
+                .last_outbound_at(conversation.as_str())
+                .await?
+                .and_then(|at| now.signed_duration_since(at).to_std().ok())
+                .is_some_and(|since| since < config.bridge.mute_followup);
+            if following_up {
+                Ok(Disposition::Deliver)
+            } else {
+                tracing::trace!(
+                    conversation = %conversation,
+                    "withholding a message from a muted conversation"
+                );
+                Ok(Disposition::Withhold)
+            }
+        }
+    }
+}
+
+/// Tell the agent what a policy it set did before it lapsed.
+///
+/// The wording differs by policy on purpose. Under a block the messages are gone and saying so is
+/// the whole of it; under a mute they were recorded, so the note points at the tool that reaches
+/// them, or the agent will assume the same thing happened to both.
+fn announce_expiry(message: &mut crate::channel::InboundMessage, lapsed: &PolicyRecord) {
+    let Some(until) = lapsed.until else {
+        return;
+    };
+    let until = until.to_rfc3339();
+    match lapsed.policy {
+        Policy::Block if lapsed.dropped > 0 => {
+            let noun = if lapsed.dropped == 1 {
                 "message was"
             } else {
                 "messages were"
             };
             message.notes.push(format!(
-                "you had muted this chat until {}; {} {noun} dropped while it was muted",
-                until.to_rfc3339(),
-                mute.dropped
+                "you had blocked this chat until {until}; {} {noun} discarded while it was blocked \
+                 and cannot be recovered",
+                lapsed.dropped
             ));
         }
-        tracing::info!(conversation = %conversation, dropped = mute.dropped, "a mute expired");
-        return Ok(false);
+        Policy::Mute => message.notes.push(format!(
+            "you had muted this chat until {until}; anything said meanwhile was recorded, and \
+             read_history will show it"
+        )),
+        Policy::Block | Policy::Active => {}
     }
+}
 
-    store.note_muted_drop(conversation.as_str()).await?;
-    tracing::debug!(
-        conversation = %conversation,
-        until = ?mute.until,
-        "dropping a message from a muted conversation"
-    );
-    Ok(true)
+/// Collect what each muted conversation in this batch said while the agent was not listening.
+///
+/// Marks it seen in the same call, so the next mention in that chat reports what has accumulated
+/// since rather than the same backlog again. The consequence is that a turn which fails and is
+/// retried from the queue gets a smaller lookback the second time: the messages themselves are
+/// still in the history, and repeating the count on every attempt would be the worse trade.
+///
+/// Every conversation in the batch is asked, not only the muted ones. Under `active` the answer is
+/// almost always nothing, because a delivered message is recorded as seen, but "almost" is doing
+/// work: unmuting a conversation leaves behind whatever piled up while it was muted. Asking only
+/// the muted ones would report that backlog to nobody and never clear it, so `unseen` would climb
+/// for the life of the conversation and `list_conversations` would go on quoting it.
+async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<MissedContext> {
+    let now = chrono::Utc::now();
+    let mut collected = Vec::new();
+    let mut visited = BTreeSet::new();
+    for event in events {
+        let conversation = event.conversation();
+        if !visited.insert(conversation.clone()) {
+            continue;
+        }
+        let InboundEvent::Message(message) = event;
+
+        let policy = match context.store.policy(conversation.as_str()).await {
+            Ok(Some(record)) if !record.expired(now) => record.policy,
+            Ok(_) => context
+                .config
+                .bridge
+                .default_policy
+                .for_kind(message.chat_kind),
+            Err(error) => {
+                tracing::error!(
+                    conversation = %conversation,
+                    "could not read the conversation's policy: {}",
+                    error
+                );
+                continue;
+            }
+        };
+        let muted = policy == Policy::Mute;
+
+        // Bounded by the newest message in this batch from this conversation, so anything that
+        // lands while the turn is being assembled stays unseen and is reported next time
+        // rather than silently marked.
+        let through = events
+            .iter()
+            .filter(|event| event.conversation() == conversation)
+            .map(InboundEvent::timestamp)
+            .max()
+            .unwrap_or(now);
+        match context
+            .store
+            .take_unseen(
+                conversation.as_str(),
+                through,
+                context.config.bridge.mute_context,
+            )
+            .await
+        {
+            // A conversation being heard in full with nothing owed has nothing to say, so it is
+            // dropped rather than rendered as an empty block. A muted one is still worth a line: it
+            // tells the agent why it is seeing one message out of a conversation.
+            Ok((0, _)) if !muted => {}
+            Ok((count, recent)) => collected.push(MissedContext {
+                conversation: conversation.clone(),
+                muted,
+                count,
+                recent: recent
+                    .into_iter()
+                    .map(|record| MissedMessage {
+                        sender: record.sender_name,
+                        // Descriptor lines stand in for a message whose content is not text, so a
+                        // photo does not read back as somebody saying nothing.
+                        text: match (record.text.trim().is_empty(), record.notes) {
+                            (true, Some(notes)) => notes,
+                            (true, None) => "[no text]".to_string(),
+                            (false, _) => record.text,
+                        },
+                        timestamp: record.timestamp,
+                    })
+                    .collect(),
+            }),
+            Err(error) => tracing::error!(
+                conversation = %conversation,
+                "could not read what a conversation withheld: {}",
+                error
+            ),
+        }
+    }
+    collected
+}
+
+/// Write one message to the history, unless history is switched off.
+async fn record_message(
+    store: &Store,
+    config: &Config,
+    event: &InboundEvent,
+    queued: bool,
+) -> Result<(), crate::store::StoreError> {
+    if config.storage.history_retention.is_zero() {
+        return Ok(());
+    }
+    let InboundEvent::Message(message) = event;
+    store
+        .record_message(crate::store::MessageRecord {
+            // Assigned by the store on insert.
+            id: 0,
+            conversation_id: message.conversation.as_str().to_string(),
+            external_id: message.external_id.clone(),
+            message_id: message.message_id.clone(),
+            sender_id: (!message.sender.id.is_empty()).then(|| message.sender.id.clone()),
+            sender_name: message.sender.display_name.clone(),
+            text: message.text.clone(),
+            notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
+            attachments: message
+                .attachments
+                .iter()
+                .filter_map(|attachment| attachment.handle.clone())
+                .collect(),
+            addressed: message.addressed,
+            // A queued message is one the agent is about to be handed, so it is accounted for
+            // already and must not also be offered back to it later as context it missed.
+            seen: queued,
+            timestamp: message.timestamp,
+        })
+        .await
 }
 
 /// Register the files an event brought with it and stamp each with the handle the agent fetches by.
@@ -397,11 +623,14 @@ async fn deliver(
 
     let identities = channel_identities(context).await;
 
+    let missed = missed_context(context, &events).await;
+
     let nonce = nonce();
     let message = Envelope {
         events: &events,
         dropped,
         identities: &identities,
+        missed: &missed,
         nonce: &nonce,
     }
     .render();
@@ -435,6 +664,9 @@ async fn deliver(
                         events: &events,
                         dropped,
                         identities: &identities,
+                        // Reused rather than recomputed: taking it again would come back empty,
+                        // because the first call marked it seen.
+                        missed: &missed,
                         nonce: &nonce,
                     }
                     .render();
@@ -795,6 +1027,7 @@ mod tests {
                 on_behalf_of_chat: false,
             },
             admission: Admission::User,
+            addressed: false,
             text: "look".to_string(),
             reply_to: None,
             edited_at: None,

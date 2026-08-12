@@ -41,7 +41,7 @@ meka ships MCP tools **deferred** by default: the agent has to call `load_tool` 
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
-Leave `send_file` and `get_conversation` deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip.
+Leave the rest deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip. `read_history` is the one worth reconsidering if the agent lives in busy groups, since a muted conversation waking on a mention often needs it immediately.
 
 ## Permissions
 
@@ -54,7 +54,8 @@ the whole surface works at `read`:
 | Sending | `send_message`, `send_file`, `react`, `edit_message`, `delete_message` |
 | Attachments | `view_attachment`, `download_attachment` |
 | Address book | `list_conversations`, `get_conversation` |
-| Attention | `mute`, `unmute` |
+| Attention | `mute`, `unmute`, `block`, `unblock` |
+| History | `read_history`, `search_history` |
 | Moderation | `moderate_member`, `set_member_rights`, `pin_message`, `set_chat`, `member` |
 
 The moderation group is present only when a channel has `admin_tools` on, which is the default; see
@@ -75,9 +76,8 @@ commands, fetch URLs and read every file, but may not say hello", which is not a
 pick deliberately, and its failure is silent from both ends.
 
 It also would not contain anything. meka grants `fetch_url` at `read`, so an agent at that level can
-already push arbitrary bytes to any host on the internet. These tools reach only conversations
-already in the bridge's store, which is to say people on your allowlist, so they are strictly more
-constrained than a tool meka already treats as read-only.
+already push arbitrary bytes to any host on the internet. These tools reach only conversations on your
+allowlist, so they are strictly more constrained than a tool meka already treats as read-only.
 
 If you want sends gated anyway, invert it on meka's side:
 

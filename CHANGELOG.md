@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-12
+
+### Added
+
+- `mute`, which turns a chat down to mentions only instead of silencing it: the rest is recorded.
+- The agent is woken in a muted chat by a mention, a reply to it, or its own recent message there.
+- A record of every message from every chat that is not blocked, kept for `history_retention`.
+- `read_history` and `search_history`, so the agent can catch up on what it was not woken for.
+- A mention in a muted chat arrives with the count of what was missed and the last few messages.
+- `mekabridge policy list|set|clear` and `mekabridge history`, the operator's side of both.
+- `[bridge].mute_followup`, so answering a mention does not need a second one to carry on.
+- `[bridge].mute_context`, the lookback printed alongside a mention. `0` makes the agent ask.
+- `doctor` reports the attention defaults, how many chats override them, and what history holds.
+
+### Changed
+
+- **Breaking:** groups and channels default to mentions only; direct messages are unchanged.
+- **Breaking:** set `[bridge.default_policy]` to `active` per chat kind to restore 0.2.x.
+- **Breaking:** the old `mute` tool is now `block`, which is what it always did.
+- **Breaking:** existing mutes migrate to blocks, so a chat already silenced stays silenced.
+- **Breaking:** `mekabridge mute list|add|rm` is now `mekabridge policy list|set|clear`.
+- `list_conversations` reports `policy`, `policy_until`, and `unseen` instead of `muted_until`.
+- A shed message is no longer called lost, since `read_history` still reaches it.
+- Telegram privacy mode should now be off; `doctor` explains why it defeats the history.
+- The policy behind each message is cached briefly, so a busy chat no longer costs a query each.
+
 ## [0.2.1] - 2026-08-11
 
 ### Fixed
@@ -74,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/k4yt3x/mekabridge/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/k4yt3x/mekabridge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/k4yt3x/mekabridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/v0.1.0

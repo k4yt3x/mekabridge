@@ -24,9 +24,10 @@ With no subcommand, mekabridge runs the daemon.
 | `queue list [--limit N]` | Messages waiting to be delivered |
 | `queue clear --yes` | Delete every queue row, including undelivered ones |
 | `conversations list [--channel X] [--limit N]` | Known conversations, most recently active first |
-| `mute list` | Conversations the agent has silenced, with how many messages each has dropped |
-| `mute add <id> [--duration 30m] [--reason X]` | Silence a conversation. Omit the duration for indefinite |
-| `mute rm <id>` | Lift a mute |
+| `policy list` | The configured defaults, plus every conversation with a policy of its own |
+| `policy set <id> <active\|mute\|block> [--duration 30m] [--reason X]` | Override the default for one conversation |
+| `policy clear <id>` | Drop a conversation's own policy so it follows the default again |
+| `history <id> [--limit N] [--search WORDS]` | What a conversation said, including what the agent was never woken for |
 | `session show` | The bound session and what meka says about it |
 | `session reset --yes` | Forget the binding so the next message starts a fresh session |
 | `cancel` | Cancel the turn currently running |
@@ -43,7 +44,11 @@ mekabridge conversations list | grep group
 mekabridge queue list --limit 5
 ```
 
-The `mute` commands exist because the agent sets mutes itself. A conversation muted indefinitely is unreachable from inside the bridge, including the one you would use to ask the agent to undo it, so `mute rm` is the way back.
+The `policy` commands exist because the agent rules on conversations itself. One it muted or blocked indefinitely is unreachable from inside the bridge, including the one you would use to ask it to undo them, so this is the way back.
+
+`policy clear` and `policy set <id> active` are different. Clearing returns the conversation to `[bridge.default_policy]`, which for a group is normally `mute`; setting it active overrides that default so the agent is woken for everything there.
+
+`history` is also how you see what recording is actually costing you, and what a muted conversation is holding. `*` marks a message the agent has not been shown and `@` one that was addressed to it.
 
 ## Destructive commands
 

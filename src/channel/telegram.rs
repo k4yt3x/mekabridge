@@ -29,8 +29,8 @@ use teloxide::{
     prelude::Requester,
     types::{
         AllowedUpdate, ChatAction, ChatId, ChatPermissions, FileId, InputFile, LinkPreviewOptions,
-        MediaKind, Message, MessageId, MessageKind, MessageOrigin, ParseMode, ReactionType,
-        Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
+        MediaKind, Message, MessageEntityKind, MessageId, MessageKind, MessageOrigin, ParseMode,
+        ReactionType, Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
     },
     update_listeners::{AsUpdateStream, Polling},
 };
@@ -65,6 +65,17 @@ const REPLY_EXCERPT_CHARS: usize = 160;
 /// over a possibly slow link. It is not a retry budget.
 const POLL_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Who the bot is, as far as deciding whether a message was aimed at it.
+///
+/// Resolved once at startup rather than per message. Telegram identifies a bot in message text by
+/// username and offers no id form there, so renaming the bot means restarting the bridge; the
+/// alternative is a `getMe` on every inbound message.
+#[derive(Debug, Clone)]
+struct BotIdentity {
+    id: UserId,
+    username: Option<String>,
+}
+
 pub struct TelegramChannel {
     id: ChannelId,
     bot: Throttle<Bot>,
@@ -79,6 +90,8 @@ pub struct TelegramChannel {
     parse_mode: TelegramParseMode,
     link_preview: bool,
     poll_timeout: std::time::Duration,
+    /// Filled by [`Channel::run`] before the first update is read.
+    identity: tokio::sync::OnceCell<BotIdentity>,
 }
 
 impl TelegramChannel {
@@ -104,7 +117,90 @@ impl TelegramChannel {
             parse_mode: config.parse_mode,
             link_preview: config.link_preview,
             poll_timeout: config.poll_timeout,
+            identity: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Whether this message was aimed at the bot rather than merely said in front of it.
+    ///
+    /// Every signal here is one Telegram produced. Three of the four compare user ids, because
+    /// Telegram supplies a `User` for them: the sender of the message being replied to, the account
+    /// in a `text_mention` entity, and the bot a message was sent via. Only a plain `mention`
+    /// entity and a targeted command come down to a username, and only because a username is
+    /// the sole identifier Telegram uses for a bot inside message text.
+    ///
+    /// Deliberately narrow. This is what wakes a conversation the agent is only half listening to,
+    /// so counting anything more generous, such as the bot's name appearing as ordinary words,
+    /// would turn a mention-only chat back into every message.
+    fn addressed(&self, message: &Message) -> bool {
+        // In a one-to-one chat there is nobody else it could be for. Checked before the identity so
+        // a direct message still reads as addressed even if `getMe` never succeeded.
+        if message.chat.is_private() {
+            return true;
+        }
+        let Some(me) = self.identity.get() else {
+            tracing::warn!(
+                channel = %self.id,
+                "the bot's own identity is unknown, so mentions cannot be recognised; \
+                 treating this message as not addressed to it"
+            );
+            return false;
+        };
+
+        // Replying to something the agent said is addressing it, and needs no mention.
+        if message
+            .reply_to_message()
+            .and_then(|replied| replied.from.as_ref())
+            .is_some_and(|user| user.id == me.id)
+        {
+            return true;
+        }
+        // Somebody used this bot's inline mode to produce the message.
+        if message.via_bot.as_ref().is_some_and(|via| via.id == me.id) {
+            return true;
+        }
+
+        // A message carries text entities or caption entities, never both, so both are consulted
+        // and the empty one costs nothing. `parse_entities` resolves Telegram's UTF-16
+        // offsets, which is why the entity's own text is read from it rather than sliced
+        // out of the body here.
+        let entities = message
+            .parse_entities()
+            .into_iter()
+            .chain(message.parse_caption_entities())
+            .flatten();
+        let matches_username = |candidate: &str| {
+            me.username
+                .as_deref()
+                // Telegram usernames are case insensitive, and clients preserve whatever the sender
+                // typed.
+                .is_some_and(|username| candidate.eq_ignore_ascii_case(username))
+        };
+        for entity in entities {
+            match entity.kind() {
+                // Carries a whole `User`, so this one is an id comparison. Telegram uses it for
+                // accounts with no username, and for the `tg://user?id=` markdown form.
+                MessageEntityKind::TextMention { user } if user.id == me.id => return true,
+                MessageEntityKind::Mention
+                    if matches_username(entity.text().trim_start_matches('@')) =>
+                {
+                    return true;
+                }
+                // `/restart@this_bot`. A bare `/restart` is not counted: in a group with several
+                // bots it is ambiguous, and Telegram's own privacy mode only forwards it on the
+                // strength of who spoke last.
+                MessageEntityKind::BotCommand
+                    if entity
+                        .text()
+                        .split_once('@')
+                        .is_some_and(|(_, target)| matches_username(target)) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Whether a message may reach the agent, and on what basis.
@@ -335,6 +431,7 @@ impl TelegramChannel {
             chat_title: message.chat.title().map(str::to_string),
             sender,
             admission,
+            addressed: self.addressed(message),
             text,
             reply_to,
             edited_at,
@@ -376,6 +473,23 @@ impl Channel for TelegramChannel {
         sink: mpsc::Sender<InboundEvent>,
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError> {
+        // Resolved before the first update, because deciding whether a message mentions the bot
+        // needs to know what the bot is called and that answer cannot be fetched per message. A
+        // failure here is the same failure `probe` reports, so it is raised the same way rather
+        // than left to surface later as a chat that never wakes.
+        let me = self
+            .bot
+            .get_me()
+            .await
+            .map_err(|error| ChannelError::Auth {
+                channel: self.id.as_str().to_string(),
+                message: error.to_string(),
+            })?;
+        let _ = self.identity.set(BotIdentity {
+            id: me.id,
+            username: me.username.clone(),
+        });
+
         // Named explicitly rather than left to teloxide's inference. Telegram withholds several
         // update kinds unless they are requested, and asking for only what is consumed keeps the
         // long poll from carrying traffic that would be discarded anyway.
@@ -1395,6 +1509,210 @@ mod tests {
         let conversation = ConversationId::parse("telegram:not-a-number").expect("parses");
         let error = channel.target(&conversation).expect_err("must be rejected");
         assert!(error.to_string().contains("Telegram chat id"));
+    }
+
+    /// Build a real `Message` from wire JSON, so the entity offsets and kinds are the ones Telegram
+    /// actually sends rather than a hand-built approximation.
+    fn wire_message(value: serde_json::Value) -> Message {
+        serde_json::from_value(value).expect("valid Telegram message")
+    }
+
+    /// A channel that knows who it is, which is what `addressed` needs.
+    fn identified() -> TelegramChannel {
+        let channel = channel(vec![], vec![-1001234]);
+        channel
+            .identity
+            .set(BotIdentity {
+                id: UserId(4242),
+                username: Some("mekabot".to_string()),
+            })
+            .expect("fresh channel");
+        channel
+    }
+
+    fn group_message(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "message_id": 42,
+            "date": 1_754_899_200,
+            "chat": {"id": -1001234, "type": "supergroup", "title": "Ops"},
+            "from": {"id": 111, "is_bot": false, "first_name": "Alice"},
+        });
+        let (Some(base_map), Some(extra_map)) = (base.as_object_mut(), extra.as_object()) else {
+            panic!("both must be objects");
+        };
+        for (key, value) in extra_map {
+            base_map.insert(key.clone(), value.clone());
+        }
+        base
+    }
+
+    #[tokio::test]
+    async fn a_username_mention_addresses_the_bot() {
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "@mekabot what do you think?",
+            "entities": [{"type": "mention", "offset": 0, "length": 8}],
+        })));
+        assert!(channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn a_username_mention_is_matched_case_insensitively() {
+        // Telegram usernames are case insensitive and clients keep whatever the sender typed, so a
+        // case-sensitive comparison would drop real mentions.
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "@MekaBot ping",
+            "entities": [{"type": "mention", "offset": 0, "length": 8}],
+        })));
+        assert!(channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn somebody_elses_mention_does_not_address_the_bot() {
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "@otherbot are you there?",
+            "entities": [{"type": "mention", "offset": 0, "length": 9}],
+        })));
+        assert!(!channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn the_bots_name_as_ordinary_words_does_not_address_it() {
+        // The whole value of mention-only is lost if the name appearing in conversation counts.
+        // Only spans Telegram itself marked as a mention are read, so this has no entities
+        // at all.
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "mekabot keeps answering things nobody asked it",
+        })));
+        assert!(!channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn a_text_mention_addresses_the_bot_by_id() {
+        // The first-class form: Telegram supplies a whole `User`, so this is an id comparison
+        // rather than a name match.
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "look at this",
+            "entities": [{
+                "type": "text_mention",
+                "offset": 0,
+                "length": 4,
+                "user": {"id": 4242, "is_bot": true, "first_name": "Mica"},
+            }],
+        })));
+        assert!(channel.addressed(&message));
+
+        let someone_else = wire_message(group_message(serde_json::json!({
+            "text": "look at this",
+            "entities": [{
+                "type": "text_mention",
+                "offset": 0,
+                "length": 4,
+                "user": {"id": 999, "is_bot": false, "first_name": "Bob"},
+            }],
+        })));
+        assert!(!channel.addressed(&someone_else));
+    }
+
+    #[tokio::test]
+    async fn replying_to_the_bot_addresses_it() {
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "no, the other one",
+            "reply_to_message": {
+                "message_id": 41,
+                "date": 1_754_899_100,
+                "chat": {"id": -1001234, "type": "supergroup", "title": "Ops"},
+                "from": {"id": 4242, "is_bot": true, "first_name": "Mica"},
+                "text": "here you go",
+            },
+        })));
+        assert!(channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn replying_to_somebody_else_does_not_address_the_bot() {
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "agreed",
+            "reply_to_message": {
+                "message_id": 41,
+                "date": 1_754_899_100,
+                "chat": {"id": -1001234, "type": "supergroup", "title": "Ops"},
+                "from": {"id": 999, "is_bot": false, "first_name": "Bob"},
+                "text": "we should ship it",
+            },
+        })));
+        assert!(!channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn a_command_aimed_at_the_bot_addresses_it_but_a_bare_one_does_not() {
+        let channel = identified();
+        let targeted = wire_message(group_message(serde_json::json!({
+            "text": "/status@mekabot",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 15}],
+        })));
+        assert!(channel.addressed(&targeted));
+
+        // Ambiguous in a group with several bots, and Telegram's own privacy mode only forwards it
+        // on the strength of who spoke last, which is not something this can reconstruct.
+        let bare = wire_message(group_message(serde_json::json!({
+            "text": "/status",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 7}],
+        })));
+        assert!(!channel.addressed(&bare));
+    }
+
+    #[tokio::test]
+    async fn a_mention_in_a_caption_addresses_the_bot() {
+        // A media message carries caption entities rather than text entities, and consulting only
+        // one of the two would make a mention on a photo invisible.
+        let channel = identified();
+        let message = wire_message(group_message(serde_json::json!({
+            "caption": "@mekabot what is this?",
+            "caption_entities": [{"type": "mention", "offset": 0, "length": 8}],
+            "photo": [{
+                "file_id": "AgACAgEAAx",
+                "file_unique_id": "AQAD",
+                "file_size": 2048,
+                "width": 90,
+                "height": 60,
+            }],
+        })));
+        assert!(channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn every_message_in_a_private_chat_addresses_the_bot() {
+        // Nobody else is there, so requiring a mention would silence the agent against the only
+        // person talking to it.
+        let channel = identified();
+        let message = wire_message(serde_json::json!({
+            "message_id": 42,
+            "date": 1_754_899_200,
+            "chat": {"id": 111, "type": "private", "first_name": "Alice"},
+            "from": {"id": 111, "is_bot": false, "first_name": "Alice"},
+            "text": "are you around?",
+        }));
+        assert!(channel.addressed(&message));
+    }
+
+    #[tokio::test]
+    async fn a_group_message_is_not_addressed_when_the_identity_is_unknown() {
+        // `run` resolves the identity before reading any update, so this only happens if that
+        // failed. Failing closed keeps a muted group quiet rather than waking the agent for
+        // everything.
+        let channel = channel(vec![], vec![-1001234]);
+        let message = wire_message(group_message(serde_json::json!({
+            "text": "@mekabot hello",
+            "entities": [{"type": "mention", "offset": 0, "length": 8}],
+        })));
+        assert!(!channel.addressed(&message));
     }
 
     #[test]

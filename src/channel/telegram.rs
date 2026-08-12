@@ -339,7 +339,7 @@ impl TelegramChannel {
     fn render(&self, markdown: &str, limit: usize) -> (Vec<String>, Option<ParseMode>) {
         match self.parse_mode {
             TelegramParseMode::Html => (render::to_html(markdown, limit), Some(ParseMode::Html)),
-            TelegramParseMode::None => (render::to_plain(markdown, limit), None),
+            TelegramParseMode::None => (crate::render::plain(markdown, limit), None),
         }
     }
 
@@ -415,7 +415,7 @@ impl TelegramChannel {
         }
 
         let edited_at = message.edit_date().copied();
-        Some(InboundEvent::Message(InboundMessage {
+        Some(InboundEvent::Message(Box::new(InboundMessage {
             channel: self.id.clone(),
             platform: Platform::Telegram,
             conversation,
@@ -432,6 +432,7 @@ impl TelegramChannel {
             sender,
             admission,
             addressed: self.addressed(message),
+            sender_roles: Vec::new(),
             text,
             reply_to,
             edited_at,
@@ -443,7 +444,7 @@ impl TelegramChannel {
             arrived_mid_turn: false,
             attachments,
             timestamp: message.date,
-        }))
+        })))
     }
 }
 
@@ -465,6 +466,9 @@ impl Channel for TelegramChannel {
             reactions: true,
             edit: true,
             admin: self.admin_tools,
+            // Telegram grants privileges to a person directly, and has no roles to hand out.
+            member_rights: self.admin_tools,
+            member_roles: false,
         }
     }
 
@@ -959,6 +963,14 @@ impl Channel for TelegramChannel {
         settings: &ChatSettings,
     ) -> Result<(), ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
+        if settings.slowmode.is_some() {
+            // Telegram has no slowmode a bot can set. Accepting the argument and doing nothing
+            // would have the agent report a change that never happened.
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "slowmode, which Telegram does not expose to bots",
+            });
+        }
         let mut applied = Vec::new();
         if let Some(title) = &settings.title {
             self.bot
@@ -1015,6 +1027,20 @@ impl Channel for TelegramChannel {
             display_name: Some(display_name(&member.user)),
             status: member_status(&member.kind),
             rights: member_rights(&member.kind),
+            // Telegram has no roles, and grants privileges to the person directly.
+            roles: Vec::new(),
+            // A Telegram restriction can be unbounded, which has no end date to report.
+            restricted_until: match &member.kind {
+                teloxide::types::ChatMemberKind::Restricted(restricted) => {
+                    match restricted.until_date {
+                        teloxide::types::UntilDate::Date(until) if until > chrono::Utc::now() => {
+                            Some(until)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
         })
     }
 
@@ -1371,6 +1397,28 @@ mod tests {
         configured(allowed_users, allowed_chats, false)
     }
 
+    #[tokio::test]
+    async fn slowmode_is_refused_rather_than_ignored() {
+        // Telegram has no slowmode a bot can set. Accepting the argument and reporting success
+        // would have the agent tell somebody it quieted a room it did not touch. Refused before any
+        // network call, so this needs no live bot.
+        let channel = channel(vec![1], Vec::new());
+        let error = channel
+            .set_chat(
+                &ConversationId::parse("telegram:1").expect("valid"),
+                &ChatSettings {
+                    slowmode: Some(std::time::Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("Telegram cannot do this");
+        assert!(
+            matches!(error, ChannelError::Unsupported { .. }),
+            "got {error:?}"
+        );
+    }
+
     fn configured(
         allowed_users: Vec<i64>,
         allowed_chats: Vec<i64>,
@@ -1476,7 +1524,9 @@ mod tests {
             std::path::Path::new("/etc/mekabridge/config.toml"),
         )
         .expect("minimal config is valid");
-        let crate::config::PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        let crate::config::PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {
+            panic!("the config under test declares one Telegram channel");
+        };
         assert!(
             telegram.poll_timeout + POLL_RESPONSE_MARGIN > TELOXIDE_DEFAULT_TIMEOUT,
             "the shipped poll timeout of {:?} plus the margin must clear teloxide's own {:?}",
@@ -1869,8 +1919,10 @@ mod tests {
     }
 
     fn inbound(event: InboundEvent) -> InboundMessage {
-        let InboundEvent::Message(message) = event;
-        message
+        let InboundEvent::Message(message) = event else {
+            panic!("a Telegram message never produces a retraction");
+        };
+        *message
     }
 
     #[tokio::test]

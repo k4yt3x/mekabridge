@@ -1344,6 +1344,26 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Drop one recorded message, because the platform says its author deleted it.
+    ///
+    /// Keyed on the platform's message id rather than the queue's `external_id`, since a deletion
+    /// names the message and knows nothing about the edit that may have given it a second row.
+    /// Returns whether anything was there to drop.
+    pub async fn forget_message(&self, conversation: &str, message_id: &str) -> Result<bool> {
+        let conversation = conversation.to_string();
+        let message_id = message_id.to_string();
+        let deleted = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+                    (conversation, message_id),
+                )
+            })
+            .await?;
+        Ok(deleted > 0)
+    }
+
     /// Unseen counts for every conversation that has any, keyed by conversation id.
     ///
     /// One grouped query rather than a count per conversation, because the caller is rendering a

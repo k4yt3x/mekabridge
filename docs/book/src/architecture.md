@@ -4,6 +4,7 @@
 
 ```
   Telegram ──long poll──►  channel  ──►  writer  ──►  SQLite queue
+  Discord  ──gateway────►
                               ▲                          │
                               │                          ▼
                              sink  ◄──  MCP server    drain loop
@@ -104,7 +105,9 @@ pub trait Channel: Send + Sync + 'static {
 
 Then: a `PlatformConfig` variant, a `Platform` variant, an array in `[channels]`, and one arm in `ChannelRegistry::build`. Nothing in the queue, the envelope, the turn runner, or the MCP tools changes.
 
-Agent-facing text is always Markdown, and each channel renders it into whatever its platform speaks. The agent should never have to know that Telegram wants a particular HTML subset.
+Agent-facing text is always Markdown, and each channel renders it into whatever its platform speaks. The agent should never have to know that Telegram wants a particular HTML subset while Discord wants its own Markdown dialect with everything else escaped.
+
+The parse is shared. `render.rs` turns Markdown into blocks and spans and does the length-safe splitting, which is the subtle part and is platform-neutral; each connector supplies only the emitter that turns a group of blocks into markup. Splitting happens on span boundaries before any markup exists, so a chunk can never be cut through a tag.
 
 ## Conversation ids
 

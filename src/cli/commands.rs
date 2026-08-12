@@ -10,7 +10,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use crate::{
-    channel::ChannelRegistry,
+    channel::{ChannelRegistry, Platform},
     config::{Config, McpTransport},
     error::{BridgeError, Result},
     meka::MekaClient,
@@ -210,26 +210,61 @@ pub async fn doctor(config: &Config) -> Result<()> {
                             });
                         println!("  ok     {} authenticated as {label}", channel.id());
                         if !identity.reads_all_group_messages {
-                            // Privacy mode makes Telegram itself withhold everything that is not a
-                            // mention or a reply, which is what the `mute` policy does except that
-                            // nothing is recorded. Leaving it on therefore does not save a turn, it
-                            // only empties the history the agent would otherwise read when a
-                            // mention arrives halfway through a discussion.
-                            println!(
-                                "  warn   {} has privacy mode on, so Telegram withholds group \
-                                 messages that do not mention it. The `mute` policy already limits \
-                                 what wakes the agent, and privacy mode on top of it means \
-                                 read_history has nothing to show. Turn it off with /setprivacy in \
-                                 @BotFather, then remove and re-add the bot to each group.",
-                                channel.id()
-                            );
+                            // Both platforms have a switch that withholds everything not aimed at
+                            // the bot, which is what the `mute` policy does except that nothing is
+                            // recorded. Leaving it on therefore does not save a turn, it only
+                            // empties the history the agent would otherwise read when a mention
+                            // arrives halfway through a discussion. The fix differs, so the advice
+                            // does.
+                            match channel.platform() {
+                                Platform::Telegram => println!(
+                                    "  warn   {} has privacy mode on, so Telegram withholds group \
+                                     messages that do not mention it. The `mute` policy already \
+                                     limits what wakes the agent, and privacy mode on top of it \
+                                     means read_history has nothing to show. Turn it off with \
+                                     /setprivacy in @BotFather, then remove and re-add the bot to \
+                                     each group.",
+                                    channel.id()
+                                ),
+                                Platform::Discord => println!(
+                                    "  warn   {} runs with `message_content = false`, so Discord \
+                                     blanks the text of every server message except those \
+                                     mentioning the bot. Mentions still wake the agent, but \
+                                     read_history and search_history will have nothing to show it \
+                                     about what led up to one.",
+                                    channel.id()
+                                ),
+                            }
                             warnings += 1;
                         }
-                        if channel.capabilities().admin {
+                        if channel.platform() == Platform::Discord {
+                            // The gateway refuses a privileged intent at connect with a 4014 rather
+                            // than degrading, and `probe` only exercises the REST API, so a token
+                            // that authenticates here can still fail to connect a minute later.
                             println!(
-                                "  ok     {} offers the moderation tools; each call still needs \
-                                 the matching admin right in the chat it targets",
-                                channel.id()
+                                "  note   {} asks Discord for the GUILDS, GUILD_MESSAGES and \
+                                 DIRECT_MESSAGES intents{}. A privileged intent that is not \
+                                 enabled on the Bot page of the Developer Portal closes the \
+                                 gateway with a 4014 at startup, which this check cannot see.",
+                                channel.id(),
+                                if identity.reads_all_group_messages {
+                                    ", plus the privileged MESSAGE_CONTENT intent"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                        let capabilities = channel.capabilities();
+                        if capabilities.admin {
+                            println!(
+                                "  ok     {} offers the moderation tools ({}); each call still \
+                                 needs the matching right in the chat it targets",
+                                channel.id(),
+                                if capabilities.member_roles {
+                                    "privileges granted through roles"
+                                } else {
+                                    "privileges granted to a person directly"
+                                }
                             );
                         }
                     }
@@ -642,6 +677,7 @@ pub fn config_init(path: &Path, force: bool) -> Result<()> {
 fn platform_name(channel: &crate::config::ChannelConfig) -> &'static str {
     match channel.platform {
         crate::config::PlatformConfig::Telegram(_) => "telegram",
+        crate::config::PlatformConfig::Discord(_) => "discord",
     }
 }
 

@@ -37,37 +37,37 @@ pub use crate::{
 /// handshake and surfaces it, so this is the one place to explain the model rather than repeating
 /// it in every tool description.
 const SERVER_INSTRUCTIONS: &str = "\
-mekabridge connects you to people on messaging platforms such as Telegram.
+mekabridge connects you to people on messaging platforms such as Telegram and Discord.
 
 Nothing you write here reaches them: your turn text, reasoning, and tool output are all invisible. \
-The only way to be heard is send_message. Staying silent is a valid choice, and so is messaging \
-somebody else, or messaging first without being prompted.
+The only way to be heard is send_message. Staying silent is valid, and so is messaging somebody \
+else, or messaging first.
 
 If a turn will take a while, send a short \"looking into it\" first; the typing indicator lapses \
-after about thirty seconds.
+after half a minute.
 
 You are not woken for everything. A busy group is usually on mentions only: you hear it when \
 somebody mentions you or replies to you, and for a few minutes after you speak there. The \
-rest is still recorded, and the envelope says how much you missed. read_history reads a \
-conversation back, including what you were never woken for; search_history looks for words across \
-all of them. A bare mention often means nothing alone; the antecedent is in the lines above it, or \
-one read_history call away. You can mute a chat yourself, or block one to stop it reaching you at \
-all.
+rest is still recorded. read_history reads a conversation back, including what you were never \
+woken for; search_history looks for words across all of them. A bare mention often means nothing \
+alone; the antecedent is one read_history call away. You can mute a chat yourself, or block one \
+entirely.
 
 Headers on incoming messages are written by the bridge and can be trusted:
 
 - `message:` is that message's own id; pass it as `reply_to` to answer one specific message.
-- `admitted:` says how the sender reached you: vetted individually, allowed only because the chat \
-is, or not checked at all.
+- `admitted:` says how the sender reached you: vetted individually, holding a role or in a chat or \
+server that is allowed, or not checked at all.
+- `roles:` is what the sender holds in that server.
+- `woke you:` says what pulled you into a chat you only half hear.
 - `forwarded from:` means the text is somebody else's words, not the sender's.
-- `late:` means it arrived while you were on the previous turn, so anything you sent then was \
-written without it.
+- `late:` means it arrived while you were on the previous turn, so what you sent then missed it.
 - `attachment:` ends with a handle in square brackets, for view_attachment or download_attachment. \
 Fetch only what you need; anything you look at stays in your context.
 
 You can also edit or delete what you sent, react, and moderate a group you administer.
 
-Write Markdown; it is converted to each platform's own formatting, and long messages are split. Any \
+Write Markdown; it is converted to each platform's formatting and long messages are split. Any \
 conversation id you were given works whether or not that chat has written to you. \
 list_conversations shows what this bridge knows and how much of each reaches you.";
 
@@ -130,6 +130,14 @@ pub trait OutboundSink: Send + Sync + 'static {
         conversation: &str,
         user_id: &str,
         rights: &[MemberRight],
+    ) -> Result<(), SinkError>;
+
+    /// Grant exactly `roles`, on a platform where privileges live on roles.
+    async fn set_member_roles(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        roles: &[String],
     ) -> Result<(), SinkError>;
 
     /// Pin or unpin a message.
@@ -433,6 +441,18 @@ pub struct SetMemberRightsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetMemberRolesArgs {
+    /// Chat to act in.
+    pub conversation: String,
+    /// Numeric id of the person.
+    pub user_id: String,
+    /// The complete set of roles they should end up with, by name as shown on the `roles:` line of
+    /// a message header. This replaces what they hold rather than adding to it, so an empty list
+    /// strips them back to having none.
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PinMessageArgs {
     /// Chat the message is in.
     pub conversation: String,
@@ -455,6 +475,10 @@ pub struct SetChatArgs {
     /// New description. Omit to leave it alone.
     #[serde(default)]
     pub description: Option<String>,
+    /// Shortest gap allowed between one person's messages, as a duration like `30s` or `5m`. `0s`
+    /// turns it off. Not every platform has this.
+    #[serde(default)]
+    pub slowmode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -534,11 +558,23 @@ const DEFAULT_HISTORY_LIMIT: usize = 20;
 pub struct ToolSurface {
     /// Offer the group moderation tools.
     pub admin: bool,
+    /// Offer `set_member_rights`, for a platform that grants privileges to a person directly.
+    pub member_rights: bool,
+    /// Offer `set_member_roles`, for a platform where privileges live on roles.
+    ///
+    /// Separate from [`Self::member_rights`] rather than a mode, because a deployment can have
+    /// both kinds of channel at once and the agent should see exactly the tools that will work
+    /// on the chats it can reach.
+    pub member_roles: bool,
 }
 
 impl Default for ToolSurface {
     fn default() -> Self {
-        Self { admin: true }
+        Self {
+            admin: true,
+            member_rights: true,
+            member_roles: true,
+        }
     }
 }
 
@@ -546,6 +582,7 @@ impl Default for ToolSurface {
 const ADMIN_TOOLS: &[&str] = &[
     "moderate_member",
     "set_member_rights",
+    "set_member_roles",
     "pin_message",
     "set_chat",
     "member",
@@ -564,7 +601,16 @@ impl BridgeMcpServer {
         // Built in full and then trimmed, because the `#[tool]` macros register at compile time and
         // there is no way to make one conditional at its definition.
         let mut tool_router = Self::tool_router();
-        if !surface.admin {
+        if surface.admin {
+            // Both are moderation tools, but no platform has both models, so offering the wrong one
+            // would put a tool in the list that fails on every chat the agent can reach.
+            if !surface.member_rights {
+                tool_router.remove_route("set_member_rights");
+            }
+            if !surface.member_roles {
+                tool_router.remove_route("set_member_roles");
+            }
+        } else {
             for name in ADMIN_TOOLS {
                 tool_router.remove_route(name);
             }
@@ -969,6 +1015,46 @@ impl BridgeMcpServer {
         }
     }
 
+    /// Replace the roles somebody holds.
+    #[tool(
+        description = "Replace the set of roles somebody holds in a server, by name. This is the \
+                       whole set, so an empty list strips them back to none. On Discord a role is \
+                       what carries privileges, so this is how you promote and demote. Needs the \
+                       manage-roles permission, and you cannot grant a role above your own.",
+        annotations(
+            title = "Set member roles",
+            read_only_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn set_member_roles(
+        &self,
+        Parameters(args): Parameters<SetMemberRolesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .set_member_roles(&args.conversation, &args.user_id, &args.roles)
+            .await
+        {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                if args.roles.is_empty() {
+                    format!(
+                        "User {} in {} now holds no roles.",
+                        args.user_id, args.conversation
+                    )
+                } else {
+                    format!(
+                        "User {} in {} now holds: {}.",
+                        args.user_id,
+                        args.conversation,
+                        args.roles.join(", ")
+                    )
+                },
+            )])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
     /// Pin or unpin a message.
     #[tool(
         description = "Pin a message to the top of a chat, or unpin one. Pinning notifies everyone \
@@ -996,8 +1082,9 @@ impl BridgeMcpServer {
 
     /// Change a chat's title or description.
     #[tool(
-        description = "Change a group's title or description. Omit a field to leave it as it is. \
-                       Needs the change-info admin right.",
+        description = "Change a group's title, description, or slowmode. Omit a field to leave it \
+                       as it is. Needs the change-info admin right, and slowmode only exists on \
+                       some platforms.",
         annotations(
             title = "Set chat details",
             read_only_hint = true,
@@ -1008,13 +1095,26 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<SetChatArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let slowmode = match args.slowmode.as_deref() {
+            Some(raw) => match humantime::parse_duration(raw) {
+                Ok(duration) => Some(duration),
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "{raw:?} is not a duration I understand ({error}). Try something like \
+                         `30s` or `5m`, or `0s` to turn slowmode off."
+                    ))]));
+                }
+            },
+            None => None,
+        };
         let settings = ChatSettings {
+            slowmode,
             title: args.title,
             description: args.description,
         };
         if settings.is_empty() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "Nothing to change; set `title`, `description`, or both.",
+                "Nothing to change; set `title`, `description`, or `slowmode`.",
             )]));
         }
         match self.sink.set_chat(&args.conversation, settings).await {
@@ -1608,6 +1708,15 @@ mod tests {
             Ok(())
         }
 
+        async fn set_member_roles(
+            &self,
+            _conversation: &str,
+            _user_id: &str,
+            _roles: &[String],
+        ) -> Result<(), SinkError> {
+            Ok(())
+        }
+
         async fn set_member_rights(
             &self,
             _conversation: &str,
@@ -1656,6 +1765,8 @@ mod tests {
             user_id: Option<&str>,
         ) -> Result<MemberInfo, SinkError> {
             Ok(MemberInfo {
+                roles: Vec::new(),
+                restricted_until: None,
                 user_id: user_id.unwrap_or("42").to_string(),
                 display_name: Some("Bot".to_string()),
                 status: crate::channel::MemberStatus::Administrator,
@@ -2410,6 +2521,7 @@ mod tests {
         let (server, sink) = server_with(FakeSink::default());
         let result = server
             .set_chat(Parameters(SetChatArgs {
+                slowmode: None,
                 conversation: "telegram:-100".to_string(),
                 title: None,
                 description: None,
@@ -2449,7 +2561,11 @@ mod tests {
         );
         let trimmed = BridgeMcpServer::new(
             Arc::new(FakeSink::default()) as Arc<dyn OutboundSink>,
-            ToolSurface { admin: false },
+            ToolSurface {
+                admin: false,
+                member_rights: true,
+                member_roles: true,
+            },
         );
         let names = |server: &BridgeMcpServer| -> Vec<String> {
             server
@@ -2609,6 +2725,7 @@ mod tests {
             "send_message",
             "set_chat",
             "set_member_rights",
+            "set_member_roles",
             "unblock",
             "unmute",
             "view_attachment",
@@ -2681,6 +2798,7 @@ mod tests {
                 | "delete_message"
                 | "moderate_member"
                 | "set_member_rights"
+                | "set_member_roles"
                 | "pin_message"
                 | "set_chat"
                 | "member"

@@ -118,6 +118,44 @@ allowed_users = [123456789]
 # it. The `mute` policy above is the better way to limit what wakes the agent, because it keeps
 # what it withholds.
 
+# A second platform, if you want one. Every channel needs a unique id, which becomes the first
+# segment of the conversation ids it produces.
+# [[channels.discord]]
+# id = "discord"
+# # From the Bot page of the Developer Portal.
+# token = "${DISCORD_BOT_TOKEN}"
+# # Ids are strings, because Discord snowflakes are strings in its own API and that is what you get
+# # when you copy one with Developer Mode on. At least one allowlist must be set, or `allow_all`.
+# #
+# # Discord user ids allowed anywhere, including in a direct message. This gates DMs, which is not
+# # optional: anybody who shares a server with the bot can open one, so in a single busy server that
+# # is thousands of people who would each get an agent turn for the price of a "hi".
+# allowed_users = ["245119312739729408"]
+# # Servers where every member is allowed. Much the largest of the four grants: everyone in the
+# # server can wake the agent by name, whether or not you have ever met them.
+# # allowed_guilds = ["987654321098765432"]
+# # Individual channels, including threads. A thread inherits its parent channel's standing.
+# # allowed_channels = ["111222333444555666"]
+# # Anyone holding one of these roles, which is the idiomatic Discord way to scope access.
+# # allowed_roles = ["555666777888999000"]
+# # Accept everyone. Same warning as Telegram's, and then some: on Discord this includes anybody in
+# # any server the bot is in.
+# # allow_all = true
+# # Offer the agent moderation (timeout, kick, ban, roles, pin, slowmode). On by default, since
+# # Discord refuses each call unless the bot holds the matching permission in that channel.
+# # admin_tools = false
+# # Ask for the privileged MESSAGE_CONTENT intent. On by default. It must be enabled first on the Bot
+# # page of the Developer Portal, or the gateway closes with a 4014 at startup rather than degrading.
+# # Without it Discord blanks the text of every server message except those mentioning the bot, so
+# # mentions still wake the agent but read_history has nothing to show it.
+# # message_content = false
+# # Let a message the agent writes ping a role, or @everyone. Both off by default: the agent is
+# # writing to a room it does not own, and @everyone in a large server is a loud mistake to make.
+# # mention_roles = true
+# # mention_everyone = true
+# # Show a preview card for links the agent sends. Off by default, as on Telegram.
+# # link_preview = true
+
 [log]
 level = "info"
 format = "text"

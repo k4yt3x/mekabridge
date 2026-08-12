@@ -9,9 +9,10 @@
 //! rather than the agent having to know that Telegram wants a particular HTML subset and Discord
 //! wants something else.
 
+pub mod discord;
 pub mod telegram;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,12 +27,14 @@ use crate::config::{ChannelConfig, PlatformConfig};
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     Telegram,
+    Discord,
 }
 
 impl Platform {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Telegram => "telegram",
+            Self::Discord => "discord",
         }
     }
 }
@@ -168,8 +171,10 @@ pub struct Sender {
 
 /// Why an inbound message was allowed to reach the agent.
 ///
-/// These are three different trust positions and the platform layer is the only thing that knows
-/// which applies. Somebody speaking in an allowlisted group has not been vetted individually, and
+/// These are five different trust positions and the platform layer is the only thing that knows
+/// which applies. Somebody holding an allowed role was never looked at as an account, somebody
+/// speaking in an allowlisted group has not been vetted individually, somebody admitted because
+/// they belong to an allowlisted server has not been vetted even to the level of the room, and
 /// somebody reaching an open channel has not been vetted at all. The bridge reports which; what to
 /// do about it is the operator's policy, expressed in the agent's own instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,8 +182,17 @@ pub struct Sender {
 pub enum Admission {
     /// The sender's own account is on the channel's user allowlist.
     User,
+    /// The sender holds a role the channel allows. An operator granted that role's holders access
+    /// deliberately, but the account itself was never looked at, and whoever administers the server
+    /// can hand the role to somebody else without the bridge hearing about it.
+    Role,
     /// The sender is not individually allowlisted; the chat they spoke in is.
     Chat,
+    /// Neither the sender nor the chat is allowlisted, but the wider space they both belong to is:
+    /// a Discord server, and later a Slack workspace or a Matrix space. Kept apart from
+    /// [`Self::Chat`] because "this one room" and "all several thousand people in this server"
+    /// are not the same grant, and only the connector knows which one happened.
+    Server,
     /// The channel accepts everyone, so nothing was checked.
     Open,
 }
@@ -188,7 +202,15 @@ impl Admission {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::User => "user allowlist",
+            Self::Role => {
+                "role allowlist (sender holds an allowed role; the account itself was \
+                           not vetted)"
+            }
             Self::Chat => "chat allowlist (sender not individually allowlisted)",
+            Self::Server => {
+                "server allowlist (neither the sender nor this chat is individually \
+                             allowlisted)"
+            }
             Self::Open => "open channel (anyone may message this bot; sender not vetted)",
         }
     }
@@ -322,6 +344,19 @@ pub struct Attachment {
     pub handle: Option<String>,
 }
 
+/// One message the platform found, from its own record rather than the bridge's.
+///
+/// Deliberately thin. Anything the bridge recorded it can say more about, and anything it did not
+/// is reachable only through this, where the platform gives text, an author, and a time and nothing
+/// the bridge could have minted a handle for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundMessage {
+    pub message_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// A transient "something is coming" signal shown in a chat.
 ///
 /// Platforms model this as a declaration of what the user is about to receive rather than as a
@@ -377,6 +412,13 @@ pub struct InboundMessage {
     /// they are decoded after an upgrade.
     #[serde(default)]
     pub addressed: bool,
+    /// Roles the sender holds in this chat, named rather than identified.
+    ///
+    /// Empty on a platform without roles, and on one that has them but did not say. Worth the
+    /// envelope line because it is the difference between a stranger and a moderator, and Discord
+    /// supplies it on every message without being asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sender_roles: Vec<String>,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyContext>,
@@ -415,7 +457,20 @@ pub struct InboundMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundEvent {
-    Message(InboundMessage),
+    // Boxed because a message is an order of magnitude larger than a retraction, and every event
+    // in flight would otherwise be sized for the biggest variant.
+    Message(Box<InboundMessage>),
+    /// A message the platform says is gone.
+    ///
+    /// Never queued and never shown to the agent: it exists so the bridge's own record of a chat
+    /// does not outlive the chat itself, replaying something its author deleted. Only platforms
+    /// that report deletions produce these, which is why it is an event rather than something the
+    /// store could work out for itself.
+    Retraction {
+        conversation: ConversationId,
+        message_id: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl InboundEvent {
@@ -423,6 +478,7 @@ impl InboundEvent {
     pub const fn conversation(&self) -> &ConversationId {
         match self {
             Self::Message(message) => &message.conversation,
+            Self::Retraction { conversation, .. } => conversation,
         }
     }
 
@@ -430,12 +486,14 @@ impl InboundEvent {
     pub fn external_id(&self) -> &str {
         match self {
             Self::Message(message) => &message.external_id,
+            Self::Retraction { message_id, .. } => message_id,
         }
     }
 
     pub const fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::Message(message) => message.timestamp,
+            Self::Retraction { timestamp, .. } => *timestamp,
         }
     }
 }
@@ -542,8 +600,16 @@ pub struct MemberInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub status: MemberStatus,
-    /// Empty for anyone who is not an administrator.
+    /// Empty for anyone who is not an administrator, and on a platform that grants privileges
+    /// through roles rather than directly.
     pub rights: Vec<MemberRight>,
+    /// Roles held, named rather than given as ids, since a name is what the agent was told in the
+    /// envelope and what a person would say. Empty on a platform with no roles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// When a restriction lifts, for somebody currently restricted with an end date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restricted_until: Option<DateTime<Utc>>,
 }
 
 /// Chat-level settings a moderator can change. `None` leaves a field alone.
@@ -551,12 +617,15 @@ pub struct MemberInfo {
 pub struct ChatSettings {
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Minimum gap between one person's messages. `Some(ZERO)` turns it off, which is why this is
+    /// not merely an absent `None`.
+    pub slowmode: Option<Duration>,
 }
 
 impl ChatSettings {
     /// Whether this would change anything at all.
     pub const fn is_empty(&self) -> bool {
-        self.title.is_none() && self.description.is_none()
+        self.title.is_none() && self.description.is_none() && self.slowmode.is_none()
     }
 }
 
@@ -582,6 +651,13 @@ pub struct ChannelCapabilities {
     /// call succeeds is still the platform's decision, based on what rights the bot holds in that
     /// particular chat.
     pub admin: bool,
+    /// Privileges are granted to a person directly, as a named set. Telegram's model.
+    pub member_rights: bool,
+    /// Privileges live on roles, and a person is granted a role. Discord's model, and the reason
+    /// this is not one `admin` flag: synthesising a role to satisfy a requested list of rights, or
+    /// guessing which role a right belongs to, is exactly the kind of invention that would make
+    /// the agent's request and the server's actual state quietly disagree.
+    pub member_roles: bool,
 }
 
 /// Who a channel is logged in as. Used by `mekabridge doctor`.
@@ -739,6 +815,29 @@ pub trait Channel: Send + Sync + 'static {
         })
     }
 
+    /// Grant exactly `roles`, which promotes, adjusts, or (when empty) strips somebody back to
+    /// having none.
+    ///
+    /// The counterpart to [`Channel::set_member_rights`] for platforms where privileges live on
+    /// roles. A platform has one model or the other, never both, and
+    /// [`ChannelCapabilities::member_rights`] and [`ChannelCapabilities::member_roles`] say which.
+    ///
+    /// Roles are named rather than identified, because a name is what the agent sees everywhere
+    /// else and asking it to carry an opaque id it was never shown would make this tool unusable
+    /// without a lookup that does not exist.
+    async fn set_member_roles(
+        &self,
+        conversation: &ConversationId,
+        user_id: &str,
+        roles: &[String],
+    ) -> Result<(), ChannelError> {
+        let _ = (conversation, user_id, roles);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "changing member roles",
+        })
+    }
+
     /// Pin or unpin a message.
     async fn pin_message(
         &self,
@@ -764,6 +863,43 @@ pub trait Channel: Send + Sync + 'static {
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "changing chat settings",
+        })
+    }
+
+    /// The id this conversation will actually be known by, if it differs from the one given.
+    ///
+    /// Exists for Discord's `discord:@<user id>` dialling address, which is not a conversation id
+    /// at all: it names a person, and the direct-message channel it stands for only gets an id once
+    /// the platform is asked. Without this the bridge would file what it sent under the dialling
+    /// address while the reply arrived under the channel, leaving two rows for one person and a
+    /// mute set on one of them doing nothing to the other.
+    ///
+    /// Defaults to the id unchanged, which is right for every platform whose ids are already final.
+    async fn canonical_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<ConversationId, ChannelError> {
+        Ok(conversation.clone())
+    }
+
+    /// Search the platform's own record of a conversation.
+    ///
+    /// Distinct from the bridge's history, and worth having alongside it: this reaches messages
+    /// from before the bot ever joined, which nothing the bridge recorded can. Most platforms have
+    /// no such thing for a bot, hence the default.
+    ///
+    /// Best-effort by contract. A platform that is still indexing, or that will not answer for this
+    /// chat, returns an error the caller is expected to fall back from rather than surface.
+    async fn search_messages(
+        &self,
+        conversation: &ConversationId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FoundMessage>, ChannelError> {
+        let _ = (conversation, query, limit);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "searching the platform's own history",
         })
     }
 
@@ -810,6 +946,9 @@ impl ChannelRegistry {
             let channel: Arc<dyn Channel> = match &config.platform {
                 PlatformConfig::Telegram(telegram) => {
                     Arc::new(telegram::TelegramChannel::new(id.clone(), telegram)?)
+                }
+                PlatformConfig::Discord(discord) => {
+                    Arc::new(discord::DiscordChannel::new(id.clone(), discord)?)
                 }
             };
             channels.insert(id.as_str().to_string(), channel);
@@ -863,6 +1002,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_admission_reads_as_one_clean_sentence() {
+        // These are printed verbatim into the envelope. A `\\`-continued literal that rustfmt joins
+        // keeps its indentation as literal spaces, which is how a run of them got into a URL
+        // elsewhere and broke it silently. Cheap to assert, and it fails loudly.
+        for admission in [
+            Admission::User,
+            Admission::Role,
+            Admission::Chat,
+            Admission::Server,
+            Admission::Open,
+        ] {
+            let text = admission.describe();
+            assert!(
+                !text.contains("  "),
+                "{admission:?} describes itself with a run of spaces: {text:?}"
+            );
+            assert!(!text.contains('\n'), "{admission:?} spans lines: {text:?}");
+        }
+    }
+
+    #[test]
     fn conversation_id_round_trips_without_a_thread() {
         let id = ConversationId::new(&ChannelId::new("telegram"), "123", None);
         assert_eq!(id.as_str(), "telegram:123");
@@ -910,7 +1070,7 @@ mod tests {
     fn inbound_event_payloads_round_trip_through_json() {
         // The queue stores events as JSON, so a payload written before a restart has to deserialize
         // afterwards.
-        let event = InboundEvent::Message(InboundMessage {
+        let event = InboundEvent::Message(Box::new(InboundMessage {
             channel: ChannelId::new("telegram"),
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:123").expect("valid"),
@@ -927,6 +1087,7 @@ mod tests {
             },
             admission: Admission::User,
             addressed: false,
+            sender_roles: Vec::new(),
             text: "hello".to_string(),
             reply_to: None,
             edited_at: None,
@@ -950,7 +1111,7 @@ mod tests {
             timestamp: DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z")
                 .expect("literal parses")
                 .with_timezone(&Utc),
-        });
+        }));
         let encoded = serde_json::to_string(&event).expect("serializes");
         let decoded: InboundEvent = serde_json::from_str(&encoded).expect("deserializes");
         assert_eq!(decoded, event);

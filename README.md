@@ -90,7 +90,7 @@ None of these talk to the daemon. They read the SQLite database and call meka di
 
 ## Documentation
 
-See the [documentation](./docs/book/src/introduction.md) for configuration, Telegram setup, meka integration, operations, and architecture.
+See the [documentation](./docs/book/src/introduction.md) for configuration, Telegram and Discord setup, meka integration, operations, and architecture.
 
 ## License
 

@@ -8,15 +8,22 @@ The allowlist decides who may reach the agent. Everything after that is the agen
 
 A bot token is a public entry point. Anyone who learns the bot's name can message it, so mekabridge refuses to start without an allowlist:
 
-| Setting | Admits |
-|---|---|
-| `allowed_users` | Specific people, wherever they message from |
-| `allowed_chats` | Every member of a group or channel |
-| `allow_all` | Everyone |
+| Setting | Admits | Platform |
+|---|---|---|
+| `allowed_users` | Specific people, wherever they message from | both |
+| `allowed_chats` | Every member of a group or channel | Telegram |
+| `allowed_channels` | Everyone in these channels, and in threads started in them | Discord |
+| `allowed_roles` | Anyone holding one of these roles | Discord |
+| `allowed_guilds` | **Every member of the server** | Discord |
+| `allow_all` | Everyone | both |
 
 Messages from outside are dropped at debug level with no reply. Not replying is deliberate: an "unauthorized" response confirms to a stranger that the bot is live.
 
-Each inbound message carries an `admitted:` line saying which rule let it through, and they are not equivalent claims. `user allowlist` means that account was vetted individually. `chat allowlist` means it was not, and is only here because somebody put the bot in a room it belongs to. `open channel` means nothing was checked.
+Each inbound message carries an `admitted:` line saying which rule let it through, and they are not equivalent claims. `user allowlist` means that account was vetted individually. `role allowlist` means it was not: somebody granted the role's holders access, and whoever administers the server can hand that role to anyone without the bridge hearing about it. `chat allowlist` means the sender is only here because somebody put the bot in a room they belong to. `server allowlist` means not even that: the person and the room are both incidental, and all that was checked is that they are somewhere in a server you named. `open channel` means nothing was checked.
+
+**`allowed_guilds` is a much larger grant than it looks.** A Telegram chat allowlist admits a room. This admits everybody in a server, each of whom can wake the agent by name, so a five-thousand-member server is five thousand people with a turn each. Startup warns whenever it is set. Prefer `allowed_channels` or `allowed_roles` where you can.
+
+**On Discord, anybody who shares a server with the bot can send it a direct message.** That is Discord's rule, not the bridge's, and it is why `allowed_users` gates direct messages there rather than being an extra convenience.
 
 **`allow_all` admits individuals, not just groups.** On Telegram a private chat id *is* the user's id, so opening a channel opens direct messages too. Every turn costs provider tokens, so an open bot is also an open invitation to spend your budget. `[bridge.default_policy]` is the preventive lever, since it applies before anybody has said anything; the agent's own `mute` and `block` are reactive.
 

@@ -22,6 +22,7 @@ The bridge reports facts and supplies capabilities; who counts as trusted, and w
 ```
                   MCP (streamable HTTP)
     meka serve  ──────── tools/call ────────►  mekabridge  ◄──── long poll ────  Telegram
+                                                          ◄──── gateway ──────  Discord
       :8080     ◄─ POST /v1/sessions/{id}/turn ─┘   │
                                                     └── SQLite: session, queue, conversations
 ```
@@ -32,6 +33,6 @@ meka and mekabridge each act as the other's client. meka calls the bridge's MCP 
 
 ## Status
 
-Telegram is the supported platform today. The channel layer is an abstraction with one implementation, so adding another is a new module plus a factory arm; nothing in the queue, envelope, or turn machinery changes.
+Telegram and Discord are the supported platforms. The channel layer is where a platform's differences live, so adding another is a new module plus a factory arm; nothing in the queue, envelope, or turn machinery changes.
 
 Continue to [Installation](./getting-started/installation.md).

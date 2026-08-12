@@ -1,8 +1,8 @@
 [package]
 name = "mekabridge"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 description = "A bridge between the meka agent and third-party messaging platforms"
 repository = "https://github.com/k4yt3x/mekabridge"
@@ -32,9 +32,7 @@ rand = "0.10"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 rmcp = { version = "3", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-# Must resolve to the same version rmcp links, or the `JsonSchema` derived on the channel enums is a
-# different trait from the one the tool macros require. A mismatch is a compile error, not a subtle
-# one, so this needs checking on an rmcp upgrade rather than watching for.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +44,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-platform-verifier", "zstd"] }
+twilight-http = { version = "0.17", default-features = false, features = ["decompression", "rustls-platform-verifier"] }
+twilight-mention = "0.17"
+twilight-model = "0.17"
+twilight-util = { version = "0.17", features = ["permission-calculator"] }
+twilight-validate = "0.17"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 

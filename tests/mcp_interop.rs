@@ -42,6 +42,7 @@ struct RecordingSink {
     moderations: Mutex<Vec<(String, MemberAction, Option<chrono::DateTime<chrono::Utc>>)>>,
     #[allow(clippy::type_complexity)]
     policies: Mutex<Vec<(String, Policy, Option<chrono::DateTime<chrono::Utc>>)>>,
+    roles: Mutex<Vec<Vec<String>>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -205,6 +206,19 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
+    async fn set_member_roles(
+        &self,
+        _conversation: &str,
+        _user_id: &str,
+        roles: &[String],
+    ) -> Result<(), SinkError> {
+        self.roles
+            .lock()
+            .expect("not poisoned")
+            .push(roles.to_vec());
+        Ok(())
+    }
+
     async fn pin_message(
         &self,
         _conversation: &str,
@@ -229,6 +243,8 @@ impl OutboundSink for RecordingSink {
         user_id: Option<&str>,
     ) -> Result<MemberInfo, SinkError> {
         Ok(MemberInfo {
+            roles: Vec::new(),
+            restricted_until: None,
             user_id: user_id.unwrap_or("7").to_string(),
             display_name: Some("Bot".to_string()),
             status: MemberStatus::Administrator,
@@ -378,10 +394,63 @@ async fn handshake_succeeds_across_the_version_gap() {
 }
 
 #[tokio::test]
+async fn each_moderation_model_is_offered_only_where_it_would_work() {
+    // A platform grants privileges to a person or through roles, never both, so offering the wrong
+    // tool puts one in the list that fails on every chat the agent can reach.
+    let harness = start_with(ToolSurface {
+        admin: true,
+        member_rights: false,
+        member_roles: true,
+    })
+    .await;
+    let client = connect(&harness).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list works");
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    assert!(names.contains(&"set_member_roles"), "got {names:?}");
+    assert!(!names.contains(&"set_member_rights"), "got {names:?}");
+    assert!(names.contains(&"moderate_member"), "got {names:?}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn setting_roles_round_trips_across_the_version_gap() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "set_member_roles",
+            serde_json::json!({
+                "conversation": "discord:123",
+                "user_id": "456",
+                "roles": ["Moderators", "Release Team"],
+            }),
+        ))
+        .await
+        .expect("the call succeeds");
+    assert_ne!(result.is_error, Some(true), "got {result:?}");
+
+    let recorded = harness.sink.roles.lock().expect("not poisoned").clone();
+    assert_eq!(recorded, vec![vec![
+        "Moderators".to_string(),
+        "Release Team".to_string()
+    ]]);
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
 async fn turning_off_admin_tools_removes_exactly_those() {
     // Conditional registration is the one thing here that can silently drop a tool, so both halves
     // are pinned: the moderation tools go, and nothing else does.
-    let harness = start_with(ToolSurface { admin: false }).await;
+    let harness = start_with(ToolSurface {
+        admin: false,
+        member_rights: true,
+        member_roles: true,
+    })
+    .await;
     let client = connect(&harness).await;
 
     let tools = client.list_all_tools().await.expect("tools/list works");
@@ -434,6 +503,7 @@ async fn all_tools_are_visible_to_an_older_client() {
         "send_message",
         "set_chat",
         "set_member_rights",
+        "set_member_roles",
         "unblock",
         "unmute",
         "view_attachment",

@@ -17,6 +17,7 @@
 //! - [`meka`] speaks meka's HTTP API, including consuming a turn's SSE stream.
 //! - [`mcp`] is the MCP server meka connects to, exposing the outbound tool surface.
 //! - [`channel`] defines the platform abstraction; each submodule is one platform.
+//! - [`render`] parses agent Markdown into the intermediate every platform's emitter works from.
 //! - [`bridge`] wires it together and owns the queue-to-turn loop.
 
 pub mod bridge;
@@ -26,4 +27,5 @@ pub mod config;
 pub mod error;
 pub mod mcp;
 pub mod meka;
+pub mod render;
 pub mod store;

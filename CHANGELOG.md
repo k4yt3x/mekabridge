@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-12
+
+### Added
+
+- Discord, as a second platform: servers, channels, threads, forum posts, and direct messages.
+- Server channels default to mentions only; `@everyone` and role pings never wake the agent.
+- `[[channels.discord]]`, with allowlists by user, role, channel, and whole server.
+- `set_member_roles`, since Discord grants privileges through roles rather than to a person.
+- `slowmode` on `set_chat`, for quieting a room rather than a person. Discord only.
+- `discord:@<user id>` reaches somebody who has never written to the bot first.
+- `search_history` also asks Discord, reaching messages from before the bot joined the server.
+- A message deleted on Discord is dropped from the bridge's history, so it is never replayed.
+- The envelope gains the sender's roles, why the agent was woken, and two weaker `admitted:` values.
+- Ids in Discord message text are resolved to names before the agent reads them.
+- A refused Discord intent is reported in plain English instead of a silent reconnect loop.
+
+### Changed
+
+- `member` reports roles and when a restriction lifts, which improves the Telegram answer too.
+- `[bridge].default_policy` now covers Discord: server channels are groups, announcements channels.
+- Only the moderation tools a configured platform can honour are offered to the agent.
+- The minimum supported Rust version is 1.89, which is twilight's floor.
+
+### Fixed
+
+- The daemon stayed up after its last channel died, looking healthy while hearing nothing.
+- A heading containing bold lost its formatting for the rest of the line on Telegram.
+- The docs said pinning needs `MANAGE_MESSAGES`; Discord now requires the separate `PIN_MESSAGES`.
+
+### Security
+
+- A newline in a display name or nickname could forge an envelope header line; now flattened.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added
@@ -100,8 +133,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/k4yt3x/mekabridge/compare/v0.2.1...v0.3.0
-[0.2.1]: https://github.com/k4yt3x/mekabridge/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/k4yt3x/mekabridge/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/k4yt3x/mekabridge/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/k4yt3x/mekabridge/compare/0.2.1...0.3.0
+[0.2.1]: https://github.com/k4yt3x/mekabridge/compare/0.2.0...0.2.1
+[0.2.0]: https://github.com/k4yt3x/mekabridge/compare/0.1.0...0.2.0
+[0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/0.1.0

@@ -326,6 +326,8 @@ mod tests {
 
         fn capabilities(&self) -> ChannelCapabilities {
             ChannelCapabilities {
+                member_rights: false,
+                member_roles: false,
                 typing_indicator: true,
                 files: true,
                 photos: true,

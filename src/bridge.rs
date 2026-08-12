@@ -9,7 +9,14 @@ pub mod envelope;
 pub mod inbound;
 pub mod turn;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -101,6 +108,9 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let shutdown = CancellationToken::new();
+    // Fires when the last channel stops, as distinct from an operator asking the process to stop.
+    // The two are kept apart so the exit status can say which happened.
+    let deaf = CancellationToken::new();
     let wake_drain = Arc::new(Notify::new());
     let (event_sender, event_receiver) = mpsc::channel::<InboundEvent>(EVENT_BUFFER);
 
@@ -118,8 +128,16 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Derived from the channels rather than read from `[mcp]`, so the tool list follows the same
     // per-channel setting that decides whether the calls would work at all.
+    // Each flag asks whether any reachable channel can honour that tool, so a tool never appears
+    // when every chat the agent can act in would reject it.
     let surface = ToolSurface {
         admin: channels.iter().any(|channel| channel.capabilities().admin),
+        member_rights: channels
+            .iter()
+            .any(|channel| channel.capabilities().member_rights),
+        member_roles: channels
+            .iter()
+            .any(|channel| channel.capabilities().member_roles),
     };
     tasks.spawn({
         let config = Arc::clone(&config);
@@ -132,10 +150,17 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
+    // Counts channels still running. A bridge with no live channel cannot do the one thing it is
+    // for, and staying up in that state is the worst of both: a supervisor sees a healthy service
+    // while every message goes unheard. One dead channel out of several is different, and is left
+    // alone.
+    let live_channels = Arc::new(AtomicUsize::new(channels.count()));
     for channel in channels.iter() {
         let channel = Arc::clone(channel);
         let sender = event_sender.clone();
         let shutdown = shutdown.clone();
+        let live_channels = Arc::clone(&live_channels);
+        let deaf = deaf.clone();
         tasks.spawn(async move {
             let id = channel.id().clone();
             match channel.run(sender, shutdown).await {
@@ -143,8 +168,15 @@ pub async fn run(config: Config) -> Result<()> {
                 // One channel failing must not take the others down: a Telegram outage should not
                 // stop a Discord bridge, and the operator needs the process alive to see the log.
                 Err(error) => {
-                    tracing::error!(channel = %id, "channel stopped with an error: {}", error)
+                    tracing::error!(channel = %id, "channel stopped with an error: {}", error);
                 }
+            }
+            if live_channels.fetch_sub(1, Ordering::SeqCst) == 1 {
+                tracing::error!(
+                    "every channel has stopped, so nothing can reach the agent; shutting down so \
+                     this is not mistaken for a healthy service"
+                );
+                deaf.cancel();
             }
         });
     }
@@ -192,7 +224,10 @@ pub async fn run(config: Config) -> Result<()> {
         "mekabridge is running; waiting for messages"
     );
 
-    shutdown_signal().await;
+    let went_deaf = tokio::select! {
+        () = shutdown_signal() => false,
+        () = deaf.cancelled() => true,
+    };
     tracing::info!("shutting down");
     shutdown.cancel();
 
@@ -215,6 +250,14 @@ pub async fn run(config: Config) -> Result<()> {
 
     if let Err(error) = store.checkpoint().await {
         tracing::warn!("WAL checkpoint on shutdown failed: {}", error);
+    }
+    if went_deaf {
+        // A non-zero exit, so a supervisor restarts rather than reporting a service that is running
+        // and hearing nothing. Some causes clear on a restart and some do not: a refused intent
+        // will fail again, which is what `StartLimitBurst` is for.
+        return Err(crate::error::BridgeError::command(
+            "every channel stopped; the bridge cannot reach anybody",
+        ));
     }
     Ok(())
 }
@@ -443,7 +486,31 @@ impl BridgeSink {
         Ok((conversation, channel))
     }
 
+    /// The id a conversation should be recorded under, which is not always the one the agent used.
+    ///
+    /// A dialling address names a person rather than a chat, so recording what was sent under it
+    /// would leave the reply arriving in a different conversation and a policy set on one not
+    /// applying to the other. A connector that cannot resolve it says so and the address is used as
+    /// given, which is no worse than not asking.
+    async fn canonical(&self, conversation: &ConversationId) -> ConversationId {
+        let Ok(channel) = self.channels.resolve(conversation) else {
+            return conversation.clone();
+        };
+        match channel.canonical_conversation(conversation).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::debug!(
+                    conversation = %conversation,
+                    "could not resolve the conversation to its final id: {}",
+                    error
+                );
+                conversation.clone()
+            }
+        }
+    }
+
     async fn note_sent(&self, conversation: &ConversationId, platform: crate::channel::Platform) {
+        let conversation = &self.canonical(conversation).await;
         // Stops the typing indicator re-arming here. Telegram already cleared it when this message
         // landed, so setting it again would announce a follow-up that is not coming.
         self.presence.note_sent(conversation);
@@ -663,6 +730,26 @@ impl OutboundSink for BridgeSink {
             user_id = %user_id,
             rights = ?rights.iter().map(|right| right.as_str()).collect::<Vec<_>>(),
             "the agent changed a member's rights"
+        );
+        Ok(())
+    }
+
+    async fn set_member_roles(
+        &self,
+        conversation: &str,
+        user_id: &str,
+        roles: &[String],
+    ) -> std::result::Result<(), SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .set_member_roles(&conversation, user_id, roles)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+        tracing::warn!(
+            conversation = %conversation,
+            user_id = %user_id,
+            roles = ?roles,
+            "the agent changed a member's roles"
         );
         Ok(())
     }
@@ -979,7 +1066,54 @@ impl OutboundSink for BridgeSink {
                     SinkError::Internal(message)
                 }
             })?;
-        Ok(records.into_iter().map(history_entry).collect())
+        let mut entries: Vec<HistoryEntry> = records.into_iter().map(history_entry).collect();
+
+        // Ask the platform too, when it keeps a record of its own and the search is aimed at one
+        // chat. Discord's reaches back before the bot ever joined, which nothing the bridge holds
+        // can, and its own index is better at matching than the bridge's. Failure here is not the
+        // agent's problem: the local results still stand, so a platform that will not answer, is
+        // still indexing, or has no search at all is logged and left.
+        if let Some(conversation) = &conversation
+            && entries.len() < limit
+            && let Ok(channel) = self.channels.resolve(conversation)
+        {
+            match channel
+                .search_messages(conversation, query, limit - entries.len())
+                .await
+            {
+                Ok(found) => {
+                    let seen: HashSet<String> = entries
+                        .iter()
+                        .map(|entry| entry.message_id.clone())
+                        .collect();
+                    for message in found {
+                        if seen.contains(&message.message_id) {
+                            continue;
+                        }
+                        entries.push(HistoryEntry {
+                            conversation: conversation.as_str().to_string(),
+                            message_id: message.message_id,
+                            sender: message.sender_name,
+                            sender_id: None,
+                            text: message.text,
+                            notes: None,
+                            attachments: Vec::new(),
+                            addressed: false,
+                            timestamp: message.timestamp.to_rfc3339(),
+                            // Not a row in the bridge's history, so there is nothing to page back
+                            // from. Zero is the value `read_history` already treats as no cursor.
+                            cursor: 0,
+                        });
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    conversation = %conversation,
+                    "the platform's own search did not answer: {}",
+                    error
+                ),
+            }
+        }
+        Ok(entries)
     }
 
     async fn conversations(

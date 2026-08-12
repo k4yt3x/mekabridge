@@ -310,6 +310,8 @@ impl Channel for MockChannel {
 
     fn capabilities(&self) -> ChannelCapabilities {
         ChannelCapabilities {
+            member_rights: false,
+            member_roles: false,
             typing_indicator: true,
             files: true,
             photos: true,
@@ -509,7 +511,7 @@ allowed_users = [1]
 }
 
 fn message(text: &str, external_id: &str) -> InboundEvent {
-    InboundEvent::Message(InboundMessage {
+    InboundEvent::Message(Box::new(InboundMessage {
         channel: ChannelId::new("mock"),
         platform: Platform::Telegram,
         conversation: ConversationId::parse("mock:1").expect("valid"),
@@ -525,6 +527,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
             on_behalf_of_chat: false,
         },
         admission: Admission::User,
+        sender_roles: Vec::new(),
         addressed: false,
         text: text.to_string(),
         reply_to: None,
@@ -535,7 +538,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
         arrived_mid_turn: false,
         attachments: Vec::new(),
         timestamp: Utc::now(),
-    })
+    }))
 }
 
 /// Everything a test needs, wired the way the daemon wires it.
@@ -1088,7 +1091,9 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
 /// A message that names the agent, which is what wakes a muted conversation.
 fn mention(text: &str, external_id: &str) -> InboundEvent {
     let mut event = message(text, external_id);
-    let InboundEvent::Message(inner) = &mut event;
+    let InboundEvent::Message(inner) = &mut event else {
+        panic!("a message was built just above");
+    };
     inner.addressed = true;
     event
 }
@@ -1096,7 +1101,9 @@ fn mention(text: &str, external_id: &str) -> InboundEvent {
 /// A message in a group nobody has ruled on, which is the shape an upgrade inherits.
 fn group_message(text: &str, external_id: &str, addressed: bool) -> InboundEvent {
     let mut event = message(text, external_id);
-    let InboundEvent::Message(inner) = &mut event;
+    let InboundEvent::Message(inner) = &mut event else {
+        panic!("a message was built just above");
+    };
     inner.conversation = ConversationId::parse("mock:-100").expect("valid");
     inner.chat_kind = ChatKind::Group;
     inner.chat_title = Some("Ops".to_string());
@@ -1224,6 +1231,50 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     );
     let policies = harness.store.list_policies().await.expect("list");
     assert_eq!(policies[0].dropped, 5);
+}
+
+#[tokio::test]
+async fn a_retracted_message_leaves_the_bridges_history_too() {
+    // A platform that reports deletions is the only one that can do this, and the point is that the
+    // agent can never be handed back something its author took down.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .sender
+        .send(message("said too much", "77"))
+        .await
+        .expect("queued");
+    await_history(&harness, 1, "the message to be recorded").await;
+
+    harness
+        .sender
+        .send(InboundEvent::Retraction {
+            conversation: ConversationId::parse("mock:1").expect("valid"),
+            message_id: "77".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await
+        .expect("queued");
+    await_history(&harness, 0, "the recorded copy to go").await;
+}
+
+/// Poll until the recorded history for `mock:1` is exactly `expected` messages long.
+///
+/// The harness's own `wait_for` takes a synchronous predicate, and reading the store is not.
+async fn await_history(harness: &Harness, expected: usize, label: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let count = harness
+            .store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .len();
+        if count == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {label}");
 }
 
 #[tokio::test]
@@ -1725,7 +1776,9 @@ async fn attachments_are_announced_with_a_handle_and_nothing_is_downloaded() {
 
     let mut event = message("what is this?", "1");
     {
-        let InboundEvent::Message(inner) = &mut event;
+        let InboundEvent::Message(inner) = &mut event else {
+            panic!("a message was built just above");
+        };
         inner.attachments = vec![mekabridge::channel::Attachment {
             kind: mekabridge::channel::AttachmentKind::Photo,
             file_name: Some("photo.jpg".to_string()),

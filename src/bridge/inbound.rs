@@ -20,7 +20,7 @@ use crate::{
         envelope::{Envelope, MissedContext, MissedMessage},
         turn::TurnRunner,
     },
-    channel::{ChannelRegistry, ConversationId, InboundEvent},
+    channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
     meka::{MekaClient, MekaError, TurnOutcome},
     store::{ConversationRecord, EnqueueOutcome, Policy, PolicyRecord, QueuedMessage, Store},
@@ -45,7 +45,33 @@ pub async fn writer(
 ) {
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
-        let disposition = match gate(&store, &config, &mut event).await {
+        // A retraction never reaches the queue, the envelope, or the agent. It exists so the
+        // bridge's own record of a chat does not outlive the chat: without it, `read_history` would
+        // keep handing back a message its author deleted, and on a platform that reports deletions
+        // there is no excuse for that.
+        let InboundEvent::Message(message) = &mut event else {
+            let InboundEvent::Retraction { message_id, .. } = &event else {
+                continue;
+            };
+            match store
+                .forget_message(conversation.as_str(), message_id)
+                .await
+            {
+                Ok(true) => tracing::debug!(
+                    conversation = %conversation,
+                    message_id = %message_id,
+                    "dropped a message its author deleted"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::error!(
+                    conversation = %conversation,
+                    "failed to drop a deleted message: {}",
+                    error
+                ),
+            }
+            continue;
+        };
+        let disposition = match gate(&store, &config, message).await {
             Ok(disposition) => disposition,
             Err(error) => {
                 // Failing open. A store that cannot answer should not also cost people their
@@ -63,21 +89,30 @@ pub async fn writer(
             continue;
         }
 
-        if let Err(error) = record_conversation(&store, &event).await {
+        if let Err(error) = record_conversation(&store, message).await {
             tracing::error!(conversation = %conversation, "failed to record conversation: {}", error);
             continue;
         }
-        if let Err(error) = register_attachments(&store, &mut event).await {
+        if let Err(error) = register_attachments(&store, message).await {
             // Registration is what mints the handles the agent fetches by, so without it the files
             // are unreachable. The message still goes through: its text is usually the point, and
             // the envelope says the attachment cannot be fetched rather than pretending otherwise.
             tracing::error!(conversation = %conversation, "failed to register attachments: {}", error);
         }
 
+        // Keyed on the gate's decision rather than on what the queue does with it below. `seen`
+        // means the agent has been accounted for this message somehow, and every queue outcome
+        // qualifies: it was queued, or it duplicates one already queued, or it was shed and counted
+        // into the notice the next envelope carries. Only a withheld message is genuinely owed.
+        let queued = disposition == Disposition::Deliver;
+        if let Err(error) = record_message(&store, &config, message, queued).await {
+            tracing::error!(conversation = %conversation, "failed to record a message: {}", error);
+        }
+
         // A withheld message stops before the queue. It is recorded, so the agent can read it when
         // something finally does wake this conversation, but it consumes no queue depth and costs
         // no provider turn.
-        if disposition == Disposition::Deliver {
+        if queued {
             let payload = match serde_json::to_string(&event) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -122,16 +157,6 @@ pub async fn writer(
                 }
             }
         }
-
-        // Keyed on the gate's decision rather than on what the queue did with it. `seen` means the
-        // agent has been accounted for this message somehow, and every outcome above qualifies: it
-        // was queued, or it duplicates one already queued, or it was shed and counted into the
-        // notice the next envelope carries. Only a withheld message is genuinely owed to the agent.
-        if let Err(error) =
-            record_message(&store, &config, &event, disposition == Disposition::Deliver).await
-        {
-            tracing::error!(conversation = %conversation, "failed to record a message: {}", error);
-        }
     }
     tracing::info!("inbound writer stopped: all channels have shut down");
 }
@@ -161,13 +186,12 @@ enum Disposition {
 async fn gate(
     store: &Store,
     config: &Config,
-    event: &mut InboundEvent,
+    message: &mut InboundMessage,
 ) -> Result<Disposition, crate::store::StoreError> {
-    let conversation = event.conversation().clone();
+    let conversation = message.conversation.clone();
     let now = chrono::Utc::now();
     let record = store.policy(conversation.as_str()).await?;
 
-    let InboundEvent::Message(message) = event;
     let policy = match record {
         Some(record) if record.expired(now) => {
             // Read back uncounted through `expire_policy` rather than reused from above: the record
@@ -275,7 +299,9 @@ async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<
         if !visited.insert(conversation.clone()) {
             continue;
         }
-        let InboundEvent::Message(message) = event;
+        let InboundEvent::Message(message) = event else {
+            continue;
+        };
 
         let policy = match context.store.policy(conversation.as_str()).await {
             Ok(Some(record)) if !record.expired(now) => record.policy,
@@ -350,13 +376,12 @@ async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<
 async fn record_message(
     store: &Store,
     config: &Config,
-    event: &InboundEvent,
+    message: &InboundMessage,
     queued: bool,
 ) -> Result<(), crate::store::StoreError> {
     if config.storage.history_retention.is_zero() {
         return Ok(());
     }
-    let InboundEvent::Message(message) = event;
     store
         .record_message(crate::store::MessageRecord {
             // Assigned by the store on insert.
@@ -389,9 +414,8 @@ async fn record_message(
 /// serialized, so the handles travel with the queued event and survive a restart.
 async fn register_attachments(
     store: &Store,
-    event: &mut InboundEvent,
+    message: &mut InboundMessage,
 ) -> Result<(), crate::store::StoreError> {
-    let InboundEvent::Message(message) = event;
     for (index, attachment) in message.attachments.iter_mut().enumerate() {
         let handle = store
             .register_attachment(crate::store::AttachmentRecord {
@@ -418,9 +442,8 @@ async fn register_attachments(
 /// Store the conversation an event came from, so it stays in the address book the agent can list.
 async fn record_conversation(
     store: &Store,
-    event: &InboundEvent,
+    message: &InboundMessage,
 ) -> Result<(), crate::store::StoreError> {
-    let InboundEvent::Message(message) = event;
     store
         .upsert_conversation(ConversationRecord {
             id: message.conversation.as_str().to_string(),
@@ -597,7 +620,9 @@ async fn deliver(
     // reads as an ordinary message rather than a wrong claim.
     if let Some(window) = last_turn {
         for event in &mut events {
-            let InboundEvent::Message(message) = event;
+            let InboundEvent::Message(message) = event else {
+                continue;
+            };
             message.arrived_mid_turn =
                 message.timestamp >= window.started_at && message.timestamp <= window.ended_at;
         }
@@ -1010,8 +1035,8 @@ mod tests {
         }
     }
 
-    fn event_with(attachments: Vec<Attachment>) -> InboundEvent {
-        InboundEvent::Message(InboundMessage {
+    fn event_with(attachments: Vec<Attachment>) -> InboundMessage {
+        InboundMessage {
             channel: ChannelId::new("telegram"),
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:1").expect("valid"),
@@ -1028,6 +1053,7 @@ mod tests {
             },
             admission: Admission::User,
             addressed: false,
+            sender_roles: Vec::new(),
             text: "look".to_string(),
             reply_to: None,
             edited_at: None,
@@ -1037,7 +1063,7 @@ mod tests {
             arrived_mid_turn: false,
             attachments,
             timestamp: Utc::now(),
-        })
+        }
     }
 
     async fn store() -> Store {
@@ -1070,7 +1096,7 @@ mod tests {
             .await
             .expect("registers");
 
-        let InboundEvent::Message(message) = &event;
+        let message = &event;
         let handles: Vec<&str> = message
             .attachments
             .iter()
@@ -1100,8 +1126,8 @@ mod tests {
             .await
             .expect("registers again");
 
-        let InboundEvent::Message(first) = &first;
-        let InboundEvent::Message(second) = &second;
+        let first = &first;
+        let second = &second;
         assert_eq!(first.attachments[0].handle, second.attachments[0].handle);
     }
 
@@ -1113,7 +1139,7 @@ mod tests {
             .await
             .expect("registers");
 
-        let InboundEvent::Message(message) = &event;
+        let message = &event;
         let handle = message.attachments[0]
             .handle
             .as_deref()

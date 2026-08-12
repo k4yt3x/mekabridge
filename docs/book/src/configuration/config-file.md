@@ -170,6 +170,31 @@ At least one of `allowed_users`, `allowed_chats`, or `allow_all` must be set. St
 
 `admin_tools` is on because Telegram refuses every moderation call unless the bot is an administrator with the matching right, so on a bot that administers nothing they are inert. Turn it off when the bot is an administrator for some other reason, such as reading all group messages. See [Security](../usage/security.md).
 
+## `[[channels.discord]]`
+
+One table per bot, in its own array. Ids here are **strings**, because Discord snowflakes are strings in its own API and that is what you get when you copy one out of the client with Developer Mode on. Each is checked at startup, so a typo is a startup error rather than an allowlist entry that silently never matches.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `id` | *(required)* | Instance name, unique across all platforms |
+| `token` / `token_file` | *(required)* | Bot token from the Developer Portal's Bot page |
+| `allowed_users` | `[]` | User ids allowed anywhere, including in a direct message |
+| `allowed_guilds` | `[]` | Servers where **every member** is allowed |
+| `allowed_channels` | `[]` | Channels where every participant is allowed. A thread inherits its parent's standing |
+| `allowed_roles` | `[]` | Anyone holding one of these roles |
+| `allow_all` | `false` | Accept everyone |
+| `admin_tools` | `true` | Offer the agent the moderation tools |
+| `message_content` | `true` | Ask for the privileged `MESSAGE_CONTENT` intent |
+| `mention_everyone` | `false` | Let a message the agent writes ping `@everyone` or `@here` |
+| `mention_roles` | `false` | Let a message the agent writes ping a role |
+| `link_preview` | `false` | Show a preview card for links the agent sends |
+
+At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direct messages, which is not optional: anybody sharing a server with the bot can open one.
+
+`allowed_guilds` warns on every startup. It is much the largest of the four grants, since everyone in the server can wake the agent by name.
+
+`message_content` must be enabled on the Bot page of the Developer Portal before it can be requested. Asking for a privileged intent that is not enabled does not degrade: Discord closes the gateway with a `4014` at startup. Running with it off is supported and warns, because the agent is still woken by mentions but has no record of what led up to one. See [Discord](../usage/discord.md).
+
 ## A complete example
 
 ```toml
@@ -213,4 +238,10 @@ id = "telegram"
 token_file = "/etc/mekabridge/telegram.token"
 allowed_users = [123456789]
 allowed_chats = [-1001234567890]
+
+[[channels.discord]]
+id = "discord"
+token_file = "/etc/mekabridge/discord.token"
+allowed_users = ["245119312739729408"]
+allowed_channels = ["111222333444555666"]
 ```

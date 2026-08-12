@@ -45,6 +45,8 @@ attachment: photo, image/jpeg, 2.1 MiB [417]
 
 Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` always appear; the rest show up when they apply.
 
+- **`woke you`** appears in a group the agent is not woken for everything in, saying what pulled it in. It is absent in a direct chat, where every message is addressed to it anyway.
+
 - **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
 - **`admitted`** says how the sender got through: `user allowlist` means they were vetted individually, `chat allowlist` means they were not and are only there because the whole chat is allowed, `open channel` means nothing was checked. The bridge reports which; what to make of it belongs in the agent's instructions.
 - **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.

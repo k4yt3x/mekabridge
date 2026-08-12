@@ -121,7 +121,9 @@ Read back what was said, including messages the agent was never woken for.
 
 This is what makes `mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
 
-Both read only what the bridge recorded. That means nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
+Both read what the bridge recorded: nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
+
+On Discord, `search_history` also asks Discord's own guild search when the search names one conversation, and merges what comes back. That reaches messages from before the bot joined, which the bridge cannot have recorded. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord has indexed it; each of those falls back to the local results rather than failing the search. A result that came from Discord rather than the archive has no attachment handles and a `cursor` of `0`, since there is no local row to page from.
 
 Attachment handles come back with each message, so a picture found in history can go straight to `view_attachment` while it is still within `attachment_retention`.
 
@@ -139,27 +141,32 @@ Restrict, ban, or reinstate somebody in a group. Present only when `admin_tools`
 | `duration` | string, optional | For `restrict` and `ban` only |
 | `revoke_messages` | bool, optional | Also delete their history. Cannot be undone |
 
-`unrestrict` restores whatever the group allows ordinary members, read back from the group rather than assumed, so it cannot leave somebody with more than everyone else has. `kick` removes without banning, which Telegram expresses as a ban lifted immediately.
+`unrestrict` restores whatever the group allows ordinary members, read back from the group rather than assumed, so it cannot leave somebody with more than everyone else has. `kick` removes without banning, which Telegram expresses as a ban lifted immediately and Discord has as a real primitive.
 
-**Durations must be between 30 seconds and 366 days.** Telegram treats anything outside that window as permanent, silently, so the bridge refuses it rather than letting a ten-second mute become a life sentence. A duration passed to an action that ignores it is refused for the same reason.
+**Durations must be between 30 seconds and 366 days on Telegram.** It treats anything outside that window as permanent, silently, so the bridge refuses it rather than letting a ten-second mute become a life sentence. A duration passed to an action that ignores it is refused for the same reason.
+
+**Discord's limits are different and are also enforced rather than rounded.** A `restrict` there is a timeout, which always expires: it requires a duration and caps at 28 days. A `ban` never expires, so a duration on one is refused with a pointer at `restrict`. `revoke_messages` deletes the last 7 days, which is Discord's own ceiling, rather than all of their history.
 
 Anonymous admins and channel posts have no user id and cannot be moderated this way.
 
-## `set_member_rights`
+## `set_member_rights` and `set_member_roles`
 
-Promote, adjust, or demote an administrator.
+Promote, adjust, or demote somebody. Which of the two you get depends on the platform, because the two moderation models do not overlap: Telegram grants privileges to a person directly, Discord puts them on roles and grants the role. Only the tool that would work on a reachable chat is offered, so a Discord-only deployment never sees `set_member_rights` and vice versa. A deployment with both platforms sees both.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
 | `conversation` | string | Group to act in |
 | `user_id` | string | Numeric id |
-| `rights` | array | The complete set they should end up with |
+| `rights` | array | `set_member_rights`: the complete set of privileges they should end up with |
+| `roles` | array | `set_member_roles`: the complete set of role **names**, as shown on a header's `roles:` line |
 
-The list replaces what they hold rather than adding to it, so an empty list demotes. Telegram lets a bot grant only privileges it holds itself.
+Both replace rather than add, so an empty list demotes. Telegram lets a bot grant only privileges it holds itself; Discord lets it grant only roles below its own. `set_member_roles` takes names rather than ids because a name is what the agent was shown, and a role name it does not recognise comes back with the list of ones that exist.
 
 ## `pin_message` and `set_chat`
 
-`pin_message` takes `conversation`, `message_id`, `pin` (false to unpin), and optional `silent`. `set_chat` takes `conversation` and an optional `title` and `description`; omitted fields are left alone.
+`pin_message` takes `conversation`, `message_id`, `pin` (false to unpin), and optional `silent`. On Discord it needs the `PIN_MESSAGES` permission, which was split out of `MANAGE_MESSAGES`, and Discord always announces a pin with no way not to, so `silent` is refused there rather than accepted and ignored.
+
+`set_chat` takes `conversation` and an optional `title`, `description`, and `slowmode`; omitted fields are left alone. `slowmode` is the shortest gap allowed between one person's messages, as a duration like `30s`, with `0s` turning it off. It is Discord-only, capped at 6 hours, and the lever for quieting a room rather than a person.
 
 ## `member`
 
@@ -171,6 +178,8 @@ Somebody's standing in a chat and the privileges they hold.
 | `user_id` | string, optional | Omit to ask about the bot itself |
 
 Omitting `user_id` is the useful case: it lets the agent find out what it is allowed to do in a group before trying, rather than discovering it from a failure. An owner is reported as holding everything, which is what Telegram means by sending no rights flags at all for one.
+
+The answer also carries the roles somebody holds and, for anyone currently restricted, when that lifts. On Discord permissions are computed for the specific channel asked about, including its overwrites, because holding a permission in a server says nothing about holding it in a given room.
 
 ## `view_attachment`
 

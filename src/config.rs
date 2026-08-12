@@ -203,6 +203,7 @@ pub struct ChannelConfig {
 #[derive(Debug)]
 pub enum PlatformConfig {
     Telegram(TelegramConfig),
+    Discord(DiscordConfig),
 }
 
 /// Telegram bot settings.
@@ -232,6 +233,47 @@ pub struct TelegramConfig {
     pub link_preview: bool,
     /// `getUpdates` long-poll timeout.
     pub poll_timeout: Duration,
+}
+
+/// Discord bot settings.
+///
+/// Ids are strings rather than the `i64` Telegram uses. Snowflakes are strings everywhere in
+/// Discord's own API, a string is what you get when you copy one out of the client, and they are
+/// validated as `u64` at load time so a typo is a startup error rather than a chat that silently
+/// never matches.
+#[derive(Debug)]
+pub struct DiscordConfig {
+    pub token: Secret,
+    /// Discord user ids permitted to reach the agent, anywhere, including in a direct message.
+    ///
+    /// This gates DMs, which is not optional: anyone sharing a server with the bot may open one.
+    /// In a single busy server that is thousands of people, each of whom would otherwise get an
+    /// unconditional agent turn for the price of a "hi".
+    pub allowed_users: Vec<u64>,
+    /// Servers whose members are all permitted. The largest of the four grants by far.
+    pub allowed_guilds: Vec<u64>,
+    /// Individual channels, including threads, whose participants are permitted.
+    pub allowed_channels: Vec<u64>,
+    /// Roles whose holders are permitted. The idiomatic Discord way to scope access, and cheap:
+    /// the roles ride along on every guild message.
+    pub allowed_roles: Vec<u64>,
+    /// Accept every sender, making all four allowlists advisory rather than gates.
+    pub allow_all: bool,
+    /// Offer the agent the moderation tools. See [`TelegramConfig::admin_tools`].
+    pub admin_tools: bool,
+    /// Request the privileged `MESSAGE_CONTENT` intent.
+    ///
+    /// Without it Discord blanks the text of every guild message except those mentioning the bot,
+    /// so the agent can still be woken by a mention but has no record of what led up to it. It
+    /// must be enabled in the Developer Portal first: asking for it without that closes the
+    /// gateway with a 4014 rather than degrading.
+    pub message_content: bool,
+    /// Allow an outgoing message to ping `@everyone` and `@here`.
+    pub mention_everyone: bool,
+    /// Allow an outgoing message to ping a role.
+    pub mention_roles: bool,
+    /// Whether a link in an outgoing message gets a preview card.
+    pub link_preview: bool,
 }
 
 /// How Telegram messages are formatted on the wire.
@@ -465,6 +507,8 @@ struct FileLog {
 struct FileChannels {
     #[serde(default)]
     telegram: Vec<FileTelegram>,
+    #[serde(default)]
+    discord: Vec<FileDiscord>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,6 +533,58 @@ struct FileTelegram {
     link_preview: bool,
     #[serde(default = "default_poll_timeout", with = "humantime_serde")]
     poll_timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileDiscord {
+    id: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    token_file: Option<PathBuf>,
+    #[serde(default)]
+    allowed_users: Vec<String>,
+    #[serde(default)]
+    allowed_guilds: Vec<String>,
+    #[serde(default)]
+    allowed_channels: Vec<String>,
+    #[serde(default)]
+    allowed_roles: Vec<String>,
+    #[serde(default)]
+    allow_all: bool,
+    #[serde(default = "default_true")]
+    admin_tools: bool,
+    #[serde(default = "default_true")]
+    message_content: bool,
+    #[serde(default)]
+    mention_everyone: bool,
+    #[serde(default)]
+    mention_roles: bool,
+    #[serde(default = "default_link_preview")]
+    link_preview: bool,
+}
+
+/// Parse a list of Discord snowflakes, naming the field and the offending value on failure.
+///
+/// Zero is rejected along with anything unparseable. No snowflake is ever zero, and the id type the
+/// connector builds these into panics on one, so letting it through here would turn a config typo
+/// into a crash at startup rather than the error it is.
+fn parse_snowflakes(label: &str, field: &str, raw: &[String]) -> Result<Vec<u64>> {
+    raw.iter()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|parsed| *parsed != 0)
+                .ok_or_else(|| {
+                    BridgeError::config(format!(
+                        "{label}: {field} contains {value:?}, which is not a Discord id; ids are \
+                         positive decimal numbers, copied with Developer Mode on"
+                    ))
+                })
+        })
+        .collect()
 }
 
 impl FileConfig {
@@ -682,9 +778,85 @@ impl FileConfig {
                 }),
             });
         }
+        for discord in self.channels.discord {
+            validate_channel_id(&discord.id)?;
+            if !seen_ids.insert(discord.id.clone()) {
+                return Err(BridgeError::config(format!(
+                    "duplicate channel id {:?}; ids must be unique across all platforms",
+                    discord.id
+                )));
+            }
+            let label = format!("[[channels.discord]] id = {:?}", discord.id);
+            let allowed_users = parse_snowflakes(&label, "allowed_users", &discord.allowed_users)?;
+            let allowed_guilds =
+                parse_snowflakes(&label, "allowed_guilds", &discord.allowed_guilds)?;
+            let allowed_channels =
+                parse_snowflakes(&label, "allowed_channels", &discord.allowed_channels)?;
+            let allowed_roles = parse_snowflakes(&label, "allowed_roles", &discord.allowed_roles)?;
+            if discord.allow_all {
+                warnings.push(format!(
+                    "{label} sets `allow_all`, so anyone who finds the bot can reach the agent, \
+                     including by direct message."
+                ));
+            } else if allowed_users.is_empty()
+                && allowed_guilds.is_empty()
+                && allowed_channels.is_empty()
+                && allowed_roles.is_empty()
+            {
+                return Err(BridgeError::config(format!(
+                    "{label} has an empty allowlist; set `allowed_users`, `allowed_guilds`, \
+                     `allowed_channels`, or `allowed_roles`, or `allow_all` if the bot really \
+                     should accept messages from anyone who finds it"
+                )));
+            }
+            if !allowed_guilds.is_empty() {
+                // A Telegram chat allowlist admits a room. This admits everybody in a server, which
+                // in a large one is thousands of people who can each wake the agent by name.
+                warnings.push(format!(
+                    "{label} sets `allowed_guilds`, which admits every member of {} server(s), not \
+                     just the people already in a shared channel.",
+                    allowed_guilds.len()
+                ));
+            }
+            if !discord.message_content {
+                warnings.push(format!(
+                    "{label} sets `message_content = false`, so Discord blanks the text of every \
+                     server message except those mentioning the bot. The agent can still be woken \
+                     by name but will have no record of what led up to it."
+                ));
+            }
+            let token = secret::resolve(
+                &label,
+                discord.token.as_deref(),
+                discord
+                    .token_file
+                    .as_deref()
+                    .map(|path| expand_path(path, &config_dir))
+                    .transpose()?
+                    .as_deref(),
+                &mut warnings,
+            )?;
+            channels.push(ChannelConfig {
+                id: discord.id,
+                platform: PlatformConfig::Discord(DiscordConfig {
+                    token,
+                    allowed_users,
+                    allowed_guilds,
+                    allowed_channels,
+                    allowed_roles,
+                    allow_all: discord.allow_all,
+                    admin_tools: discord.admin_tools,
+                    message_content: discord.message_content,
+                    mention_everyone: discord.mention_everyone,
+                    mention_roles: discord.mention_roles,
+                    link_preview: discord.link_preview,
+                }),
+            });
+        }
         if channels.is_empty() {
             return Err(BridgeError::config(
-                "no channels are configured; add at least one [[channels.telegram]] entry",
+                "no channels are configured; add at least one [[channels.telegram]] or \
+                 [[channels.discord]] entry",
             ));
         }
 
@@ -973,6 +1145,89 @@ token = "bot-token"
 allowed_users = [123]
 "#;
 
+    const MINIMAL_DISCORD: &str = r#"
+[meka]
+token = "meka-token"
+
+[[channels.discord]]
+id = "discord"
+token = "bot-token"
+allowed_users = ["245119312739729408"]
+"#;
+
+    #[test]
+    fn a_discord_channel_parses_its_snowflakes() {
+        let config = parse(MINIMAL_DISCORD).expect("valid");
+        let PlatformConfig::Discord(discord) = &config.channels[0].platform else {
+            panic!("the config under test declares one Discord channel");
+        };
+        assert_eq!(discord.allowed_users, vec![245_119_312_739_729_408]);
+        assert!(
+            discord.message_content,
+            "the intent is requested by default"
+        );
+        assert!(!discord.mention_everyone);
+    }
+
+    #[test]
+    fn a_snowflake_that_is_not_a_number_is_rejected_at_load() {
+        let raw = MINIMAL_DISCORD.replace("245119312739729408", "not-an-id");
+        let error = parse(&raw).expect_err("a typo is a config error");
+        assert!(error.to_string().contains("allowed_users"), "got: {error}");
+    }
+
+    #[test]
+    fn a_zero_snowflake_is_rejected_rather_than_panicking_later() {
+        // No Discord id is ever zero, and the id type the connector builds these into panics on
+        // one, so letting it through here would turn a typo into a crash at startup.
+        let raw = MINIMAL_DISCORD.replace("245119312739729408", "0");
+        let error = parse(&raw).expect_err("zero is not an id");
+        assert!(error.to_string().contains("allowed_users"), "got: {error}");
+    }
+
+    #[test]
+    fn a_discord_channel_with_no_allowlist_at_all_is_refused() {
+        let raw = MINIMAL_DISCORD.replace(r#"allowed_users = ["245119312739729408"]"#, "");
+        let error = parse(&raw).expect_err("an open bot must be a decision");
+        assert!(error.to_string().contains("allowlist"), "got: {error}");
+    }
+
+    #[test]
+    fn allowlisting_a_whole_server_warns_every_startup() {
+        let raw = MINIMAL_DISCORD.replace(
+            r#"allowed_users = ["245119312739729408"]"#,
+            r#"allowed_guilds = ["987654321098765432"]"#,
+        );
+        let config = parse(&raw).expect("valid");
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("allowed_guilds")),
+            "admitting a whole server is the largest grant there is: {:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn two_platforms_may_not_share_a_channel_id() {
+        let raw = format!(
+            "{MINIMAL}
+{}",
+            MINIMAL_DISCORD
+                .replace(
+                    "
+[meka]
+token = \"meka-token\"
+",
+                    ""
+                )
+                .replace("id = \"discord\"", "id = \"telegram\"")
+        );
+        let error = parse(&raw).expect_err("ids are unique across platforms");
+        assert!(error.to_string().contains("duplicate"), "got: {error}");
+    }
+
     #[test]
     fn minimal_config_fills_in_defaults() {
         let config = parse(MINIMAL).expect("minimal config is valid");
@@ -990,7 +1245,9 @@ allowed_users = [123]
         assert_eq!(config.channels.len(), 1);
         assert_eq!(config.channels[0].id, "telegram");
 
-        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {
+            panic!("the config under test declares one Telegram channel");
+        };
         assert_eq!(telegram.parse_mode, TelegramParseMode::Html);
         assert!(
             !telegram.link_preview,
@@ -1117,7 +1374,9 @@ allowed_users = [123]
     fn link_previews_can_be_turned_back_on() {
         let raw = format!("{MINIMAL}link_preview = true\n");
         let config = parse(&raw).expect("valid");
-        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {
+            panic!("the config under test declares one Telegram channel");
+        };
         assert!(telegram.link_preview);
     }
 
@@ -1154,7 +1413,9 @@ token = "bot-token"
 allow_all = true
 "#;
         let config = parse(raw).expect("an explicitly open bot is allowed");
-        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform;
+        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {
+            panic!("the config under test declares one Telegram channel");
+        };
         assert!(telegram.allow_all);
         assert!(
             config

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-12
+
+### Fixed
+
+- A message could be declared undeliverable when meka was busy with a turn of its own.
+
 ## [0.4.0] - 2026-08-12
 
 ### Added
@@ -133,7 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.4.1...HEAD
+[0.4.1]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/k4yt3x/mekabridge/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/k4yt3x/mekabridge/compare/0.2.1...0.3.0
 [0.2.1]: https://github.com/k4yt3x/mekabridge/compare/0.2.0...0.2.1

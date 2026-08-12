@@ -1024,6 +1024,30 @@ impl Store {
     /// Each row's attempt counter is incremented; rows still within `max_attempts` return to
     /// `pending` for another try, the rest become `failed` and are reported back so the operator
     /// can be told which messages will never be delivered.
+    /// Return a batch to the queue without spending an attempt.
+    ///
+    /// For a batch that was never handed over, as distinct from one that failed. meka refusing a
+    /// submission because a turn is already running is the case this exists for: nothing reached
+    /// the agent, nothing was lost, and counting it as a failed delivery would let a busy session
+    /// exhaust the retry budget and declare a message undeliverable that was never even attempted.
+    pub async fn release_batch(&self, sequences: &[i64]) -> Result<()> {
+        let sequences = sequences.to_vec();
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                for sequence in sequences {
+                    transaction.execute(
+                        "UPDATE inbound_queue SET state = 'pending' WHERE seq = ?1",
+                        [sequence],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn fail_batch(
         &self,
         sequences: &[i64],
@@ -2261,6 +2285,41 @@ mod tests {
             .map(|message| message.payload.as_str())
             .collect();
         assert_eq!(payloads, vec!["0", "1", "2"]);
+    }
+
+    #[tokio::test]
+    async fn a_released_batch_keeps_its_attempt_budget() {
+        // meka refusing a submission because a turn is already running is a deferral, not a failed
+        // delivery: it now does that routinely for background tasks and scheduled wakes. Spending
+        // an attempt on it would let a busy session declare a message undeliverable that meka never
+        // saw, which is exactly what happened in the field.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("enqueue");
+
+        for _ in 0..5 {
+            let batch = store.claim_batch(10).await.expect("claim");
+            assert_eq!(batch.len(), 1, "the message must stay claimable");
+            assert_eq!(batch[0].attempts, 0, "a deferral is not an attempt");
+            let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+            store.release_batch(&sequences).await.expect("release");
+            assert_eq!(store.pending_count().await.expect("count"), 1);
+        }
+
+        // And the budget is still intact for a genuine failure afterwards.
+        let batch = store.claim_batch(10).await.expect("claim");
+        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+        let outcome = store
+            .fail_batch(&sequences, "provider 502", 1)
+            .await
+            .expect("fail");
+        assert_eq!(
+            outcome.retrying, sequences,
+            "the first real failure retries"
+        );
+        assert_eq!(store.queue_stats().await.expect("stats").failed, 0);
     }
 
     #[tokio::test]

@@ -59,6 +59,8 @@ struct MekaRecorder {
     truncate_first: Mutex<usize>,
     /// What `GET /v1/sessions/{id}` reports for `turn_in_flight`.
     turn_in_flight: Mutex<bool>,
+    /// Turns to refuse with a `turn-in-flight` 409, as meka does while it runs a turn of its own.
+    busy_first: Mutex<usize>,
     /// Turns to answer with meka's empty-response stand-in and no tool calls.
     empty_first: Mutex<usize>,
     /// How long a turn takes to answer. The default of zero makes the suite fast; a test that
@@ -114,6 +116,29 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
             [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
             r#"{"type":"https://meka.so/errors/session-not-found","title":"Session not found",
                 "status":404,"detail":"gone"}"#
+                .to_string(),
+        )
+            .into_response();
+    }
+
+    let should_refuse = {
+        let mut remaining = recorder
+            .busy_first
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *remaining > 0 {
+            *remaining -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if should_refuse {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+            r#"{"type":"https://meka.so/errors/turn-in-flight","title":"Turn already in flight",
+                "status":409,"detail":"another turn is already in flight on this session"}"#
                 .to_string(),
         )
             .into_response();
@@ -1231,6 +1256,44 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     );
     let policies = harness.store.list_policies().await.expect("list");
     assert_eq!(policies[0].dropped, 5);
+}
+
+#[tokio::test]
+async fn a_busy_session_defers_a_batch_instead_of_giving_up_on_it() {
+    // meka runs background tasks and scheduled wakes of its own, so it can refuse a submission with
+    // a 409 for reasons that have nothing to do with this batch. Counting those against the retry
+    // budget declared a message undeliverable that meka had never seen, which is what happened in
+    // the field. Four refusals is more than `turn_retries + 1`, so under the old accounting this
+    // message was dead before the fifth submission ever happened.
+    let harness = Harness::start(1, 0).await;
+    *harness
+        .recorder
+        .busy_first
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 4;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for(
+            "the batch to survive the busy session and land",
+            |harness| {
+                harness
+                    .turns()
+                    .iter()
+                    .any(|turn| turn.contains("are you there?"))
+            },
+        )
+        .await;
+
+    // Delivered, not failed, and the owner was never told it was undeliverable.
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.failed, 0, "a busy session is not a delivery failure");
+    assert_eq!(stats.pending, 0, "the batch finished");
 }
 
 #[tokio::test]

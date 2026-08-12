@@ -2,8 +2,10 @@
 //!
 //! Two tasks, deliberately separate. The writer persists every event before acknowledging it, so a
 //! crash cannot swallow a message a user already sent. The drain loop claims batches and runs
-//! turns, and is the only thing that talks to meka, which is what enforces "one turn at a time"
-//! without any locking: there is exactly one drain loop.
+//! turns, and is the only thing here that talks to meka. One drain loop means the bridge never
+//! races itself, but it no longer means the session is idle whenever the bridge wants it: meka runs
+//! background tasks and scheduled wakes of its own, so a submission can be refused by a turn this
+//! bridge knows nothing about. That refusal is a deferral, not a failure, and is treated as one.
 //!
 //! Batching is the reason messages that pile up during a turn become one turn rather than several.
 //! That matches what happens to a person who puts their phone down: they come back to the whole
@@ -781,6 +783,22 @@ async fn deliver(
                 }
             }
         }
+        // meka is running a turn this bridge did not start. It has been able to do that since it
+        // grew background tasks and scheduled wakes, so this is an ordinary condition rather than
+        // the dropped-stream anomaly `submit` was originally written for. The submission was
+        // refused before it ran, so nothing reached the agent and nothing was lost: the batch goes
+        // back to the queue untouched and the next drain tick tries again. Counting it as a failed
+        // delivery would let a busy session burn the retry budget and eventually declare a message
+        // undeliverable that meka never even saw.
+        Err(error) if error.is_turn_in_flight() => {
+            tracing::info!(
+                "meka is busy with a turn this bridge did not start; requeueing the batch to try \
+                 again shortly"
+            );
+            if let Err(error) = context.store.release_batch(&sequences).await {
+                tracing::error!("failed to requeue a deferred batch: {}", error);
+            }
+        }
         Err(error) => {
             tracing::error!("turn failed: {}", error);
             record_failure(context, &sequences, &error.to_string()).await;
@@ -795,9 +813,10 @@ async fn deliver(
 
 /// Submit a turn, waiting out a turn that is already running instead of failing on the 409.
 ///
-/// A `turn-in-flight` rejection means one of this bridge's own earlier turns is still going, which
-/// happens when a previous stream dropped. The batch was refused before it ran, so waiting and
-/// resubmitting delivers it exactly once.
+/// A `turn-in-flight` rejection means some turn is still going: one of this bridge's own, after a
+/// dropped stream, or one meka started for itself. The batch was refused before it ran, so waiting
+/// and resubmitting delivers it exactly once. If it is still refused after that, the caller
+/// requeues rather than failing, because the session going busy again is not this batch's fault.
 async fn submit(
     context: &DrainContext,
     session_id: Uuid,

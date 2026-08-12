@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-12
+
+### Added
+
+- `list_members`, reporting who is in a chat, with `coverage` saying how much of it the answer covers.
+- Discord member search, which needs no privileged intent, and full rosters where the intent is on.
+- Discord presence behind `presence` on the channel, reporting who is online, idle, or busy.
+- `online_only` on `list_members`, for finding who is actually around to be given work.
+- `[bridge].typing_max`, a ceiling on the typing indicator, following the turn budget by default.
+
+### Changed
+
+- The typing indicator now lasts as long as the turn, rather than lapsing after 30 seconds.
+- The indicator opens once meka accepts the turn, not when the bridge tries to submit one.
+- A chat waiting on a turn meka started itself now sees the indicator instead of silence.
+- A busy session is retried on a timer, and logged once per wait rather than once per attempt.
+
+### Fixed
+
+- A batch meka refused was resubmitted hundreds of times a second until the other turn finished.
+- A cancelled typing indicator still went out, leaving chats typing minutes after the agent stopped.
+- A deferred batch flagged the next batch's own messages as having arrived mid-turn.
+- The queue-overflow notice was lost when a deferred batch's envelope was discarded.
+- A zero `[meka].turn_timeout` was accepted, turning every deferral into a request flood.
+- The documented moderation tool group omitted `set_member_roles`.
+- A listing narrowed by `online_only` still claimed to cover everyone in the chat.
+
 ## [0.4.1] - 2026-08-12
 
 ### Fixed
@@ -139,7 +166,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.4.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.5.0...HEAD
+[0.5.0]: https://github.com/k4yt3x/mekabridge/compare/0.4.1...0.5.0
 [0.4.1]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/k4yt3x/mekabridge/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/k4yt3x/mekabridge/compare/0.2.1...0.3.0

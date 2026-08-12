@@ -610,6 +610,121 @@ pub struct MemberInfo {
     /// When a restriction lifts, for somebody currently restricted with an end date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restricted_until: Option<DateTime<Utc>>,
+    /// Whether they are around, where the platform reports it and the operator switched it on.
+    ///
+    /// Absent rather than `unknown` when the channel cannot answer at all, so "this platform does
+    /// not do presence" and "this person's presence is not known" stay distinguishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<Presence>,
+}
+
+/// Whether somebody is around, as far as the platform will say.
+///
+/// Four states rather than a flag, because they are not interchangeable to anyone deciding whether
+/// to give a person work: someone on Do Not Disturb is at their desk and has asked not to be
+/// interrupted, which is a different answer from idle and a very different one from offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceStatus {
+    Online,
+    /// Connected but away from the keyboard.
+    Idle,
+    /// Around, and has asked not to be disturbed.
+    DoNotDisturb,
+    /// Offline, or appearing so by choice.
+    Offline,
+    /// Nothing is known. Distinct from offline on purpose: a platform that does not report presence
+    /// at all, a bridge that has not finished connecting, and a genuinely absent person are three
+    /// different things, and only the last one means "do not assign this to them".
+    Unknown,
+}
+
+impl PresenceStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Idle => "idle",
+            Self::DoNotDisturb => "do_not_disturb",
+            Self::Offline => "offline",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether somebody is at their machine at all, whatever they have asked for.
+    pub const fn is_present(self) -> bool {
+        matches!(self, Self::Online | Self::Idle | Self::DoNotDisturb)
+    }
+}
+
+/// Somebody's availability, and when that was last true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Presence {
+    pub status: PresenceStatus,
+    /// When the bridge last heard anything about this chat's presence.
+    ///
+    /// Presence cannot be fetched on demand, only accumulated from a live connection, so an answer
+    /// is only ever as good as the last update that reached it. Carried so a caller can see that
+    /// for itself instead of trusting a status with no age on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<DateTime<Utc>>,
+}
+
+impl Presence {
+    /// What to report when nothing is known, which is never the same as offline.
+    pub const fn unknown() -> Self {
+        Self {
+            status: PresenceStatus::Unknown,
+            as_of: None,
+        }
+    }
+}
+
+/// How much of a chat's membership a listing actually covers.
+///
+/// Carried alongside the members rather than left implicit, because the platforms answer different
+/// questions and a caller that assumes it holds the whole room when it holds three administrators
+/// will reason confidently from a list that is mostly missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberCoverage {
+    /// Everyone, up to the page limit. More may remain behind [`MemberListing::next_after`].
+    Everyone,
+    /// Only those whose name matched the query.
+    Matching,
+    /// Only administrators, because that is the whole of what the platform will enumerate.
+    Administrators,
+    /// Only those at their machine, filtered out of whichever page was examined.
+    ///
+    /// Distinct from the others because it is the one where the members are not a sample of
+    /// `total`: a page of fifty holding three online people, in a chat of fourteen hundred, is not
+    /// three people online out of fourteen hundred. Later pages hold more.
+    Present,
+}
+
+impl MemberCoverage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Everyone => "everyone",
+            Self::Matching => "matching",
+            Self::Administrators => "administrators",
+            Self::Present => "present",
+        }
+    }
+}
+
+/// Who is in a chat, and how completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberListing {
+    pub coverage: MemberCoverage,
+    pub members: Vec<MemberInfo>,
+    /// How many people are in the chat, when the platform will say. Often knowable even where the
+    /// roster is not, which is the difference between "I cannot tell you who is here" and "I
+    /// cannot tell you who is here, and there are fourteen hundred of them".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// Cursor for the next page, absent at the end of the listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
 }
 
 /// Chat-level settings a moderator can change. `None` leaves a field alone.
@@ -653,6 +768,9 @@ pub struct ChannelCapabilities {
     pub admin: bool,
     /// Privileges are granted to a person directly, as a named set. Telegram's model.
     pub member_rights: bool,
+    /// The channel reports whether people are online. Off unless the platform does presence at all
+    /// and the operator enabled it, since on Discord it costs a privileged intent.
+    pub presence: bool,
     /// Privileges live on roles, and a person is granted a role. Discord's model, and the reason
     /// this is not one `admin` flag: synthesising a role to satisfy a requested list of rights, or
     /// guessing which role a right belongs to, is exactly the kind of invention that would make
@@ -916,6 +1034,26 @@ pub trait Channel: Send + Sync + 'static {
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "reading chat membership",
+        })
+    }
+
+    /// List who is in a chat, or those whose name matches `query`.
+    ///
+    /// What comes back differs by platform and by what the operator has enabled, which is why the
+    /// answer carries its own [`MemberCoverage`] rather than being a bare list. A platform that
+    /// cannot answer at all should say so through [`ChannelError::Unsupported`] with a reason
+    /// specific enough to act on, since "who is here" has no workaround the caller can guess at.
+    async fn list_members(
+        &self,
+        conversation: &ConversationId,
+        query: Option<&str>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<MemberListing, ChannelError> {
+        let _ = (conversation, query, limit, after);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "listing chat membership",
         })
     }
 

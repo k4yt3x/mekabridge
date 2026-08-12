@@ -32,6 +32,14 @@ use crate::{
 /// that became eligible without an enqueue, such as a failed batch returning to `pending`.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long to leave a session alone after it refuses a submission because it is already running a
+/// turn.
+///
+/// There is nothing to wait on but the next refusal, so this is the whole of the backoff. Short
+/// enough that a chat is answered promptly once meka frees up, long enough that a turn lasting
+/// minutes costs a handful of rejected requests rather than thousands.
+const DEFER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Length of the per-turn fence marker. Six hex characters is 24 bits, which is far more than
 /// enough against a user guessing it inside a single turn.
 const NONCE_BYTES: usize = 3;
@@ -526,7 +534,7 @@ pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: Canc
             if batch.is_empty() {
                 break;
             }
-            last_turn = deliver(&context, batch, last_turn).await;
+            last_turn = deliver(&context, batch, last_turn, &shutdown).await;
         }
     }
 }
@@ -587,6 +595,7 @@ async fn deliver(
     context: &DrainContext,
     batch: Vec<QueuedMessage>,
     last_turn: Option<TurnWindow>,
+    shutdown: &CancellationToken,
 ) -> Option<TurnWindow> {
     let started_at = chrono::Utc::now();
     let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
@@ -669,7 +678,7 @@ async fn deliver(
         "submitting a turn"
     );
 
-    let result = submit(context, session_id, &message, &conversations).await;
+    let result = submit(context, session_id, &message, &conversations, shutdown).await;
 
     // meka forgetting the session (its row was deleted, or the database was replaced) is
     // recoverable exactly once: bind a fresh session and replay the same batch into it.
@@ -697,7 +706,7 @@ async fn deliver(
                         nonce: &nonce,
                     }
                     .render();
-                    submit(context, replacement, &message, &conversations).await
+                    submit(context, replacement, &message, &conversations, shutdown).await
                 }
                 Err(error) => Err(error),
             }
@@ -751,6 +760,10 @@ async fn deliver(
         // reach the agent and resubmitting would duplicate a reply the user is about to receive.
         // The messages are marked delivered once the session goes idle: what the agent chose to do
         // with them is its business, and that is exactly the contract for a normal turn too.
+        //
+        // `wait_until_idle` is trustworthy here and nowhere else in this function. The turn it is
+        // waiting on is one this bridge submitted over HTTP, which is the only kind meka counts in
+        // the `turn_in_flight` it answers with; see `submit` for what that field misses.
         Err(error) if error.turn_may_still_be_running() => {
             tracing::warn!(
                 "lost the turn stream ({}); the turn is still running, waiting for it to finish",
@@ -783,21 +796,31 @@ async fn deliver(
                 }
             }
         }
-        // meka is running a turn this bridge did not start. It has been able to do that since it
-        // grew background tasks and scheduled wakes, so this is an ordinary condition rather than
-        // the dropped-stream anomaly `submit` was originally written for. The submission was
-        // refused before it ran, so nothing reached the agent and nothing was lost: the batch goes
-        // back to the queue untouched and the next drain tick tries again. Counting it as a failed
-        // delivery would let a busy session burn the retry budget and eventually declare a message
-        // undeliverable that meka never even saw.
+        // meka spent a whole turn budget refusing, having retried throughout `submit`, so this is a
+        // session that is wedged rather than merely occupied. Every submission was refused before
+        // it ran, so nothing reached the agent and nothing was lost: the batch goes back to the
+        // queue untouched and the next drain tick starts a fresh round of retries. Counting it as a
+        // failed delivery would let a busy session burn the retry budget and eventually declare a
+        // message undeliverable that meka never even saw.
         Err(error) if error.is_turn_in_flight() => {
-            tracing::info!(
-                "meka is busy with a turn this bridge did not start; requeueing the batch to try \
-                 again shortly"
+            tracing::warn!(
+                "meka has been busy with a turn this bridge did not start for a full turn budget; \
+                 requeueing the batch"
             );
             if let Err(error) = context.store.release_batch(&sequences).await {
                 tracing::error!("failed to requeue a deferred batch: {}", error);
             }
+            // The envelope this counter was rendered into is being thrown away, so put it back or
+            // the notice that the queue overflowed is lost to a turn that never ran.
+            if dropped > 0
+                && let Err(error) = context.store.note_dropped(dropped).await
+            {
+                tracing::error!("failed to restore the dropped-message counter: {}", error);
+            }
+            // No turn ran, so there is no window to report. Inventing one would flag the next
+            // batch's messages as having arrived mid-turn against a turn that never happened, and
+            // those messages are in that very batch.
+            return last_turn;
         }
         Err(error) => {
             tracing::error!("turn failed: {}", error);
@@ -811,40 +834,62 @@ async fn deliver(
     })
 }
 
-/// Submit a turn, waiting out a turn that is already running instead of failing on the 409.
+/// Submit a turn, retrying on a timer while meka is busy with a turn of its own.
 ///
-/// A `turn-in-flight` rejection means some turn is still going: one of this bridge's own, after a
-/// dropped stream, or one meka started for itself. The batch was refused before it ran, so waiting
-/// and resubmitting delivers it exactly once. If it is still refused after that, the caller
-/// requeues rather than failing, because the session going busy again is not this batch's fault.
+/// A `turn-in-flight` rejection means some turn is running: one of this bridge's own after a
+/// dropped stream, or one meka started for itself. The batch is refused before it runs, so retrying
+/// delivers it exactly once. It stays claimed throughout, so nothing else picks it up and the
+/// envelope is not rebuilt per attempt.
+///
+/// The 409 is the only trustworthy sign that the session is busy. meka's `turn_in_flight` is not,
+/// and asking it is worse than not asking: the field reports an atomic counter only `POST /turn`
+/// increments, while the refusal comes from a session mutex that scheduled jobs and background-task
+/// outcomes hold as well (meka's `schedule::run_prompt_in_session`). Through one of those the
+/// session calls itself idle and refuses anyway, so waiting for it to go idle returns at once and
+/// the retry becomes a spin as tight as the two processes can trade requests.
 async fn submit(
     context: &DrainContext,
     session_id: Uuid,
     message: &str,
     conversations: &BTreeSet<ConversationId>,
+    shutdown: &CancellationToken,
 ) -> Result<crate::bridge::turn::TurnReport, MekaError> {
-    let first = context.runner.run(session_id, message, conversations).await;
-    if !first
-        .as_ref()
-        .err()
-        .is_some_and(MekaError::is_turn_in_flight)
-    {
-        return first;
-    }
-    tracing::info!("a turn is already running on this session; waiting for it to finish");
-    match context
-        .meka
-        .wait_until_idle(session_id, context.config.meka.turn_timeout)
-        .await
-    {
-        Ok(true) => context.runner.run(session_id, message, conversations).await,
-        Ok(false) => {
-            tracing::warn!("the session is still busy after a full turn budget");
-            first
+    let deadline = tokio::time::Instant::now() + context.config.meka.turn_timeout;
+    let mut waiting = false;
+    loop {
+        let result = context.runner.run(session_id, message, conversations).await;
+        if !result
+            .as_ref()
+            .err()
+            .is_some_and(MekaError::is_turn_in_flight)
+            || tokio::time::Instant::now() >= deadline
+        {
+            return result;
         }
-        Err(error) => {
-            tracing::warn!("could not poll the session while waiting: {}", error);
-            first
+        if !waiting {
+            waiting = true;
+            // Once per episode, not once per attempt: at one line per attempt this buried whatever
+            // an operator opened the log to find.
+            tracing::info!(
+                "meka is running a turn this bridge did not start; holding the batch and retrying \
+                 every {}s until it finishes",
+                DEFER_RETRY_INTERVAL.as_secs()
+            );
+        }
+
+        // Opened only across the wait. meka refuses solely because it is running a turn, and since
+        // a backgrounded tool call delivers its outcome as one, the agent is working just as much
+        // as it would be on ours; without this the chat is silent for as long as the other turn
+        // lasts. Cancelled before the retry so an accepted turn opens its own on `Started` rather
+        // than leaving two refresh loops running over one chat.
+        let typing = context.runner.start_typing(conversations);
+        let interrupted = tokio::select! {
+            () = shutdown.cancelled() => true,
+            () = tokio::time::sleep(DEFER_RETRY_INTERVAL) => false,
+        };
+        typing.cancel();
+        if interrupted {
+            return result;
         }
     }
 }

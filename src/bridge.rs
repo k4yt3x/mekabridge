@@ -190,6 +190,7 @@ pub async fn run(config: Config) -> Result<()> {
                 meka.clone(),
                 Arc::clone(&channels),
                 config.bridge.typing_indicator,
+                config.bridge.typing_max,
                 Arc::clone(&presence),
             ),
             identities: Arc::new(tokio::sync::OnceCell::new()),
@@ -791,6 +792,20 @@ impl OutboundSink for BridgeSink {
         let (conversation, channel) = self.admin_target(conversation)?;
         channel
             .member(&conversation, user_id)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))
+    }
+
+    async fn list_members(
+        &self,
+        conversation: &str,
+        query: Option<&str>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> std::result::Result<crate::channel::MemberListing, SinkError> {
+        let (conversation, channel) = self.admin_target(conversation)?;
+        channel
+            .list_members(&conversation, query, limit, after)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))
     }

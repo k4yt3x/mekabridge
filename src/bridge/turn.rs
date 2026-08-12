@@ -9,12 +9,20 @@
 //! content, the same signal a person's phone shows while they type, so it does not compete with the
 //! agent's decision about whether to reply at all.
 //!
-//! It is deliberately not held for the whole turn. The indicator is a claim that a message is about
-//! to arrive, and the bridge cannot know that: the agent may work for minutes and then decide to
-//! say nothing, which is a supported outcome. So it opens on submission, stops the moment a reply
-//! actually lands, and lapses after `TYPING_MAX_DURATION` regardless. Overstating is worse than
-//! staying quiet, because a user who watched "typing" for ten minutes and got nothing has been
-//! actively misled.
+//! It is held for as long as the turn runs: it opens once meka accepts the turn, stops the moment a
+//! reply actually lands, and stops again when the turn ends. `[bridge].typing_max` is a ceiling on
+//! top of that, defaulting to the turn budget, so it only fires if a turn somehow outlives both.
+//!
+//! Cancelling it has to abandon any request still in flight, not merely stop making new ones. Both
+//! platforms queue rate-limited calls rather than refusing them, so an indicator that is allowed to
+//! finish sending after its turn has ended goes on being drawn for as long as the backlog takes to
+//! drain, which is a chat that claims the agent is working when it has been idle for minutes.
+//!
+//! Holding it that long slightly overstates the case, since an agent grinding through tool calls is
+//! working rather than composing, and it may decide to say nothing at all. Stopping early is worse.
+//! A cap shorter than the turn produces a chat that shows "typing" briefly and is then silent for
+//! minutes, which reads as a bot that has died rather than one that is thinking, and the user has
+//! no way to tell those apart. Neither platform limits how long the indicator may be renewed.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -26,17 +34,17 @@ use crate::{
     meka::{MekaClient, MekaError, TurnOutcome, sse::TurnEvent},
 };
 
-/// How often the typing indicator is refreshed. Telegram clears it after about five seconds, so the
-/// interval has to sit under that to look continuous.
-const TYPING_REFRESH: Duration = Duration::from_secs(4);
-
-/// How long the indicator may be held before it stops saying anything useful.
+/// How often the typing indicator is refreshed.
 ///
-/// A turn that spends minutes on tool calls is working, not composing, and Telegram's own guidance
-/// is to use the action when a reply will take a *noticeable* time to arrive rather than as a
-/// general busy light. Past this the bridge would only be claiming to type for longer than any
-/// person ever would.
-const TYPING_MAX_DURATION: Duration = Duration::from_secs(30);
+/// Telegram clears the status after about five seconds and Discord after ten, so the interval has
+/// to sit under the shorter of the two to look continuous on both. Neither platform caps how many
+/// times it may be renewed, so holding the indicator for as long as the work lasts costs one cheap
+/// call every few seconds.
+///
+/// Cheap, but not free: Discord meters the typing endpoint on its own bucket, and twilight queues
+/// rather than refuses once that is exhausted. One refresh loop per conversation stays well inside
+/// it; anything that opens indicators in a loop does not.
+const TYPING_REFRESH: Duration = Duration::from_secs(4);
 
 /// Which conversations the agent has already sent to during the current turn.
 ///
@@ -137,6 +145,9 @@ pub struct TurnRunner {
     meka: MekaClient,
     channels: Arc<ChannelRegistry>,
     typing_enabled: bool,
+    /// Ceiling on how long the indicator is held, from
+    /// [`crate::config::BridgeConfig::typing_max`].
+    typing_max: Duration,
     /// Shared with the outbound sink so the indicator can stop once a reply has actually landed.
     presence: Arc<Presence>,
 }
@@ -146,12 +157,14 @@ impl TurnRunner {
         meka: MekaClient,
         channels: Arc<ChannelRegistry>,
         typing_enabled: bool,
+        typing_max: Duration,
         presence: Arc<Presence>,
     ) -> Self {
         Self {
             meka,
             channels,
             typing_enabled,
+            typing_max,
             presence,
         }
     }
@@ -168,7 +181,12 @@ impl TurnRunner {
     ) -> Result<TurnReport, MekaError> {
         // Sends from an earlier turn must not suppress this turn's indicator.
         self.presence.reset();
-        let typing = self.start_typing(conversations);
+        // Opened on `Started` rather than here, because until meka accepts the turn nothing has
+        // reached the agent and there is nothing to be composing. That matters more than it reads:
+        // a refused submission is retried rather than dropped, so announcing it here put out one
+        // flash per attempt, which on a platform whose indicator outlives the retry interval is
+        // indistinguishable from a bot that types forever.
+        let mut typing: Option<CancellationToken> = None;
 
         let mut sends = 0_usize;
         let mut tool_calls = 0_usize;
@@ -178,6 +196,14 @@ impl TurnRunner {
         let result = self
             .meka
             .run_turn(session_id, message, |event| match event {
+                TurnEvent::Started { .. } => {
+                    // Replacing rather than assuming there is only ever one. A second `Started`
+                    // would otherwise strand the first token's refresh loop, which nothing would
+                    // then cancel and which would run until the ceiling.
+                    if let Some(previous) = typing.replace(self.start_typing(conversations)) {
+                        previous.cancel();
+                    }
+                }
                 TurnEvent::AssistantText { text } => {
                     text_length += text.chars().count();
                     // Bounded: a long answer would otherwise be held in memory for a log line.
@@ -209,7 +235,9 @@ impl TurnRunner {
             })
             .await;
 
-        typing.cancel();
+        if let Some(typing) = typing {
+            typing.cancel();
+        }
 
         result.map(|outcome| TurnReport {
             outcome,
@@ -220,9 +248,17 @@ impl TurnRunner {
         })
     }
 
-    /// Keep a typing indicator alive in each conversation until the turn ends, the agent replies
-    /// there, or the indicator has been held long enough to stop meaning anything.
-    fn start_typing(&self, conversations: &BTreeSet<ConversationId>) -> CancellationToken {
+    /// Open the indicator in each conversation until the returned token is cancelled, the agent
+    /// replies there, or the ceiling is reached.
+    ///
+    /// Visible to the drain loop so it can cover the one stretch a turn stream cannot: meka running
+    /// a turn this bridge did not submit, which is how a backgrounded tool call delivers its
+    /// outcome. The agent is genuinely running then, and the batch waiting on it belongs to a
+    /// conversation we know by name, so the claim is as true there as it is during our own turn.
+    pub(super) fn start_typing(
+        &self,
+        conversations: &BTreeSet<ConversationId>,
+    ) -> CancellationToken {
         let token = CancellationToken::new();
         if !self.typing_enabled {
             return token;
@@ -237,9 +273,10 @@ impl TurnRunner {
             let channel = Arc::clone(channel);
             let conversation = conversation.clone();
             let presence = Arc::clone(&self.presence);
+            let typing_max = self.typing_max;
             let token = token.child_token();
             tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + TYPING_MAX_DURATION;
+                let deadline = tokio::time::Instant::now() + typing_max;
                 loop {
                     // Checked before re-arming rather than after sending, so the burst that follows
                     // a reply never happens in the first place.
@@ -253,10 +290,19 @@ impl TurnRunner {
                         );
                         return;
                     }
-                    if let Err(error) = channel
-                        .set_activity(&conversation, crate::channel::Activity::Typing)
-                        .await
-                    {
+                    // Raced against the token rather than simply awaited. A rate-limited platform
+                    // parks the request instead of refusing it -- twilight queues typing calls
+                    // behind the channel's bucket -- so a request that outlives its turn has to be
+                    // abandoned, not merely followed by no more. Otherwise a burst of indicators
+                    // goes on arriving long after the agent stopped, which is exactly how a spin on
+                    // a refused submission turned into minutes of phantom typing.
+                    let sent = tokio::select! {
+                        biased;
+                        () = token.cancelled() => return,
+                        result = channel
+                            .set_activity(&conversation, crate::channel::Activity::Typing) => result,
+                    };
+                    if let Err(error) = sent {
                         // Presence is cosmetic; a chat that will not accept a typing action should
                         // never take down the turn that is actually doing the work.
                         tracing::debug!(
@@ -292,10 +338,17 @@ mod tests {
         meka::sse::Usage,
     };
 
+    /// A short ceiling, so the test that proves the indicator lapses does not take half an hour.
+    /// Production follows `[meka].turn_timeout` unless the operator pins it.
+    const TEST_TYPING_MAX: Duration = Duration::from_secs(30);
+
     /// Records the activity actions a turn asks for, so the indicator's timing can be asserted.
     struct SpyChannel {
         id: ChannelId,
         activities: Mutex<Vec<Activity>>,
+        /// How long `set_activity` takes to reach the platform, standing in for a request parked
+        /// behind a rate limit bucket.
+        latency: Duration,
     }
 
     impl SpyChannel {
@@ -303,6 +356,15 @@ mod tests {
             Self {
                 id: ChannelId::new("spy"),
                 activities: Mutex::new(Vec::new()),
+                latency: Duration::ZERO,
+            }
+        }
+
+        /// A channel whose typing calls sit in a queue before they go out.
+        fn slow(latency: Duration) -> Self {
+            Self {
+                latency,
+                ..Self::new()
             }
         }
 
@@ -334,6 +396,7 @@ mod tests {
                 reactions: true,
                 edit: true,
                 admin: true,
+                presence: false,
             }
         }
 
@@ -391,6 +454,9 @@ mod tests {
             _conversation: &ConversationId,
             activity: Activity,
         ) -> Result<(), ChannelError> {
+            if !self.latency.is_zero() {
+                tokio::time::sleep(self.latency).await;
+            }
             self.activities
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -420,7 +486,7 @@ mod tests {
         let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
             channel as Arc<dyn Channel>
         ]));
-        TurnRunner::new(meka, channels, true, presence)
+        TurnRunner::new(meka, channels, true, TEST_TYPING_MAX, presence)
     }
 
     fn conversations() -> BTreeSet<ConversationId> {
@@ -470,6 +536,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelling_stops_the_indicator_promptly() {
+        // What actually ends the indicator on a normal turn. Nothing covered it, and the ceiling
+        // used to be 30s, so a leak here would have looked like a brief tail rather than the
+        // half-hour one the turn budget now allows.
+        let channel = Arc::new(SpyChannel::new());
+        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+
+        let token = runner.start_typing(&conversations());
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert!(
+            channel.activity_count() > 1,
+            "the indicator must be live to begin with"
+        );
+
+        token.cancel();
+        // Settled past one refresh interval before measuring, so what follows proves the loop has
+        // stopped for good rather than merely slowed.
+        tokio::time::sleep(TYPING_REFRESH).await;
+        let after_cancel = channel.activity_count();
+        tokio::time::sleep(TYPING_REFRESH * 20).await;
+        assert_eq!(
+            channel.activity_count(),
+            after_cancel,
+            "the indicator kept refreshing after the turn ended"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_abandons_a_typing_request_that_has_not_gone_out_yet() {
+        // Discord queues typing calls behind the channel's rate limit bucket, so one can sit for
+        // seconds before it is sent. Cancelling has to drop the request, not just decline to make
+        // the next one: a bridge that spun on a refused submission left thousands of them queued,
+        // and the platform went on drawing the indicator for minutes after meka had gone idle.
+        let channel = Arc::new(SpyChannel::slow(Duration::from_secs(10)));
+        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+
+        let token = runner.start_typing(&conversations());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        token.cancel();
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            channel.activity_count(),
+            0,
+            "a cancelled indicator still reached the platform"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn typing_lapses_once_the_turn_outlives_the_window() {
         // A turn grinding through tool calls is working, not composing. Holding the indicator for
         // its whole duration claims something no person would.
@@ -477,16 +592,52 @@ mod tests {
         let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
 
         let token = runner.start_typing(&conversations());
-        tokio::time::sleep(TYPING_MAX_DURATION * 4).await;
+        tokio::time::sleep(TEST_TYPING_MAX * 4).await;
 
         let sent = channel.activity_count();
-        let ceiling = (TYPING_MAX_DURATION.as_secs() / TYPING_REFRESH.as_secs()) as usize + 1;
+        let ceiling = (TEST_TYPING_MAX.as_secs() / TYPING_REFRESH.as_secs()) as usize + 1;
         assert!(
             sent <= ceiling,
             "held the indicator for {sent} refreshes, past the {ceiling} the window allows"
         );
         assert!(sent > 1, "the window must still cover a normal turn");
         token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_refused_submission_does_not_announce_typing() {
+        // The indicator claims the agent is composing. A submission meka refuses never reached the
+        // agent at all, so announcing it is a plain falsehood -- and since a refused batch is now
+        // retried rather than dropped, one flash per attempt reads as a permanently typing bot.
+        let channel = Arc::new(SpyChannel::new());
+        // Nothing listens on this port, so the submission fails before meka ever sees it.
+        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
+            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
+            token: crate::config::secret::Secret::new("test", "test"),
+            connect_timeout: Duration::from_millis(50),
+            turn_timeout: Duration::from_secs(1),
+            max_retries: 0,
+        })
+        .expect("client builds");
+        let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
+            Arc::clone(&channel) as Arc<dyn Channel>,
+        ]));
+        let runner = TurnRunner::new(
+            meka,
+            channels,
+            true,
+            TEST_TYPING_MAX,
+            Arc::new(Presence::default()),
+        );
+
+        let _ = runner
+            .run(uuid::Uuid::new_v4(), "hello", &conversations())
+            .await;
+        assert_eq!(
+            channel.activity_count(),
+            0,
+            "typing was announced for a turn that was never accepted"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -503,7 +654,13 @@ mod tests {
         let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
             Arc::clone(&channel) as Arc<dyn Channel>,
         ]));
-        let runner = TurnRunner::new(meka, channels, false, Arc::new(Presence::default()));
+        let runner = TurnRunner::new(
+            meka,
+            channels,
+            false,
+            TEST_TYPING_MAX,
+            Arc::new(Presence::default()),
+        );
 
         let token = runner.start_typing(&conversations());
         tokio::time::sleep(TYPING_REFRESH * 2).await;

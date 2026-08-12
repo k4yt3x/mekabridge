@@ -19,6 +19,7 @@
 //! [`Channel::member`] computes the answer for the specific channel asked about.
 
 pub mod cache;
+pub mod presence;
 pub mod render;
 
 use std::{
@@ -68,14 +69,18 @@ use crate::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
         FetchedFile, ForwardOrigin, FoundMessage, InboundEvent, InboundMessage, MemberAction,
-        MemberInfo, MemberStatus, Platform, ReplyContext, SendOptions, Sender,
-        discord::cache::NameCache,
+        MemberCoverage, MemberInfo, MemberListing, MemberStatus, Platform, Presence, ReplyContext,
+        SendOptions, Sender,
+        discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
 };
 
 /// Longest excerpt kept from a replied-to message.
 const REPLY_EXCERPT_CHARS: usize = 160;
+
+/// Most members Discord will return from one listing or search call.
+const MAX_MEMBER_PAGE: usize = 1000;
 
 /// Discord's ceiling on a timeout, which it enforces and will not round for you.
 const MAX_TIMEOUT: chrono::TimeDelta = chrono::TimeDelta::days(28);
@@ -119,7 +124,8 @@ const WANTED_EVENTS: EventTypeFlags = EventTypeFlags::READY
     .union(EventTypeFlags::THREAD_DELETE)
     .union(EventTypeFlags::ROLE_CREATE)
     .union(EventTypeFlags::ROLE_UPDATE)
-    .union(EventTypeFlags::ROLE_DELETE);
+    .union(EventTypeFlags::ROLE_DELETE)
+    .union(EventTypeFlags::PRESENCE_UPDATE);
 
 pub struct DiscordChannel {
     id: ChannelId,
@@ -134,10 +140,13 @@ pub struct DiscordChannel {
     allow_all: bool,
     admin_tools: bool,
     message_content: bool,
+    presence: bool,
     mention_everyone: bool,
     mention_roles: bool,
     link_preview: bool,
     names: Arc<NameCache>,
+    /// Who is online, accumulated from the gateway. Empty and unused unless `presence` is set.
+    presences: Arc<PresenceCache>,
     /// The bot's own account id, filled by [`Channel::run`] before the first event is read. It is
     /// what `addressed` compares against, and what keeps the bot from answering itself.
     identity: tokio::sync::OnceCell<Id<UserMarker>>,
@@ -191,10 +200,12 @@ impl DiscordChannel {
             allow_all: config.allow_all,
             admin_tools: config.admin_tools,
             message_content: config.message_content,
+            presence: config.presence,
             mention_everyone: config.mention_everyone,
             mention_roles: config.mention_roles,
             link_preview: config.link_preview,
             names: NameCache::new(),
+            presences: Arc::new(PresenceCache::default()),
             identity: tokio::sync::OnceCell::new(),
             dm_channels: RwLock::new(HashMap::new()),
         })
@@ -214,8 +225,13 @@ impl DiscordChannel {
         let base = Intents::GUILDS
             .union(Intents::GUILD_MESSAGES)
             .union(Intents::DIRECT_MESSAGES);
-        if self.message_content {
+        let base = if self.message_content {
             base.union(Intents::MESSAGE_CONTENT)
+        } else {
+            base
+        };
+        if self.presence {
+            base.union(Intents::GUILD_PRESENCES)
         } else {
             base
         }
@@ -744,10 +760,30 @@ impl DiscordChannel {
                     *guild
                 {
                     self.names.insert_guild(&guild);
+                    // Skipped entirely when the intent is off, because nothing reads the cache
+                    // in that case: `presence_of` answers `None` before it is consulted. Seeding
+                    // anyway would hold a map of every member of every server for no reader.
+                    if self.presence {
+                        self.presences.seed(
+                            guild.id,
+                            guild
+                                .presences
+                                .iter()
+                                .map(|presence| (presence.user.id(), presence.status)),
+                            Utc::now(),
+                        );
+                    }
                 }
             }
             Event::GuildUpdate(guild) => self.names.rename_guild(guild.id, &guild.name),
-            Event::GuildDelete(guild) => self.names.remove_guild(guild.id),
+            Event::GuildDelete(guild) => {
+                self.names.remove_guild(guild.id);
+                self.presences.forget(guild.id);
+            }
+            Event::PresenceUpdate(update) => {
+                self.presences
+                    .update(update.guild_id, update.user.id(), update.status, Utc::now());
+            }
             Event::ChannelCreate(channel) => self.names.insert_channel(&channel),
             Event::ChannelUpdate(channel) => self.names.insert_channel(&channel),
             Event::ChannelDelete(channel) => self.names.remove_channel(channel.id),
@@ -817,6 +853,91 @@ impl DiscordChannel {
     /// Built from parts rather than one long literal, and separated out so a test can look at it:
     /// a `\\`-continued string here was once joined by rustfmt with its indentation intact, which
     /// put a run of spaces in the URL and made every search fail to build a request at all.
+    /// Somebody's availability, or nothing at all when the operator has not switched presence on.
+    ///
+    /// `None` and [`crate::channel::PresenceStatus::Unknown`] both mean "cannot say", and the
+    /// difference is worth keeping: `None` is a bridge that was never asked to track this, which no
+    /// amount of waiting will change, while `Unknown` is one that has not caught up yet.
+    fn presence_of(&self, guild_id: Id<GuildMarker>, user: Id<UserMarker>) -> Option<Presence> {
+        self.presence.then(|| self.presences.get(guild_id, user))
+    }
+
+    /// Everything needed to place a member in a server, fetched once and reused across a page.
+    ///
+    /// Deriving status per member from a full permission calculation would be a round trip each,
+    /// which for a thousand-member page is not worth doing to fill in one field. The owner and the
+    /// set of roles carrying `ADMINISTRATOR` answer it from two calls for the whole page.
+    async fn server_standing(
+        &self,
+        guild_id: Id<GuildMarker>,
+    ) -> Result<ServerStanding, ChannelError> {
+        let guild = self
+            .http
+            .guild(guild_id)
+            .with_counts(true)
+            .await
+            .map_err(|error| self.delivery_error("reading the server", &error))?
+            .model()
+            .await
+            .map_err(|error| self.decode_error("the server", &error))?;
+        let roles = self
+            .http
+            .roles(guild_id)
+            .await
+            .map_err(|error| self.delivery_error("reading the server's roles", &error))?
+            .models()
+            .await
+            .map_err(|error| self.decode_error("the server's roles", &error))?;
+        Ok(ServerStanding {
+            owner_id: guild.owner_id,
+            total: guild.approximate_member_count,
+            admin_roles: roles
+                .iter()
+                .filter(|role| role.permissions.contains(Permissions::ADMINISTRATOR))
+                .map(|role| role.id)
+                .collect(),
+        })
+    }
+
+    /// Turn one member of a listing into the platform-neutral shape.
+    fn summarise_member(
+        &self,
+        guild_id: Id<GuildMarker>,
+        member: &twilight_model::guild::Member,
+        standing: &ServerStanding,
+    ) -> MemberInfo {
+        let restricted_until = member
+            .communication_disabled_until
+            .and_then(timestamp_to_chrono)
+            .filter(|until| *until > Utc::now());
+        let status = if member.user.id == standing.owner_id {
+            MemberStatus::Owner
+        } else if member
+            .roles
+            .iter()
+            .any(|role| standing.admin_roles.contains(role))
+        {
+            MemberStatus::Administrator
+        } else if restricted_until.is_some() {
+            MemberStatus::Restricted
+        } else {
+            MemberStatus::Member
+        };
+        MemberInfo {
+            user_id: member.user.id.to_string(),
+            display_name: member
+                .nick
+                .clone()
+                .or_else(|| member.user.global_name.clone())
+                .or_else(|| Some(member.user.name.clone())),
+            status,
+            rights: Vec::new(),
+            roles: self.names.role_names(guild_id, &member.roles),
+            restricted_until,
+            presence: self.presence_of(guild_id, member.user.id),
+        }
+    }
+
     fn search_path(
         &self,
         guild_id: Id<GuildMarker>,
@@ -1002,6 +1123,27 @@ fn attachment_kind(media_type: Option<&str>, voice: bool) -> AttachmentKind {
     AttachmentKind::Document
 }
 
+/// Server-wide facts needed to place every member of a page, fetched once per listing.
+struct ServerStanding {
+    owner_id: Id<UserMarker>,
+    /// Discord's own estimate of the server's size, which it will give even where it will not give
+    /// the roster.
+    total: Option<u64>,
+    admin_roles: HashSet<Id<RoleMarker>>,
+}
+
+/// Whether Discord refused outright, as opposed to failing for some other reason.
+///
+/// A privileged-intent refusal arrives as a plain 403 rather than anything more specific, so this
+/// is what stands between "you have not switched the intent on" and a transport error the operator
+/// would go looking in the wrong place for.
+fn is_forbidden(error: &twilight_http::Error) -> bool {
+    matches!(
+        error.kind(),
+        twilight_http::error::ErrorType::Response { status, .. } if status.get() == 403
+    )
+}
+
 fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(timestamp.as_micros())
 }
@@ -1064,6 +1206,7 @@ impl Channel for DiscordChannel {
             reactions: true,
             edit: true,
             admin: self.admin_tools,
+            presence: self.presence,
             // Discord grants privileges through roles only. There is no per-member permission set
             // to hand a named list of rights to.
             member_rights: false,
@@ -1712,6 +1855,8 @@ impl Channel for DiscordChannel {
                     rights: Vec::new(),
                     roles: Vec::new(),
                     restricted_until: None,
+                    // Not in the server, so there is nothing to be present for.
+                    presence: None,
                 });
             }
         };
@@ -1755,6 +1900,103 @@ impl Channel for DiscordChannel {
             rights: Vec::new(),
             roles: self.names.role_names(guild_id, &member.roles),
             restricted_until,
+            presence: self.presence_of(guild_id, user),
+        })
+    }
+
+    /// List a server's members, or search them by name.
+    ///
+    /// The two halves have very different requirements, which is the whole reason both are offered.
+    /// Enumerating everyone needs the `GUILD_MEMBERS` privileged intent enabled in the Developer
+    /// Portal; searching by name does not. So a bot whose operator has not enabled it can still
+    /// answer "is there someone called Dana here", just not "who is here".
+    ///
+    /// The intent is checked at the application level, independently of what the gateway identified
+    /// with, so this needs no change to the intents this bot connects with and cannot cause a
+    /// `4014`. Discord answers with a plain 403 instead, which is turned into a message saying
+    /// which switch to flip.
+    async fn list_members(
+        &self,
+        conversation: &ConversationId,
+        query: Option<&str>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<MemberListing, ChannelError> {
+        let channel_id = self.target(conversation).await?;
+        // A direct message belongs to no server, so there is no roster to ask for. Caught here
+        // because `guild_of` would otherwise report it as a malformed conversation, which sends
+        // whoever reads the error looking for a typo that is not there.
+        if chat_kind(self.names.kind_of(channel_id)) == ChatKind::Direct {
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "listing the members of a direct message, which is just the two of you",
+            });
+        }
+        let guild_id = self.guild_of(conversation, channel_id).await?;
+        let limit = limit.clamp(1, MAX_MEMBER_PAGE) as u16;
+
+        if let Some(query) = query {
+            let members = self
+                .http
+                .search_guild_members(guild_id, query)
+                .limit(limit)
+                .await
+                .map_err(|error| self.delivery_error("searching this server's members", &error))?
+                .models()
+                .await
+                .map_err(|error| self.decode_error("the member search results", &error))?;
+            let standing = self.server_standing(guild_id).await?;
+            return Ok(MemberListing {
+                coverage: MemberCoverage::Matching,
+                members: members
+                    .iter()
+                    .map(|member| self.summarise_member(guild_id, member, &standing))
+                    .collect(),
+                // Deliberately absent: the server's size reported against a search reads as the
+                // number of matches, which is a different and much smaller number.
+                total: None,
+                next_after: None,
+            });
+        }
+
+        let mut request = self.http.guild_members(guild_id).limit(limit);
+        if let Some(after) = after {
+            request = request.after(self.parse_user(after)?);
+        }
+        let members = match request.await {
+            Ok(response) => response
+                .models()
+                .await
+                .map_err(|error| self.decode_error("the member list", &error))?,
+            Err(error) if is_forbidden(&error) => {
+                return Err(ChannelError::Unsupported {
+                    channel: self.id.as_str().to_string(),
+                    feature: "listing everyone in a Discord server without the server members \
+                              intent, which is switched on under Privileged Gateway Intents on the \
+                              bot's page in the Discord Developer Portal. Searching members by \
+                              name works without it",
+                });
+            }
+            Err(error) => {
+                return Err(self.delivery_error("listing this server's members", &error));
+            }
+        };
+
+        let standing = self.server_standing(guild_id).await?;
+        // Discord pages by "the highest user id seen so far", and a short page means the end.
+        let next_after = (members.len() == limit as usize)
+            .then(|| members.iter().map(|member| member.user.id.get()).max())
+            .flatten()
+            .map(|highest| highest.to_string());
+
+        Ok(MemberListing {
+            coverage: MemberCoverage::Everyone,
+            members: members
+                .iter()
+                .map(|member| self.summarise_member(guild_id, member, &standing))
+                .collect(),
+            total: standing.total,
+            next_after,
         })
     }
 
@@ -1856,6 +2098,7 @@ mod tests {
             allow_all,
             admin_tools: true,
             message_content: true,
+            presence: false,
             mention_everyone: false,
             mention_roles: false,
             link_preview: false,

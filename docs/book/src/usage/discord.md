@@ -133,6 +133,34 @@ The bridge records what it sees, the same as on Telegram, and `read_history` and
 
 **`search_history` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
 
+## Listing who is in a server
+
+`list_members` answers two different questions with two different requirements, and only one of them needs anything switched on.
+
+**Searching by name is not gated.** Passing `query` uses Discord's member search, which works with no privileged intent, so a bot can always answer "is there someone here called Dana".
+
+**Listing everyone needs the Server Members intent.** Omitting `query` walks the full roster, which Discord restricts to applications with **Server Members** enabled on the Bot page, under Privileged Gateway Intents. Once a bot is in 100 or more servers, Discord must approve it. Without it the call fails with an error naming that switch and pointing at the search, rather than returning a short list that reads like the whole server.
+
+Unlike Message Content, this one carries no startup risk. Discord gates the HTTP API on the application setting alone, "independently of Gateway restrictions, and unaffected by which intents your app passes in the `intents` parameter when Identifying". So mekabridge never asks for it at the gateway, enabling it changes nothing about how the bridge connects, and it cannot produce a `4014`.
+
+`total` comes back either way, from Discord's own approximate count, so the size of a server is knowable even when its roster is not.
+
+## Seeing who is online
+
+Off by default. Set `presence = true` on the channel to turn it on.
+
+This is the one capability that cannot be reached over HTTP: Discord delivers presence only over the gateway, so the intent goes into the connection handshake rather than being checked per call. Two consequences follow.
+
+**It can stop the bot starting.** Enable **Presence Intent** under Privileged Gateway Intents in the Developer Portal *before* setting the flag. Asking for an intent you have not been granted closes the gateway with a `4014` at startup, exactly as with Message Content. This is the opposite of member listing, where a missing toggle only fails the one call.
+
+**It is a running tally, not a lookup.** Availability is accumulated from the gateway and held in memory. Nothing is written to disk, and it starts empty on every restart.
+
+The bridge keeps **only the status** — online, idle, do not disturb, offline. Discord also sends what each person is playing, listening to, and their custom status; none of that is stored, logged, or exposed. Enabling this still means ingesting the availability of everyone in every server the bot is in, none of whom opted into it, so it is worth turning on deliberately rather than by default.
+
+Somebody who has set themselves invisible is reported as offline. That is what they chose to appear as, and undoing it for a bot's benefit is not the bridge's call.
+
+`member` and `list_members` both carry the result, and `online_only` on a listing narrows it to people at their machine. See [`list_members`](./mcp-tools.md#list_members) for what the statuses mean and why `unknown` is not offline.
+
 ## Attachments
 
 Announced in the envelope with a handle, fetched only when the agent asks, as everywhere else. Two Discord specifics are worth knowing:

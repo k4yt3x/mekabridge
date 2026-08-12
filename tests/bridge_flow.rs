@@ -297,6 +297,14 @@ struct MockChannel {
 }
 
 impl MockChannel {
+    /// How many typing/upload indicators have been raised, for tests that watch presence.
+    fn activity_count(&self) -> usize {
+        self.activities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     fn new(id: &str) -> Self {
         Self {
             id: ChannelId::new(id),
@@ -343,6 +351,7 @@ impl Channel for MockChannel {
             reactions: true,
             edit: true,
             admin: true,
+            presence: false,
         }
     }
 
@@ -486,6 +495,7 @@ fn sink_with_storage(
             ([127, 0, 0, 1], 1).into(),
             std::path::Path::new("/tmp/mekabridge-unused.db"),
             0,
+            false,
         )
         .meka,
     )
@@ -504,7 +514,12 @@ fn sink_with_storage(
     )
 }
 
-fn config_for(meka_address: SocketAddr, database: &std::path::Path, retries: u32) -> Config {
+fn config_for(
+    meka_address: SocketAddr,
+    database: &std::path::Path,
+    retries: u32,
+    typing: bool,
+) -> Config {
     let raw = format!(
         r#"
 [meka]
@@ -516,7 +531,7 @@ turn_timeout = "20s"
 batch_max_messages = 32
 max_queue_depth = 64
 turn_retries = {retries}
-typing_indicator = false
+typing_indicator = {typing}
 # Scaled down from the shipped 2s/6s so the suite exercises the same logic without sleeping through
 # a real settle window on every test.
 settle = "150ms"
@@ -570,6 +585,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
 struct Harness {
     store: Store,
     sender: mpsc::Sender<InboundEvent>,
+    channel: Arc<MockChannel>,
     recorder: Arc<MekaRecorder>,
     shutdown: CancellationToken,
     meka_shutdown: CancellationToken,
@@ -596,13 +612,19 @@ impl Harness {
         Self::start_full(retries, fail_first, forget_first, 0).await
     }
 
+    /// A harness with the typing indicator on, which the others leave off so the suite is not
+    /// measuring presence it does not care about.
+    async fn start_with_typing() -> Self {
+        Self::start_all(1, 0, 0, 0, 0, true).await
+    }
+
     async fn start_full(
         retries: u32,
         fail_first: usize,
         forget_first: usize,
         truncate_first: usize,
     ) -> Self {
-        Self::start_all(retries, fail_first, forget_first, truncate_first, 0).await
+        Self::start_all(retries, fail_first, forget_first, truncate_first, 0, false).await
     }
 
     async fn start_all(
@@ -611,6 +633,7 @@ impl Harness {
         forget_first: usize,
         truncate_first: usize,
         empty_first: usize,
+        typing: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("state.db");
@@ -633,13 +656,14 @@ impl Harness {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = empty_first;
 
         let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
-        let config = Arc::new(config_for(meka_address, &database, retries));
+        let config = Arc::new(config_for(meka_address, &database, retries, typing));
 
         let store = Store::open(&config.storage.path)
             .await
             .expect("store opens");
+        let channel = Arc::new(MockChannel::new("mock"));
         let channels = Arc::new(ChannelRegistry::from_channels([
-            Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
+            Arc::clone(&channel) as Arc<dyn Channel>
         ]));
         let meka = MekaClient::new(&config.meka).expect("client builds");
 
@@ -659,7 +683,14 @@ impl Harness {
                 config: Arc::clone(&config),
                 meka: meka.clone(),
                 channels: Arc::clone(&channels),
-                runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
+                runner: TurnRunner::new(
+                    meka,
+                    channels,
+                    // From the config rather than pinned off, so a test can exercise presence.
+                    config.bridge.typing_indicator,
+                    config.bridge.typing_max,
+                    Arc::new(Presence::default()),
+                ),
                 identities: Arc::new(tokio::sync::OnceCell::new()),
                 permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             };
@@ -670,6 +701,7 @@ impl Harness {
         Self {
             store,
             sender,
+            channel,
             recorder,
             shutdown,
             meka_shutdown,
@@ -1014,7 +1046,7 @@ async fn queued_messages_survive_a_restart() {
     // Second run: startup recovery returns the stranded row to the queue and it gets delivered.
     let recorder = Arc::new(MekaRecorder::default());
     let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
-    let config = Arc::new(config_for(meka_address, &database, 1));
+    let config = Arc::new(config_for(meka_address, &database, 1, false));
     let store = Store::open(&config.storage.path).await.expect("opens");
     let recovered = store.reset_in_flight().await.expect("recovers");
     assert_eq!(recovered, 1);
@@ -1032,7 +1064,13 @@ async fn queued_messages_survive_a_restart() {
             config: Arc::clone(&config),
             meka: meka.clone(),
             channels: Arc::clone(&channels),
-            runner: TurnRunner::new(meka, channels, false, Arc::new(Presence::default())),
+            runner: TurnRunner::new(
+                meka,
+                channels,
+                false,
+                Duration::from_secs(30),
+                Arc::new(Presence::default()),
+            ),
             identities: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
         };
@@ -1256,6 +1294,91 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     );
     let policies = harness.store.list_policies().await.expect("list");
     assert_eq!(policies[0].dropped, 5);
+}
+
+#[tokio::test]
+async fn a_chat_waiting_on_someone_elses_turn_is_told_the_agent_is_busy() {
+    // meka only refuses because it is running a turn, and a backgrounded tool call delivers its
+    // outcome as one. The agent is working; the chat should not look dead while it does.
+    //
+    // `turn_in_flight` is deliberately left false throughout, which is what the real meka reports
+    // while it refuses: the field tracks a counter only `POST /turn` bumps, and the refusal comes
+    // from a mutex that background-outcome turns hold without touching it.
+    let harness = Harness::start_with_typing().await;
+    *harness
+        .recorder
+        .busy_first
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 1;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the indicator to go up while meka is busy", |harness| {
+            harness.channel.activity_count() > 0
+        })
+        .await;
+
+    harness
+        .wait_for("the batch to land once meka frees up", |harness| {
+            harness
+                .turns()
+                .iter()
+                .any(|turn| turn.contains("are you there?"))
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_session_that_refuses_while_reporting_itself_idle_is_retried_on_a_timer() {
+    // The field failure this pins. meka answers `turn_in_flight` from an atomic that only
+    // `POST /turn` increments, while the 409 comes from a session mutex that scheduled jobs and
+    // background-task outcomes hold as well. For the length of one of those the session reports
+    // idle and refuses anyway, so waiting for it to say it is free returns instantly and the
+    // resubmission is refused just as fast: ~125 submissions a second for as long as the other turn
+    // ran. Each one opened a typing indicator, and Discord's rate limiter went on replaying the
+    // backlog for minutes after everything had gone quiet, which is what the chat actually showed.
+    let harness = Harness::start_with_typing().await;
+    // Effectively forever: this session never admits to being busy and never accepts a turn.
+    *harness
+        .recorder
+        .busy_first
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 100_000;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the first submission", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let submissions = harness.turns().len();
+    assert!(
+        submissions <= 4,
+        "{submissions} submissions in three seconds of refusals: the bridge is spinning on the \
+         409 rather than waiting the other turn out"
+    );
+    let activities = harness.channel.activity_count();
+    assert!(
+        activities <= 4,
+        "{activities} typing actions in three seconds: a refused submission is queueing indicators \
+         faster than the platform will drain them"
+    );
+    assert!(
+        activities > 0,
+        "the chat was left silent while meka was busy with a turn of its own"
+    );
 }
 
 #[tokio::test]

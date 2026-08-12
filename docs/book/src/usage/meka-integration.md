@@ -56,7 +56,7 @@ the whole surface works at `read`:
 | Address book | `list_conversations`, `get_conversation` |
 | Attention | `mute`, `unmute`, `block`, `unblock` |
 | History | `read_history`, `search_history` |
-| Moderation | `moderate_member`, `set_member_rights`, `pin_message`, `set_chat`, `member` |
+| Moderation | `moderate_member`, `set_member_rights`, `set_member_roles`, `pin_message`, `set_chat`, `member`, `list_members` |
 
 The moderation group is present only when a channel has `admin_tools` on, which is the default; see
 [Security](./security.md). A test asserts the exact set in both configurations, because conditional

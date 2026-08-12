@@ -18,8 +18,8 @@ use mekabridge::{
     config::{McpConfig, McpTransport},
     mcp::{
         ChatSettings, ConversationSummary, DownloadedAttachment, HistoryEntry, MemberAction,
-        MemberInfo, MemberRight, OutboundSink, Policy, SendOptions, SinkError, ToolSurface,
-        ViewedAttachment, serve,
+        MemberCoverage, MemberInfo, MemberListing, MemberRight, OutboundSink, Policy, SendOptions,
+        SinkError, ToolSurface, ViewedAttachment, serve,
     },
 };
 use rmcp2::{
@@ -249,6 +249,22 @@ impl OutboundSink for RecordingSink {
             display_name: Some("Bot".to_string()),
             status: MemberStatus::Administrator,
             rights: vec![MemberRight::RestrictMembers],
+            presence: None,
+        })
+    }
+
+    async fn list_members(
+        &self,
+        _conversation: &str,
+        _query: Option<&str>,
+        _limit: usize,
+        _after: Option<&str>,
+    ) -> Result<MemberListing, SinkError> {
+        Ok(MemberListing {
+            coverage: MemberCoverage::Administrators,
+            members: Vec::new(),
+            total: Some(3),
+            next_after: None,
         })
     }
 
@@ -492,6 +508,7 @@ async fn all_tools_are_visible_to_an_older_client() {
         "edit_message",
         "get_conversation",
         "list_conversations",
+        "list_members",
         "member",
         "moderate_member",
         "mute",

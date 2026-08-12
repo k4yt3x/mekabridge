@@ -27,7 +27,7 @@ How to reach `meka serve`.
 | `base_url` | `http://127.0.0.1:8080` | Where meka is listening |
 | `token` / `token_file` | *(required)* | Bearer token; needs the `sessions:r` and `sessions:w` scopes |
 | `connect_timeout` | `10s` | TCP connect budget |
-| `turn_timeout` | `30m` | Ceiling on one turn. On expiry the turn is cancelled server-side so meka stops burning provider tokens |
+| `turn_timeout` | `30m` | Ceiling on one turn. On expiry the turn is cancelled server-side so meka stops burning provider tokens. Must be greater than zero, since it also bounds how long a batch waits out a turn meka is running for itself |
 | `max_retries` | `3` | Attempts against retryable failures on read-only calls |
 
 Turn submission is never retried at this layer. A replayed `POST /turn` can bill twice and send a second round of messages, so turn-level retry belongs to the queue's attempt counter instead.
@@ -72,9 +72,12 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `settle_max` | `6s` | Ceiling on that wait. In a chat busy enough that messages keep landing inside the settle window, this is what releases every batch, so it is felt as constant latency |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
-| `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and lapses after 30 seconds |
+| `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and when the turn ends |
+| `typing_max` | `[meka].turn_timeout` | Ceiling on how long that state is held for one turn. A safety net: the indicator already stops on a reply and at the end of the turn |
 | `mute_followup` | `5m` | How long a muted conversation goes on waking the agent for everything after the agent's own last message there |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
+
+`typing_max` is worth raising rather than lowering. Neither Telegram nor Discord limits how long an indicator may be renewed, so holding one costs a single cheap call every few seconds. A ceiling shorter than a turn is the worst of both: it stops while the agent is still working, and a chat that has been quiet for minutes reads as a bot that has died rather than one that is busy.
 
 `owner_conversation` is the only place the bridge writes chat content itself, and only to say that it could not deliver something. Without it, a repeated delivery failure is visible only in the logs.
 

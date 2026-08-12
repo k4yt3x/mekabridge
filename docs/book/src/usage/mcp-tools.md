@@ -181,6 +181,40 @@ Omitting `user_id` is the useful case: it lets the agent find out what it is all
 
 The answer also carries the roles somebody holds and, for anyone currently restricted, when that lifts. On Discord permissions are computed for the specific channel asked about, including its overwrites, because holding a permission in a server says nothing about holding it in a given room.
 
+## `list_members`
+
+Who is in a chat, or who matches a name.
+
+| Argument | Type | Meaning |
+|----------|------|---------|
+| `conversation` | string | Chat to look in |
+| `query` | string, optional | Name or partial name. Omit to ask for everyone |
+| `limit` | integer, optional | Defaults to 50, capped by the platform |
+| `after` | string, optional | Cursor from a previous call's `next_after` |
+| `online_only` | boolean, optional | Keep only people who are at their machine |
+
+The platforms answer different questions here, so the reply says which one it answered in `coverage`: `everyone` is the roster, `matching` is a name search, `administrators` means that is all the platform will enumerate, and `present` is a page narrowed by `online_only`. Reading a partial list as a complete one is the mistake this exists to prevent.
+
+`total` is the headcount where the platform gives one. It is often known even when the roster is not, so "I cannot tell you who is here, and there are fourteen hundred of them" is a possible and useful answer.
+
+**Telegram cannot list ordinary members at all.** The Bot API has no method for it and none for searching them, so a listing returns the administrators with `coverage: administrators`, and a `query` is refused with an error saying so. `total` still comes back.
+
+**Discord needs the server members intent for the full roster.** It is switched on under Privileged Gateway Intents on the bot's page in the Developer Portal, and once a bot is in 100 or more servers Discord must approve it. Without it, asking for everyone fails with an error naming that switch. Searching by name is not gated and keeps working either way, which is why the refusal points at it.
+
+Enabling that intent does not change how the bridge connects and cannot cause a `4014`: Discord gates the HTTP API on the application setting alone, independently of what the gateway identifies with.
+
+Where the channel reports availability, each person carries a `presence` with a `status` and an `as_of`. The status is one of `online`, `idle`, `do_not_disturb`, `offline`, or `unknown`.
+
+`unknown` is not offline. It means the bridge has no answer, which is the case for a platform that does not do presence at all, and for the seconds after startup before the gateway has caught up. Treating it as absent would send an agent looking for somebody to hand work to away empty-handed at exactly the moment it knows least.
+
+`do_not_disturb` is present but asking not to be interrupted, which is a different answer from `idle` and a very different one from `offline`. That is why this is five states rather than a flag.
+
+`online_only` keeps just those at their machine, which includes Do Not Disturb and excludes `unknown`. It exists because paging a large server to find the handful who are around otherwise costs a lot of context for a short answer.
+
+Filtering is applied to the page, so `coverage` comes back as `present` rather than `everyone`, and `total` still counts the whole chat. Three survivors of a fifty-person page in a chat of fourteen hundred are not three people online out of fourteen hundred — keep paging while `next_after` is set, including when a page comes back empty.
+
+`as_of` is when the bridge last heard anything about that chat's presence. Presence cannot be fetched on demand, only accumulated from a live connection, so an answer is only ever as fresh as the last update that reached it. **Telegram reports no presence at all**, so the field is absent there rather than `unknown`.
+
 ## `view_attachment`
 
 Look at a picture, without writing anything to disk.

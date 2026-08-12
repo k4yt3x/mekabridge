@@ -84,6 +84,20 @@ Two Telegram behaviours worth knowing:
 
 Anonymous admins post as the chat and carry no user id, so they cannot be moderated this way.
 
+## Listing who is in a chat
+
+Telegram will not enumerate ordinary members. The Bot API has no method for it and none for searching them, and no permission or setting changes that, so `list_members` answers a narrower question than it is asked and says so:
+
+- It returns the chat's **administrators**, with `coverage: administrators`.
+- It carries `total`, the full headcount, which is the one thing Telegram will say about everybody.
+- A `query` is refused, with an error explaining that Telegram has no member search rather than quietly returning nothing.
+
+Telegram also reports **no presence of any kind**. There is no online status, no last-seen, and no last-online date anywhere in the Bot API, at any permission level, so `presence` is absent rather than `unknown` on every Telegram member. Recency is the only proxy: `get_conversation` and `read_history` carry timestamps, so "posted four minutes ago" is available where "is online" is not.
+
+To reach an ordinary member, the agent needs their user id, which it gets from the `from:` line of something they said. `member` then works on them normally.
+
+Discord differs here: it will list a whole server, given one intent. See [Discord](./discord.md#listing-who-is-in-a-server).
+
 ## What wakes the agent in a group
 
 Groups default to `mute`, meaning the agent is woken only by a message addressed to it. Everything else said there is still received and recorded, so it can read the surrounding discussion when it needs to. See [`[bridge.default_policy]`](../configuration/config-file.md).

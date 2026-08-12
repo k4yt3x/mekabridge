@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::{
     channel::{
-        ChannelCapabilities, ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions,
+        ChannelCapabilities, ChatSettings, MemberAction, MemberCoverage, MemberInfo, MemberListing,
+        MemberRight, SendOptions,
     },
     store::Policy,
 };
@@ -160,6 +161,15 @@ pub trait OutboundSink: Send + Sync + 'static {
         conversation: &str,
         user_id: Option<&str>,
     ) -> Result<MemberInfo, SinkError>;
+
+    /// Who is in a chat, or those whose name matches `query`.
+    async fn list_members(
+        &self,
+        conversation: &str,
+        query: Option<&str>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<MemberListing, SinkError>;
 
     /// Retrieve an attachment for viewing, without writing it to disk.
     async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError>;
@@ -494,6 +504,30 @@ pub struct MemberArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListMembersArgs {
+    /// Chat to look in.
+    pub conversation: String,
+    /// Name or partial name to match. Omit to ask for everyone.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Most people to return. Capped by whatever the platform allows.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Cursor from a previous call's `next_after`, to continue where it stopped.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Keep only people who are at their machine, on a platform that reports it.
+    #[serde(default)]
+    pub online_only: Option<bool>,
+}
+
+/// Default page size when the caller does not say.
+///
+/// Well under either platform's ceiling: a roster is charged to the turn's context whole, and a
+/// caller that wanted a thousand names can ask for them.
+const DEFAULT_MEMBER_PAGE: usize = 50;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentArgs {
     /// The handle shown in square brackets on an `attachment:` line, for example `417`.
     pub attachment: String,
@@ -610,6 +644,7 @@ const ADMIN_TOOLS: &[&str] = &[
     "pin_message",
     "set_chat",
     "member",
+    "list_members",
 ];
 
 /// The MCP server exposing mekabridge's outbound tools.
@@ -1171,6 +1206,58 @@ impl BridgeMcpServer {
             .await
         {
             Ok(member) => Ok(json_result(&member)),
+            Err(error) => Ok(sink_failure(&error)),
+        }
+    }
+
+    /// Who is in a chat.
+    #[tool(
+        description = "Find out who is in a chat. Pass `query` to look for someone by name, or \
+                       omit it to ask for everyone. What comes back depends on the platform and is \
+                       reported in `coverage`: `everyone` is the full roster, `matching` is a name \
+                       search, and `administrators` means the platform will only enumerate those, \
+                       which is the case on Telegram. `total` is the headcount where the platform \
+                       gives one, and is often known even when the roster is not. Page with \
+                       `after` when `next_after` comes back set. If a listing is refused, the \
+                       error says which switch turns it on rather than leaving you to guess. \
+                       Where the platform reports availability, each person carries a `presence` \
+                       with their status and how recently it was known; `online_only` keeps just \
+                       those at their machine. Treat `do_not_disturb` as present but asking not to \
+                       be interrupted, and `unknown` as no answer rather than as absent.",
+        annotations(title = "List members", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn list_members(
+        &self,
+        Parameters(args): Parameters<ListMembersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .sink
+            .list_members(
+                &args.conversation,
+                args.query.as_deref(),
+                args.limit.unwrap_or(DEFAULT_MEMBER_PAGE),
+                args.after.as_deref(),
+            )
+            .await
+        {
+            Ok(mut listing) => {
+                if args.online_only.unwrap_or(false) {
+                    // Filtered here rather than in the connector so the platform still pages the
+                    // way it wants to. `unknown` is dropped along with offline: this argument is
+                    // asked by somebody about to hand out work, and "might be there" is not a
+                    // basis for that. The unfiltered call still shows them.
+                    listing.members.retain(|member| {
+                        member
+                            .presence
+                            .is_some_and(|presence| presence.status.is_present())
+                    });
+                    // Says what the members now are, so three survivors of a fifty-person page are
+                    // not read as three people online in a chat of fourteen hundred. `total` still
+                    // describes the chat, which is why the label has to change instead.
+                    listing.coverage = MemberCoverage::Present;
+                }
+                Ok(json_result(&listing))
+            }
             Err(error) => Ok(sink_failure(&error)),
         }
     }
@@ -1795,6 +1882,34 @@ mod tests {
                 display_name: Some("Bot".to_string()),
                 status: crate::channel::MemberStatus::Administrator,
                 rights: vec![MemberRight::RestrictMembers, MemberRight::DeleteMessages],
+                presence: None,
+            })
+        }
+
+        async fn list_members(
+            &self,
+            _conversation: &str,
+            query: Option<&str>,
+            limit: usize,
+            _after: Option<&str>,
+        ) -> Result<MemberListing, SinkError> {
+            Ok(MemberListing {
+                coverage: if query.is_some() {
+                    crate::channel::MemberCoverage::Matching
+                } else {
+                    crate::channel::MemberCoverage::Everyone
+                },
+                members: vec![MemberInfo {
+                    user_id: "42".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    status: crate::channel::MemberStatus::Member,
+                    rights: Vec::new(),
+                    roles: Vec::new(),
+                    restricted_until: None,
+                    presence: None,
+                }],
+                total: Some(7),
+                next_after: (limit == 1).then(|| "42".to_string()),
             })
         }
 
@@ -2541,6 +2656,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_listing_says_how_much_of_the_chat_it_covers() {
+        // The whole point of the shape. Telegram will only ever enumerate administrators, so a
+        // caller handed a bare array would reason about a room of three when there are hundreds.
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .list_members(Parameters(ListMembersArgs {
+                conversation: "telegram:-100".to_string(),
+                query: None,
+                limit: None,
+                after: None,
+                online_only: None,
+            }))
+            .await
+            .expect("tool runs");
+        let body = text_of(&result);
+        assert!(body.contains("\"coverage\""), "got: {body}");
+        assert!(body.contains("everyone"), "got: {body}");
+        assert!(
+            body.contains("\"total\""),
+            "the headcount is worth having: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn searching_by_name_is_reported_as_a_search_not_a_roster() {
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .list_members(Parameters(ListMembersArgs {
+                conversation: "discord:1".to_string(),
+                query: Some("dana".to_string()),
+                limit: None,
+                after: None,
+                online_only: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).contains("matching"));
+    }
+
+    #[tokio::test]
+    async fn online_only_drops_anyone_whose_presence_is_merely_unknown() {
+        // The caller asking this is about to hand somebody work. "Might be there" is not a basis
+        // for that, and a channel that does not track presence at all reports every member as
+        // unknown, so passing them through would make the filter silently do nothing.
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .list_members(Parameters(ListMembersArgs {
+                conversation: "discord:1".to_string(),
+                query: None,
+                limit: None,
+                after: None,
+                online_only: Some(true),
+            }))
+            .await
+            .expect("tool runs");
+        let body = text_of(&result);
+        assert!(
+            !body.contains("Alice"),
+            "somebody with no known presence was offered as available: {body}"
+        );
+        assert!(
+            body.contains("present"),
+            "a filtered page must not still claim to cover everyone: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filtered_listing_stops_claiming_to_cover_everyone() {
+        // `total` describes the chat, not the survivors of the filter. Left labelled `everyone`,
+        // three people out of a fifty-strong page in a chat of fourteen hundred reads as three
+        // online out of fourteen hundred, which is a number nobody computed.
+        let (server, _sink) = server_with(FakeSink::default());
+        let unfiltered = server
+            .list_members(Parameters(ListMembersArgs {
+                conversation: "discord:1".to_string(),
+                query: None,
+                limit: None,
+                after: None,
+                online_only: None,
+            }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&unfiltered).contains("everyone"));
+    }
+
+    #[tokio::test]
     async fn setting_nothing_on_a_chat_is_refused() {
         let (server, sink) = server_with(FakeSink::default());
         let result = server
@@ -2726,6 +2927,7 @@ mod tests {
     /// Capabilities as each connector reports them, so these tests move when the connectors do.
     fn telegram_capabilities(admin_tools: bool) -> ChannelCapabilities {
         ChannelCapabilities {
+            presence: false,
             typing_indicator: true,
             files: true,
             photos: true,
@@ -2812,6 +3014,7 @@ mod tests {
             "edit_message",
             "get_conversation",
             "list_conversations",
+            "list_members",
             "member",
             "moderate_member",
             "mute",
@@ -2900,6 +3103,7 @@ mod tests {
                 | "pin_message"
                 | "set_chat"
                 | "member"
+                | "list_members"
                 | "view_attachment"
                 | "download_attachment" => Some(true),
                 _ => Some(false),

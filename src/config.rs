@@ -90,6 +90,16 @@ pub struct BridgeConfig {
     /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
     pub turn_retries: u32,
     pub typing_indicator: bool,
+    /// Ceiling on how long the typing indicator is held for one turn.
+    ///
+    /// A safety net rather than a schedule: the indicator already stops when the agent replies and
+    /// when the turn ends, so this only fires if a turn outlives both. Defaults to
+    /// `[meka].turn_timeout`, which is the longest a turn can run, so in practice it never fires.
+    ///
+    /// Worth raising rather than lowering. A cap shorter than a turn is the worst of both: the
+    /// indicator stops while the agent is still working, and a chat that has gone quiet for
+    /// minutes reads as a bot that has died rather than one that is busy.
+    pub typing_max: Duration,
     /// What happens to a conversation nobody has ruled on, decided by its chat kind.
     pub default_policy: DefaultPolicy,
     /// How long after the agent's own message a muted conversation goes on waking it for
@@ -268,6 +278,13 @@ pub struct DiscordConfig {
     /// must be enabled in the Developer Portal first: asking for it without that closes the
     /// gateway with a 4014 rather than degrading.
     pub message_content: bool,
+    /// Track who is online, which needs the server presence intent.
+    ///
+    /// Unlike the member roster, this cannot be reached over HTTP at all, so it goes into the
+    /// gateway handshake and an ungranted intent closes the connection with a 4014 at startup
+    /// rather than failing one call. Off by default for that reason, and because it means
+    /// ingesting the availability of everyone in every server the bot is in.
+    pub presence: bool,
     /// Allow an outgoing message to ping `@everyone` and `@here`.
     pub mention_everyone: bool,
     /// Allow an outgoing message to ping a role.
@@ -440,6 +457,9 @@ struct FileBridge {
     turn_retries: u32,
     #[serde(default = "default_true")]
     typing_indicator: bool,
+    /// Unset follows `[meka].turn_timeout`, which is resolved once both are known.
+    #[serde(default, with = "humantime_serde")]
+    typing_max: Option<Duration>,
     #[serde(default)]
     default_policy: FileDefaultPolicy,
     #[serde(default = "default_mute_followup", with = "humantime_serde")]
@@ -558,6 +578,8 @@ struct FileDiscord {
     #[serde(default = "default_true")]
     message_content: bool,
     #[serde(default)]
+    presence: bool,
+    #[serde(default)]
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: bool,
@@ -598,6 +620,15 @@ impl FileConfig {
                 self.meka.base_url
             ))
         })?;
+        if self.meka.turn_timeout.is_zero() {
+            // Every turn would time out on the spot, and worse, the budget doubles as the ceiling
+            // on how long a batch may wait out a turn meka is running for itself. At
+            // zero that wait ends before it starts, and the batch is requeued and
+            // resubmitted as fast as the two processes can trade requests.
+            return Err(BridgeError::config(
+                "[meka].turn_timeout must be greater than zero",
+            ));
+        }
         let meka = MekaConfig {
             base_url,
             token: secret::resolve(
@@ -818,6 +849,16 @@ impl FileConfig {
                     allowed_guilds.len()
                 ));
             }
+            if discord.presence {
+                warnings.push(format!(
+                    "{label} sets `presence = true`, so this bot asks Discord for the server \
+                     presence intent. Enable Server Members and Presence Intent under Privileged \
+                     Gateway Intents in the Developer Portal first, or the gateway closes with a \
+                     4014 at startup. The bridge will track the availability of everyone in every \
+                     server it is in; it keeps only online or idle or busy, never what they are \
+                     doing, and writes none of it to disk."
+                ));
+            }
             if !discord.message_content {
                 warnings.push(format!(
                     "{label} sets `message_content = false`, so Discord blanks the text of every \
@@ -847,6 +888,7 @@ impl FileConfig {
                     allow_all: discord.allow_all,
                     admin_tools: discord.admin_tools,
                     message_content: discord.message_content,
+                    presence: discord.presence,
                     mention_everyone: discord.mention_everyone,
                     mention_roles: discord.mention_roles,
                     link_preview: discord.link_preview,
@@ -881,6 +923,9 @@ impl FileConfig {
                 settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
                 typing_indicator: self.bridge.typing_indicator,
+                // Follows the turn budget unless pinned, so the indicator lasts exactly as long as
+                // the work does rather than lapsing partway through a long turn.
+                typing_max: self.bridge.typing_max.unwrap_or(self.meka.turn_timeout),
                 default_policy: DefaultPolicy {
                     direct: self.bridge.default_policy.direct,
                     group: self.bridge.default_policy.group,
@@ -955,6 +1000,7 @@ impl Default for FileBridge {
             settle_max: default_settle_max(),
             turn_retries: default_turn_retries(),
             typing_indicator: true,
+            typing_max: None,
             default_policy: FileDefaultPolicy::default(),
             mute_followup: default_mute_followup(),
             mute_context: default_mute_context(),
@@ -1226,6 +1272,45 @@ token = \"meka-token\"
         );
         let error = parse(&raw).expect_err("ids are unique across platforms");
         assert!(error.to_string().contains("duplicate"), "got: {error}");
+    }
+
+    #[test]
+    fn the_typing_ceiling_follows_the_turn_budget_by_default() {
+        // A ceiling shorter than a turn is the failure this defaults away from: the indicator stops
+        // while the agent is still working, and the chat reads as a dead bot rather than a busy
+        // one.
+        let config = parse(MINIMAL).expect("valid");
+        assert_eq!(
+            config.bridge.typing_max, config.meka.turn_timeout,
+            "unpinned, the indicator lasts exactly as long as a turn can"
+        );
+
+        let raw = MINIMAL.replace(
+            "token = \"meka-token\"",
+            "token = \"meka-token\"\nturn_timeout = \"5m\"",
+        );
+        let config = parse(&raw).expect("valid");
+        assert_eq!(config.bridge.typing_max, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_zero_turn_budget_is_refused() {
+        // It is also the ceiling on waiting out a turn meka is running for itself. At zero that
+        // wait ends before it begins, and the batch is requeued and resubmitted as fast as
+        // the two processes can trade requests, which is the spin this rejects outright.
+        let raw = MINIMAL.replace(
+            "token = \"meka-token\"",
+            "token = \"meka-token\"\nturn_timeout = \"0s\"",
+        );
+        let error = parse(&raw).expect_err("a zero turn budget cannot be honoured");
+        assert!(error.to_string().contains("turn_timeout"), "got: {error}");
+    }
+
+    #[test]
+    fn the_typing_ceiling_can_be_pinned() {
+        let raw = format!("{MINIMAL}\n[bridge]\ntyping_max = \"45s\"\n");
+        let config = parse(&raw).expect("valid");
+        assert_eq!(config.bridge.typing_max, Duration::from_secs(45));
     }
 
     #[test]

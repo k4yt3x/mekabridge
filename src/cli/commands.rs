@@ -255,6 +255,14 @@ pub async fn doctor(config: &Config) -> Result<()> {
                             );
                         }
                         let capabilities = channel.capabilities();
+                        if capabilities.presence {
+                            println!(
+                                "  ok     {} tracks who is online; availability is built up from \
+                                 the gateway, so it is empty for a moment after every restart and \
+                                 reads as unknown until it fills",
+                                channel.id()
+                            );
+                        }
                         if capabilities.admin {
                             println!(
                                 "  ok     {} offers the moderation tools ({}); each call still \

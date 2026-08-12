@@ -41,8 +41,9 @@ use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        FetchedFile, ForwardOrigin, InboundEvent, InboundMessage, MemberAction, MemberInfo,
-        MemberRight, MemberStatus, Platform, ReplyContext, SendOptions, Sender,
+        FetchedFile, ForwardOrigin, InboundEvent, InboundMessage, MemberAction, MemberCoverage,
+        MemberInfo, MemberListing, MemberRight, MemberStatus, Platform, ReplyContext, SendOptions,
+        Sender,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -466,6 +467,8 @@ impl Channel for TelegramChannel {
             reactions: true,
             edit: true,
             admin: self.admin_tools,
+            // No presence of any kind in the Bot API, so this is not a switch an operator can flip.
+            presence: false,
             // Telegram grants privileges to a person directly, and has no roles to hand out.
             member_rights: self.admin_tools,
             member_roles: false,
@@ -1029,6 +1032,8 @@ impl Channel for TelegramChannel {
             rights: member_rights(&member.kind),
             // Telegram has no roles, and grants privileges to the person directly.
             roles: Vec::new(),
+            // The Bot API reports no presence of any kind, at any permission level.
+            presence: None,
             // A Telegram restriction can be unbounded, which has no end date to report.
             restricted_until: match &member.kind {
                 teloxide::types::ChatMemberKind::Restricted(restricted) => {
@@ -1041,6 +1046,80 @@ impl Channel for TelegramChannel {
                 }
                 _ => None,
             },
+        })
+    }
+
+    /// List a chat's administrators, which is the whole of what the Bot API will enumerate.
+    ///
+    /// Telegram has no method for listing ordinary members and no way to search them, by design. So
+    /// this answers a narrower question than it is asked, says so through
+    /// [`MemberCoverage::Administrators`], and carries the total headcount alongside, which is the
+    /// one thing the platform will say about everyone.
+    async fn list_members(
+        &self,
+        conversation: &ConversationId,
+        query: Option<&str>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<MemberListing, ChannelError> {
+        if query.is_some() {
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "searching members by name on Telegram, which the Bot API has no method \
+                          for. Omit the query to get the administrators, or use member with a user \
+                          id you already have",
+            });
+        }
+        // Paging an administrator list would be inventing a limit Telegram does not have: it
+        // returns every administrator in one call, and a chat cannot hold enough of them for that
+        // to matter.
+        if after.is_some() {
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "paging through members on Telegram, which returns its administrators \
+                          whole",
+            });
+        }
+        let (chat, _thread) = self.target(conversation)?;
+
+        let administrators = self
+            .bot
+            .get_chat_administrators(Recipient::Id(chat))
+            .await
+            .map_err(|error| self.delivery_error(&error))?;
+        let total = self
+            .bot
+            .get_chat_member_count(Recipient::Id(chat))
+            .await
+            .ok()
+            .map(u64::from);
+
+        if administrators.len() > limit {
+            // Truncating would hand back a short list with no cursor to continue from, which is
+            // indistinguishable from a chat that simply has few administrators. There are never
+            // many, so raising the limit is always possible.
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "listing part of a Telegram chat's administrators, which arrive whole and \
+                          cannot be paged. Raise the limit past their number",
+            });
+        }
+        Ok(MemberListing {
+            coverage: MemberCoverage::Administrators,
+            members: administrators
+                .iter()
+                .map(|member| MemberInfo {
+                    user_id: member.user.id.0.to_string(),
+                    display_name: Some(display_name(&member.user)),
+                    status: member_status(&member.kind),
+                    rights: member_rights(&member.kind),
+                    roles: Vec::new(),
+                    restricted_until: None,
+                    presence: None,
+                })
+                .collect(),
+            total,
+            next_after: None,
         })
     }
 
@@ -1395,6 +1474,47 @@ mod tests {
 
     fn channel(allowed_users: Vec<i64>, allowed_chats: Vec<i64>) -> TelegramChannel {
         configured(allowed_users, allowed_chats, false)
+    }
+
+    #[tokio::test]
+    async fn searching_members_by_name_is_refused_with_the_reason() {
+        // The Bot API has no member search and no member listing, so the only honest answer is to
+        // say which question Telegram will actually take. Refused before any network call, so this
+        // needs no live bot.
+        let channel = channel(vec![1], Vec::new());
+        let error = channel
+            .list_members(
+                &ConversationId::parse("telegram:-100").expect("valid"),
+                Some("dana"),
+                50,
+                None,
+            )
+            .await
+            .expect_err("Telegram cannot do this");
+        let message = error.to_string();
+        assert!(message.contains("Bot API has no method"), "got: {message}");
+        assert!(
+            message.contains("administrators"),
+            "the refusal has to name what does work: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_members_is_refused_rather_than_faked() {
+        // Telegram returns its administrators whole, so there is no cursor to hand back. Accepting
+        // `after` and ignoring it would replay the same first page forever while looking like
+        // progress. Refused before any network call, so this needs no live bot.
+        let channel = channel(vec![1], Vec::new());
+        let error = channel
+            .list_members(
+                &ConversationId::parse("telegram:-100").expect("valid"),
+                None,
+                50,
+                Some("12345"),
+            )
+            .await
+            .expect_err("Telegram cannot do this");
+        assert!(error.to_string().contains("whole"), "got: {error}");
     }
 
     #[tokio::test]

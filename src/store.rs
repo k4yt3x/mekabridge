@@ -1019,11 +1019,6 @@ impl Store {
         Ok(())
     }
 
-    /// Record that a batch's turn failed.
-    ///
-    /// Each row's attempt counter is incremented; rows still within `max_attempts` return to
-    /// `pending` for another try, the rest become `failed` and are reported back so the operator
-    /// can be told which messages will never be delivered.
     /// Return a batch to the queue without spending an attempt.
     ///
     /// For a batch that was never handed over, as distinct from one that failed. meka refusing a
@@ -1048,6 +1043,11 @@ impl Store {
         Ok(())
     }
 
+    /// Record that a batch's turn failed.
+    ///
+    /// Each row's attempt counter is incremented; rows still within `max_attempts` return to
+    /// `pending` for another try, the rest become `failed` and are reported back so the operator
+    /// can be told which messages will never be delivered.
     pub async fn fail_batch(
         &self,
         sequences: &[i64],
@@ -1343,17 +1343,34 @@ impl Store {
                     )?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
-                transaction.execute(
-                    "UPDATE messages SET seen = 1
-                     WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2",
-                    rusqlite::params![&conversation_id, &through],
-                )?;
                 transaction.commit()?;
                 Ok((count.max(0) as u64, records))
             })
             .await?;
         records.reverse();
         Ok((count, records))
+    }
+
+    /// Mark everything a conversation withheld up to `through` as accounted for.
+    ///
+    /// Split from [`Self::take_unseen`] so the backlog is only spent once a turn carrying it has
+    /// actually reached meka. Marking at read time meant a submission meka refused threw the
+    /// envelope away *and* the count, and the retry then told the agent nothing had been said in a
+    /// chat where thirty messages were waiting.
+    pub async fn mark_seen(&self, conversation_id: &str, through: DateTime<Utc>) -> Result<usize> {
+        let conversation_id = conversation_id.to_string();
+        let through = to_rfc3339(through);
+        let marked = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE messages SET seen = 1
+                     WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2",
+                    rusqlite::params![&conversation_id, &through],
+                )
+            })
+            .await?;
+        Ok(marked)
     }
 
     /// Drop recorded messages older than `before`. The FTS index follows through its triggers.
@@ -2075,6 +2092,18 @@ mod tests {
             .expect("take");
         assert_eq!(count, 1);
 
+        // Reading is not spending. The backlog is only marked once a turn carrying it has actually
+        // been accepted, so until then the same count comes back.
+        let (count, _) = store
+            .take_unseen("telegram:1", through, 5)
+            .await
+            .expect("take");
+        assert_eq!(count, 1, "reading it again must not consume it");
+
+        store
+            .mark_seen("telegram:1", through)
+            .await
+            .expect("mark seen");
         let (count, context) = store
             .take_unseen("telegram:1", through, 5)
             .await
@@ -2095,11 +2124,13 @@ mod tests {
         later.timestamp = now() + chrono::Duration::minutes(5);
         store.record_message(later).await.expect("record");
 
+        let cutoff = now() + chrono::Duration::minutes(1);
         let (count, _) = store
-            .take_unseen("telegram:1", now() + chrono::Duration::minutes(1), 5)
+            .take_unseen("telegram:1", cutoff, 5)
             .await
             .expect("take");
         assert_eq!(count, 1);
+        store.mark_seen("telegram:1", cutoff).await.expect("mark");
         let (count, _) = store
             .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 5)
             .await

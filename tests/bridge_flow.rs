@@ -49,7 +49,11 @@ const ONE_PIXEL_PNG: &[u8] = &[
 /// What the stub meka observed, so tests can assert on the envelope the agent would have seen.
 #[derive(Default)]
 struct MekaRecorder {
+    /// Bodies of turns meka actually accepted. A refusal never lands here, so a test asserting
+    /// that a batch was delivered cannot be satisfied by one that was turned away.
     turns: Mutex<Vec<String>>,
+    /// Every `POST /turn`, accepted or refused, for tests that measure submission rate.
+    attempts: Mutex<usize>,
     /// Turns to fail before starting to succeed, for exercising the retry path.
     fail_first: Mutex<usize>,
     /// Turns to answer with `session-not-found`, for exercising session recreation.
@@ -84,19 +88,10 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    recorder
-        .turns
+    *recorder
+        .attempts
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(message);
-
-    let delay = *recorder
-        .turn_delay
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !delay.is_zero() {
-        tokio::time::sleep(delay).await;
-    }
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
 
     let should_forget = {
         let mut remaining = recorder
@@ -142,6 +137,20 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                 .to_string(),
         )
             .into_response();
+    }
+
+    recorder
+        .turns
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(message);
+
+    let delay = *recorder
+        .turn_delay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
 
     let should_truncate = {
@@ -496,6 +505,7 @@ fn sink_with_storage(
             std::path::Path::new("/tmp/mekabridge-unused.db"),
             0,
             false,
+            "20s",
         )
         .meka,
     )
@@ -519,13 +529,14 @@ fn config_for(
     database: &std::path::Path,
     retries: u32,
     typing: bool,
+    turn_timeout: &str,
 ) -> Config {
     let raw = format!(
         r#"
 [meka]
 base_url = "http://{meka_address}"
 token = "test-token"
-turn_timeout = "20s"
+turn_timeout = "{turn_timeout}"
 
 [bridge]
 batch_max_messages = 32
@@ -567,6 +578,7 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
             on_behalf_of_chat: false,
         },
         admission: Admission::User,
+        sender_allowlisted: true,
         sender_roles: Vec::new(),
         addressed: false,
         text: text.to_string(),
@@ -614,8 +626,22 @@ impl Harness {
 
     /// A harness with the typing indicator on, which the others leave off so the suite is not
     /// measuring presence it does not care about.
+    /// A harness whose turn budget is shorter than two retry intervals, so a persistent refusal
+    /// makes `submit` give up and `deliver` genuinely release and rebuild the batch. Without that
+    /// the envelope is built once and reused across `submit`'s internal retries, and anything about
+    /// rebuilding it is untestable.
+    async fn start_impatient(busy: usize) -> Self {
+        let harness = Self::start_all(1, 0, 0, 0, 0, false, "3s").await;
+        *harness
+            .recorder
+            .busy_first
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = busy;
+        harness
+    }
+
     async fn start_with_typing() -> Self {
-        Self::start_all(1, 0, 0, 0, 0, true).await
+        Self::start_all(1, 0, 0, 0, 0, true, "20s").await
     }
 
     async fn start_full(
@@ -624,7 +650,16 @@ impl Harness {
         forget_first: usize,
         truncate_first: usize,
     ) -> Self {
-        Self::start_all(retries, fail_first, forget_first, truncate_first, 0, false).await
+        Self::start_all(
+            retries,
+            fail_first,
+            forget_first,
+            truncate_first,
+            0,
+            false,
+            "20s",
+        )
+        .await
     }
 
     async fn start_all(
@@ -634,6 +669,9 @@ impl Harness {
         truncate_first: usize,
         empty_first: usize,
         typing: bool,
+        // `[meka].turn_timeout`, which also bounds how long `submit` retries a refusal before
+        // giving up and letting `deliver` release the batch.
+        turn_timeout: &str,
     ) -> Self {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("state.db");
@@ -656,7 +694,13 @@ impl Harness {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = empty_first;
 
         let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
-        let config = Arc::new(config_for(meka_address, &database, retries, typing));
+        let config = Arc::new(config_for(
+            meka_address,
+            &database,
+            retries,
+            typing,
+            turn_timeout,
+        ));
 
         let store = Store::open(&config.storage.path)
             .await
@@ -707,6 +751,14 @@ impl Harness {
             meka_shutdown,
             _directory: directory,
         }
+    }
+
+    fn attempts(&self) -> usize {
+        *self
+            .recorder
+            .attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn turns(&self) -> Vec<String> {
@@ -1046,7 +1098,7 @@ async fn queued_messages_survive_a_restart() {
     // Second run: startup recovery returns the stranded row to the queue and it gets delivered.
     let recorder = Arc::new(MekaRecorder::default());
     let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
-    let config = Arc::new(config_for(meka_address, &database, 1, false));
+    let config = Arc::new(config_for(meka_address, &database, 1, false, "20s"));
     let store = Store::open(&config.storage.path).await.expect("opens");
     let recovered = store.reset_in_flight().await.expect("recovers");
     assert_eq!(recovered, 1);
@@ -1356,14 +1408,12 @@ async fn a_session_that_refuses_while_reporting_itself_idle_is_retried_on_a_time
         .await
         .expect("queued");
     harness
-        .wait_for("the first submission", |harness| {
-            !harness.turns().is_empty()
-        })
+        .wait_for("the first submission", |harness| harness.attempts() > 0)
         .await;
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let submissions = harness.turns().len();
+    let submissions = harness.attempts();
     assert!(
         submissions <= 4,
         "{submissions} submissions in three seconds of refusals: the bridge is spinning on the \
@@ -1604,6 +1654,57 @@ async fn a_follow_up_window_that_has_closed_stops_waking_the_agent() {
         harness.turns().is_empty(),
         "a chat the agent stopped answering has to go quiet again: {:?}",
         harness.turns()
+    );
+}
+
+#[tokio::test]
+async fn a_refused_submission_does_not_spend_the_backlog_it_reported() {
+    // The envelope for a refused turn is thrown away, and the backlog it reported has to survive
+    // with it. Marking at read time meant the retry counted zero and, because the conversation is
+    // muted, told the agent nothing had been said in a chat with four messages waiting.
+    // Refused enough times that `submit` exhausts its budget and `deliver` releases the batch,
+    // which is the only path that rebuilds the envelope and so the only one where spending the
+    // backlog early is visible.
+    // Three: `submit` refuses at t=0, t=2 and t=4 against a 3s budget, so the third gives up and
+    // the batch is released. Two would be answered on the retry that follows the second sleep,
+    // reusing the envelope built the first time and hiding the bug entirely.
+    let harness = Harness::start_impatient(3).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+    for index in 0..4 {
+        harness
+            .sender
+            .send(message(&format!("while muted {index}"), &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(harness.turns().is_empty(), "a mute withholds all four");
+
+    let mut mention = message("@bot what do you make of that?", "9");
+    if let InboundEvent::Message(inner) = &mut mention {
+        inner.addressed = true;
+    }
+    harness.sender.send(mention).await.expect("queued");
+
+    harness
+        .wait_for("the batch to land on the retry", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    let turns = harness.turns();
+    let envelope = turns.first().expect("one turn");
+    assert!(
+        envelope.contains("while muted 3"),
+        "the backlog was spent by the refused attempt:\n{envelope}"
+    );
+    assert!(
+        !envelope.contains("Nothing else has been said"),
+        "the retry told the agent a chat with four waiting messages was silent:\n{envelope}"
     );
 }
 
@@ -1891,12 +1992,14 @@ async fn a_forgotten_session_is_replaced_and_the_batch_is_replayed() {
         .expect("queued");
 
     harness
-        .wait_for("the replay", |harness| harness.turns().len() >= 2)
+        .wait_for("the replay", |harness| !harness.turns().is_empty())
         .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let turns = harness.turns();
-    assert!(turns[1].contains("still here?"), "got:\n{}", turns[1]);
+    // Only the replay lands: the first submission was answered with `session-not-found`, so it
+    // never reached an agent and is not a delivered turn.
+    assert!(turns[0].contains("still here?"), "got:\n{}", turns[0]);
     let stats = harness.store.queue_stats().await.expect("stats");
     assert_eq!(stats.done, 1, "the message must end up delivered");
     assert_eq!(stats.failed, 0);

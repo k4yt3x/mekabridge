@@ -96,10 +96,12 @@ history_retention = "30d"
 id = "telegram"
 # From @BotFather.
 token = "${TELEGRAM_BOT_TOKEN}"
-# Telegram user ids allowed to reach the agent. A bot token is a public entry point, so this is
-# mandatory and starts empty-means-nobody. Message @userinfobot to find your id.
+# Telegram user ids allowed to message the bot directly. A bot token is a public entry point, so
+# this is mandatory and starts empty-means-nobody. Message @userinfobot to find your id. This grants
+# nothing in a group: to be heard in one, add its id to `allowed_chats` below.
 allowed_users = [123456789]
-# Group and channel ids where every member is allowed. Group ids are negative.
+# Group and channel ids where every member is allowed. Group ids are negative. This is the only
+# way for the bot to hear anything in a group, including from people named above.
 # allowed_chats = [-1001234567890]
 # Accept everyone, for a public or customer-service bot. Note that on Telegram a private chat id is
 # the user's own id, so this admits individuals as well as groups: anybody who finds the bot can
@@ -127,9 +129,10 @@ allowed_users = [123456789]
 # # Ids are strings, because Discord snowflakes are strings in its own API and that is what you get
 # # when you copy one with Developer Mode on. At least one allowlist must be set, or `allow_all`.
 # #
-# # Discord user ids allowed anywhere, including in a direct message. This gates DMs, which is not
-# # optional: anybody who shares a server with the bot can open one, so in a single busy server that
-# # is thousands of people who would each get an agent turn for the price of a "hi".
+# # Discord user ids allowed to message the bot directly. This gates DMs, which is not optional:
+# # anybody who shares a server with the bot can open one, so in a single busy server that is
+# # thousands of people who would each get an agent turn for the price of a "hi". It grants nothing
+# # inside a server: to be heard in a channel, name the channel, a role, or the server itself.
 # allowed_users = ["245119312739729408"]
 # # Servers where every member is allowed. Much the largest of the four grants: everyone in the
 # # server can wake the agent by name, whether or not you have ever met them.
@@ -149,6 +152,11 @@ allowed_users = [123456789]
 # # Without it Discord blanks the text of every server message except those mentioning the bot, so
 # # mentions still wake the agent but read_history has nothing to show it.
 # # message_content = false
+# # Track who is online, for deciding who is around to be given work. Off by default: unlike the
+# # other intents this one cannot be reached over HTTP, so it goes into the connection handshake, and
+# # an ungranted Presence Intent closes the gateway at startup. Only the status is kept, never what
+# # anyone is doing, and none of it is written to disk.
+# # presence = true
 # # Let a message the agent writes ping a role, or @everyone. Both off by default: the agent is
 # # writing to a room it does not own, and @everyone in a large server is a loud mistake to make.
 # # mention_roles = true

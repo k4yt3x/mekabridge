@@ -159,8 +159,8 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 |-----|---------|---------|
 | `id` | *(required)* | Instance name, unique across all platforms. Becomes the first segment of conversation ids, so it may only contain letters, digits, `-` and `_` |
 | `token` / `token_file` | *(required)* | Bot token from @BotFather |
-| `allowed_users` | `[]` | Telegram user ids allowed to reach the agent |
-| `allowed_chats` | `[]` | Group and channel ids where every member is allowed. Group ids are negative |
+| `allowed_users` | `[]` | Telegram user ids allowed to message the bot **directly**. Grants nothing in a group |
+| `allowed_chats` | `[]` | Group and channel ids where every member is allowed. Group ids are negative. The only way to be heard in a group |
 | `allow_all` | `false` | Accept everyone, for a public or customer-service bot |
 | `admin_tools` | `true` | Offer the agent the group moderation tools |
 | `parse_mode` | `html` | `html` renders Markdown into Telegram's HTML subset; `none` sends the Markdown verbatim |
@@ -169,7 +169,7 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 
 At least one of `allowed_users`, `allowed_chats`, or `allow_all` must be set. Startup fails otherwise, because a bot with an empty allowlist would accept messages from anyone who finds it, and that should be a decision rather than an oversight.
 
-`allow_all` warns on every startup. On Telegram a private chat id *is* the user's own id, so it admits individuals as well as groups, and every message it lets through costs a provider turn. Setting `allowed_users` alongside it still does something useful: those people are reported to the agent as individually vetted rather than merely admitted.
+`allow_all` warns on every startup. On Telegram a private chat id *is* the user's own id, so it admits individuals as well as groups, and every message it lets through costs a provider turn. Setting `allowed_users` alongside it still does something useful: those people are marked on the `admitted:` line as individually named, wherever they write.
 
 `admin_tools` is on because Telegram refuses every moderation call unless the bot is an administrator with the matching right, so on a bot that administers nothing they are inert. Turn it off when the bot is an administrator for some other reason, such as reading all group messages. See [Security](../usage/security.md).
 
@@ -181,18 +181,19 @@ One table per bot, in its own array. Ids here are **strings**, because Discord s
 |-----|---------|---------|
 | `id` | *(required)* | Instance name, unique across all platforms |
 | `token` / `token_file` | *(required)* | Bot token from the Developer Portal's Bot page |
-| `allowed_users` | `[]` | User ids allowed anywhere, including in a direct message |
+| `allowed_users` | `[]` | User ids allowed to message the bot **directly**. Grants nothing inside a server |
 | `allowed_guilds` | `[]` | Servers where **every member** is allowed |
 | `allowed_channels` | `[]` | Channels where every participant is allowed. A thread inherits its parent's standing |
 | `allowed_roles` | `[]` | Anyone holding one of these roles |
 | `allow_all` | `false` | Accept everyone |
 | `admin_tools` | `true` | Offer the agent the moderation tools |
 | `message_content` | `true` | Ask for the privileged `MESSAGE_CONTENT` intent |
+| `presence` | `false` | Track who is online, which needs the privileged Presence Intent. Off by default: it cannot be reached over HTTP, so an ungranted intent closes the gateway at startup |
 | `mention_everyone` | `false` | Let a message the agent writes ping `@everyone` or `@here` |
 | `mention_roles` | `false` | Let a message the agent writes ping a role |
 | `link_preview` | `false` | Show a preview card for links the agent sends |
 
-At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direct messages, which is not optional: anybody sharing a server with the bot can open one.
+At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direct messages, which is not optional: anybody sharing a server with the bot can open one. It grants nothing inside a server, so a config naming only people is reachable by DM alone; startup warns when that is the case.
 
 `allowed_guilds` warns on every startup. It is much the largest of the four grants, since everyone in the server can wake the agent by name.
 

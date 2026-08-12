@@ -248,8 +248,17 @@ impl DiscordChannel {
         channel_id: Id<ChannelMarker>,
         guild_id: Option<Id<GuildMarker>>,
         roles: &[Id<RoleMarker>],
+        direct: bool,
     ) -> Option<Admission> {
-        if self.allowed_users.contains(&user_id) {
+        // Direct messages only. `allowed_users` names people the bot should be reachable by, which
+        // is not the same as a pass into every room it can see: somebody allowlisted so they can
+        // message the bot privately should not thereby be heard in a server channel nobody named,
+        // on a server nobody named. Reaching them in a channel is what the channel, role, and
+        // server grants are for.
+        // `direct` rather than merely "no guild": a group DM also carries no guild id, and up to
+        // ten people can be in one, so admitting it here would report `user allowlist` for a room
+        // the operator never named and the docs promise is a one-to-one chat.
+        if direct && self.allowed_users.contains(&user_id) {
             return Some(Admission::User);
         }
         if roles.iter().any(|role| self.allowed_roles.contains(role)) {
@@ -476,14 +485,6 @@ impl DiscordChannel {
             .as_ref()
             .map(|member| member.roles.clone())
             .unwrap_or_default();
-        let admission = self.admission(
-            message.author.id,
-            message.channel_id,
-            message.guild_id,
-            &roles,
-        )?;
-
-        let conversation = ConversationId::new(&self.id, &message.channel_id.to_string(), None);
         // Discord announces server channels over the gateway but not direct-message channels, so
         // the cache has nothing to say about a DM. The absent `guild_id` is the reliable signal,
         // and without this a DM would be filed as an unknown room and shown that way in the
@@ -493,6 +494,16 @@ impl DiscordChannel {
             None if message.guild_id.is_none() => ChatKind::Direct,
             None => ChatKind::Unknown,
         };
+        let sender_allowlisted = self.allowed_users.contains(&message.author.id);
+        let admission = self.admission(
+            message.author.id,
+            message.channel_id,
+            message.guild_id,
+            &roles,
+            chat_kind == ChatKind::Direct,
+        )?;
+
+        let conversation = ConversationId::new(&self.id, &message.channel_id.to_string(), None);
         let display_name = message
             .member
             .as_ref()
@@ -602,6 +613,7 @@ impl DiscordChannel {
                 on_behalf_of_chat: message.webhook_id.is_some(),
             },
             admission,
+            sender_allowlisted,
             addressed: self.addressed(message, channel_kind),
             sender_roles: message
                 .guild_id
@@ -848,11 +860,6 @@ impl DiscordChannel {
         }
     }
 
-    /// The path and query for one search request.
-    ///
-    /// Built from parts rather than one long literal, and separated out so a test can look at it:
-    /// a `\\`-continued string here was once joined by rustfmt with its indentation intact, which
-    /// put a run of spaces in the URL and made every search fail to build a request at all.
     /// Somebody's availability, or nothing at all when the operator has not switched presence on.
     ///
     /// `None` and [`crate::channel::PresenceStatus::Unknown`] both mean "cannot say", and the
@@ -938,6 +945,11 @@ impl DiscordChannel {
         }
     }
 
+    /// The path and query for one search request.
+    ///
+    /// Built from parts rather than one long literal, and separated out so a test can look at it:
+    /// a `\\`-continued string here was once joined by rustfmt with its indentation intact, which
+    /// put a run of spaces in the URL and made every search fail to build a request at all.
     fn search_path(
         &self,
         guild_id: Id<GuildMarker>,
@@ -2108,7 +2120,9 @@ mod tests {
 
     /// A channel that knows who it is, which is what `addressed` needs.
     fn identified() -> DiscordChannel {
-        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        // Granted the server as well as the person: the user list no longer admits anybody in a
+        // server channel, and these fixtures are server messages.
+        let channel = channel_with(vec![1], vec![900], vec![], vec![], false);
         channel
             .identity
             .set(Id::new(99))
@@ -2151,13 +2165,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_allowlisted_person_is_admitted_as_themselves() {
+    async fn an_allowlisted_person_is_admitted_as_themselves_in_a_direct_message() {
         let channel = channel_with(vec![1], vec![900], vec![], vec![], false);
-        // Narrower than the server grant that would also have let them through, since that is the
-        // truer statement about how much was checked.
         assert_eq!(
-            channel.admission(Id::new(1), Id::new(2000), Some(Id::new(900)), &[]),
+            channel.admission(Id::new(1), Id::new(2000), None, &[], true),
             Some(Admission::User)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_person_is_not_thereby_admitted_in_a_server() {
+        // `allowed_users` says who may message the bot, not which rooms it listens in. Anyone who
+        // shares a server with a bot can open a DM with it, so the individual grant is how somebody
+        // reaches it privately; letting that same grant carry into every channel of every server it
+        // can see would make one entry far wider than it reads.
+        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        assert_eq!(
+            channel.admission(Id::new(1), Id::new(2000), Some(Id::new(900)), &[], false),
+            None,
+            "an individual grant must not reach into an unlisted server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_person_in_a_listed_server_is_admitted_by_the_server() {
+        // Both name them, but only the server grant reaches a server channel, so that is what the
+        // agent is told. `user allowlist` here would claim more was checked about this room than
+        // was.
+        let channel = channel_with(vec![1], vec![900], vec![], vec![], false);
+        assert_eq!(
+            channel.admission(Id::new(1), Id::new(2000), Some(Id::new(900)), &[], false),
+            Some(Admission::Server)
         );
     }
 
@@ -2165,7 +2203,7 @@ mod tests {
     async fn a_server_grant_is_reported_as_a_server_grant() {
         let channel = channel_with(vec![], vec![900], vec![], vec![], false);
         assert_eq!(
-            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[]),
+            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[], false),
             Some(Admission::Server)
         );
     }
@@ -2175,14 +2213,35 @@ mod tests {
         // Reporting this as `User` would tell the agent the account was looked at, when all that
         // was checked is a role anybody who administers the server can hand out.
         let channel = channel_with(vec![], vec![], vec![], vec![555], false);
-        let admission =
-            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[Id::new(
-                555,
-            )]);
+        let admission = channel.admission(
+            Id::new(7),
+            Id::new(2000),
+            Some(Id::new(900)),
+            &[Id::new(555)],
+            false,
+        );
         assert_eq!(admission, Some(Admission::Role));
         assert!(
-            Admission::Role.describe().contains("not vetted"),
-            "the agent has to be told this account was not checked"
+            Admission::Role.describe().contains("role you allow"),
+            "the grant has to name what was actually checked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_dm_is_not_a_direct_message() {
+        // A group DM carries no server id, so a rule written as "no guild" admits it. Up to ten
+        // people can be in one, and the envelope would report `user allowlist` for a room the
+        // operator never named and the docs promise is a one-to-one chat.
+        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        assert_eq!(
+            channel.admission(Id::new(1), Id::new(2000), None, &[], false),
+            None,
+            "a group DM must not ride in on the individual grant"
+        );
+        assert_eq!(
+            channel.admission(Id::new(1), Id::new(2000), None, &[], true),
+            Some(Admission::User),
+            "a real direct message still works"
         );
     }
 
@@ -2190,7 +2249,7 @@ mod tests {
     async fn a_stranger_in_an_unlisted_server_is_dropped() {
         let channel = channel_with(vec![1], vec![], vec![], vec![], false);
         assert_eq!(
-            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[]),
+            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[], false),
             None
         );
     }
@@ -2200,7 +2259,7 @@ mod tests {
         // Anyone sharing a server with the bot can open a DM, so this is not a small set.
         let channel = channel_with(vec![1], vec![900], vec![], vec![], false);
         assert_eq!(
-            channel.admission(Id::new(7), Id::new(3000), None, &[]),
+            channel.admission(Id::new(7), Id::new(3000), None, &[], true),
             None
         );
     }
@@ -2209,7 +2268,7 @@ mod tests {
     async fn allow_all_admits_a_stranger_as_unvetted() {
         let channel = channel_with(vec![], vec![], vec![], vec![], true);
         assert_eq!(
-            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[]),
+            channel.admission(Id::new(7), Id::new(2000), Some(Id::new(900)), &[], false),
             Some(Admission::Open)
         );
     }

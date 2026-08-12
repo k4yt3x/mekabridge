@@ -209,11 +209,13 @@ Where the channel reports availability, each person carries a `presence` with a 
 
 `do_not_disturb` is present but asking not to be interrupted, which is a different answer from `idle` and a very different one from `offline`. That is why this is five states rather than a flag.
 
-`online_only` keeps just those at their machine, which includes Do Not Disturb and excludes `unknown`. It exists because paging a large server to find the handful who are around otherwise costs a lot of context for a short answer.
+`online_only` keeps just those at their machine, which includes Do Not Disturb and excludes `unknown`. On a platform that reports no availability at all, such as Telegram, it is **refused** rather than returning an empty list that would read as nobody being around. It exists because paging a large server to find the handful who are around otherwise costs a lot of context for a short answer.
 
 Filtering is applied to the page, so `coverage` comes back as `present` rather than `everyone`, and `total` still counts the whole chat. Three survivors of a fifty-person page in a chat of fourteen hundred are not three people online out of fourteen hundred — keep paging while `next_after` is set, including when a page comes back empty.
 
 `as_of` is when the bridge last heard anything about that chat's presence. Presence cannot be fetched on demand, only accumulated from a live connection, so an answer is only ever as fresh as the last update that reached it. **Telegram reports no presence at all**, so the field is absent there rather than `unknown`.
+
+Both `member` and `list_members` are withheld when a channel sets `admin_tools = false`, since they read about people rather than messages.
 
 ## `view_attachment`
 

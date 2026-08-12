@@ -41,7 +41,7 @@ A bot token is a public entry point, and Discord's reach is wider than Telegram'
 
 Four grants, checked from the narrowest to the widest:
 
-- `allowed_users` admits specific people wherever they write, including in a DM.
+- `allowed_users` admits specific people **in a direct message**, and nowhere else. Since anyone sharing a server with the bot can open a DM, this is the list that decides who may do so; it grants nothing inside a server.
 - `allowed_roles` admits anyone holding one of these roles. Cheap and idiomatic: the roles ride along on every server message, so no lookup is needed. It reads as `role allowlist` rather than `user allowlist`, because anybody who can hand out the role can hand out access with it.
 - `allowed_channels` admits everyone in these channels. A thread inherits the standing of the channel it was started in.
 - `allowed_guilds` admits **every member of the server**. This is much the largest grant, and `mekabridge doctor` and startup both say so.
@@ -73,7 +73,7 @@ conversation: discord:1183429847290374144
 message: 1287733441209827329
 from: Ali (@alice_dev, id 245119312739729408)
 roles: Moderators, Release Team
-admitted: server allowlist (neither the sender nor this chat is individually allowlisted)
+admitted: server allowlist (the server this was said in is allowed); sender not individually allowlisted
 chat: group "#deploys in Acme Corp"
 at: 2026-08-12T14:03:11.427+00:00
 woke you: you were named, or this replies to something you said
@@ -89,7 +89,7 @@ a19f4c>>>
 - **`roles`** is what they hold in this server, which is the difference between a stranger and a moderator. Discord supplies it on every message, so it costs nothing.
 - **`chat`** names the channel and the server. A thread reads `#deploys › rollback tonight in Acme Corp`, so the agent can tell a tangent from the room it came out of.
 - **`woke you`** appears only where the agent is not woken for everything, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest.
-- **`admitted`** gains two values on Discord. `role allowlist` means the sender holds a role you allowed, so an operator granted access deliberately but nobody looked at the account. `server allowlist` means neither the person nor the channel was allowlisted, only the server they are both in.
+- **`admitted`** gains two grants on Discord. `role allowlist` means the sender holds a role you allowed, so an operator granted access deliberately but nobody looked at the account. `server allowlist` means neither the person nor the channel was allowlisted, only the server they are both in. The clause after the semicolon is a separate fact: whether the sender is on `allowed_users`, which on Discord admits direct messages only and so never appears as the grant here.
 
 ### Mentions are resolved to names
 

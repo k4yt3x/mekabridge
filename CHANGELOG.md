@@ -7,11 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-12
+
+### Changed
+
+- **Breaking:** `allowed_users` admits a person in a direct message only, not in groups or servers.
+- Startup warns when a channel allowlists people but no rooms, so it is reachable by DM alone.
+- The `admitted:` line reports the grant and whether the sender is on `allowed_users` separately.
+
+### Fixed
+
+- A deferred batch lost what a muted chat had missed, and the retry then reported it as silent.
+- `typing_max` never applied while a batch waited on a turn meka started itself.
+- `online_only` emptied the list on a platform reporting no presence, reading as nobody around.
+- The `presence` warning told operators to enable Server Members, which the bridge never asks for.
+- `presence` was missing from the config reference and the template `config init` writes.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added
 
-- `list_members`, reporting who is in a chat, with `coverage` saying how much of it the answer covers.
+- `list_members`, reporting who is in a chat, with `coverage` saying how much of it is covered.
 - Discord member search, which needs no privileged intent, and full rosters where the intent is on.
 - Discord presence behind `presence` on the channel, reporting who is online, idle, or busy.
 - `online_only` on `list_members`, for finding who is actually around to be given work.
@@ -30,9 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A cancelled typing indicator still went out, leaving chats typing minutes after the agent stopped.
 - A deferred batch flagged the next batch's own messages as having arrived mid-turn.
 - The queue-overflow notice was lost when a deferred batch's envelope was discarded.
-- A zero `[meka].turn_timeout` was accepted, turning every deferral into a request flood.
+- A zero `[meka].turn_timeout` was accepted, so every turn timed out before it could start.
 - The documented moderation tool group omitted `set_member_roles`.
-- A listing narrowed by `online_only` still claimed to cover everyone in the chat.
 
 ## [0.4.1] - 2026-08-12
 
@@ -166,7 +181,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.5.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.6.0...HEAD
+[0.6.0]: https://github.com/k4yt3x/mekabridge/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/k4yt3x/mekabridge/compare/0.4.1...0.5.0
 [0.4.1]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/k4yt3x/mekabridge/compare/0.3.0...0.4.0

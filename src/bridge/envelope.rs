@@ -14,7 +14,9 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 
-use crate::channel::{Attachment, ChatKind, ConversationId, InboundEvent, InboundMessage};
+use crate::channel::{
+    Admission, Attachment, ChatKind, ConversationId, InboundEvent, InboundMessage,
+};
 
 /// What a conversation has said that the agent has not been shown.
 ///
@@ -209,7 +211,19 @@ impl Envelope<'_> {
                     .join(", ")
             );
         }
-        let _ = writeln!(out, "admitted: {}", message.admission.describe());
+        // Two facts on one line, because they are both about how far to trust this. The grant says
+        // what let the message through; the clause says whether the person behind it was named by
+        // hand. In a room the agent is only half listening to, an operator's own message reads as
+        // an ordinary member's without the second half.
+        let _ = writeln!(out, "admitted: {}{}", message.admission.describe(), match (
+            message.admission,
+            message.sender_allowlisted
+        ) {
+            // Already says it: the user list is the only thing that produces this grant.
+            (Admission::User, _) => "",
+            (_, true) => "; sender is also on your user allowlist",
+            (_, false) => "; sender not individually allowlisted",
+        });
         let _ = writeln!(out, "chat: {}", format_chat(message));
         let _ = writeln!(out, "at: {}", message.timestamp.to_rfc3339());
 
@@ -416,8 +430,8 @@ mod tests {
 
     use super::*;
     use crate::channel::{
-        Admission, AttachmentKind, ChannelId, ChatKind, ConversationId, ForwardOrigin, Platform,
-        ReplyContext, Sender,
+        AttachmentKind, ChannelId, ChatKind, ConversationId, ForwardOrigin, Platform, ReplyContext,
+        Sender,
     };
 
     fn timestamp() -> DateTime<Utc> {
@@ -443,6 +457,7 @@ mod tests {
                 on_behalf_of_chat: false,
             },
             admission: Admission::User,
+            sender_allowlisted: true,
             addressed: false,
             sender_roles: Vec::new(),
             text: text.to_string(),
@@ -890,6 +905,26 @@ mod tests {
     }
 
     #[test]
+    fn somebody_named_by_hand_is_still_named_when_a_room_admitted_them() {
+        // The user list reaches direct messages only, so an operator writing in an allowlisted
+        // group is admitted by the group. Saying only that would report the person who configured
+        // the bot as an unvetted member of the room, which is both false and exactly backwards for
+        // deciding how much weight to give what they ask for.
+        let mut event = message("ship it");
+        event.admission = Admission::Chat;
+        event.sender_allowlisted = true;
+        let rendered = render(vec![event]);
+        assert!(
+            rendered.contains("sender is also on your user allowlist"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("not individually allowlisted"),
+            "the envelope contradicted itself:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn an_edit_says_so_rather_than_looking_like_a_repeat() {
         let mut event = message("actually, tomorrow");
         event.edited_at = Some(
@@ -914,9 +949,13 @@ mod tests {
 
         let mut event = message("hi");
         event.admission = Admission::Chat;
+        event.sender_allowlisted = false;
         let rendered = render(vec![event]);
         assert!(
-            rendered.contains("admitted: chat allowlist (sender not individually allowlisted)"),
+            rendered.contains(
+                "admitted: chat allowlist (this room is allowed); sender not \
+                               individually allowlisted"
+            ),
             "got:\n{rendered}"
         );
 

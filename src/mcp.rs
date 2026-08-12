@@ -1242,6 +1242,23 @@ impl BridgeMcpServer {
         {
             Ok(mut listing) => {
                 if args.online_only.unwrap_or(false) {
+                    // A channel that reports no presence at all answers every member `None`, so
+                    // filtering would empty the list and read as "nobody is around" -- the exact
+                    // confusion the `unknown` state exists to prevent, and worse here because an
+                    // empty page carries no cursor suggesting there is more. Refused instead.
+                    if listing
+                        .members
+                        .iter()
+                        .all(|member| member.presence.is_none())
+                        && !listing.members.is_empty()
+                    {
+                        return Ok(sink_failure(&SinkError::Delivery(
+                            "this platform does not report who is online, so `online_only` would \
+                             hide everybody rather than narrow the list. Ask without it, and use \
+                             the message timestamps in read_history to judge who is around."
+                                .to_string(),
+                        )));
+                    }
                     // Filtered here rather than in the connector so the platform still pages the
                     // way it wants to. `unknown` is dropped along with offline: this argument is
                     // asked by somebody about to hand out work, and "might be there" is not a
@@ -1679,6 +1696,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSink {
+        /// Stands in for a platform that reports no availability at all, such as Telegram.
+        no_presence: bool,
         sent: Mutex<Vec<(String, String, SendOptions)>>,
         reactions: Mutex<Vec<(String, String, Option<String>)>>,
         edits: Mutex<Vec<(String, String, String)>>,
@@ -1899,15 +1918,34 @@ mod tests {
                 } else {
                     crate::channel::MemberCoverage::Everyone
                 },
-                members: vec![MemberInfo {
-                    user_id: "42".to_string(),
-                    display_name: Some("Alice".to_string()),
-                    status: crate::channel::MemberStatus::Member,
-                    rights: Vec::new(),
-                    roles: Vec::new(),
-                    restricted_until: None,
-                    presence: None,
-                }],
+                members: vec![
+                    MemberInfo {
+                        user_id: "42".to_string(),
+                        display_name: Some("Alice".to_string()),
+                        status: crate::channel::MemberStatus::Member,
+                        rights: Vec::new(),
+                        roles: Vec::new(),
+                        restricted_until: None,
+                        // Present unless the fixture is standing in for a platform that reports
+                        // nothing, which is a different case from one person being unaccounted for.
+                        presence: (!self.no_presence).then_some(crate::channel::Presence {
+                            status: crate::channel::PresenceStatus::Unknown,
+                            as_of: None,
+                        }),
+                    },
+                    MemberInfo {
+                        user_id: "43".to_string(),
+                        display_name: Some("Dana".to_string()),
+                        status: crate::channel::MemberStatus::Member,
+                        rights: Vec::new(),
+                        roles: Vec::new(),
+                        restricted_until: None,
+                        presence: (!self.no_presence).then_some(crate::channel::Presence {
+                            status: crate::channel::PresenceStatus::Online,
+                            as_of: None,
+                        }),
+                    },
+                ],
                 total: Some(7),
                 next_after: (limit == 1).then(|| "42".to_string()),
             })
@@ -2714,7 +2752,11 @@ mod tests {
         let body = text_of(&result);
         assert!(
             !body.contains("Alice"),
-            "somebody with no known presence was offered as available: {body}"
+            "somebody whose presence is unknown was offered as available: {body}"
+        );
+        assert!(
+            body.contains("Dana"),
+            "the person actually online was filtered out too: {body}"
         );
         assert!(
             body.contains("present"),
@@ -2723,10 +2765,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_filtered_listing_stops_claiming_to_cover_everyone() {
-        // `total` describes the chat, not the survivors of the filter. Left labelled `everyone`,
-        // three people out of a fifty-strong page in a chat of fourteen hundred reads as three
-        // online out of fourteen hundred, which is a number nobody computed.
+    async fn online_only_is_refused_where_the_platform_reports_no_presence() {
+        // Telegram reports availability for nobody, so filtering would empty the list and read as
+        // "nobody is around". An empty page carries no cursor either, so there is nothing to
+        // suggest the answer is an artefact of the filter rather than the truth.
+        let (server, _sink) = server_with(FakeSink {
+            no_presence: true,
+            ..FakeSink::default()
+        });
+        let result = server
+            .list_members(Parameters(ListMembersArgs {
+                conversation: "telegram:-100".to_string(),
+                query: None,
+                limit: None,
+                after: None,
+                online_only: Some(true),
+            }))
+            .await
+            .expect("tool runs");
+        let body = text_of(&result);
+        assert!(
+            body.contains("does not report who is online"),
+            "got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_listing_says_it_covers_everyone() {
+        // The counterpart to the test above: `coverage` only narrows when the filter actually ran.
         let (server, _sink) = server_with(FakeSink::default());
         let unfiltered = server
             .list_members(Parameters(ListMembersArgs {

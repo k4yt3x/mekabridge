@@ -300,9 +300,17 @@ fn announce_expiry(message: &mut crate::channel::InboundMessage, lapsed: &Policy
 /// work: unmuting a conversation leaves behind whatever piled up while it was muted. Asking only
 /// the muted ones would report that backlog to nobody and never clear it, so `unseen` would climb
 /// for the life of the conversation and `list_conversations` would go on quoting it.
-async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<MissedContext> {
+async fn missed_context(
+    context: &DrainContext,
+    events: &[InboundEvent],
+) -> (
+    Vec<MissedContext>,
+    Vec<(ConversationId, chrono::DateTime<chrono::Utc>)>,
+) {
     let now = chrono::Utc::now();
     let mut collected = Vec::new();
+    // What to mark accounted for, once a turn carrying it has actually been accepted.
+    let mut spent = Vec::new();
     let mut visited = BTreeSet::new();
     for event in events {
         let conversation = event.conversation();
@@ -352,26 +360,30 @@ async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<
             // A conversation being heard in full with nothing owed has nothing to say, so it is
             // dropped rather than rendered as an empty block. A muted one is still worth a line: it
             // tells the agent why it is seeing one message out of a conversation.
-            Ok((0, _)) if !muted => {}
-            Ok((count, recent)) => collected.push(MissedContext {
-                conversation: conversation.clone(),
-                muted,
-                count,
-                recent: recent
-                    .into_iter()
-                    .map(|record| MissedMessage {
-                        sender: record.sender_name,
-                        // Descriptor lines stand in for a message whose content is not text, so a
-                        // photo does not read back as somebody saying nothing.
-                        text: match (record.text.trim().is_empty(), record.notes) {
-                            (true, Some(notes)) => notes,
-                            (true, None) => "[no text]".to_string(),
-                            (false, _) => record.text,
-                        },
-                        timestamp: record.timestamp,
-                    })
-                    .collect(),
-            }),
+            Ok((0, _)) if !muted => spent.push((conversation.clone(), through)),
+            Ok((count, recent)) => {
+                spent.push((conversation.clone(), through));
+                collected.push(MissedContext {
+                    conversation: conversation.clone(),
+                    muted,
+                    count,
+                    recent: recent
+                        .into_iter()
+                        .map(|record| MissedMessage {
+                            sender: record.sender_name,
+                            // Descriptor lines stand in for a message whose content is not text, so
+                            // a photo does not read back as somebody
+                            // saying nothing.
+                            text: match (record.text.trim().is_empty(), record.notes) {
+                                (true, Some(notes)) => notes,
+                                (true, None) => "[no text]".to_string(),
+                                (false, _) => record.text,
+                            },
+                            timestamp: record.timestamp,
+                        })
+                        .collect(),
+                });
+            }
             Err(error) => tracing::error!(
                 conversation = %conversation,
                 "could not read what a conversation withheld: {}",
@@ -379,7 +391,7 @@ async fn missed_context(context: &DrainContext, events: &[InboundEvent]) -> Vec<
             ),
         }
     }
-    collected
+    (collected, spent)
 }
 
 /// Write one message to the history, unless history is switched off.
@@ -659,7 +671,7 @@ async fn deliver(
 
     let identities = channel_identities(context).await;
 
-    let missed = missed_context(context, &events).await;
+    let (missed, withheld) = missed_context(context, &events).await;
 
     let nonce = nonce();
     let message = Envelope {
@@ -713,6 +725,25 @@ async fn deliver(
         }
         other => other,
     };
+
+    // Spent for every outcome except the refusal above, which returns before this. A turn that
+    // failed still reached the agent, and repeating the whole backlog on each retry would be the
+    // worse trade; a turn meka never accepted did not reach it at all.
+    if !matches!(&result, Err(error) if error.is_turn_in_flight()) {
+        for (conversation, through) in &withheld {
+            if let Err(error) = context
+                .store
+                .mark_seen(conversation.as_str(), *through)
+                .await
+            {
+                tracing::error!(
+                    conversation = %conversation,
+                    "failed to record what the agent was shown: {}",
+                    error
+                );
+            }
+        }
+    }
 
     match result {
         // A turn that produced meka's empty-response stand-in and called nothing did no work at
@@ -817,9 +848,13 @@ async fn deliver(
             {
                 tracing::error!("failed to restore the dropped-message counter: {}", error);
             }
-            // No turn ran, so there is no window to report. Inventing one would flag the next
-            // batch's messages as having arrived mid-turn against a turn that never happened, and
-            // those messages are in that very batch.
+            // The backlog this envelope reported is deliberately *not* marked accounted for. It
+            // was never delivered, and spending it here would leave the retry telling a chat with
+            // thirty messages waiting that nothing had been said in it.
+            //
+            // No turn ran, so there is no window to report either. Inventing one would flag the
+            // next batch's messages as having arrived mid-turn against a turn that never happened,
+            // and those messages are in that very batch.
             return last_turn;
         }
         Err(error) => {
@@ -855,19 +890,29 @@ async fn submit(
     shutdown: &CancellationToken,
 ) -> Result<crate::bridge::turn::TurnReport, MekaError> {
     let deadline = tokio::time::Instant::now() + context.config.meka.turn_timeout;
-    let mut waiting = false;
+    // Opened once for the whole episode rather than per attempt. Per attempt, each call started its
+    // own `typing_max` countdown, so the ceiling could never be reached however long the wait ran;
+    // it also cancelled every request mid-flight, which on a channel whose typing endpoint is
+    // rate-limited past the retry interval meant the indicator never appeared at all.
+    let mut typing: Option<CancellationToken> = None;
+    let mut attempt = 0_u32;
     loop {
         let result = context.runner.run(session_id, message, conversations).await;
-        if !result
+        let refused = result
             .as_ref()
             .err()
-            .is_some_and(MekaError::is_turn_in_flight)
-            || tokio::time::Instant::now() >= deadline
-        {
+            .is_some_and(MekaError::is_turn_in_flight);
+        // Belt and braces rather than load-bearing: the same budget bounds the turn itself, so a
+        // 409 can only ever be seen strictly before the deadline -- a refusal that took longer
+        // would have failed as a timeout and never reached this path. The guard costs one
+        // comparison and keeps the loop correct if those two budgets are ever separated.
+        if !refused || (attempt > 0 && tokio::time::Instant::now() >= deadline) {
+            if let Some(typing) = typing {
+                typing.cancel();
+            }
             return result;
         }
-        if !waiting {
-            waiting = true;
+        if attempt == 0 {
             // Once per episode, not once per attempt: at one line per attempt this buried whatever
             // an operator opened the log to find.
             tracing::info!(
@@ -875,20 +920,21 @@ async fn submit(
                  every {}s until it finishes",
                 DEFER_RETRY_INTERVAL.as_secs()
             );
+            // meka refuses solely because it is running a turn, and since a backgrounded tool call
+            // delivers its outcome as one, the agent is working just as much as it would be on
+            // ours. Without this the chat is silent for as long as the other turn lasts.
+            typing = Some(context.runner.start_typing(conversations));
         }
+        attempt += 1;
 
-        // Opened only across the wait. meka refuses solely because it is running a turn, and since
-        // a backgrounded tool call delivers its outcome as one, the agent is working just as much
-        // as it would be on ours; without this the chat is silent for as long as the other turn
-        // lasts. Cancelled before the retry so an accepted turn opens its own on `Started` rather
-        // than leaving two refresh loops running over one chat.
-        let typing = context.runner.start_typing(conversations);
         let interrupted = tokio::select! {
             () = shutdown.cancelled() => true,
             () = tokio::time::sleep(DEFER_RETRY_INTERVAL) => false,
         };
-        typing.cancel();
         if interrupted {
+            if let Some(typing) = typing {
+                typing.cancel();
+            }
             return result;
         }
     }
@@ -1116,6 +1162,7 @@ mod tests {
                 on_behalf_of_chat: false,
             },
             admission: Admission::User,
+            sender_allowlisted: true,
             addressed: false,
             sender_roles: Vec::new(),
             text: "look".to_string(),

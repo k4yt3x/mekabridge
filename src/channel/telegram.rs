@@ -214,8 +214,16 @@ impl TelegramChannel {
     /// who qualifies under more than one is reported at the strongest. That ordering is why
     /// `allow_all` comes last rather than short-circuiting: an open channel can still name the
     /// people it knows, and "this one was vetted" stays worth saying.
-    fn admission(&self, user_id: Option<i64>, chat_id: i64) -> Option<Admission> {
-        if user_id.is_some_and(|user_id| self.allowed_users.contains(&user_id)) {
+    fn admission(&self, user_id: Option<i64>, chat_id: i64, direct: bool) -> Option<Admission> {
+        // Direct messages only. `allowed_users` names people the bot should be reachable by, which
+        // is not the same as a pass into every group it happens to have been added to: somebody
+        // allowlisted so they can message the bot privately should not thereby be heard in a group
+        // nobody named. Reaching them in a group is what `allowed_chats` is for.
+        //
+        // Told whether the chat is private rather than comparing the chat id against the user id.
+        // The two are equal in a Telegram private chat, but relying on that would leave the rule
+        // resting on a coincidence of the id space rather than on the thing being asked.
+        if direct && user_id.is_some_and(|user_id| self.allowed_users.contains(&user_id)) {
             return Some(Admission::User);
         }
         if self.allowed_chats.contains(&chat_id) {
@@ -349,7 +357,10 @@ impl TelegramChannel {
         let chat_id = message.chat.id;
         let user = message.from.as_ref();
         let user_id = user.map(|user| user.id.0 as i64);
-        let Some(admission) = self.admission(user_id, chat_id.0) else {
+        // Recognition is independent of where they wrote, unlike admission.
+        let sender_allowlisted =
+            user_id.is_some_and(|user_id| self.allowed_users.contains(&user_id));
+        let Some(admission) = self.admission(user_id, chat_id.0, message.chat.is_private()) else {
             tracing::debug!(
                 channel = %self.id,
                 chat_id = chat_id.0,
@@ -432,6 +443,7 @@ impl TelegramChannel {
             chat_title: message.chat.title().map(str::to_string),
             sender,
             admission,
+            sender_allowlisted,
             addressed: self.addressed(message),
             sender_roles: Vec::new(),
             text,
@@ -1087,12 +1099,20 @@ impl Channel for TelegramChannel {
             .get_chat_administrators(Recipient::Id(chat))
             .await
             .map_err(|error| self.delivery_error(&error))?;
-        let total = self
-            .bot
-            .get_chat_member_count(Recipient::Id(chat))
-            .await
-            .ok()
-            .map(u64::from);
+        // Best effort: the administrators are the answer, and the headcount is a bonus that should
+        // not cost them. Logged rather than dropped, so a chat where this always fails is
+        // discoverable instead of just quietly missing a field.
+        let total = match self.bot.get_chat_member_count(Recipient::Id(chat)).await {
+            Ok(count) => Some(u64::from(count)),
+            Err(error) => {
+                tracing::debug!(
+                    channel = %self.id,
+                    "could not read the chat's member count: {}",
+                    error
+                );
+                None
+            }
+        };
 
         if administrators.len() > limit {
             // Truncating would hand back a short list with no cursor to continue from, which is
@@ -1558,10 +1578,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlist_admits_listed_users() {
+    async fn allowlist_admits_listed_users_in_their_own_chat() {
         let channel = channel(vec![111], vec![]);
-        assert_eq!(channel.admission(Some(111), 111), Some(Admission::User));
-        assert_eq!(channel.admission(Some(222), 222), None);
+        assert_eq!(
+            channel.admission(Some(111), 111, true),
+            Some(Admission::User)
+        );
+        assert_eq!(channel.admission(Some(222), 222, true), None);
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_user_is_not_thereby_admitted_in_a_group() {
+        // `allowed_users` says who may message the bot, not which rooms it listens in. Somebody
+        // allowlisted so they can talk to it privately should not drag it into every group they
+        // happen to add it to, because that is a room the operator never named.
+        let channel = channel(vec![111], vec![]);
+        assert_eq!(
+            channel.admission(Some(111), -1001234, false),
+            None,
+            "an individual grant must not reach into an unlisted group"
+        );
     }
 
     #[tokio::test]
@@ -1569,46 +1605,54 @@ mod tests {
         // A group is allowlisted as a whole so every member can talk to the agent in it.
         let channel = channel(vec![], vec![-1001234]);
         assert_eq!(
-            channel.admission(Some(999), -1001234),
+            channel.admission(Some(999), -1001234, false),
             Some(Admission::Chat)
         );
-        assert_eq!(channel.admission(Some(999), -1009999), None);
+        assert_eq!(channel.admission(Some(999), -1009999, false), None);
     }
 
     #[tokio::test]
-    async fn being_individually_allowlisted_outranks_the_chat() {
-        // Both apply here. The agent is told the stronger one, because "this person was vetted" and
-        // "this person happens to be in a vetted room" are not the same claim.
+    async fn a_listed_user_in_a_listed_group_is_admitted_by_the_group() {
+        // Both lists name them, but only one of the two grants reaches a group, so that is the one
+        // the agent is told about. Reporting `user allowlist` here would claim the person was
+        // vetted for this room when what was vetted is the room itself.
         let channel = channel(vec![111], vec![-1001234]);
         assert_eq!(
-            channel.admission(Some(111), -1001234),
-            Some(Admission::User)
+            channel.admission(Some(111), -1001234, false),
+            Some(Admission::Chat)
         );
         assert_eq!(
-            channel.admission(Some(222), -1001234),
-            Some(Admission::Chat)
+            channel.admission(Some(111), 111, true),
+            Some(Admission::User),
+            "their own chat is still theirs"
         );
     }
 
     #[tokio::test]
     async fn allowlist_rejects_anonymous_senders_outside_allowed_chats() {
         let channel = channel(vec![111], vec![]);
-        assert_eq!(channel.admission(None, 111), None);
+        assert_eq!(channel.admission(None, 111, true), None);
     }
 
     #[tokio::test]
     async fn empty_allowlist_admits_nobody() {
         // Config rejects this combination, but the channel must fail closed regardless.
         let channel = channel(vec![], vec![]);
-        assert_eq!(channel.admission(Some(1), 1), None);
-        assert_eq!(channel.admission(None, 1), None);
+        assert_eq!(channel.admission(Some(1), 1, true), None);
+        assert_eq!(channel.admission(None, 1, true), None);
     }
 
     #[tokio::test]
     async fn an_open_channel_admits_anyone() {
         let channel = configured(vec![], vec![], true);
-        assert_eq!(channel.admission(Some(999), 999), Some(Admission::Open));
-        assert_eq!(channel.admission(None, -100123), Some(Admission::Open));
+        assert_eq!(
+            channel.admission(Some(999), 999, true),
+            Some(Admission::Open)
+        );
+        assert_eq!(
+            channel.admission(None, -100123, false),
+            Some(Admission::Open)
+        );
     }
 
     #[tokio::test]
@@ -1616,12 +1660,23 @@ mod tests {
         // Being open does not make everyone equally unknown. Someone on the user list is still
         // reported as vetted, which is the whole reason the agent is told the admission at all.
         let channel = configured(vec![111], vec![-1001234], true);
-        assert_eq!(channel.admission(Some(111), 555), Some(Admission::User));
         assert_eq!(
-            channel.admission(Some(222), -1001234),
+            channel.admission(Some(111), 111, true),
+            Some(Admission::User)
+        );
+        assert_eq!(
+            channel.admission(Some(222), -1001234, false),
             Some(Admission::Chat)
         );
-        assert_eq!(channel.admission(Some(222), 222), Some(Admission::Open));
+        assert_eq!(
+            channel.admission(Some(222), 222, true),
+            Some(Admission::Open)
+        );
+        // Open is what carries them in a group now, not the user list, and the agent is told so.
+        assert_eq!(
+            channel.admission(Some(111), -1009999, false),
+            Some(Admission::Open)
+        );
     }
 
     #[test]

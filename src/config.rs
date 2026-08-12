@@ -784,6 +784,20 @@ impl FileConfig {
                      `allow_all` if the bot really should accept messages from anyone who finds it"
                 )));
             }
+            // Says out loud what changed under them. `allowed_users` used to admit a person
+            // wherever they wrote, so a config naming only people worked in groups too; now it
+            // reaches direct messages alone, and a bot that had been answering in a group would go
+            // quiet there with nothing to explain it.
+            if !telegram.allowed_users.is_empty()
+                && telegram.allowed_chats.is_empty()
+                && !telegram.allow_all
+            {
+                warnings.push(format!(
+                    "{label} allowlists people but no chats, so the agent is reachable by direct \
+                     message only. Add the group's id to `allowed_chats` to be heard in it; \
+                     `allowed_users` no longer admits anybody outside their own chat."
+                ));
+            }
             let token = secret::resolve(
                 &label,
                 telegram.token.as_deref(),
@@ -840,6 +854,19 @@ impl FileConfig {
                      should accept messages from anyone who finds it"
                 )));
             }
+            if !allowed_users.is_empty()
+                && allowed_guilds.is_empty()
+                && allowed_channels.is_empty()
+                && allowed_roles.is_empty()
+                && !discord.allow_all
+            {
+                warnings.push(format!(
+                    "{label} allowlists people but no channels, servers, or roles, so the agent is \
+                     reachable by direct message only. Add ids to `allowed_channels`, \
+                     `allowed_roles`, or `allowed_guilds` to be heard in a server; \
+                     `allowed_users` no longer admits anybody outside a direct message."
+                ));
+            }
             if !allowed_guilds.is_empty() {
                 // A Telegram chat allowlist admits a room. This admits everybody in a server, which
                 // in a large one is thousands of people who can each wake the agent by name.
@@ -851,12 +878,11 @@ impl FileConfig {
             }
             if discord.presence {
                 warnings.push(format!(
-                    "{label} sets `presence = true`, so this bot asks Discord for the server \
-                     presence intent. Enable Server Members and Presence Intent under Privileged \
-                     Gateway Intents in the Developer Portal first, or the gateway closes with a \
-                     4014 at startup. The bridge will track the availability of everyone in every \
-                     server it is in; it keeps only online or idle or busy, never what they are \
-                     doing, and writes none of it to disk."
+                    "{label} sets `presence = true`, so this bot asks Discord for the Presence \
+                     Intent. Enable it under Privileged Gateway Intents in the Developer Portal \
+                     first, or the gateway closes with a 4014 at startup. The bridge will track the \
+                     availability of everyone in every server it is in; it keeps only online or \
+                     idle or busy, never what they are doing, and writes none of it to disk."
                 ));
             }
             if !discord.message_content {
@@ -1291,6 +1317,47 @@ token = \"meka-token\"
         );
         let config = parse(&raw).expect("valid");
         assert_eq!(config.bridge.typing_max, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn allowlisting_only_people_says_the_bot_is_reachable_by_dm_alone() {
+        // The upgrade hazard. `allowed_users` used to admit a person wherever they wrote, so a
+        // config naming only people worked in groups too. It now reaches direct messages alone, and
+        // a bot that had been answering in a group goes quiet there with nothing on the wire to
+        // explain it. This warning is the only thing that does.
+        let telegram = parse(MINIMAL).expect("valid");
+        assert!(
+            telegram
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("direct message only")),
+            "got: {:?}",
+            telegram.warnings
+        );
+
+        let discord = parse(MINIMAL_DISCORD).expect("valid");
+        assert!(
+            discord
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("direct message only")),
+            "got: {:?}",
+            discord.warnings
+        );
+    }
+
+    #[test]
+    fn naming_a_room_as_well_draws_no_warning() {
+        let raw = format!("{MINIMAL}allowed_chats = [-1001234567890]\n");
+        let config = parse(&raw).expect("valid");
+        assert!(
+            !config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("direct message only")),
+            "a config that names a room is not DM-only: {:?}",
+            config.warnings
+        );
     }
 
     #[test]

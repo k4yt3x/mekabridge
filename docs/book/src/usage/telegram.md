@@ -17,8 +17,8 @@ Message the bot once before expecting the agent to reach you. Telegram bots cann
 
 A bot token is a public entry point: anyone who guesses or discovers the bot's name can message it. mekabridge refuses to start with an empty allowlist for that reason.
 
-- `allowed_users` admits specific people wherever they message from.
-- `allowed_chats` admits a whole group or channel, so every member of it can talk to the agent. Group ids are negative, for example `-1001234567890`.
+- `allowed_users` admits specific people **in their own chat with the bot**, and nowhere else. It says who may talk to the agent, not which rooms it listens in.
+- `allowed_chats` admits a whole group or channel, so every member of it can talk to the agent. Group ids are negative, for example `-1001234567890`. **This is the only way to be heard in a group**, including for people already on `allowed_users`.
 - `allow_all` admits everyone, for a public or customer-service bot. On Telegram a private chat id is the user's own id, so this opens direct messages too, not just groups.
 
 Messages from outside the allowlist are dropped at debug level with no reply. Not replying is deliberate: an "unauthorized" response would confirm to a stranger that the bot is live.
@@ -34,7 +34,7 @@ channel: telegram
 conversation: telegram:-1001234567890
 message: 4471
 from: Bob (@bob, id 987654321)
-admitted: chat allowlist (sender not individually allowlisted)
+admitted: chat allowlist (this room is allowed); sender not individually allowlisted
 chat: group "Deploy Crew"
 at: 2026-08-11T14:22:31+00:00
 forwarded from: Alice (@alice, id 111222333)
@@ -48,7 +48,7 @@ Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` 
 - **`woke you`** appears in a group the agent is not woken for everything in, saying what pulled it in. It is absent in a direct chat, where every message is addressed to it anyway.
 
 - **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
-- **`admitted`** says how the sender got through: `user allowlist` means they were vetted individually, `chat allowlist` means they were not and are only there because the whole chat is allowed, `open channel` means nothing was checked. The bridge reports which; what to make of it belongs in the agent's instructions.
+- **`admitted`** carries two facts. First the grant that let the message through: `user allowlist` (a direct message from somebody you named), `chat allowlist` (the room is allowed), or `open channel` (nothing was checked). Then, separately, whether the sender's own account is on `allowed_users` at all. Since that list reaches direct messages only, somebody you named writing in an allowlisted group is admitted *by the group*, and the second clause is what still identifies them. The bridge reports both; what to make of them belongs in the agent's instructions.
 - **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
 - **`album`** ties the parts of a multi-photo post together, so a batch of pictures does not read as several unrelated ones.
 - **`attachment`** ends with a handle for the fetch tools. See [Attachments](#attachments).

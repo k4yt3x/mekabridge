@@ -180,7 +180,10 @@ pub struct Sender {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Admission {
-    /// The sender's own account is on the channel's user allowlist.
+    /// The sender's own account is on the channel's user allowlist, and they wrote directly to the
+    /// bot. The list reaches nowhere else: it says who may talk to the agent, not which rooms the
+    /// agent listens in, so the same person speaking in a group is admitted by that group's own
+    /// grant or not at all.
     User,
     /// The sender holds a role the channel allows. An operator granted that role's holders access
     /// deliberately, but the account itself was never looked at, and whoever administers the server
@@ -202,16 +205,10 @@ impl Admission {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::User => "user allowlist",
-            Self::Role => {
-                "role allowlist (sender holds an allowed role; the account itself was \
-                           not vetted)"
-            }
-            Self::Chat => "chat allowlist (sender not individually allowlisted)",
-            Self::Server => {
-                "server allowlist (neither the sender nor this chat is individually \
-                             allowlisted)"
-            }
-            Self::Open => "open channel (anyone may message this bot; sender not vetted)",
+            Self::Role => "role allowlist (sender holds a role you allow)",
+            Self::Chat => "chat allowlist (this room is allowed)",
+            Self::Server => "server allowlist (the server this was said in is allowed)",
+            Self::Open => "open channel (anyone may message this bot)",
         }
     }
 }
@@ -401,6 +398,18 @@ pub struct InboundMessage {
     pub sender: Sender,
     /// Why this message was allowed through.
     pub admission: Admission,
+    /// Whether the sender's own account is on the channel's user allowlist, wherever they wrote.
+    ///
+    /// Deliberately separate from [`Self::admission`], which names the grant that admitted *this
+    /// message*. Since the user list reaches direct messages only, an operator writing in a group
+    /// is admitted by the group, and reporting solely that would say nothing about the person was
+    /// checked when in fact they were named by hand. The two facts answer different questions and
+    /// collapsing them loses the one the agent most wants.
+    ///
+    /// Defaulted on decode so a message queued by an older build still reads back rather than
+    /// being dropped as unreadable.
+    #[serde(default)]
+    pub sender_allowlisted: bool,
     /// Whether this message was aimed at the agent rather than merely said in front of it.
     ///
     /// What counts is the platform's own notion, not a guess from the text: a mention it marked as
@@ -1224,6 +1233,7 @@ mod tests {
                 on_behalf_of_chat: false,
             },
             admission: Admission::User,
+            sender_allowlisted: true,
             addressed: false,
             sender_roles: Vec::new(),
             text: "hello".to_string(),

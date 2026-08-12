@@ -29,7 +29,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 pub use crate::{
-    channel::{ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions},
+    channel::{
+        ChannelCapabilities, ChatSettings, MemberAction, MemberInfo, MemberRight, SendOptions,
+    },
     store::Policy,
 };
 
@@ -566,6 +568,28 @@ pub struct ToolSurface {
     /// both kinds of channel at once and the agent should see exactly the tools that will work
     /// on the chats it can reach.
     pub member_roles: bool,
+}
+
+impl ToolSurface {
+    /// The surface a set of configured channels can actually honour.
+    ///
+    /// Each flag asks whether *any* reachable channel could carry out that tool, so a tool never
+    /// appears when every chat the agent can act in would reject it, and never disappears merely
+    /// because one channel among several cannot do it. Taking capabilities rather than the registry
+    /// keeps this decidable without building any channels, which is what makes it testable.
+    pub fn for_channels(capabilities: impl IntoIterator<Item = ChannelCapabilities>) -> Self {
+        let mut surface = Self {
+            admin: false,
+            member_rights: false,
+            member_roles: false,
+        };
+        for capability in capabilities {
+            surface.admin |= capability.admin;
+            surface.member_rights |= capability.member_rights;
+            surface.member_roles |= capability.member_roles;
+        }
+        surface
+    }
 }
 
 impl Default for ToolSurface {
@@ -2697,6 +2721,80 @@ mod tests {
         let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("the result is JSON");
         assert_eq!(parsed[0]["cursor"], 8_212, "got: {text}");
+    }
+
+    /// Capabilities as each connector reports them, so these tests move when the connectors do.
+    fn telegram_capabilities(admin_tools: bool) -> ChannelCapabilities {
+        ChannelCapabilities {
+            typing_indicator: true,
+            files: true,
+            photos: true,
+            reactions: true,
+            edit: true,
+            admin: admin_tools,
+            member_rights: admin_tools,
+            member_roles: false,
+        }
+    }
+
+    fn discord_capabilities(admin_tools: bool) -> ChannelCapabilities {
+        ChannelCapabilities {
+            member_rights: false,
+            member_roles: admin_tools,
+            ..telegram_capabilities(admin_tools)
+        }
+    }
+
+    #[test]
+    fn a_platform_only_tool_is_absent_when_that_platform_is_not_configured() {
+        // The decision a real deployment actually gets. Every other test here builds a
+        // `ToolSurface` by hand, so without this an inverted `any` would ship without a
+        // failure anywhere.
+        let telegram_only = ToolSurface::for_channels([telegram_capabilities(true)]);
+        assert!(
+            telegram_only.member_rights,
+            "Telegram grants rights directly"
+        );
+        assert!(
+            !telegram_only.member_roles,
+            "there is no Discord here, so a roles tool would fail on every chat"
+        );
+
+        let discord_only = ToolSurface::for_channels([discord_capabilities(true)]);
+        assert!(discord_only.member_roles);
+        assert!(
+            !discord_only.member_rights,
+            "there is no Telegram here, so a rights tool would fail on every chat"
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_both_platforms_gets_both_moderation_models() {
+        let both =
+            ToolSurface::for_channels([telegram_capabilities(true), discord_capabilities(true)]);
+        assert!(both.admin);
+        assert!(both.member_rights);
+        assert!(both.member_roles);
+    }
+
+    #[test]
+    fn one_channel_that_can_do_it_is_enough() {
+        // Turning admin off for one channel must not withdraw the tools from the other, since the
+        // agent can still act in that one.
+        let mixed =
+            ToolSurface::for_channels([telegram_capabilities(false), discord_capabilities(true)]);
+        assert!(mixed.admin);
+        assert!(mixed.member_roles);
+        assert!(!mixed.member_rights, "the Telegram channel opted out");
+    }
+
+    #[test]
+    fn no_channel_offering_moderation_withdraws_all_of_it() {
+        let surface =
+            ToolSurface::for_channels([telegram_capabilities(false), discord_capabilities(false)]);
+        assert!(!surface.admin);
+        assert!(!surface.member_rights);
+        assert!(!surface.member_roles);
     }
 
     #[test]

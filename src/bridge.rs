@@ -128,17 +128,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Derived from the channels rather than read from `[mcp]`, so the tool list follows the same
     // per-channel setting that decides whether the calls would work at all.
-    // Each flag asks whether any reachable channel can honour that tool, so a tool never appears
-    // when every chat the agent can act in would reject it.
-    let surface = ToolSurface {
-        admin: channels.iter().any(|channel| channel.capabilities().admin),
-        member_rights: channels
-            .iter()
-            .any(|channel| channel.capabilities().member_rights),
-        member_roles: channels
-            .iter()
-            .any(|channel| channel.capabilities().member_roles),
-    };
+    let surface = ToolSurface::for_channels(channels.iter().map(|channel| channel.capabilities()));
     tasks.spawn({
         let config = Arc::clone(&config);
         let shutdown = shutdown.clone();

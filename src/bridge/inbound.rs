@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     bridge::{
         envelope::{Envelope, MissedContext, MissedMessage},
-        turn::TurnRunner,
+        turn::{TurnReport, TurnRunner},
     },
     channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
@@ -40,12 +40,28 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// minutes costs a handful of rejected requests rather than thousands.
 const DEFER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Ceiling on the wait between attempts, and on a `Retry-After` the upstream asks for.
+///
+/// A provider is entitled to ask for an hour. Honouring that would hold a conversation open for an
+/// hour with nobody told, which is worse for the person waiting than being told promptly that it
+/// did not work; the retry budget is meant to ride out a blip, not an outage.
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(120);
+
 /// How long after the last notice somebody still counts as typing.
 ///
 /// Discord repeats its notice about every ten seconds while a person keeps going, so this is that
 /// heartbeat plus enough slack to survive one being late or dropped. Erring long costs a moment of
 /// extra wait; erring short would release mid-sentence, which is the thing being fixed.
 const TYPING_TTL: Duration = Duration::from_secs(12);
+
+/// How long a conversation is left alone after being told that something failed.
+///
+/// Long enough that a sustained outage produces one message rather than one per batch, short enough
+/// that somebody who comes back an hour later and tries again is told rather than ignored.
+const NOTICE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Ceiling on how many conversations are remembered as having been told.
+const NOTICE_LOG_MAX: usize = 4096;
 
 /// Ceiling on how many conversations are remembered as having somebody mid-thought.
 ///
@@ -667,6 +683,9 @@ pub struct DrainContext {
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
     /// Who is composing right now, so a conversation can be held until they stop.
     pub typing: Arc<TypingState>,
+    /// Who has already been told that something failed, so an outage is reported once rather than
+    /// once per batch.
+    pub notices: NoticeLog,
 }
 
 /// Claim batches and run turns until `shutdown` fires.
@@ -799,10 +818,29 @@ async fn readiness(context: &DrainContext) -> Readiness {
     let mut ready = Vec::new();
     let mut soonest: Option<Duration> = None;
     for window in windows {
+        // Checked ahead of everything below, the ceiling included. `settle_max` bounds how long a
+        // person may be made to wait, which is not a reason to ignore what the upstream said about
+        // when to come back: a conversation released early here simply fails again and spends
+        // another attempt for nothing.
+        //
+        // Clamped on the way out as well as on the way in. `retry_delay` bounds what gets written,
+        // but the value read back is a wall-clock instant, and a host clock stepping backwards --
+        // an NTP correction, a restored snapshot -- would otherwise hold the conversation for the
+        // whole size of the jump with nothing to overrule it, since the ceiling is skipped here.
+        if let Some(not_before) = window.not_before {
+            let remaining = (not_before - now)
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                .min(RETRY_DELAY_MAX);
+            if remaining > Duration::ZERO {
+                soonest = Some(soonest.map_or(remaining, |soonest| soonest.min(remaining)));
+                continue;
+            }
+        }
         let waited = elapsed(window.oldest);
-        // The ceiling wins over everything else, including the floor, so a conversation nobody
-        // stops typing in cannot hold its own messages forever. It also releases a backlog replayed
-        // after downtime at once, since those carry their original send times.
+        // Below a pending deferral, the ceiling wins over everything: a conversation nobody stops
+        // typing in cannot hold its own messages forever. It also releases a backlog replayed after
+        // downtime at once, since those carry their original send times.
         //
         // The cost is that a conversation whose oldest message is already past the ceiling skips
         // the floor, so a split post arriving with timestamps that old is not held together. That
@@ -864,13 +902,27 @@ async fn deliver(
     shutdown: &CancellationToken,
 ) -> Option<TurnWindow> {
     let started_at = chrono::Utc::now();
-    let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+    // How many attempts the most-tried message here has already had, which is what the wait before
+    // the next one is scaled from. Read now because the batch is consumed below.
+    let attempts = batch
+        .iter()
+        .map(|message| message.attempts)
+        .max()
+        .unwrap_or(0);
 
     let mut events: Vec<InboundEvent> = Vec::with_capacity(batch.len());
+    // Only the rows that survive decoding. Taking the whole batch here meant a row discarded just
+    // below was still handed to `fail_batch` and `release_batch` later, and neither filters on
+    // state, so the row it had just marked `done` was resurrected to `pending` to be discarded
+    // again on the next round. It also inflated the count in the notice sent to the owner.
+    let mut sequences: Vec<i64> = Vec::with_capacity(batch.len());
     let mut undecodable = Vec::new();
     for message in &batch {
         match serde_json::from_str::<InboundEvent>(&message.payload) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                events.push(event);
+                sequences.push(message.seq);
+            }
             Err(error) => {
                 // A payload this build cannot read will never become readable, so retrying it would
                 // wedge the queue behind it forever.
@@ -891,6 +943,7 @@ async fn deliver(
     if events.is_empty() {
         return last_turn;
     }
+    let delivered_count = events.len();
 
     // A message whose own timestamp falls inside the previous turn arrived while the agent was
     // working. Compared against platform time, so clock skew can only cause an under-report, which
@@ -918,7 +971,25 @@ async fn deliver(
     let session_id = match ensure_session(context).await {
         Ok(session_id) => session_id,
         Err(error) => {
-            record_failure(context, &sequences, &error.to_string()).await;
+            // Nothing was submitted, so nothing ran and the batch is intact. Backed off all the
+            // same: meka being unreachable now is the best evidence available about whether it will
+            // be a moment from now.
+            let retry = if error.is_retryable() {
+                Retry::After(retry_delay(
+                    context.config.bridge.retry_base,
+                    attempts,
+                    error.retry_after(),
+                ))
+            } else {
+                Retry::Never
+            };
+            record_failure(context, &sequences, &Failure {
+                reason: &error.to_string(),
+                retry,
+                answered: false,
+                delivered: false,
+            })
+            .await;
             return last_turn;
         }
     };
@@ -944,85 +1015,129 @@ async fn deliver(
         "submitting a turn"
     );
 
-    let result = submit(context, session_id, &message, &conversations, shutdown).await;
+    let mut report = submit(context, session_id, &message, &conversations, shutdown).await;
 
     // meka forgetting the session (its row was deleted, or the database was replaced) is
-    // recoverable exactly once: bind a fresh session and replay the same batch into it.
-    let result = match result {
-        Err(error) if error.is_session_missing() && context.config.session.recreate_on_missing => {
-            tracing::warn!(
-                "meka no longer knows session {}; creating a replacement. The agent's memory of \
-                 earlier conversations is gone. If this keeps happening, check meka's \
-                 `[serve].delete_on_idle`: with it on, an idle session's row is deleted rather \
-                 than merely evicted, which wipes the assistant every idle_timeout.",
-                session_id
-            );
-            if let Err(error) = context.store.clear_session_id().await {
-                tracing::error!("failed to clear the stale session binding: {}", error);
-            }
-            match ensure_session(context).await {
-                Ok(replacement) => {
-                    let message = Envelope {
-                        events: &events,
-                        dropped,
-                        identities: &identities,
-                        // Reused rather than recomputed: taking it again would come back empty,
-                        // because the first call marked it seen.
-                        missed: &missed,
-                        nonce: &nonce,
-                    }
-                    .render();
-                    submit(context, replacement, &message, &conversations, shutdown).await
-                }
-                Err(error) => Err(error),
-            }
+    // recoverable exactly once: bind a fresh session and replay the same batch into it. Safe to
+    // replay because the rejection happens before anything runs, so the first submission cannot
+    // have left work behind.
+    if matches!(&report.outcome, Err(error) if error.is_session_missing())
+        && context.config.session.recreate_on_missing
+    {
+        tracing::warn!(
+            "meka no longer knows session {}; creating a replacement. The agent's memory of \
+             earlier conversations is gone. If this keeps happening, check meka's \
+             `[serve].delete_on_idle`: with it on, an idle session's row is deleted rather than \
+             merely evicted, which wipes the assistant every idle_timeout.",
+            session_id
+        );
+        if let Err(error) = context.store.clear_session_id().await {
+            tracing::error!("failed to clear the stale session binding: {}", error);
         }
-        other => other,
-    };
-
-    // Spent for every outcome except the refusal above, which returns before this. A turn that
-    // failed still reached the agent, and repeating the whole backlog on each retry would be the
-    // worse trade; a turn meka never accepted did not reach it at all.
-    if !matches!(&result, Err(error) if error.is_turn_in_flight()) {
-        for (conversation, through) in &withheld {
-            if let Err(error) = context
-                .store
-                .mark_seen(conversation.as_str(), *through)
-                .await
-            {
-                tracing::error!(
-                    conversation = %conversation,
-                    "failed to record what the agent was shown: {}",
-                    error
-                );
+        report = match ensure_session(context).await {
+            Ok(replacement) => {
+                let message = Envelope {
+                    events: &events,
+                    dropped,
+                    identities: &identities,
+                    // Reused rather than recomputed: taking it again would come back empty, because
+                    // the first call marked it seen.
+                    missed: &missed,
+                    nonce: &nonce,
+                }
+                .render();
+                submit(context, replacement, &message, &conversations, shutdown).await
             }
+            Err(error) => TurnReport::failed(error),
+        };
+    }
+
+    // meka spent a whole turn budget refusing, having retried throughout `submit`, so this is a
+    // session that is wedged rather than merely occupied. Every submission was refused before it
+    // ran, so nothing reached the agent and nothing was lost: the batch goes back to the queue
+    // untouched and the next drain tick starts a fresh round of retries. Counting it as a failed
+    // delivery would let a busy session burn the retry budget and eventually declare a message
+    // undeliverable that meka never even saw.
+    if matches!(&report.outcome, Err(error) if error.is_turn_in_flight()) {
+        tracing::warn!(
+            "meka has been busy with a turn this bridge did not start for a full turn budget; \
+             requeueing the batch"
+        );
+        if let Err(error) = context.store.release_batch(&sequences).await {
+            tracing::error!("failed to requeue a deferred batch: {}", error);
+        }
+        // The envelope this counter was rendered into is being thrown away, so put it back or the
+        // notice that the queue overflowed is lost to a turn that never ran.
+        if dropped > 0
+            && let Err(error) = context.store.note_dropped(dropped).await
+        {
+            tracing::error!("failed to restore the dropped-message counter: {}", error);
+        }
+        // The backlog this envelope reported is deliberately *not* marked accounted for. It was
+        // never delivered, and spending it here would leave the retry telling a chat with thirty
+        // messages waiting that nothing had been said in it.
+        //
+        // No turn ran, so there is no window to report either. Inventing one would flag the next
+        // batch's messages as having arrived mid-turn against a turn that never happened, and those
+        // messages are in that very batch.
+        return last_turn;
+    }
+
+    // Spent for every outcome except that refusal. A turn that failed still reached the agent, and
+    // repeating the whole backlog on each retry would be the worse trade; a turn meka never
+    // accepted did not reach it at all.
+    for (conversation, through) in &withheld {
+        if let Err(error) = context
+            .store
+            .mark_seen(conversation.as_str(), *through)
+            .await
+        {
+            tracing::error!(
+                conversation = %conversation,
+                "failed to record what the agent was shown: {}",
+                error
+            );
         }
     }
 
-    match result {
+    let failure = match &report.outcome {
+        Ok(TurnOutcome::Finished { stop_reason, .. }) => {
+            tracing::info!(
+                stop_reason = %stop_reason,
+                sends = report.sends,
+                tool_calls = report.tool_calls,
+                text_chars = report.text_length,
+                "turn finished"
+            );
+            None
+        }
+        Ok(TurnOutcome::Cancelled { reason }) => {
+            tracing::warn!(reason = %reason, "turn cancelled");
+            None
+        }
+        Err(error) => Some(error),
+    };
+
+    match failure {
         // A turn that produced meka's empty-response stand-in and called nothing did no work at
         // all: no message was sent, no tool ran. Handing the batch over again is therefore free of
         // side effects, and far better than leaving somebody who just messaged the bot in silence.
-        Ok(report) if report.produced_nothing() => {
+        // At once, too, rather than after a wait. Nothing upstream asked to be left alone here: an
+        // empty response is the model having produced nothing, not a service saying it is busy.
+        None if report.produced_nothing() => {
             tracing::warn!(
                 text = %report.text_preview.trim(),
                 "the model returned an empty response and called no tools; retrying the batch"
             );
-            record_failure(context, &sequences, "the model returned an empty response").await;
+            record_failure(context, &sequences, &Failure {
+                reason: "the model returned an empty response",
+                retry: Retry::Now,
+                answered: false,
+                delivered: false,
+            })
+            .await;
         }
-        Ok(report) => {
-            match &report.outcome {
-                TurnOutcome::Finished { stop_reason, .. } => tracing::info!(
-                    stop_reason = %stop_reason,
-                    sends = report.sends,
-                    tool_calls = report.tool_calls,
-                    text_chars = report.text_length,
-                    "turn finished"
-                ),
-                TurnOutcome::Cancelled { reason } => {
-                    tracing::warn!(reason = %reason, "turn cancelled");
-                }
-            }
+        None => {
             if report.is_silent() {
                 // Not an error: the agent is allowed to read something and say nothing. Logged at
                 // warn with what it produced instead, because from the other end this looks exactly
@@ -1034,12 +1149,7 @@ async fn deliver(
                     "the agent sent no messages this turn"
                 );
             }
-            if let Err(error) = context.store.complete_batch(&sequences).await {
-                tracing::error!("failed to mark a delivered batch: {}", error);
-            }
-            if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await {
-                tracing::error!("failed to record the turn timestamp: {}", error);
-            }
+            complete(context, &sequences).await;
         }
         // The turn was accepted and then the stream died. meka keeps running it, so the batch did
         // reach the agent and resubmitting would duplicate a reply the user is about to receive.
@@ -1049,7 +1159,7 @@ async fn deliver(
         // `wait_until_idle` is trustworthy here and nowhere else in this function. The turn it is
         // waiting on is one this bridge submitted over HTTP, which is the only kind meka counts in
         // the `turn_in_flight` it answers with; see `submit` for what that field misses.
-        Err(error) if error.turn_may_still_be_running() => {
+        Some(error) if error.turn_may_still_be_running() => {
             tracing::warn!(
                 "lost the turn stream ({}); the turn is still running, waiting for it to finish",
                 error
@@ -1061,13 +1171,7 @@ async fn deliver(
             {
                 Ok(true) => {
                     tracing::info!("the interrupted turn finished; marking its batch delivered");
-                    if let Err(error) = context.store.complete_batch(&sequences).await {
-                        tracing::error!("failed to mark a delivered batch: {}", error);
-                    }
-                    if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await
-                    {
-                        tracing::error!("failed to record the turn timestamp: {}", error);
-                    }
+                    complete(context, &sequences).await;
                 }
                 Ok(false) | Err(_) => {
                     // Still busy after a full turn budget, or unreachable. Requeueing risks a
@@ -1077,43 +1181,77 @@ async fn deliver(
                         "could not confirm the interrupted turn finished; requeueing its batch, \
                          which may deliver the same messages twice"
                     );
-                    record_failure(context, &sequences, &error.to_string()).await;
+                    record_failure(context, &sequences, &Failure {
+                        reason: &error.to_string(),
+                        retry: Retry::After(retry_delay(
+                            context.config.bridge.retry_base,
+                            attempts,
+                            error.retry_after(),
+                        )),
+                        answered: report.sends > 0,
+                        delivered: false,
+                    })
+                    .await;
                 }
             }
         }
-        // meka spent a whole turn budget refusing, having retried throughout `submit`, so this is a
-        // session that is wedged rather than merely occupied. Every submission was refused before
-        // it ran, so nothing reached the agent and nothing was lost: the batch goes back to the
-        // queue untouched and the next drain tick starts a fresh round of retries. Counting it as a
-        // failed delivery would let a busy session burn the retry budget and eventually declare a
-        // message undeliverable that meka never even saw.
-        Err(error) if error.is_turn_in_flight() => {
-            tracing::warn!(
-                "meka has been busy with a turn this bridge did not start for a full turn budget; \
-                 requeueing the batch"
+        // The agent sent something, or ran something, and then the turn died. Handing the batch
+        // over again would repeat that work, and the agent would have no memory of the first run to
+        // tell it from the second, so the batch is accounted for instead: the same contract a turn
+        // that finished gets.
+        //
+        // `content_started` is what makes this reachable rather than theoretical. meka scopes that
+        // flag to a single provider call, so a rate limit on the third call of a tool loop is
+        // retried inside meka and, when those retries run out, arrives here with the first two
+        // iterations' tool calls already made.
+        Some(error) if report.had_side_effects() => {
+            tracing::error!(
+                sends = report.sends,
+                tool_calls = report.tool_calls,
+                "the turn failed after the agent had already acted, so its batch will not be \
+                 retried: {}",
+                error
             );
-            if let Err(error) = context.store.release_batch(&sequences).await {
-                tracing::error!("failed to requeue a deferred batch: {}", error);
-            }
-            // The envelope this counter was rendered into is being thrown away, so put it back or
-            // the notice that the queue overflowed is lost to a turn that never ran.
-            if dropped > 0
-                && let Err(error) = context.store.note_dropped(dropped).await
-            {
-                tracing::error!("failed to restore the dropped-message counter: {}", error);
-            }
-            // The backlog this envelope reported is deliberately *not* marked accounted for. It
-            // was never delivered, and spending it here would leave the retry telling a chat with
-            // thirty messages waiting that nothing had been said in it.
-            //
-            // No turn ran, so there is no window to report either. Inventing one would flag the
-            // next batch's messages as having arrived mid-turn against a turn that never happened,
-            // and those messages are in that very batch.
-            return last_turn;
+            complete(context, &sequences).await;
+            announce(
+                context,
+                &conversations,
+                &Failure {
+                    reason: &error.to_string(),
+                    retry: Retry::Never,
+                    answered: report.sends > 0,
+                    delivered: true,
+                },
+                Lost {
+                    count: delivered_count,
+                    attempts: attempts + 1,
+                    // Nothing was un-seen: the messages reached the agent, so they are accounted
+                    // for rather than owed.
+                    recoverable: false,
+                },
+            )
+            .await;
         }
-        Err(error) => {
+        Some(error) => {
             tracing::error!("turn failed: {}", error);
-            record_failure(context, &sequences, &error.to_string()).await;
+            // A failure needing an operator will not stop happening on its own, so spending the
+            // whole budget on it only delays the notice that says so.
+            let retry = if error.is_retryable() {
+                Retry::After(retry_delay(
+                    context.config.bridge.retry_base,
+                    attempts,
+                    error.retry_after(),
+                ))
+            } else {
+                Retry::Never
+            };
+            record_failure(context, &sequences, &Failure {
+                reason: &error.to_string(),
+                retry,
+                answered: false,
+                delivered: false,
+            })
+            .await;
         }
     }
 
@@ -1121,6 +1259,16 @@ async fn deliver(
         started_at,
         ended_at: chrono::Utc::now(),
     })
+}
+
+/// Mark a batch delivered and note when the turn that carried it ended.
+async fn complete(context: &DrainContext, sequences: &[i64]) {
+    if let Err(error) = context.store.complete_batch(sequences).await {
+        tracing::error!("failed to mark a delivered batch: {}", error);
+    }
+    if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await {
+        tracing::error!("failed to record the turn timestamp: {}", error);
+    }
 }
 
 /// Submit a turn, retrying on a timer while meka is busy with a turn of its own.
@@ -1142,7 +1290,7 @@ async fn submit(
     message: &str,
     conversations: &BTreeSet<ConversationId>,
     shutdown: &CancellationToken,
-) -> Result<crate::bridge::turn::TurnReport, MekaError> {
+) -> TurnReport {
     let deadline = tokio::time::Instant::now() + context.config.meka.turn_timeout;
     // Opened once for the whole episode rather than per attempt. Per attempt, each call started its
     // own `typing_max` countdown, so the ceiling could never be reached however long the wait ran;
@@ -1151,8 +1299,9 @@ async fn submit(
     let mut typing: Option<CancellationToken> = None;
     let mut attempt = 0_u32;
     loop {
-        let result = context.runner.run(session_id, message, conversations).await;
-        let refused = result
+        let report = context.runner.run(session_id, message, conversations).await;
+        let refused = report
+            .outcome
             .as_ref()
             .err()
             .is_some_and(MekaError::is_turn_in_flight);
@@ -1164,7 +1313,7 @@ async fn submit(
             if let Some(typing) = typing {
                 typing.cancel();
             }
-            return result;
+            return report;
         }
         if attempt == 0 {
             // Once per episode, not once per attempt: at one line per attempt this buried whatever
@@ -1189,16 +1338,84 @@ async fn submit(
             if let Some(typing) = typing {
                 typing.cancel();
             }
-            return result;
+            return report;
         }
     }
 }
 
-/// Mark a batch failed, and tell the operator about anything that will never be delivered.
-async fn record_failure(context: &DrainContext, sequences: &[i64], reason: &str) {
+/// What should happen to a batch whose turn did not deliver it.
+struct Failure<'a> {
+    /// Recorded against the rows and quoted to the owner verbatim.
+    reason: &'a str,
+    /// Whether it is worth handing over again, and when.
+    retry: Retry,
+    /// Whether the agent got a word in anywhere before this went wrong.
+    ///
+    /// A chat that was answered is not owed an apology, and one sent anyway would contradict what
+    /// the agent had just said in it. Whether *this* chat was answered would be the sharper
+    /// question, and the answer is deliberately not asked for: the only record of it is the turn
+    /// runner's presence state, which is meaningful solely after a turn actually ran, and half the
+    /// callers here are failures where none did. Erring toward silence costs a chat in a
+    /// multi-conversation batch its apology; erring the other way apologises to somebody who was
+    /// just answered.
+    answered: bool,
+    /// Whether the messages reached the agent despite this.
+    ///
+    /// Changes the whole of what the owner is looking at. Messages that never arrived are lost and
+    /// somebody has to decide what to do about them; messages the agent read and acted on before
+    /// the turn died are not lost, but whatever it was in the middle of is half done.
+    delivered: bool,
+}
+
+/// Whether a failed batch is worth another attempt, and how long to leave it first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Offer it again once this has passed.
+    After(Duration),
+    /// Offer it again on the next pass, for a failure that did nothing and says nothing about when
+    /// it might stop happening.
+    Now,
+    /// Do not offer it again. For a failure that needs an operator, where further attempts only
+    /// delay the notice saying so.
+    Never,
+}
+
+/// How long a batch waits before it is offered again.
+///
+/// `attempts` is how many it has already had, so the first failure waits `base` and each one after
+/// that twice as long. Exponential rather than fixed because the failure this exists for is an
+/// upstream out of quota, where the right wait is unknowable and the cost of guessing short is an
+/// attempt spent for nothing.
+///
+/// A `Retry-After` raises the wait but never lowers it. It is the only number here that is not a
+/// guess, so it is honoured when it asks for longer; letting it ask for *shorter* would undo the
+/// whole point on the one error that actually carries it today. meka sends it on its
+/// concurrency-limit 429 with a flat one second, which taken literally would put all four attempts
+/// inside four seconds.
+fn retry_delay(base: Duration, attempts: u32, retry_after: Option<Duration>) -> Duration {
+    // Capped exponent as well as capped result: `Duration * u32` panics on overflow, and this is
+    // reached with whatever attempt count a database row happens to hold.
+    let scheduled = base * 2_u32.saturating_pow(attempts.min(8));
+    retry_after
+        .map_or(scheduled, |asked| asked.max(scheduled))
+        .min(RETRY_DELAY_MAX)
+}
+
+/// Mark a batch failed, and tell whoever is waiting about anything that will never be delivered.
+async fn record_failure(context: &DrainContext, sequences: &[i64], failure: &Failure<'_>) {
+    let (max_attempts, retry_at) = match failure.retry {
+        Retry::After(delay) => (
+            context.config.bridge.turn_retries,
+            chrono::Duration::from_std(delay)
+                .ok()
+                .map(|delay| chrono::Utc::now() + delay),
+        ),
+        Retry::Now => (context.config.bridge.turn_retries, None),
+        Retry::Never => (0, None),
+    };
     let outcome = context
         .store
-        .fail_batch(sequences, reason, context.config.bridge.turn_retries)
+        .fail_batch(sequences, failure.reason, max_attempts, retry_at)
         .await;
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -1210,54 +1427,266 @@ async fn record_failure(context: &DrainContext, sequences: &[i64], reason: &str)
     if !outcome.retrying.is_empty() {
         tracing::warn!(
             count = outcome.retrying.len(),
+            retry_in = ?retry_at.map(|at| at - chrono::Utc::now()),
             "requeued messages after a failed turn"
         );
     }
     if outcome.exhausted.is_empty() {
         return;
     }
+    // The row's own counter rather than `max_attempts`, which a permanent error forces to zero and
+    // which would then report a message that had already been tried four times as having had one.
+    let spent = outcome
+        .exhausted
+        .iter()
+        .map(|message| message.attempts)
+        .max()
+        .unwrap_or(1);
     tracing::error!(
         count = outcome.exhausted.len(),
-        "giving up on messages after {} attempt(s); they will never reach the agent",
-        context.config.bridge.turn_retries + 1
+        "giving up on {} message(s) after {spent} attempt(s)",
+        outcome.exhausted.len()
     );
-    notify_owner(
-        context,
-        &format!(
-            "mekabridge could not deliver {} message(s) to the agent after {} attempt(s). Last \
-             error: {reason}",
-            outcome.exhausted.len(),
-            context.config.bridge.turn_retries + 1
-        ),
-    )
+
+    // Owed to the agent again. A message is marked seen the moment it is queued, on the assumption
+    // that the agent is about to be handed it, and this is exactly where that assumption fails.
+    // Without this it is neither delivered nor owed, so nothing but `read_history` over the right
+    // window would ever turn it up again.
+    let mut affected: BTreeSet<ConversationId> = BTreeSet::new();
+    // Whether that actually worked, which it cannot when `[storage].history_retention` is zero:
+    // there is no history row to un-see, so the message really is gone. The owner is told which of
+    // the two happened rather than promised the recoverable one.
+    let mut recoverable = false;
+    for message in &outcome.exhausted {
+        match context
+            .store
+            .mark_unseen(&message.conversation_id, &message.external_id)
+            .await
+        {
+            Ok(marked) => recoverable |= marked,
+            Err(error) => tracing::error!(
+                conversation = %message.conversation_id,
+                "failed to mark an undeliverable message unseen: {}",
+                error
+            ),
+        }
+        if let Some(conversation) = ConversationId::parse(&message.conversation_id) {
+            affected.insert(conversation);
+        }
+    }
+    announce(context, &affected, failure, Lost {
+        count: outcome.exhausted.len(),
+        attempts: spent,
+        recoverable,
+    })
     .await;
 }
 
-/// Send an operator notice to the configured owner conversation.
+/// What became of the messages a notice is about.
+struct Lost {
+    count: usize,
+    /// Attempts actually spent, which is not `turn_retries + 1` when a permanent error cut it
+    /// short.
+    attempts: u32,
+    /// Whether they can still be reached, which needs a history to have been kept.
+    recoverable: bool,
+}
+
+/// Tell the chats that were waiting, and the owner, that something did not get through.
 ///
-/// This is the one case where the bridge writes chat content of its own. It is strictly about the
-/// bridge being broken, never about the conversation, and it is skipped entirely when no owner is
-/// configured.
-async fn notify_owner(context: &DrainContext, text: &str) {
-    let Some(owner) = &context.config.bridge.owner_conversation else {
+/// Deliberately two different messages. The chat gets no detail at all: whoever is in it did
+/// nothing wrong, cannot act on an upstream status code, and may not be somebody an operator would
+/// hand a stack trace to. The owner gets everything, because the owner is the one who can fix it.
+async fn announce(
+    context: &DrainContext,
+    affected: &BTreeSet<ConversationId>,
+    failure: &Failure<'_>,
+    lost: Lost,
+) {
+    let configured = context.config.bridge.owner_conversation.as_deref();
+    let owner = configured.and_then(ConversationId::parse);
+    if let Some(configured) = configured
+        && owner.is_none()
+    {
+        // Startup validation only checks the channel prefix, so an id missing its chat segment gets
+        // this far. Silence here would drop every operator notice this bridge ever tries to send
+        // and leave nothing anywhere saying why.
+        tracing::error!("[bridge].owner_conversation {configured:?} is not a valid id");
+    }
+
+    let mut told = Vec::new();
+    if context.config.bridge.notify_failures && !failure.answered {
+        for conversation in affected {
+            // The owner hears the detailed version below, and hearing both would be one message
+            // apologising for what the next one goes on to explain.
+            if owner.as_ref() == Some(conversation) {
+                continue;
+            }
+            if context.notices.due(conversation.as_str()).is_none() {
+                continue;
+            }
+            // Which of the two happened matters to the person waiting. A message that never
+            // reached the agent is worth sending again; one it read and acted on before the turn
+            // died is not, and telling them it never arrived would have them repeat something that
+            // may be half done.
+            let text = if failure.delivered {
+                "Something went wrong on my end while I was working on your message, so I may not \
+                 have finished. Best to check before asking again."
+            } else {
+                "Something went wrong on my end and I could not get to your message. Please try \
+                 again in a little while."
+            };
+            notify(context, conversation, text).await;
+            told.push(conversation.as_str().to_string());
+        }
+    }
+
+    let Some(owner) = owner else {
         return;
     };
-    let Some(conversation) = ConversationId::parse(owner) else {
-        tracing::error!("[bridge].owner_conversation {:?} is not a valid id", owner);
+    let Some(suppressed) = context.notices.due(owner.as_str()) else {
         return;
     };
-    let channel = match context.channels.resolve(&conversation) {
+    let count = lost.count;
+    let mut text = if failure.delivered {
+        format!(
+            "mekabridge: a turn carrying {count} message(s) failed after the agent had already \
+             acted, so whatever it was doing is half finished. The messages themselves are \
+             accounted for and were not sent again, since a second run would repeat what the first \
+             one did.\n\nError: {}",
+            failure.reason
+        )
+    } else if lost.recoverable {
+        format!(
+            "mekabridge could not deliver {count} message(s) to the agent. They are back among \
+             what it has not seen, so `unseen` counts them and they will be offered as context the \
+             next time one of these chats wakes it.\n\nLast error: {}",
+            failure.reason
+        )
+    } else {
+        // `[storage].history_retention = "0s"` writes no history at all, so there is no row to put
+        // back and nothing will ever surface these again. That is the one configuration where a
+        // message is genuinely lost, and it is worth saying plainly rather than promising a
+        // recovery that cannot happen.
+        format!(
+            "mekabridge could not deliver {count} message(s) to the agent, and no history is being \
+             kept, so nothing will bring them back. Only the platform's own scrollback still has \
+             them.\n\nLast error: {}",
+            failure.reason
+        )
+    };
+    if !affected.is_empty() {
+        let ids: Vec<&str> = affected
+            .iter()
+            .map(crate::channel::ConversationId::as_str)
+            .collect();
+        text.push_str(&format!("\nConversations: {}", ids.join(", ")));
+    }
+    if !failure.delivered {
+        text.push_str(&match failure.retry {
+            Retry::Never => {
+                "\nGiven up on at once: this one needs you rather than another attempt.".to_string()
+            }
+            Retry::Now | Retry::After(_) => {
+                format!("\nTried {} time(s) before giving up.", lost.attempts)
+            }
+        });
+    }
+    if told.is_empty() {
+        text.push_str("\nNobody was told in the chats themselves.");
+    } else {
+        text.push_str(&format!("\nApologised in: {}", told.join(", ")));
+    }
+    if suppressed > 0 {
+        text.push_str(&format!(
+            "\n{suppressed} further failure(s) since the last notice were not reported."
+        ));
+    }
+    notify(context, &owner, &text).await;
+}
+
+/// Write one line of the bridge's own into a conversation.
+///
+/// The only place the bridge does that. It is strictly about the bridge being broken, never about
+/// what anybody said, and it is not recorded in the message history: outbound is not, so the agent
+/// is never shown a message from its own account that it has no memory of sending.
+async fn notify(context: &DrainContext, conversation: &ConversationId, text: &str) {
+    let channel = match context.channels.resolve(conversation) {
         Ok(channel) => channel,
         Err(error) => {
-            tracing::error!("cannot reach the owner conversation: {}", error);
+            tracing::error!(conversation = %conversation, "cannot reach it to say so: {}", error);
             return;
         }
     };
     if let Err(error) = channel
-        .send_text(&conversation, text, &crate::channel::SendOptions::default())
+        .send_text(conversation, text, &crate::channel::SendOptions::default())
         .await
     {
-        tracing::error!("failed to notify the owner: {}", error);
+        tracing::error!(conversation = %conversation, "failed to say so: {}", error);
+    }
+}
+
+/// When each conversation was last told that something failed.
+///
+/// In memory only, because after a restart telling somebody again is the right answer rather than
+/// the wrong one. Owned outright by the drain loop rather than shared behind an `Arc` the way
+/// [`TypingState`] is, since nothing else here writes it; the mutex is for interior mutability
+/// through the `&DrainContext` every function in this file takes.
+///
+/// Without it a provider out of quota for half an hour writes an apology into every affected chat
+/// every time a batch runs out of attempts, which is a worse experience than the silence it
+/// replaced.
+#[derive(Debug, Default)]
+pub struct NoticeLog {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Notice>>,
+}
+
+#[derive(Debug)]
+struct Notice {
+    /// When this conversation was last told, or `None` when it never has been.
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Failures inside the window that were not reported.
+    suppressed: u64,
+}
+
+impl NoticeLog {
+    /// Whether this conversation may be told now, and how many failures went unreported since it
+    /// last was.
+    ///
+    /// `None` means it was told recently enough. The count matters for the owner and not for the
+    /// chats: one message about one failure reads like a blip, and an upstream out of quota for an
+    /// hour is not one.
+    fn due(&self, conversation_id: &str) -> Option<u64> {
+        let now = chrono::Utc::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bounded by emptying it, the same rule the store's policy cache uses. An entry matters
+        // only for the length of the window, and losing one means somebody is told twice rather
+        // than not at all.
+        if entries.len() >= NOTICE_LOG_MAX {
+            entries.clear();
+        }
+        let notice = entries
+            .entry(conversation_id.to_string())
+            .or_insert(Notice {
+                at: None,
+                suppressed: 0,
+            });
+        let recent = notice.at.is_some_and(|at| {
+            // A negative interval means the clock went backwards, which reads here as not recent
+            // and so tells somebody again. The alternative is silence for however far it jumped.
+            (now - at)
+                .to_std()
+                .is_ok_and(|since| since < NOTICE_INTERVAL)
+        });
+        if recent {
+            notice.suppressed += 1;
+            return None;
+        }
+        notice.at = Some(now);
+        Some(std::mem::take(&mut notice.suppressed))
     }
 }
 
@@ -1598,6 +2027,94 @@ mod tests {
         record.until = None;
         announce_expiry(&mut message, &record, Policy::Mute);
         assert!(message.notes.is_empty(), "got {:?}", message.notes);
+    }
+
+    #[test]
+    fn the_wait_between_attempts_grows_and_is_bounded() {
+        let base = Duration::from_secs(10);
+        assert_eq!(retry_delay(base, 0, None), Duration::from_secs(10));
+        assert_eq!(retry_delay(base, 1, None), Duration::from_secs(20));
+        assert_eq!(retry_delay(base, 2, None), Duration::from_secs(40));
+        assert_eq!(retry_delay(base, 3, None), Duration::from_secs(80));
+        // Bounded rather than doubling forever, and bounded without panicking: this is reached with
+        // whatever attempt count a row in the database happens to carry, and `Duration * u32`
+        // panics on overflow rather than saturating.
+        assert_eq!(retry_delay(base, 4, None), RETRY_DELAY_MAX);
+        assert_eq!(retry_delay(base, u32::MAX, None), RETRY_DELAY_MAX);
+    }
+
+    #[test]
+    fn a_retry_after_can_lengthen_the_wait_but_never_shorten_it() {
+        let base = Duration::from_secs(10);
+        // Longer than the schedule: honoured, because the upstream knows when it will be ready and
+        // this does not.
+        assert_eq!(
+            retry_delay(base, 0, Some(Duration::from_secs(45))),
+            Duration::from_secs(45)
+        );
+        // Shorter: ignored. meka attaches a flat one second to its concurrency-limit 429, and
+        // taking that literally on the fourth attempt would put the whole budget inside a few
+        // seconds, which is the failure this backoff exists to prevent arriving by another road.
+        assert_eq!(
+            retry_delay(base, 3, Some(Duration::from_secs(1))),
+            Duration::from_secs(80)
+        );
+        // An upstream is entitled to ask for an hour. Waiting it out would hold a conversation open
+        // for an hour with nobody told, which is worse than saying promptly that it did not work.
+        assert_eq!(
+            retry_delay(base, 0, Some(Duration::from_secs(3600))),
+            RETRY_DELAY_MAX
+        );
+    }
+
+    #[test]
+    fn a_conversation_is_told_once_and_then_left_alone() {
+        let log = NoticeLog::default();
+        assert_eq!(
+            log.due("telegram:1"),
+            Some(0),
+            "a chat nothing has been said to yet is due at once"
+        );
+        assert_eq!(log.due("telegram:1"), None, "and not again straight after");
+        assert_eq!(log.due("telegram:1"), None);
+        // A different conversation is a different decision: one chat being told does not silence
+        // the rest, which is what a shared timer would do.
+        assert_eq!(log.due("telegram:2"), Some(0));
+    }
+
+    #[test]
+    fn what_went_unreported_is_counted_for_the_next_notice() {
+        // Without this the owner reads one message about one failure, which is what a blip looks
+        // like, when what happened was an upstream out of quota for half an hour.
+        let log = NoticeLog::default();
+        assert_eq!(log.due("telegram:1"), Some(0));
+        for _ in 0..5 {
+            assert_eq!(log.due("telegram:1"), None);
+        }
+        // Reaching back past the window rather than sleeping through it.
+        {
+            let mut entries = log
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let notice = entries.get_mut("telegram:1").expect("recorded");
+            notice.at = Some(
+                Utc::now() - chrono::Duration::from_std(NOTICE_INTERVAL * 2).expect("in range"),
+            );
+        }
+        assert_eq!(log.due("telegram:1"), Some(5));
+        // And the tally starts again, so the next notice does not re-report what this one just did.
+        {
+            let mut entries = log
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let notice = entries.get_mut("telegram:1").expect("recorded");
+            notice.at = Some(
+                Utc::now() - chrono::Duration::from_std(NOTICE_INTERVAL * 2).expect("in range"),
+            );
+        }
+        assert_eq!(log.due("telegram:1"), Some(0));
     }
 
     #[test]

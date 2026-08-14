@@ -200,6 +200,7 @@ pub async fn run(config: Config) -> Result<()> {
             ),
             identities: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
+            notices: inbound::NoticeLog::default(),
         };
         let wake_drain = Arc::clone(&wake_drain);
         let shutdown = shutdown.clone();

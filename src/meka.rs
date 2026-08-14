@@ -5,10 +5,12 @@
 //! (which matters behind proxies with read timeouts), visibility of tool calls in the log, and a
 //! clean terminal event instead of a connection that may or may not still be alive.
 //!
-//! Retries are deliberately asymmetric. Read-only endpoints retry on connect failures, 5xx, and
-//! 429. Session creation and turn submission never do: a retried `POST /turn` can bill a second
-//! time and send a second round of messages, so turn-level retry belongs to the queue's attempt
-//! counter in [`crate::store`], where it is bounded and observable.
+//! Retries are deliberately asymmetric. Read-only endpoints retry what [`MekaError::is_retryable`]
+//! admits, which is meka's own error taxonomy by `type` URI rather than by status code, plus a bare
+//! 429 or 5xx from whatever sits between the two processes. Session creation and turn submission
+//! never retry: a retried `POST /turn` can bill a second time and send a second round of messages,
+//! so turn-level retry belongs to the queue's attempt counter in [`crate::store`], where it is
+//! bounded, spaced out, and observable.
 
 pub mod sse;
 
@@ -34,6 +36,14 @@ pub struct ProblemDetail {
     pub status: u16,
     pub detail: String,
     pub instance: Option<String>,
+    /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
+    ///
+    /// meka sends this on its concurrency-limit 429 and nowhere else. What it does *not* send it
+    /// on is the case that matters most: `RetryableProvider` carries the provider's own
+    /// `Retry-After` and then drops it at the boundary that turns an error into a Problem
+    /// Detail, so a rate limit arrives here with the one number that is not a guess already
+    /// discarded.
+    pub retry_after: Option<f64>,
 }
 
 impl ProblemDetail {
@@ -123,19 +133,57 @@ pub enum MekaError {
 
 impl MekaError {
     /// Whether retrying the same request could plausibly succeed.
+    ///
+    /// `provider` is deliberately absent. meka maps both its `Provider` and `InvalidRequest`
+    /// variants onto that type URI and both are its explicitly non-retryable bucket: by the time a
+    /// request is malformed enough for the upstream to reject it, meka's own agent loop has already
+    /// tried to repair it. What a rate limit or an overload becomes is `internal`, because meka's
+    /// `RetryableProvider` has no arm of its own in the mapping and falls through.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(error) => {
                 error.is_timeout() || error.is_connect() || error.is_request()
             }
-            Self::Problem(problem) => matches!(
-                problem.kind(),
+            Self::Problem(problem) => match problem.kind() {
                 ProblemKind::ConcurrencyLimit
-                    | ProblemKind::Provider
-                    | ProblemKind::Internal
-                    | ProblemKind::SessionLocked
-            ),
+                | ProblemKind::Internal
+                | ProblemKind::SessionLocked => true,
+                // A `type` this build has never heard of, where the status is the only thing left
+                // to go on. Reading those as permanent is a trap rather than a conservative
+                // default: this bridge asks meka to give `RetryableProvider` an arm of its own
+                // instead of letting it fall through to `internal`, and the natural way to grant
+                // that is a new URI. Landing it would otherwise turn every rate limit into a
+                // message given up on at the first attempt, which is the fault the whole retry
+                // budget exists to prevent.
+                ProblemKind::Other => problem.status == 429 || (500..600).contains(&problem.status),
+                _ => false,
+            },
+            // No Problem Detail body, so nothing to route on but the status. This is what a reverse
+            // proxy in front of meka produces: nginx's 503 while meka restarts, or a 429 from
+            // whatever is metering the hop. Treating those as permanent meant `doctor` and `status`
+            // giving up on the first hiccup.
+            Self::UnexpectedStatus { status, .. } => *status == 429 || (500..600).contains(status),
+            // A body that would not parse, which is a truncated or garbled response rather than a
+            // considered refusal. It is also what a failure of the bridge's *own* database is
+            // laundered into on the way out of `ensure_session`, and a busy SQLite file is the most
+            // transient thing here: calling that permanent would declare a message undeliverable
+            // over a lock that cleared a second later.
+            Self::Decode(_) => true,
             _ => false,
+        }
+    }
+
+    /// How long the upstream asked the caller to wait, when it said.
+    ///
+    /// `try_from` rather than `from`: the plain conversion panics on a value too large for a
+    /// `Duration`, and a JSON number is whatever the other side put there.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Problem(problem) => problem
+                .retry_after
+                .filter(|seconds| *seconds >= 0.0)
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),
+            _ => None,
         }
     }
 
@@ -632,6 +680,7 @@ mod tests {
             status: 409,
             detail: "d".to_string(),
             instance: None,
+            retry_after: None,
         }
     }
 
@@ -665,9 +714,97 @@ mod tests {
 
     #[test]
     fn retryable_classification_covers_transient_failures() {
-        assert!(MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
         assert!(
             MekaError::Problem(problem("https://meka.so/errors/concurrency-limit")).is_retryable()
+        );
+        // Where a provider rate limit or overload lands once meka's own retries are spent: its
+        // `RetryableProvider` has no arm in the Problem Detail mapping and falls through to this.
+        assert!(MekaError::Problem(problem("https://meka.so/errors/internal")).is_retryable());
+    }
+
+    #[test]
+    fn a_type_this_build_has_never_heard_of_falls_back_to_the_status() {
+        // Forward compatibility with the very change this bridge asks meka for. Its
+        // `RetryableProvider` currently has no arm in the mapping onto a Problem Detail and lands
+        // on `internal`; giving it one means a new URI, and reading an unknown URI as permanent
+        // would turn every rate limit into a message abandoned on the first attempt the day that
+        // improvement shipped.
+        let retryable = |status| {
+            let mut detail = problem("https://meka.so/errors/retryable-provider");
+            detail.status = status;
+            MekaError::Problem(detail).is_retryable()
+        };
+        assert!(retryable(429));
+        assert!(retryable(503));
+        assert!(retryable(529), "Anthropic's overloaded status");
+        // An unknown type on a 4xx is still somebody's mistake to fix rather than a wait.
+        assert!(!retryable(403));
+        assert!(!retryable(422));
+    }
+
+    #[test]
+    fn a_bare_status_from_something_between_the_two_processes_is_retried() {
+        // A reverse proxy answering while meka restarts sends HTML, not RFC 9457, so there is no
+        // `type` to route on. Reading those as permanent had `doctor` and `status` give up on the
+        // first hiccup.
+        for status in [429, 500, 502, 503, 504] {
+            assert!(
+                MekaError::UnexpectedStatus {
+                    status,
+                    body: "<html>".to_string()
+                }
+                .is_retryable(),
+                "status {status} should be retryable"
+            );
+        }
+        assert!(
+            !MekaError::UnexpectedStatus {
+                status: 404,
+                body: "<html>".to_string()
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn a_retry_after_hint_is_read_when_meka_sends_one() {
+        let mut detail = problem("https://meka.so/errors/internal");
+        detail.retry_after = Some(45.0);
+        assert_eq!(
+            MekaError::Problem(detail).retry_after(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            MekaError::Problem(problem("https://meka.so/errors/internal")).retry_after(),
+            None
+        );
+        // Nonsense rather than an instruction to wait forever. The last two matter more than they
+        // look: `Duration::from_secs_f64` *panics* on a value it cannot represent, and this reads
+        // whatever number the other side put in a JSON body.
+        for nonsense in [-1.0, f64::NAN, f64::INFINITY, 1e300] {
+            let mut detail = problem("https://meka.so/errors/internal");
+            detail.retry_after = Some(nonsense);
+            assert_eq!(
+                MekaError::Problem(detail).retry_after(),
+                None,
+                "{nonsense} must not be read as a wait"
+            );
+        }
+    }
+
+    #[test]
+    fn a_concurrency_limit_carries_a_retry_after_today() {
+        // Contradicting an earlier comment here that said meka never sends this. `TurnGuard`
+        // answers its 429 with `with_retry_after(1)`, which sets both the header and a
+        // `retry_after` body extension that flattens to the top level. The value is an
+        // integer there, so the field has to tolerate one.
+        let body = r#"{"type":"https://meka.so/errors/concurrency-limit",
+                       "title":"Too many concurrent turns","status":429,
+                       "detail":"retry shortly","retry_after":1}"#;
+        let detail: ProblemDetail = serde_json::from_str(body).expect("parses");
+        assert_eq!(
+            MekaError::Problem(detail).retry_after(),
+            Some(Duration::from_secs(1))
         );
     }
 
@@ -676,6 +813,10 @@ mod tests {
         // Retrying an auth or validation failure just burns time; both need operator action.
         assert!(!MekaError::Problem(problem("https://meka.so/errors/auth")).is_retryable());
         assert!(!MekaError::Problem(problem("https://meka.so/errors/invalid-body")).is_retryable());
+        // meka's non-retryable upstream bucket, despite the name reading like a transient fault:
+        // both `Provider` and `InvalidRequest` map onto this URI and the agent loop has already
+        // tried to repair what it could.
+        assert!(!MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
         assert!(
             !MekaError::Problem(problem("https://meka.so/errors/session-not-found")).is_retryable()
         );

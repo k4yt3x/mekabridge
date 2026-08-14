@@ -1,0 +1,13 @@
+-- When a deferred batch may be offered again.
+--
+-- NULL on every row that has never failed, which is the overwhelming majority, so this costs nothing
+-- until something goes wrong. It is written by `fail_batch` on the rows it returns to `pending`, and
+-- read by `pending_windows` as `max(not_before)` per conversation.
+--
+-- Deferral is per conversation rather than per row on purpose: the drain loop claims by `seq` order,
+-- so releasing one row of a conversation while a lower-numbered sibling is still waiting out a
+-- provider's `Retry-After` would hand the agent a later message before an earlier one.
+--
+-- Stored the same way as `received_at`: RFC 3339 with a fixed `+00:00` offset, which is what makes
+-- `max()` over the text agree with chronological order.
+ALTER TABLE inbound_queue ADD COLUMN not_before TEXT;

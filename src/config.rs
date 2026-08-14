@@ -35,6 +35,15 @@ const APP_DIR: &str = "mekabridge";
 /// anybody types.
 const DEFAULT_COALESCE_FLOOR: Duration = Duration::from_secs(1);
 
+/// First wait between attempts at a batch whose turn failed, doubled on each further attempt.
+///
+/// A failed turn used to be reoffered on the very next pass of the drain loop, which for the
+/// failure this exists for is the wrong move twice over: the upstream said it was out of quota or
+/// overloaded, and coming straight back spends the next attempt inside the same window. Ten seconds
+/// is long enough to be past a burst and short enough that somebody waiting on a reply is not left
+/// wondering.
+const DEFAULT_RETRY_BASE: Duration = Duration::from_secs(10);
+
 /// Ceiling on `[bridge].mute_context`. The lookback is charged to every turn a muted conversation
 /// wakes, so a generous setting quietly turns "only wake me for mentions" back into "send me the
 /// whole chat".
@@ -107,7 +116,26 @@ pub struct BridgeConfig {
     /// open, would otherwise hold a chat open for as long as it liked.
     pub settle_max: Duration,
     /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
+    ///
+    /// Spaced out rather than made back to back: the failure this budget exists for is an upstream
+    /// out of quota, and a second attempt in the same second lands in the same window as the
+    /// first.
     pub turn_retries: u32,
+    /// How long the first of those attempts waits, doubling thereafter.
+    ///
+    /// Absent from the file format for the same reason as [`BridgeConfig::coalesce_floor`]: it
+    /// describes how an upstream behaves under load rather than anything an operator has a
+    /// preference about. Together with [`BridgeConfig::turn_retries`] it decides how long somebody
+    /// waits before being told there will be no answer, and that is the knob worth having.
+    pub retry_base: Duration,
+    /// Whether a chat is told when a message from it could not be delivered to the agent.
+    ///
+    /// The one exception to the bridge writing no chat content of its own, so it is defeatable.
+    /// The notice says nothing but that something went wrong: whoever is in the chat did
+    /// nothing wrong, cannot act on an upstream status code, and is not necessarily somebody
+    /// an operator would hand one to. Detail goes to [`BridgeConfig::owner_conversation`]
+    /// instead.
+    pub notify_failures: bool,
     pub typing_indicator: bool,
     /// Ceiling on how long the typing indicator is held for one turn.
     ///
@@ -466,6 +494,8 @@ struct FileBridge {
     settle_max: Duration,
     #[serde(default = "default_turn_retries")]
     turn_retries: u32,
+    #[serde(default = "default_true")]
+    notify_failures: bool,
     #[serde(default = "default_true")]
     typing_indicator: bool,
     /// Unset follows `[meka].turn_timeout`, which is resolved once both are known.
@@ -945,6 +975,32 @@ impl FileConfig {
                      not configured"
                 )));
             }
+            // Not rejected outright, only because the id could name a conversation this build's
+            // parser is stricter about than the platform is. It is still worth saying: every
+            // operator notice the bridge tries to send goes nowhere.
+            if crate::channel::ConversationId::parse(owner).is_none() {
+                warnings.push(format!(
+                    "[bridge].owner_conversation {owner:?} is not a conversation id, so operator \
+                     notices cannot be delivered; it wants the <channel>:<chat> form"
+                ));
+            }
+        } else if !self.bridge.notify_failures {
+            warnings.push(
+                "[bridge].notify_failures is off and no [bridge].owner_conversation is set, so a \
+                 message the agent never receives is reported only in the logs"
+                    .to_string(),
+            );
+        }
+
+        // The recovery path for an undeliverable message is to put it back among what the agent has
+        // not seen, and that needs a history row to exist. With retention off there is none, so a
+        // message that runs out of attempts is gone for good rather than merely late.
+        if storage.history_retention.is_zero() {
+            warnings.push(
+                "[storage].history_retention is zero, so a message the agent never receives cannot \
+                 be recovered afterwards; only the platform's own scrollback will still have it"
+                    .to_string(),
+            );
         }
 
         Ok(Config {
@@ -955,9 +1011,11 @@ impl FileConfig {
                 max_queue_depth: self.bridge.max_queue_depth,
                 batch_max_messages: self.bridge.batch_max_messages,
                 coalesce_floor: DEFAULT_COALESCE_FLOOR,
+                retry_base: DEFAULT_RETRY_BASE,
                 settle: self.bridge.settle,
                 settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
+                notify_failures: self.bridge.notify_failures,
                 typing_indicator: self.bridge.typing_indicator,
                 // Follows the turn budget unless pinned, so the indicator lasts exactly as long as
                 // the work does rather than lapsing partway through a long turn.
@@ -1034,6 +1092,7 @@ impl Default for FileBridge {
             settle: default_settle(),
             settle_max: default_settle_max(),
             turn_retries: default_turn_retries(),
+            notify_failures: true,
             typing_indicator: true,
             typing_max: None,
             default_policy: FileDefaultPolicy::default(),
@@ -1132,8 +1191,14 @@ const fn default_batch_max_messages() -> usize {
     32
 }
 
+/// Four attempts in all, spaced 10s, 20s and 40s apart, so a batch survives a little over a minute
+/// of an upstream being unavailable.
+///
+/// One retry was defensible only while the retries were free and instant. Now that each costs a
+/// real wait, this is the number that decides how long somebody is left with no answer before they
+/// are told there will not be one, and a minute is about as long as silence reads as thinking.
 const fn default_turn_retries() -> u32 {
-    1
+    3
 }
 
 const fn default_mcp_transport() -> McpTransport {

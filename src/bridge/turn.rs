@@ -93,10 +93,19 @@ const SEND_TOOL_SUFFIX: &str = "__send_message";
 /// stand-ins whole, and to show the opening of a real answer that never got delivered.
 const TEXT_PREVIEW_CHARS: usize = 240;
 
-/// What a completed turn did, for logging and for deciding whether to warn about a silent turn.
-#[derive(Debug, Clone, PartialEq)]
+/// What a turn did, for logging, for deciding whether to warn about a silent turn, and for deciding
+/// whether a failed one may be handed over again.
+///
+/// Reported for a failed turn as much as a finished one, which is the whole reason the outcome is a
+/// `Result` in here rather than the return type. A failure reaching the bridge means meka's own
+/// retries ran out, and those are scoped to a single provider call, so the turn may well have made
+/// several already: a rate limit on the third call of a tool loop arrives with the first two
+/// iterations' tool calls behind it. Whether anything actually happened is the difference between a
+/// batch that is safe to offer again and one whose retry would repeat work the agent cannot
+/// remember doing.
+#[derive(Debug)]
 pub struct TurnReport {
-    pub outcome: TurnOutcome,
+    pub outcome: Result<TurnOutcome, MekaError>,
     /// Times the agent called a send tool during the turn.
     pub sends: usize,
     /// Total tool calls, including sends.
@@ -111,12 +120,33 @@ pub struct TurnReport {
 }
 
 impl TurnReport {
+    /// A turn that never got as far as running, so nothing was produced and nothing was done.
+    pub fn failed(error: MekaError) -> Self {
+        Self {
+            outcome: Err(error),
+            sends: 0,
+            tool_calls: 0,
+            text_length: 0,
+            text_preview: String::new(),
+        }
+    }
+
     /// A turn that produced text but sent nothing.
     ///
     /// Legal, and sometimes correct, but almost always worth a log line: from the user's side it is
     /// indistinguishable from the bridge being broken.
     pub const fn is_silent(&self) -> bool {
         self.sends == 0
+    }
+
+    /// Whether anything happened that a second attempt would repeat.
+    ///
+    /// Sends and tool calls, not text. Text costs tokens and nothing else, so a turn that wrote a
+    /// paragraph and then died can be handed over again without anybody noticing; a turn that ran a
+    /// shell command cannot, and the agent would have no memory of the first run to tell it apart
+    /// from the second.
+    pub const fn had_side_effects(&self) -> bool {
+        self.sends > 0 || self.tool_calls > 0
     }
 
     /// Whether the turn did nothing at all because the model came back empty.
@@ -131,7 +161,7 @@ impl TurnReport {
     /// turn is simply treated as silent and logged, rather than retried.
     pub fn produced_nothing(&self) -> bool {
         if self.tool_calls > 0
-            || matches!(self.outcome, TurnOutcome::Finished { ref stop_reason, .. } if stop_reason == "refusal")
+            || matches!(self.outcome, Ok(TurnOutcome::Finished { ref stop_reason, .. }) if stop_reason == "refusal")
         {
             return false;
         }
@@ -178,7 +208,7 @@ impl TurnRunner {
         session_id: Uuid,
         message: &str,
         conversations: &BTreeSet<ConversationId>,
-    ) -> Result<TurnReport, MekaError> {
+    ) -> TurnReport {
         // Sends from an earlier turn must not suppress this turn's indicator.
         self.presence.reset();
         // Opened on `Started` rather than here, because until meka accepts the turn nothing has
@@ -239,13 +269,16 @@ impl TurnRunner {
             typing.cancel();
         }
 
-        result.map(|outcome| TurnReport {
-            outcome,
+        // The counters are kept on the error path too. They used to be dropped with the `Ok`, which
+        // left the caller unable to tell a turn that failed before the agent did anything from one
+        // that failed after it had already answered somebody.
+        TurnReport {
+            outcome: result,
             sends,
             tool_calls,
             text_length,
             text_preview,
-        })
+        }
     }
 
     /// Open the indicator in each conversation until the returned token is cancelled, the agent
@@ -631,9 +664,10 @@ mod tests {
             Arc::new(Presence::default()),
         );
 
-        let _ = runner
+        let report = runner
             .run(uuid::Uuid::new_v4(), "hello", &conversations())
             .await;
+        assert!(report.outcome.is_err(), "nothing is listening on that port");
         assert_eq!(
             channel.activity_count(),
             0,
@@ -671,11 +705,11 @@ mod tests {
 
     fn report(sends: usize) -> TurnReport {
         TurnReport {
-            outcome: TurnOutcome::Finished {
+            outcome: Ok(TurnOutcome::Finished {
                 stop_reason: "end_turn".to_string(),
                 refusal_text: None,
                 usage: Usage::default(),
-            },
+            }),
             sends,
             tool_calls: sends,
             text_length: 10,
@@ -689,13 +723,37 @@ mod tests {
         assert!(!report(1).is_silent());
     }
 
+    #[test]
+    fn a_failed_turn_still_says_whether_the_agent_had_acted() {
+        // The distinction the whole retry decision rests on. meka only retries a provider failure
+        // while nothing has reached the frontend, so a failure that gets this far may well have a
+        // sent message and a shell command behind it, and handing that batch over again would
+        // repeat both with the agent none the wiser.
+        let failed = |sends, tool_calls| TurnReport {
+            outcome: Err(MekaError::Timeout(Duration::from_secs(1))),
+            sends,
+            tool_calls,
+            text_length: 400,
+            text_preview: "I'll take a look".to_string(),
+        };
+        assert!(failed(1, 1).had_side_effects());
+        assert!(
+            failed(0, 3).had_side_effects(),
+            "tool calls count even when nothing was sent"
+        );
+        assert!(
+            !failed(0, 0).had_side_effects(),
+            "text alone costs tokens and nothing else"
+        );
+    }
+
     fn empty_turn(stop_reason: &str, tool_calls: usize, text: &str) -> TurnReport {
         TurnReport {
-            outcome: TurnOutcome::Finished {
+            outcome: Ok(TurnOutcome::Finished {
                 stop_reason: stop_reason.to_string(),
                 refusal_text: None,
                 usage: Usage::default(),
-            },
+            }),
             sends: 0,
             tool_calls,
             text_length: text.chars().count(),

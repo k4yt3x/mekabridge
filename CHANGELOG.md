@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mekabridge unseen` prints a watcher marker on stdout that moves only when a chat does.
 - `unmute` and `unblock` take a `duration`, for joining a discussion without having to leave it.
 - A Group Attention page, covering what wakes the agent and what it can arrange for itself.
+- **Breaking:** a chat whose message could not be delivered is told so, in one line and no detail.
+- The owner is told which chats lost what, after how many attempts, and the error verbatim.
+- Both notices are held to one per chat per 15 minutes; the owner's counts what it swallowed.
+- `[bridge].notify_failures` turns the chat's notice off, leaving the owner's and the logs.
 
 ### Changed
 
@@ -23,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every chat is held 1s regardless, so the parts of a split post arrive as one turn. Not tunable.
 - `woke you:` is stated on every message from a group, including the ones nothing addressed.
 - A muted conversation's envelope block names the two things that do wake the agent there.
+- `turn_retries` defaults to `3`, now that the attempts are spaced out rather than instant.
+- A `provider` error is no longer retried on read-only calls; meka means it as one it cannot repair.
+- A turn that failed after the agent had sent or run something is no longer retried at all.
+- An error needing an operator is given up on at once instead of spending the whole budget.
 
 ### Removed
 
@@ -31,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failed batch was retried instantly, so a rate limit consumed every attempt in seconds.
+- A message that ran out of attempts stayed marked seen, so nothing would ever surface it again.
+- A 429 or 5xx without a Problem Detail body, as a reverse proxy sends, was never retried.
 - A chat mid-burst delayed delivery for every other chat; readiness is now per conversation.
 - A lapsed policy's notice was filed where nothing would read it, so the agent was never told.
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.

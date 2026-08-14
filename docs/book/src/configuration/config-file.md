@@ -66,12 +66,13 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `owner_conversation` | none | Conversation that receives operator notices, e.g. `telegram:123456789` |
+| `owner_conversation` | none | Conversation that receives the detailed version of an operator notice, e.g. `telegram:123456789` |
+| `notify_failures` | `true` | Tell the affected chat, in one line and no detail, when its message could not be delivered |
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
-| `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported |
+| `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a batch waiting out a retry |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
-| `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
+| `turn_retries` | `3` | Extra attempts for a batch whose turn failed, waiting 10s, 20s then 40s between them |
 | `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and when the turn ends |
 | `typing_max` | `[meka].turn_timeout` | Ceiling on how long that state is held for one turn. A safety net: the indicator already stops on a reply and at the end of the turn |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
@@ -84,7 +85,13 @@ Every conversation is also held for one second regardless, which is not configur
 
 `typing_max` is worth raising rather than lowering. Neither Telegram nor Discord limits how long an indicator may be renewed, so holding one costs a single cheap call every few seconds. A ceiling shorter than a turn is the worst of both: it stops while the agent is still working, and a chat that has been quiet for minutes reads as a bot that has died rather than one that is busy.
 
-`owner_conversation` is the only place the bridge writes chat content itself, and only to say that it could not deliver something. Without it, a repeated delivery failure is visible only in the logs.
+A message that runs out of attempts produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
+
+Both are rate limited to one message per conversation per fifteen minutes, and the owner's notice says how many failures went unreported in between, so a provider out of quota for an hour reads as an hour rather than as a blip.
+
+Those two are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the first. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
+
+The message is also put back among what the agent has not seen, so `unseen` counts it and it comes back as missed context the next time that conversation wakes.
 
 When the queue is full, further messages are dropped and counted, and the next envelope tells the agent how many it did not see. Nothing is discarded silently.
 
@@ -219,7 +226,7 @@ permission = "write"
 [bridge]
 owner_conversation = "telegram:123456789"
 batch_max_messages = 32
-turn_retries = 1
+turn_retries = 3
 
 [bridge.default_policy]
 direct = "active"

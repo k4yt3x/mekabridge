@@ -46,6 +46,23 @@ const ONE_PIXEL_PNG: &[u8] = &[
     0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// How a scripted failure behaves. The three differ in exactly what the bridge is entitled to do
+/// next, which is the whole of what these tests are about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FailureKind {
+    /// Where a rate limit or an overload actually lands: meka's `RetryableProvider` has no arm of
+    /// its own in the mapping onto a Problem Detail and falls through to `internal`. Nothing ran,
+    /// so the batch may be handed over again.
+    #[default]
+    Transient,
+    /// meka's bucket for an upstream failure its own agent loop has already tried and failed to
+    /// repair. More attempts would only delay the notice saying an operator is needed.
+    Unrepairable,
+    /// The agent called a send tool and then the turn died. Nothing may be retried: the work is
+    /// done and a second attempt would repeat it with the agent having no memory of the first.
+    AfterActing,
+}
+
 /// What the stub meka observed, so tests can assert on the envelope the agent would have seen.
 #[derive(Default)]
 struct MekaRecorder {
@@ -56,6 +73,14 @@ struct MekaRecorder {
     attempts: Mutex<usize>,
     /// Turns to fail before starting to succeed, for exercising the retry path.
     fail_first: Mutex<usize>,
+    /// What those failures look like, which is what decides whether the batch may be tried again.
+    failure: Mutex<FailureKind>,
+    /// A conversation id that must appear in the envelope for a turn to be failed at all, so one
+    /// chat can be kept in trouble while another is answered normally.
+    fail_only: Mutex<Option<String>>,
+    /// When each `POST /turn` arrived, for tests that measure the wait between attempts rather
+    /// than how many there were.
+    attempt_times: Mutex<Vec<std::time::Instant>>,
     /// Turns to answer with `session-not-found`, for exercising session recreation.
     forget_session_first: Mutex<usize>,
     /// Turns to answer with a stream that stops before any terminal event, simulating a dropped
@@ -92,6 +117,11 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         .attempts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+    recorder
+        .attempt_times
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(std::time::Instant::now());
 
     let should_forget = {
         let mut remaining = recorder
@@ -143,7 +173,7 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         .turns
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(message);
+        .push(message.clone());
 
     let delay = *recorder
         .turn_delay
@@ -208,11 +238,17 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
     }
 
     let should_fail = {
+        let only = recorder
+            .fail_only
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let eligible = only.is_none_or(|conversation| message.contains(&conversation));
         let mut remaining = recorder
             .fail_first
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *remaining > 0 {
+        if eligible && *remaining > 0 {
             *remaining -= 1;
             true
         } else {
@@ -221,11 +257,33 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
     };
 
     let stream = if should_fail {
-        "retry: 3000\n\n\
-         event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
-         event: turn.failed\nid: 1\ndata: {\"error\":{\"type\":\"https://meka.so/errors/provider\",\
-         \"title\":\"Provider failed\",\"status\":502,\"detail\":\"upstream\"}}\n\n"
-            .to_string()
+        let kind = *recorder
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The tool call is what makes the bridge treat the batch as spent: it counts sends off the
+        // event stream, not off anything reaching a channel, so this is enough to stand in for an
+        // agent that had already answered somebody when the turn died.
+        let acted = if kind == FailureKind::AfterActing {
+            "event: tool_call.executing\nid: 1\n\
+             data: {\"id\":\"c1\",\"name\":\"mcp__mekabridge__send_message\"}\n\n"
+        } else {
+            ""
+        };
+        let error = if kind == FailureKind::Unrepairable {
+            "{\"type\":\"https://meka.so/errors/provider\",\"title\":\"Provider failed\",\
+             \"status\":502,\"detail\":\"upstream refused\"}"
+        } else {
+            "{\"type\":\"https://meka.so/errors/internal\",\"title\":\"Internal server error\",\
+             \"status\":500,\
+             \"detail\":\"provider temporarily unavailable: API returned status 429\"}"
+        };
+        format!(
+            "retry: 3000\n\n\
+             event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
+             {acted}\
+             event: turn.failed\nid: 2\ndata: {{\"error\":{error}}}\n\n"
+        )
     } else {
         "retry: 3000\n\n\
          event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
@@ -555,11 +613,6 @@ batch_max_messages = 32
 max_queue_depth = 64
 turn_retries = {retries}
 typing_indicator = {typing}
-# Scaled down from the shipped 3s/30s so the suite exercises the same logic without sleeping through
-# a real settle window on every test.
-settle = "150ms"
-settle_max = "600ms"
-
 [storage]
 path = "{}"
 
@@ -572,16 +625,13 @@ allowed_users = [1]
     );
     let mut config =
         Config::from_toml(&raw, std::path::Path::new("/tmp/config.toml")).expect("valid config");
-    // Not reachable from the file format on purpose, so it is scaled down here instead. At the
-    // shipped second the suite would sleep through a real floor on every test that waits for a
-    // turn, which is most of them.
+    // The floor is set per test by `Setup`, since the suite pulls both ways on it; see there.
     //
-    // Not scaled down as far as the settle window, though. The floor is measured from the
-    // platform's send time, so it only coalesces a burst if the writer persists every part of it
-    // within the floor. At 20ms a loaded machine could claim the first message before the rest
-    // were written, which made the album and batching tests fail under load rather than reporting
-    // a real defect.
-    config.bridge.coalesce_floor = Duration::from_millis(100);
+    // The retry base is not in the file format for the same reason: at the shipped ten seconds
+    // any test covering a retry would sleep through a real backoff, and every test that merely
+    // tolerates one would take the same hit. Not scaled as far down as the floor, because a test
+    // that asserts a wait happened has to be able to tell it from the round trip it replaced.
+    config.bridge.retry_base = Duration::from_millis(250);
     config
 }
 
@@ -628,6 +678,81 @@ struct Harness {
     _directory: tempfile::TempDir,
 }
 
+/// The parts of the config a test may want that the shared TOML does not cover. Most of the suite
+/// takes the default, which is why these live here rather than as more positional arguments on a
+/// constructor that already has several.
+#[derive(Debug, Clone)]
+struct Setup {
+    /// Where a delivery failure gets reported in detail.
+    owner: Option<String>,
+    /// Whether the affected chat hears about one at all.
+    notify_failures: bool,
+    /// Not reachable from the file format on purpose, so it is set here instead. At the shipped
+    /// second the suite would sleep through a real floor on every test that waits for a turn,
+    /// which is most of them.
+    ///
+    /// The default is a compromise between two groups of tests pulling opposite ways. The floor is
+    /// measured from the platform's send time, so it only coalesces a burst if the writer persists
+    /// every part of it inside the window, and on a loaded machine that takes longer than it
+    /// looks; meanwhile the tests that assert a message is *not* held measure against this
+    /// same number. Burst tests take [`Setup::coalescing`] rather than pushing the default up.
+    coalesce_floor: Duration,
+    /// Scaled down from the shipped 3s/30s so the suite exercises the same logic without sleeping
+    /// through a real quiet period on every test. Here rather than in the TOML because a test that
+    /// asserts the quiet period was *not* applied needs it far enough from the floor to tell the
+    /// two apart; see [`Setup::patient`].
+    settle: Duration,
+    settle_max: Duration,
+    /// Whether the bridge announces a turn in the originating chats. Off for most of the suite, so
+    /// it is not measuring presence it does not care about.
+    typing_indicator: bool,
+    /// `[meka].turn_timeout`, which also bounds how long `submit` retries a refusal before giving
+    /// up and letting `deliver` release the batch.
+    turn_timeout: String,
+    /// Zero writes no message history at all, which is what makes an undeliverable message
+    /// unrecoverable: there is no row to put back among what the agent has not seen.
+    history_retention: Duration,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            notify_failures: true,
+            coalesce_floor: Duration::from_millis(100),
+            settle: Duration::from_millis(150),
+            settle_max: Duration::from_millis(600),
+            typing_indicator: false,
+            turn_timeout: "20s".to_string(),
+            history_retention: Duration::from_secs(86_400),
+        }
+    }
+}
+
+impl Setup {
+    /// A floor generous enough to hold a burst together while the writer persists it, for the tests
+    /// that are about coalescing rather than about latency.
+    fn coalescing() -> Self {
+        Self {
+            coalesce_floor: Duration::from_millis(600),
+            // Clear of the floor, or the ceiling would release the burst at the very moment the
+            // floor was meant to be holding it together.
+            settle_max: Duration::from_secs(3),
+            ..Self::default()
+        }
+    }
+
+    /// A quiet period long enough that a test asserting it was skipped can say so without racing
+    /// the floor. At the default the two are 50ms apart, which on a loaded machine is noise.
+    fn patient() -> Self {
+        Self {
+            settle: Duration::from_secs(2),
+            settle_max: Duration::from_secs(4),
+            ..Self::default()
+        }
+    }
+}
+
 impl Harness {
     async fn start(retries: u32, fail_first: usize) -> Self {
         Self::start_with(retries, fail_first, 0).await
@@ -655,7 +780,11 @@ impl Harness {
     /// the envelope is built once and reused across `submit`'s internal retries, and anything about
     /// rebuilding it is untestable.
     async fn start_impatient(busy: usize) -> Self {
-        let harness = Self::start_all(1, 0, 0, 0, 0, false, "3s").await;
+        let harness = Self::start_all(1, 0, 0, 0, 0, Setup {
+            turn_timeout: "3s".to_string(),
+            ..Setup::default()
+        })
+        .await;
         *harness
             .recorder
             .busy_first
@@ -664,8 +793,24 @@ impl Harness {
         harness
     }
 
+    /// A harness whose floor is generous enough to hold a burst together while the writer persists
+    /// it, for the tests that are about coalescing rather than about latency.
+    async fn start_coalescing() -> Self {
+        Self::start_all(1, 0, 0, 0, 0, Setup::coalescing()).await
+    }
+
+    /// A harness whose quiet period is long enough to be unmistakable, for the tests about whether
+    /// one was applied at all.
+    async fn start_patient() -> Self {
+        Self::start_all(1, 0, 0, 0, 0, Setup::patient()).await
+    }
+
     async fn start_with_typing() -> Self {
-        Self::start_all(1, 0, 0, 0, 0, true, "20s").await
+        Self::start_all(1, 0, 0, 0, 0, Setup {
+            typing_indicator: true,
+            ..Setup::default()
+        })
+        .await
     }
 
     async fn start_full(
@@ -680,10 +825,23 @@ impl Harness {
             forget_first,
             truncate_first,
             0,
-            false,
-            "20s",
+            Setup::default(),
         )
         .await
+    }
+
+    /// A harness set up to be watched failing: a scripted failure of a given shape, somewhere to
+    /// report it, and a say in whether the chat itself hears about it.
+    async fn start_failing(retries: u32, failure: FailureKind, setup: Setup) -> Self {
+        // Far more failures scripted than any of these tests will get through, so the batch never
+        // succeeds by running out of them.
+        let harness = Self::start_all(retries, 64, 0, 0, 0, setup).await;
+        *harness
+            .recorder
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = failure;
+        harness
     }
 
     async fn start_all(
@@ -692,10 +850,7 @@ impl Harness {
         forget_first: usize,
         truncate_first: usize,
         empty_first: usize,
-        typing: bool,
-        // `[meka].turn_timeout`, which also bounds how long `submit` retries a refusal before
-        // giving up and letting `deliver` release the batch.
-        turn_timeout: &str,
+        setup: Setup,
     ) -> Self {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("state.db");
@@ -722,9 +877,22 @@ impl Harness {
             meka_address,
             &database,
             retries,
-            typing,
-            turn_timeout,
+            setup.typing_indicator,
+            &setup.turn_timeout,
         ));
+
+        let mut config = config;
+        // Set here rather than through `config_for`, which validates the owner against the
+        // configured channels and would need the whole TOML threading through for two fields.
+        {
+            let config = Arc::get_mut(&mut config).expect("sole reference");
+            config.bridge.owner_conversation = setup.owner;
+            config.bridge.notify_failures = setup.notify_failures;
+            config.bridge.coalesce_floor = setup.coalesce_floor;
+            config.bridge.settle = setup.settle;
+            config.bridge.settle_max = setup.settle_max;
+            config.storage.history_retention = setup.history_retention;
+        }
 
         let store = Store::open(&config.storage.path)
             .await
@@ -764,6 +932,7 @@ impl Harness {
                 ),
                 identities: Arc::new(tokio::sync::OnceCell::new()),
                 permission_checked: Arc::new(tokio::sync::OnceCell::new()),
+                notices: inbound::NoticeLog::default(),
             };
             let shutdown = shutdown.clone();
             async move { inbound::drain_loop(context, wake, shutdown).await }
@@ -970,6 +1139,406 @@ async fn a_failed_turn_is_retried_and_then_given_up_on() {
 }
 
 #[tokio::test]
+async fn a_second_attempt_waits_rather_than_going_straight_back() {
+    // The defect this pins: a failed batch used to be reoffered on the very next pass of the drain
+    // loop, because readiness is measured from the platform's send time and that is long past by
+    // the time a turn has failed. For the failure the budget exists for, an upstream out of quota,
+    // both attempts then landed inside the same window and the message was declared undeliverable
+    // seconds after it arrived.
+    let harness = Harness::start_failing(3, FailureKind::Transient, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("a third attempt", |harness| harness.attempts() >= 3)
+        .await;
+
+    let times = harness
+        .recorder
+        .attempt_times
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let first = times[1].duration_since(times[0]);
+    assert!(
+        first >= Duration::from_millis(200),
+        "the retry came back after only {first:?}, so nothing waited"
+    );
+    let second = times[2].duration_since(times[1]);
+    assert!(
+        second >= Duration::from_millis(450),
+        "the second wait was {second:?}, so it did not double"
+    );
+}
+
+#[tokio::test]
+async fn traffic_in_another_chat_does_not_release_a_deferred_one() {
+    // The ordering inside `readiness`. A batch waiting out a rate limit is by then long past
+    // `settle_max`, since that is measured from when the message was sent, so a ceiling checked
+    // first would release it into the very window it just bounced off. Nothing notices while the
+    // drain loop is asleep on the deferral itself; it takes a message somewhere else to wake it
+    // mid-wait, which is what this arranges.
+    // A budget deep enough that the chat is still in the queue throughout, so any extra submission
+    // is a release rather than the last attempt of a batch on its way out.
+    let harness = Harness::start_failing(8, FailureKind::Transient, Setup::default()).await;
+    *harness
+        .recorder
+        .fail_only
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("mock:1".to_string());
+
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    // Four attempts in, the next wait is two seconds: long enough that the chat spends nearly all
+    // of it past the 600ms ceiling, which is the state the ordering has to survive.
+    harness
+        .wait_for("the wait to grow past the ceiling", |harness| {
+            attempts_at(harness, "mock:1") >= 4
+        })
+        .await;
+    let before = attempts_at(&harness, "mock:1");
+
+    for index in 0..7 {
+        harness
+            .sender
+            .send(message_elsewhere("unrelated", &format!("b{index}")))
+            .await
+            .expect("queued");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        attempts_at(&harness, "mock:1"),
+        before,
+        "a message in another chat woke the drain loop and it released the deferred one"
+    );
+}
+
+/// How many turns carried a message from `conversation`, failures included.
+fn attempts_at(harness: &Harness, conversation: &str) -> usize {
+    harness
+        .turns()
+        .iter()
+        .filter(|envelope| envelope.contains(&format!("conversation: {conversation}")))
+        .count()
+}
+
+#[tokio::test]
+async fn an_unrepairable_failure_is_not_retried_at_all() {
+    // meka maps both its `Provider` and `InvalidRequest` errors onto this type, and both are ones
+    // its own agent loop has already tried and failed to repair. Spending the budget on them only
+    // delays the notice that says an operator is needed.
+    let harness = Harness::start_failing(3, FailureKind::Unrepairable, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the first attempt", |harness| harness.attempts() >= 1)
+        .await;
+    // Longer than three of the harness's backoffs, so a second attempt would have happened by now.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(
+        harness.attempts(),
+        1,
+        "an error needing an operator must not be tried four times first"
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.pending, 0);
+}
+
+#[tokio::test]
+async fn a_turn_that_failed_after_the_agent_acted_is_not_retried() {
+    // meka only retries an upstream failure while nothing has reached its frontend, so one that
+    // gets as far as the bridge may well have a sent message and a shell command behind it.
+    // Handing the batch over again would repeat both, and the agent would have no memory of the
+    // first run to tell it from the second.
+    let harness = Harness::start_failing(3, FailureKind::AfterActing, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the first attempt", |harness| harness.attempts() >= 1)
+        .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(
+        harness.attempts(),
+        1,
+        "the turn already had side effects, so it must not be run again"
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.pending, 0);
+}
+
+#[tokio::test]
+async fn an_undeliverable_message_is_owed_to_the_agent_again() {
+    // A message is marked seen the moment it is queued, on the assumption that the agent is about
+    // to be handed it. Running out of attempts is exactly where that assumption fails, and without
+    // putting it back the message is neither delivered nor owed: absent from `unseen`, from the
+    // missed-context lookback, and from the `mekabridge unseen` predicate.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup::default()).await;
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the batch to be given up on", |harness| {
+            harness.attempts() >= 1
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let summary = harness
+        .store
+        .unseen_summary(Some("mock:1"))
+        .await
+        .expect("summary");
+    assert_eq!(
+        summary.count, 1,
+        "a message that never reached the agent must still be owed to it"
+    );
+}
+
+#[tokio::test]
+async fn a_chat_is_told_that_something_broke_and_nothing_more() {
+    // Whoever is in the chat did nothing wrong, cannot act on an upstream status code, and is not
+    // necessarily somebody an operator would hand one to. The detail goes to the owner instead.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the chat to be told", |harness| {
+            !harness.channel.sent().is_empty()
+        })
+        .await;
+
+    let sent = harness.channel.sent();
+    assert_eq!(sent.len(), 1, "one apology, not one per attempt");
+    let (conversation, text) = &sent[0];
+    assert_eq!(
+        conversation, "mock:1",
+        "told the chat the message came from"
+    );
+    assert!(text.contains("went wrong"), "got {text:?}");
+    for leak in ["429", "500", "internal", "provider", "meka"] {
+        assert!(
+            !text.to_ascii_lowercase().contains(leak),
+            "the chat was told {leak:?}, which is the owner's business: {text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_owner_hears_what_the_chat_is_spared() {
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup {
+        owner: Some("mock:99".to_string()),
+        notify_failures: true,
+        ..Setup::default()
+    })
+    .await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("both notices", |harness| harness.channel.sent().len() >= 2)
+        .await;
+
+    let sent = harness.channel.sent();
+    let owner = sent
+        .iter()
+        .find(|(conversation, _)| conversation == "mock:99")
+        .expect("the owner must be told");
+    assert!(
+        owner.1.contains("429"),
+        "the owner needs the actual error: {:?}",
+        owner.1
+    );
+    assert!(
+        owner.1.contains("mock:1"),
+        "and which conversation lost something: {:?}",
+        owner.1
+    );
+    assert!(
+        sent.iter()
+            .any(|(conversation, _)| conversation == "mock:1"),
+        "the chat itself must still be told, vaguely"
+    );
+}
+
+#[tokio::test]
+async fn the_owner_is_not_promised_a_recovery_that_cannot_happen() {
+    // With `[storage].history_retention` at zero nothing is written to the history, so there is no
+    // row for `mark_unseen` to put back and the message really is gone. Telling the owner it will
+    // come back as unseen context would send them looking for something that does not exist, in
+    // the one configuration where a message is genuinely lost.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup {
+        owner: Some("mock:99".to_string()),
+        history_retention: Duration::ZERO,
+        ..Setup::default()
+    })
+    .await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the owner to be told", |harness| {
+            harness
+                .channel
+                .sent()
+                .iter()
+                .any(|(conversation, _)| conversation == "mock:99")
+        })
+        .await;
+
+    let sent = harness.channel.sent();
+    let owner = sent
+        .iter()
+        .find(|(conversation, _)| conversation == "mock:99")
+        .expect("told");
+    assert!(
+        owner.1.contains("nothing will bring them back"),
+        "the owner must be told the message is gone: {:?}",
+        owner.1
+    );
+    assert!(
+        !owner.1.contains("unseen"),
+        "and not pointed at a backlog that was never written: {:?}",
+        owner.1
+    );
+}
+
+#[tokio::test]
+async fn a_chat_hears_nothing_when_notify_failures_is_off() {
+    // The bridge writing chat content of its own is a real exception to how it otherwise behaves,
+    // so an operator who does not want the bot speaking unprompted in a group can say so.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup {
+        owner: Some("mock:99".to_string()),
+        notify_failures: false,
+        ..Setup::default()
+    })
+    .await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the owner to be told", |harness| {
+            !harness.channel.sent().is_empty()
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let sent = harness.channel.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "mock:99", "only the owner may hear about it");
+}
+
+#[tokio::test]
+async fn a_chat_the_agent_answered_is_not_apologised_to() {
+    // An apology after the agent has just replied contradicts what it said. The owner still hears,
+    // because a turn that died after acting is exactly the kind worth looking into.
+    let harness = Harness::start_failing(0, FailureKind::AfterActing, Setup {
+        owner: Some("mock:99".to_string()),
+        notify_failures: true,
+        ..Setup::default()
+    })
+    .await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the owner to be told", |harness| {
+            !harness.channel.sent().is_empty()
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let sent = harness.channel.sent();
+    assert_eq!(sent.len(), 1, "got {sent:?}");
+    assert_eq!(sent[0].0, "mock:99");
+    // And told the right story about it. "Could not deliver" would be false here: the agent read
+    // the messages and acted on them, and what needs looking at is the work it left half done.
+    assert!(
+        sent[0].1.contains("half finished"),
+        "the owner was told the wrong thing: {:?}",
+        sent[0].1
+    );
+    assert!(
+        !sent[0].1.contains("could not deliver"),
+        "the messages did reach the agent: {:?}",
+        sent[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_chat_is_not_apologised_to_twice_for_the_same_outage() {
+    // An upstream out of quota for half an hour would otherwise write an apology into every
+    // affected chat every time a batch ran out of attempts, which is worse than the silence it
+    // replaced.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the first apology", |harness| {
+            !harness.channel.sent().is_empty()
+        })
+        .await;
+
+    harness
+        .sender
+        .send(message("are you there?", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the second message to fail too", |harness| {
+            harness.attempts() >= 2
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(
+        harness.channel.sent().len(),
+        1,
+        "the same chat was apologised to twice inside the suppression window"
+    );
+}
+
+#[tokio::test]
 async fn a_transient_failure_is_recovered_by_the_retry() {
     let harness = Harness::start(1, 1).await;
     harness
@@ -990,7 +1559,7 @@ async fn a_transient_failure_is_recovered_by_the_retry() {
 
 #[tokio::test]
 async fn messages_that_arrive_together_are_batched_into_one_turn() {
-    let harness = Harness::start(1, 0).await;
+    let harness = Harness::start_coalescing().await;
     for index in 0..5 {
         harness
             .sender
@@ -1100,6 +1669,9 @@ async fn a_chat_held_for_typing_does_not_hold_up_another() {
     // A typing hold makes the drain loop's own wait long, and a wait nothing can interrupt is a
     // wait every other conversation shares. That is the fault splitting readiness per conversation
     // was meant to end, and a long hold is exactly where it would come back.
+    // Not the patient harness: the channel reports typing for every chat on it, so a long quiet
+    // period would be one the second chat legitimately waits out too, and the test would be
+    // measuring that rather than the hold on the first.
     let harness = Harness::start(1, 0).await;
     harness.channel.report_typing();
     harness
@@ -1124,11 +1696,11 @@ async fn a_chat_held_for_typing_does_not_hold_up_another() {
                 .any(|turn| turn.contains("are you there?"))
         })
         .await;
-    // Tight on purpose. With the wake branch this is the 100ms floor plus scheduling; without it
-    // the loop sleeps however long the held chat asked for, which the harness ceiling caps at
-    // roughly 450ms here and which in production is the full typing TTL.
+    // Tight on purpose. With the wake branch this is the 150ms quiet period plus scheduling;
+    // without it the loop sleeps however long the held chat asked for, which the harness ceiling
+    // caps at roughly 450ms here and which in production is the full typing TTL.
     assert!(
-        sent.elapsed() < Duration::from_millis(250),
+        sent.elapsed() < Duration::from_millis(350),
         "an unrelated chat must not wait behind a typing hold, waited {:?}",
         sent.elapsed()
     );
@@ -1163,9 +1735,12 @@ async fn typing_does_not_hold_a_chat_past_the_ceiling() {
 async fn a_platform_that_cannot_report_typing_does_not_hold_a_message() {
     // The whole point of gating the quiet period on the capability. Telegram has no typing update
     // of any kind, so any wait there is a guess, and a guess long enough to catch somebody typing a
-    // second sentence is far too long to impose on somebody who only ever meant to send one. The
-    // harness settle is 150ms; the floor is 20ms.
-    let harness = Harness::start(1, 0).await;
+    // second sentence is far too long to impose on somebody who only ever meant to send one.
+    //
+    // A patient harness, so the two numbers are far apart: the quiet period is two seconds and the
+    // floor a tenth of one, and anything under a second is unambiguously the floor. At the suite's
+    // usual 150ms and 100ms the gap is smaller than the scheduling noise on a loaded machine.
+    let harness = Harness::start_patient().await;
     let sent = tokio::time::Instant::now();
     harness
         .sender
@@ -1176,8 +1751,9 @@ async fn a_platform_that_cannot_report_typing_does_not_hold_a_message() {
         .wait_for("the turn", |harness| !harness.turns().is_empty())
         .await;
     assert!(
-        sent.elapsed() < Duration::from_millis(150),
-        "a chat nobody can be seen typing in must not wait out the quiet period"
+        sent.elapsed() < Duration::from_secs(1),
+        "a chat nobody can be seen typing in waited {:?}, which is the quiet period",
+        sent.elapsed()
     );
 }
 
@@ -1187,7 +1763,7 @@ async fn the_parts_of_one_split_post_arrive_together() {
     // album as one update per photo and the bridge has no album assembly of its own, so without a
     // floor the agent gets a photo and then a separate turn carrying the rest. Milliseconds apart,
     // which is why the floor is sized against the wire rather than against people.
-    let harness = Harness::start(1, 0).await;
+    let harness = Harness::start_coalescing().await;
     for index in 0..3 {
         let mut event = message("", &index.to_string());
         if let InboundEvent::Message(inner) = &mut event {
@@ -1403,6 +1979,7 @@ async fn queued_messages_survive_a_restart() {
             ),
             identities: Arc::new(tokio::sync::OnceCell::new()),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
+            notices: inbound::NoticeLog::default(),
         };
         let shutdown = shutdown.clone();
         let wake = Arc::clone(&wake);
@@ -1488,6 +2065,19 @@ fn mention(text: &str, external_id: &str) -> InboundEvent {
         panic!("a message was built just above");
     };
     inner.addressed = true;
+    event
+}
+
+/// The same message, in a second direct chat.
+fn message_elsewhere(text: &str, external_id: &str) -> InboundEvent {
+    let mut event = message(text, external_id);
+    let InboundEvent::Message(inner) = &mut event else {
+        panic!("a message was built just above");
+    };
+    inner.conversation = ConversationId::parse("mock:2").expect("valid");
+    inner.sender.id = "2".to_string();
+    inner.sender.display_name = "Bob".to_string();
+    inner.sender.username = Some("bob".to_string());
     event
 }
 

@@ -24,9 +24,21 @@ turn_timeout = "30m"
 permission = "read"
 
 [bridge]
-# Where operator notices go when a message cannot be delivered to the agent at all. Optional, but
-# without it a repeated failure is only visible in the logs.
+# Where operator notices go when a message cannot be delivered to the agent at all: which chats lost
+# something, how many attempts were made, and the error itself. Optional, but without it the only
+# detailed record is the logs.
 # owner_conversation = "telegram:123456789"
+
+# Whether the affected chat is told, in one line that says nothing but that something went wrong.
+# The one place the bridge writes chat content of its own, so it can be turned off; the detail goes
+# to owner_conversation either way. With both off, a message the agent never receives is reported
+# only in the logs.
+notify_failures = true
+
+# Extra attempts at a batch whose turn failed, waiting 10s, then 20s, then 40s, so a message
+# survives about a minute of the provider being out of quota or overloaded. Past that the chat is
+# told rather than left in silence. 0 gives up after the first failure.
+turn_retries = 3
 
 # Messages that arrive during a turn are batched into the next one.
 batch_max_messages = 32

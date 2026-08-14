@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_002.sql"),
     include_str!("store/schema_003.sql"),
     include_str!("store/schema_004.sql"),
+    include_str!("store/schema_005.sql"),
 ];
 
 /// How long a resolved policy is reused before the store is consulted again.
@@ -158,6 +159,12 @@ pub struct PendingWindow {
     pub oldest: DateTime<Utc>,
     /// Says whether a burst is still in progress.
     pub newest: DateTime<Utc>,
+    /// When a failed batch may be offered again, latest first, or `None` when nothing here has
+    /// failed.
+    ///
+    /// The latest rather than the earliest because the whole conversation waits: see
+    /// `store/schema_005.sql` for why releasing part of one would deliver out of order.
+    pub not_before: Option<DateTime<Utc>>,
 }
 
 /// What a conversation, or the whole bridge, is holding for the agent.
@@ -292,7 +299,9 @@ pub struct FailureOutcome {
     /// Rows returned to `pending` for another attempt.
     pub retrying: Vec<i64>,
     /// Rows that exhausted their attempts and are now `failed`. These are what an operator needs
-    /// to hear about, because their messages will never reach the agent.
+    /// to hear about: the agent was never handed them, and nothing will hand them over now.
+    /// What is still possible is [`Store::mark_unseen`], which puts them back among what it is
+    /// owed.
     pub exhausted: Vec<QueuedMessage>,
 }
 
@@ -909,35 +918,42 @@ impl Store {
     /// Derived from the queue rather than from in-memory state so the behaviour is the same on the
     /// first message after a restart.
     pub async fn pending_windows(&self) -> Result<Vec<PendingWindow>> {
-        let rows: Vec<(String, String, String)> = self
+        let rows: Vec<(String, String, String, Option<String>)> = self
             .connection
             .call(move |connection| {
+                // `max()` ignores NULLs, so a conversation with one deferred row and ten fresh ones
+                // reports that row's deferral rather than nothing.
                 let mut statement = connection.prepare(
-                    "SELECT conversation_id, min(received_at), max(received_at)
+                    "SELECT conversation_id, min(received_at), max(received_at), max(not_before)
                      FROM inbound_queue
                      WHERE state = 'pending'
                      GROUP BY conversation_id",
                 )?;
                 let rows = statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
             .await?;
-        let parse = |raw: &str| {
+        let parse = |column: &str, raw: &str| {
             DateTime::parse_from_rfc3339(raw)
                 .map(|value| value.with_timezone(&Utc))
                 .map_err(|error| StoreError::Corrupt {
-                    key: "inbound_queue.received_at".to_string(),
+                    key: format!("inbound_queue.{column}"),
                     message: format!("{raw:?} is not an RFC 3339 timestamp: {error}"),
                 })
         };
         rows.into_iter()
-            .map(|(conversation_id, oldest, newest)| {
+            .map(|(conversation_id, oldest, newest, not_before)| {
                 Ok(PendingWindow {
                     conversation_id,
-                    oldest: parse(&oldest)?,
-                    newest: parse(&newest)?,
+                    oldest: parse("received_at", &oldest)?,
+                    newest: parse("received_at", &newest)?,
+                    not_before: not_before
+                        .map(|raw| parse("not_before", &raw))
+                        .transpose()?,
                 })
             })
             .collect()
@@ -1066,15 +1082,22 @@ impl Store {
     ///
     /// Each row's attempt counter is incremented; rows still within `max_attempts` return to
     /// `pending` for another try, the rest become `failed` and are reported back so the operator
-    /// can be told which messages will never be delivered.
+    /// can be told which messages the agent will never be handed.
+    ///
+    /// `retry_at` is when a retrying row may be offered again. `None` means at once, which is right
+    /// for a failure that says nothing about when it might stop happening, and wrong for the one
+    /// this argument exists for: coming straight back from a provider's rate limit spends the next
+    /// attempt inside the same window it just bounced off.
     pub async fn fail_batch(
         &self,
         sequences: &[i64],
         error: &str,
         max_attempts: u32,
+        retry_at: Option<DateTime<Utc>>,
     ) -> Result<FailureOutcome> {
         let sequences = sequences.to_vec();
         let error = error.to_string();
+        let retry_at = retry_at.map(to_rfc3339);
         let outcome = self
             .connection
             .call(move |connection| {
@@ -1084,9 +1107,9 @@ impl Store {
                 for sequence in sequences {
                     transaction.execute(
                         "UPDATE inbound_queue
-                         SET attempts = attempts + 1, last_error = ?2
+                         SET attempts = attempts + 1, last_error = ?2, not_before = ?3
                          WHERE seq = ?1",
-                        rusqlite::params![sequence, error],
+                        rusqlite::params![sequence, error, retry_at],
                     )?;
                     let attempts: u32 = transaction.query_row(
                         "SELECT attempts FROM inbound_queue WHERE seq = ?1",
@@ -1390,6 +1413,33 @@ impl Store {
             })
             .await?;
         Ok(marked)
+    }
+
+    /// Put one message back among what the agent is owed.
+    ///
+    /// The inverse of [`Self::mark_seen`], and the reason it is keyed on one message rather than a
+    /// watermark: a message is marked seen the moment it is queued, on the assumption that the
+    /// agent is about to be handed it, and that assumption fails exactly when its batch runs out of
+    /// attempts. Without this the message is neither delivered nor owed, so it is absent from
+    /// `unseen`, from the missed-context lookback, and from the `mekabridge unseen` predicate.
+    /// Nothing short of `read_history` over the right window would find it again.
+    ///
+    /// Returns whether a row was actually changed. `[storage].history_retention` of zero writes no
+    /// history at all, so there is legitimately nothing to un-see.
+    pub async fn mark_unseen(&self, conversation_id: &str, external_id: &str) -> Result<bool> {
+        let conversation_id = conversation_id.to_string();
+        let external_id = external_id.to_string();
+        let changed = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE messages SET seen = 0
+                     WHERE conversation_id = ?1 AND external_id = ?2",
+                    rusqlite::params![&conversation_id, &external_id],
+                )
+            })
+            .await?;
+        Ok(changed > 0)
     }
 
     /// How much is owed to the agent, without spending any of it.
@@ -2613,7 +2663,7 @@ mod tests {
         let batch = claim_all(&store, 10).await;
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
         let outcome = store
-            .fail_batch(&sequences, "provider 502", 1)
+            .fail_batch(&sequences, "provider 502", 1, None)
             .await
             .expect("fail");
         assert_eq!(
@@ -2634,7 +2684,7 @@ mod tests {
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
 
         let first = store
-            .fail_batch(&sequences, "provider 502", 1)
+            .fail_batch(&sequences, "provider 502", 1, None)
             .await
             .expect("fail");
         assert_eq!(first.retrying, sequences);
@@ -2644,13 +2694,112 @@ mod tests {
         let batch = claim_all(&store, 10).await;
         assert_eq!(batch[0].attempts, 1);
         let second = store
-            .fail_batch(&sequences, "provider 502", 1)
+            .fail_batch(&sequences, "provider 502", 1, None)
             .await
             .expect("fail");
         assert!(second.retrying.is_empty());
         assert_eq!(second.exhausted.len(), 1);
         assert_eq!(store.pending_count().await.expect("count"), 0);
         assert_eq!(store.queue_stats().await.expect("stats").failed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_row_reports_when_it_may_be_offered_again() {
+        // What stops the drain loop coming straight back to a provider that has just rate limited
+        // it. Without the column the retry lands inside the same window and spends the budget for
+        // nothing.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let batch = claim_all(&store, 10).await;
+        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+
+        let retry_at = now() + chrono::Duration::seconds(30);
+        store
+            .fail_batch(&sequences, "rate limited", 3, Some(retry_at))
+            .await
+            .expect("fail");
+
+        let windows = store.pending_windows().await.expect("windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].not_before, Some(retry_at));
+    }
+
+    #[tokio::test]
+    async fn one_deferred_row_defers_its_whole_conversation() {
+        // `max()` rather than `min()`, and the reason is ordering: the drain loop claims by `seq`,
+        // so releasing the fresh message while its predecessor waits out a rate limit would hand
+        // the agent the second half of an exchange before the first.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let batch = claim_all(&store, 10).await;
+        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+        let retry_at = now() + chrono::Duration::seconds(30);
+        store
+            .fail_batch(&sequences, "rate limited", 3, Some(retry_at))
+            .await
+            .expect("fail");
+
+        store
+            .enqueue("telegram:123", "m2", "b", now(), 10)
+            .await
+            .expect("enqueue");
+
+        let windows = store.pending_windows().await.expect("windows");
+        assert_eq!(
+            windows[0].not_before,
+            Some(retry_at),
+            "a fresh message must not release its deferred predecessor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_message_is_owed_to_the_agent_again() {
+        // A message is marked seen the moment it is queued, on the assumption that the agent is
+        // about to be handed it. Running out of attempts is exactly when that assumption fails, and
+        // without this the message is neither delivered nor owed: absent from `unseen`, from the
+        // missed-context lookback, and from the `mekabridge unseen` predicate.
+        let store = store_with_conversation().await;
+        let mut record = message("telegram:123", "m1", "are you there?");
+        record.seen = true;
+        store.record_message(record).await.expect("record");
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:123"))
+                .await
+                .expect("summary")
+                .count,
+            0
+        );
+
+        assert!(
+            store
+                .mark_unseen("telegram:123", "m1")
+                .await
+                .expect("unsee")
+        );
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:123"))
+                .await
+                .expect("summary")
+                .count,
+            1,
+            "an undeliverable message must come back as something the agent has not seen"
+        );
+
+        assert!(
+            !store
+                .mark_unseen("telegram:123", "nothing-here")
+                .await
+                .expect("unsee"),
+            "a message that was never recorded cannot be un-seen"
+        );
     }
 
     #[tokio::test]
@@ -2662,7 +2811,10 @@ mod tests {
             .expect("enqueue");
         let batch = claim_all(&store, 10).await;
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
-        let outcome = store.fail_batch(&sequences, "boom", 0).await.expect("fail");
+        let outcome = store
+            .fail_batch(&sequences, "boom", 0, None)
+            .await
+            .expect("fail");
         assert_eq!(outcome.exhausted.len(), 1);
         assert!(outcome.retrying.is_empty());
     }
@@ -2949,6 +3101,15 @@ mod tests {
                 connection.execute("INSERT INTO meta (key, value) VALUES ('session_id', ?1)", [
                     Uuid::nil().to_string(),
                 ])?;
+                // A message that was already waiting when the daemon was stopped to upgrade it.
+                // Written without the columns later migrations add, so it is the row most likely to
+                // trip one of them up.
+                connection.execute(
+                    "INSERT INTO inbound_queue
+                         (conversation_id, external_id, payload, received_at, state)
+                     VALUES ('telegram:123', 'pending-across-the-upgrade', 'a', ?1, 'pending')",
+                    [to_rfc3339(now())],
+                )?;
                 Ok::<(), tokio_rusqlite::Error>(())
             })
             .await
@@ -2960,6 +3121,18 @@ mod tests {
             store.session_id().await.expect("read"),
             Some(Uuid::nil()),
             "an upgrade must carry existing state forward"
+        );
+
+        // The row predates `not_before` entirely, so its column is NULL. Reading and claiming it
+        // has to treat that as "no deferral" rather than failing to parse or holding it forever.
+        let windows = store.pending_windows().await.expect("windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].not_before, None);
+        let claimed = claim_all(&store, 10).await;
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a message queued before the upgrade must still be deliverable after it"
         );
         store
             .set_policy("telegram:1", Policy::Mute, None, None, now())

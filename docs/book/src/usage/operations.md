@@ -77,7 +77,10 @@ Delivered rows are kept for seven days rather than deleted immediately, because 
 |------|---------|
 | `submitting a turn messages=N` | A batch went to the agent |
 | `the agent sent no messages this turn` | The agent read the batch and sent nothing. Legal, but logged at warn with the text it produced instead, because from the other end it is indistinguishable from a broken bridge |
-| `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the batch is retried |
+| `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the batch is retried at once |
+| `requeued messages after a failed turn` | The batch goes back for another attempt. `retry_in` says how long it waits first, and is absent only for the empty-response case, which is offered again at once |
+| `the turn failed after the agent had already acted` | Not retried, and the batch is marked delivered. meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
+| `giving up on messages after N attempt(s)` | The batch is `failed`. The chat is told something went wrong, the owner is told what, and the message goes back to being unseen |
 | `inbound queue is full` | Messages are being shed; the agent is told how many in the next envelope |
 | `recovered messages that were in flight` | The previous run died mid-turn |
 | `meka no longer knows session ...` | The session was deleted in meka; a replacement is created and the agent's memory is gone |
@@ -121,10 +124,26 @@ That last part is what `read_history` and `search_history` read, and it makes th
 
 **One message went unanswered while others worked.** Look for `the model returned an empty response`
 or `the agent sent no messages this turn` around that timestamp. The first means the provider
-returned nothing at all; the bridge retries once and reports a failure if it happens again. The
-second carries the text the agent produced instead, which is usually enough to tell "it decided not
-to reply" from "it wrote an answer and never sent it". Neither is a delivery fault: the queue will
-show the batch as `done`.
+returned nothing at all; the bridge hands the batch straight back and reports a failure if it keeps
+happening. The second carries the text the agent produced instead, which is usually enough to tell
+"it decided not to reply" from "it wrote an answer and never sent it". Neither is a delivery fault:
+the queue will show the batch as `done`.
+
+**A chat was told the bridge had a problem.** Three things produce that notice, and the owner's
+copy says which:
+
+- The retry budget ran out: `[bridge].turn_retries` attempts spaced 10s, 20s and 40s apart, so about
+  a minute. A rate limit or an overloaded provider is the usual cause, and meka's own three retries
+  happen inside the first attempt, so the upstream has been unavailable for a while by then.
+- The error was one no retry could fix, such as a rejected token. Given up on immediately, so this
+  one arrives seconds after the message rather than a minute.
+- The turn failed *after* the agent had already sent or run something. Not retried, and the chat is
+  told it may not have finished rather than that its message never arrived.
+
+`owner_conversation` has the error verbatim. `mekabridge queue list` shows the rows as `failed`, and
+`mekabridge unseen` counts what the agent still has not been shown, unless
+`[storage].history_retention` is zero, in which case there is no history to put the message back
+into and it is gone.
 
 **The agent reads messages but never replies.** Check `mekabridge doctor`. The usual cause is
 `[session].permission` being `ask` or `none`, at which meka denies the send. (`read` is fine: the

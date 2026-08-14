@@ -9,7 +9,7 @@
 //!
 //! The limit is 2000 characters against Telegram's 4096, so replies split about twice as often.
 
-use crate::render::{Block, Span, into_messages};
+use crate::render::{Block, Span, block_separator, into_messages};
 
 /// Discord's per-message character limit.
 pub const MESSAGE_LIMIT: usize = 2000;
@@ -27,13 +27,11 @@ pub fn to_markdown(markdown: &str, limit: usize) -> Vec<String> {
 fn render_group(blocks: &[Block]) -> String {
     let mut out = String::new();
     for (index, block) in blocks.iter().enumerate() {
-        if index > 0 {
-            let previous_tight = blocks.get(index - 1).is_some_and(Block::is_tight);
-            out.push_str(if previous_tight || block.is_tight() {
-                "\n"
-            } else {
-                "\n\n"
-            });
+        if let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|previous| blocks.get(previous))
+        {
+            out.push_str(block_separator(previous, block));
         }
         match block {
             Block::Text { spans, quoted, .. } => {
@@ -324,6 +322,48 @@ mod tests {
         let rendered = render("| a | b |\n|---|---|\n| 1 | 2 |");
         assert!(rendered.starts_with("```\n"), "got {rendered:?}");
         assert!(rendered.contains("a | b"), "got {rendered:?}");
+    }
+
+    #[test]
+    fn a_list_keeps_its_paragraphs_apart() {
+        // A list packs tightly against itself, not against whatever sits either side of it. Testing
+        // one side rather than both ran the intro and the conclusion into the bullets, and a reply
+        // built from all three arrived as a single wall of text.
+        assert_eq!(
+            render("Intro.\n\n- one\n- two\n\nOutro."),
+            "Intro.\n\n\u{2022} one\n\u{2022} two\n\nOutro."
+        );
+        assert_eq!(render("Before.\n\n- one"), "Before.\n\n\u{2022} one");
+        assert_eq!(render("- one\n\nAfter."), "\u{2022} one\n\nAfter.");
+    }
+
+    #[test]
+    fn ordinary_paragraphs_keep_their_blank_line() {
+        assert_eq!(render("A.\n\nB.\n\nC."), "A.\n\nB.\n\nC.");
+        // Any run of blank lines is one paragraph break in Markdown, so this is not a bug to fix.
+        assert_eq!(render("A.\n\n\n\nB."), "A.\n\nB.");
+        // A single newline is a soft break inside one paragraph, which is what it looks like.
+        assert_eq!(render("A.\nB."), "A.\nB.");
+    }
+
+    #[test]
+    fn a_loose_list_keeps_the_spacing_it_was_written_with() {
+        // CommonMark reports looseness only by wrapping each item in a paragraph, and the parser
+        // used to discard that, so a list written with blank lines between its items arrived packed
+        // as tight as one written without.
+        assert_eq!(render("- one\n- two"), "\u{2022} one\n\u{2022} two");
+        assert_eq!(render("- one\n\n- two"), "\u{2022} one\n\n\u{2022} two");
+        assert_eq!(render("1. one\n\n2. two"), "1. one\n\n2. two");
+    }
+
+    #[test]
+    fn a_second_paragraph_in_an_item_is_not_mistaken_for_the_next_item() {
+        // The worse half of the same bug: a continuation paragraph was joined to its bullet by a
+        // single newline, so it read as a malformed item rather than as more of the one above it.
+        assert_eq!(
+            render("- first para\n\n  second para\n- next item"),
+            "\u{2022} first para\n\nsecond para\n\n\u{2022} next item"
+        );
     }
 
     #[test]

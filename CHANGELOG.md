@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
+- A list written with blank lines between its items was packed as tight as one without.
+- A second paragraph inside a list item was joined to its bullet, reading as a broken item.
+
 ## [0.6.0] - 2026-08-12
 
 ### Changed

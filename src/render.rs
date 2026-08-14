@@ -201,9 +201,18 @@ struct ParseState {
     /// Level of the heading currently being collected, if any.
     heading: Option<u8>,
     /// One entry per open list; `Some(n)` carries the next number for an ordered list.
-    lists: Vec<Option<u64>>,
+    lists: Vec<ListState>,
     code_block: Option<(Option<String>, String)>,
     table: Option<TableState>,
+}
+
+/// One open list, innermost last.
+struct ListState {
+    /// Next number for an ordered list, or `None` for a bulleted one.
+    next_number: Option<u64>,
+    /// Whether the list was written with blank lines between its items, which CommonMark reports
+    /// only by wrapping each item's content in a paragraph.
+    loose: bool,
 }
 
 #[derive(Default)]
@@ -251,7 +260,14 @@ impl ParseState {
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => {}
+            // A list whose items wrap their content in paragraphs is a loose one, which is the
+            // only signal CommonMark gives and the only one pulldown-cmark passes on. Noted on the
+            // innermost list so its items are spaced the way they were written.
+            Tag::Paragraph => {
+                if let Some(list) = self.lists.last_mut() {
+                    list.loose = true;
+                }
+            }
             Tag::Heading { level, .. } => {
                 self.flush(false);
                 self.heading = Some(level as u8);
@@ -273,19 +289,26 @@ impl ParseState {
             }
             Tag::List(start) => {
                 self.flush(false);
-                self.lists.push(start);
+                self.lists.push(ListState {
+                    next_number: start,
+                    loose: false,
+                });
             }
             Tag::Item => {
                 self.flush(false);
                 let depth = self.lists.len().saturating_sub(1);
                 let indent = "  ".repeat(depth);
-                let marker = match self.lists.last_mut() {
-                    Some(Some(number)) => {
+                let marker = match self
+                    .lists
+                    .last_mut()
+                    .and_then(|list| list.next_number.as_mut())
+                {
+                    Some(number) => {
                         let current = *number;
                         *number = number.saturating_add(1);
                         format!("{current}. ")
                     }
-                    _ => "\u{2022} ".to_string(),
+                    None => "\u{2022} ".to_string(),
                 };
                 self.spans.push(Span::plain(format!("{indent}{marker}")));
             }
@@ -434,7 +457,11 @@ impl ParseState {
             None => Block::Text {
                 spans,
                 quoted: self.quote_depth > 0,
-                tight: tight || !self.lists.is_empty(),
+                // Only a tight list packs its items together. A loose one was written with blank
+                // lines between its items, and flattening that also merged the paragraphs of a
+                // multi-paragraph item into its bullet, where a continuation was indistinguishable
+                // from the next item.
+                tight: tight || self.lists.last().is_some_and(|list| !list.loose),
             },
         };
         if !block.is_empty() {
@@ -492,6 +519,23 @@ impl ParseState {
     }
 }
 
+/// What separates two adjacent blocks: a newline, or a blank line.
+///
+/// Only list items pack tightly, and only against each other. Testing either side rather than both
+/// let a list's tightness leak onto its neighbours, so a paragraph before or after a list was run
+/// into it and a reply built from an intro, a list and a conclusion arrived as one wall of text.
+///
+/// Shared because the emitters and [`group_blocks`] have to agree: the packer budgets for this
+/// separator's length, and if it assumed one character where an emitter wrote two, a message could
+/// be packed a character over the platform's limit and refused.
+pub(crate) fn block_separator(previous: &Block, next: &Block) -> &'static str {
+    if previous.is_tight() && next.is_tight() {
+        "\n"
+    } else {
+        "\n\n"
+    }
+}
+
 /// Pack blocks into groups that each fit within `limit` visible characters.
 fn group_blocks(blocks: Vec<Block>, limit: usize) -> Vec<Vec<Block>> {
     let mut groups: Vec<Vec<Block>> = Vec::new();
@@ -501,13 +545,9 @@ fn group_blocks(blocks: Vec<Block>, limit: usize) -> Vec<Vec<Block>> {
     for block in blocks {
         for piece in split_block(block, limit) {
             let piece_length = piece.visible_length();
-            let separator = if current.is_empty() {
-                0
-            } else if current.last().is_some_and(Block::is_tight) || piece.is_tight() {
-                1
-            } else {
-                2
-            };
+            let separator = current
+                .last()
+                .map_or(0, |last| block_separator(last, &piece).len());
             if !current.is_empty() && current_length + separator + piece_length > limit {
                 groups.push(std::mem::take(&mut current));
                 current_length = 0;

@@ -481,6 +481,10 @@ impl Channel for TelegramChannel {
             admin: self.admin_tools,
             // No presence of any kind in the Bot API, so this is not a switch an operator can flip.
             presence: false,
+            // Nor any typing status. The Bot API lets a bot send a chat action and never receive
+            // one: there is no update kind for it, so this is a platform limit rather than a
+            // setting. A Telegram chat is therefore never held waiting for somebody to finish.
+            typing_status: false,
             // Telegram grants privileges to a person directly, and has no roles to hand out.
             member_rights: self.admin_tools,
             member_roles: false,

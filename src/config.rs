@@ -28,6 +28,13 @@ use crate::{
 /// Directory name used under the platform config and data directories.
 const APP_DIR: &str = "mekabridge";
 
+/// Shortest a conversation is ever held before its messages are claimed.
+///
+/// A second is generous for the thing it exists for: the parts of a split post land milliseconds
+/// apart, so this is sized against network delay and reconnects rather than against how fast
+/// anybody types.
+const DEFAULT_COALESCE_FLOOR: Duration = Duration::from_secs(1);
+
 /// Ceiling on `[bridge].mute_context`. The lookback is charged to every turn a muted conversation
 /// wakes, so a generous setting quietly turns "only wake me for mentions" back into "send me the
 /// whole chat".
@@ -76,16 +83,28 @@ pub struct BridgeConfig {
     pub owner_conversation: Option<String>,
     pub max_queue_depth: usize,
     pub batch_max_messages: usize,
-    /// Quiet period a conversation must go through before its messages are handed to the agent.
+    /// Quiet period a conversation goes through before its messages are handed to the agent, on
+    /// platforms that report when somebody is typing.
     ///
-    /// Without one, the first fragment of a burst starts a turn on its own and the agent answers
-    /// before it has read the rest of the thought.
+    /// Ignored everywhere else, and that is the point. Without the signal any wait is a guess, and
+    /// a guess long enough to catch somebody typing a second sentence is far too long to impose on
+    /// somebody who only ever meant to send one. Where the signal exists the conversation is held
+    /// while they are still going and for this long after they stop.
     pub settle: Duration,
+    /// Shortest a conversation is held before its messages are claimed.
+    ///
+    /// Deliberately absent from the file format. It exists for the wire rather than for people:
+    /// platforms split one thing into several messages, Telegram's multi-photo albums above all,
+    /// and without a floor a post arrives as one photo followed by a separate turn carrying the
+    /// rest. An operator tuning it would be tuning Telegram's wire format rather than a
+    /// preference, so it lives here, where the test harness can shrink it and a config file
+    /// cannot reach it.
+    pub coalesce_floor: Duration,
     /// Ceiling on how long [`BridgeConfig::settle`] may defer a message.
     ///
-    /// Matters more than it looks: in a chat busy enough that messages keep arriving inside the
-    /// settle window, the timer never expires and this becomes the normal release path rather than
-    /// a rare fallback.
+    /// What stops a conversation being held indefinitely by somebody who never finishes: the
+    /// typing signal is a heartbeat, so a client that keeps sending it, or a compose box left
+    /// open, would otherwise hold a chat open for as long as it liked.
     pub settle_max: Duration,
     /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
     pub turn_retries: u32,
@@ -935,6 +954,7 @@ impl FileConfig {
                 owner_conversation: self.bridge.owner_conversation,
                 max_queue_depth: self.bridge.max_queue_depth,
                 batch_max_messages: self.bridge.batch_max_messages,
+                coalesce_floor: DEFAULT_COALESCE_FLOOR,
                 settle: self.bridge.settle,
                 settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
@@ -1094,16 +1114,18 @@ const fn default_max_queue_depth() -> usize {
     256
 }
 
-/// Long enough to catch the fragments of one thought typed in quick succession, short enough that a
-/// reply still feels prompt.
+/// Long enough for the gap between sentences, which is what it is now for. It only applies where
+/// the platform reports typing, so the wait ends when the person stops rather than when this
+/// expires, and erring long costs nothing on the common path.
 const fn default_settle() -> Duration {
-    Duration::from_secs(2)
+    Duration::from_secs(3)
 }
 
-/// Deliberately modest. A busy chat releases on this ceiling every time rather than on the quiet
-/// period, so it is felt as constant added latency rather than an occasional delay.
+/// Long enough for a considered paragraph, short enough that a compose box somebody opened and
+/// walked away from does not strand a message for a minute. Only reached where the platform reports
+/// typing, since nowhere else is a conversation held long enough to hit it.
 const fn default_settle_max() -> Duration {
-    Duration::from_secs(6)
+    Duration::from_secs(30)
 }
 
 const fn default_batch_max_messages() -> usize {
@@ -1480,23 +1502,29 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn settle_defaults_are_modest() {
+    fn the_settle_defaults_are_sized_for_somebody_composing() {
+        // Both only apply where the platform reports typing, so neither is latency anybody pays on
+        // a message they finished writing before sending. That is what lets them be this generous.
         let config = parse(MINIMAL).expect("valid");
-        assert_eq!(config.bridge.settle, Duration::from_secs(2));
+        assert_eq!(config.bridge.settle, Duration::from_secs(3));
+        assert_eq!(config.bridge.settle_max, Duration::from_secs(30));
         assert_eq!(
-            config.bridge.settle_max,
-            Duration::from_secs(6),
-            "a busy chat releases on this every time, so it is felt as constant latency"
+            config.bridge.coalesce_floor,
+            Duration::from_secs(1),
+            "the floor is the whole of the wait where typing cannot be seen, so it stays small"
         );
     }
 
     #[test]
-    fn debouncing_can_be_turned_off_entirely() {
-        // The escape hatch for anyone who would rather have the latency back: zero means hand every
-        // message over the moment it lands, as the bridge did before settling existed.
+    fn waiting_for_somebody_to_finish_can_be_turned_off() {
+        // For an operator who would rather be answered mid-sentence than wait. Zero removes the
+        // whole typing-gated wait, including the hold while somebody is still composing, and
+        // nothing else: the floor is not reachable from the file format, because it exists for the
+        // wire rather than as a preference.
         let raw = format!("{MINIMAL}\n[bridge]\nsettle = \"0s\"\n");
         let config = parse(&raw).expect("zero is a valid setting, not a rejected one");
         assert!(config.bridge.settle.is_zero());
+        assert!(!config.bridge.coalesce_floor.is_zero());
     }
 
     #[test]

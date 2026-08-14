@@ -13,7 +13,7 @@ mekabridge treats the agent as a person with a phone.
 
 One instance owns exactly one meka session, permanently. That session is the agent's memory: everyone it has talked to, on every platform, in one continuous context.
 
-> This is a personal assistant bridge, not a multi-tenant chatbot host. Everyone on the allowlist shares one agent context. The allowlist is mandatory and starts empty.
+> The session is not per person. Everyone who can reach the bot shares one agent context and one memory, so anything said in one conversation can inform an answer in another. The allowlist starts empty for that reason: what the agent knows is worth as much as what it can do.
 
 ## Installation
 
@@ -66,14 +66,20 @@ meka retries a failed MCP connect in the background, so the wrong order recovers
 
 ## Tools the agent gets
 
-| Tool | Purpose |
-|------|---------|
-| `send_message` | Send Markdown to a conversation. Long text is split automatically |
-| `send_file` | Send a local file, optionally shown inline as a photo |
-| `list_conversations` | The address book, so the agent can find an id it no longer has in context |
-| `get_conversation` | Details for one conversation |
+| Group | Tools |
+|-------|-------|
+| Sending | `send_message`, `send_file`, `react`, `edit_message`, `delete_message` |
+| Attachments | `view_attachment`, `download_attachment` |
+| Address book | `list_conversations`, `get_conversation` |
+| Attention | `mute`, `unmute`, `block`, `unblock`, `unseen` |
+| History | `read_history`, `search_history` |
+| Moderation | `moderate_member`, `set_member_rights`, `set_member_roles`, `pin_message`, `set_chat`, `member`, `list_members` |
+
+Every one is annotated read-only, so the whole surface works at meka's `read` permission level. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
 
 Routing is explicit because it has to be: meka's MCP client sends no session identity with a tool call, so an MCP server cannot infer which conversation a call belongs to. Every send names its target, which is also what makes messaging somebody else, or messaging first, the same operation as replying.
+
+The agent is not woken for everything. Groups and server channels default to mentions only; the rest is recorded and reachable through the history tools. See [Group attention](./docs/book/src/usage/group-attention.md).
 
 ## Operator commands
 
@@ -82,6 +88,10 @@ mekabridge doctor                   # check everything, non-zero on real problem
 mekabridge status                   # session, queue depth, conversations
 mekabridge queue list               # what is waiting
 mekabridge conversations list       # who the agent can message
+mekabridge policy list              # what reaches the agent, and from where
+mekabridge policy clear <id>        # undo a decision the agent made about a chat
+mekabridge history <id>             # what was said, including what the agent never saw
+mekabridge unseen [<id>]            # what is waiting unread, as an exit code a job can gate on
 mekabridge session show
 mekabridge cancel                   # stop the running turn
 ```

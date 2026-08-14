@@ -173,11 +173,15 @@ pub async fn run(config: Config) -> Result<()> {
     // The writer ends when every channel has dropped its sender, so this handle must not linger.
     drop(event_sender);
 
+    // Written by the writer and read by the drain loop, which is why it is shared rather than owned
+    // by either.
+    let typing = Arc::new(inbound::TypingState::default());
     tasks.spawn({
         let store = store.clone();
         let config = Arc::clone(&config);
         let wake_drain = Arc::clone(&wake_drain);
-        async move { inbound::writer(store, config, event_receiver, wake_drain).await }
+        let typing = Arc::clone(&typing);
+        async move { inbound::writer(store, config, event_receiver, wake_drain, typing).await }
     });
 
     tasks.spawn({
@@ -186,6 +190,7 @@ pub async fn run(config: Config) -> Result<()> {
             config: Arc::clone(&config),
             meka: meka.clone(),
             channels: Arc::clone(&channels),
+            typing,
             runner: TurnRunner::new(
                 meka.clone(),
                 Arc::clone(&channels),

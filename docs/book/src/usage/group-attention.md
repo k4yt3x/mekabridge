@@ -151,6 +151,36 @@ Two settings make the predicate permanently `1`, and neither is an error: `[stor
 = "0s"` records nothing at all, and a conversation set to `block` keeps nothing. Check those before
 concluding a room is quiet.
 
+## Waiting for somebody to finish
+
+A person typing a thought across three messages should get one turn, not three, and the agent should
+not answer "hey" before the question arrives. The only honest way to know they are still going is to
+be told, and exactly one of the two platforms will tell you.
+
+**Discord does.** The bridge asks for the two typing intents, which are unprivileged, and holds a
+conversation while somebody is composing in it, plus `settle` after they stop, capped by
+`settle_max`.
+
+**Telegram cannot.** The Bot API lets a bot *send* a chat action and never receive one; there is no
+update for it. So nothing on Telegram is held waiting for anybody, and a message starts a turn as
+soon as it arrives.
+
+That asymmetry is deliberate rather than an omission. Without the signal any wait is a guess, and
+there is no number that works for both cases: a few seconds is nowhere near long enough to type a
+second sentence, and long enough for that is a long time to make somebody wait who only ever meant
+to send one message. So the wait exists only where it can end when the person actually stops.
+
+The consequence on Telegram is worth stating plainly: two messages a few seconds apart produce two
+turns, and the agent may answer the first before reading the second. If the second lands while the agent is still working on the first, it arrives
+flagged `late:`, so the agent knows its reply was written without it and can correct itself with
+`edit_message`.
+
+Every conversation is held for one second regardless, on every platform, unless its oldest waiting
+message is already older than `settle_max`, which only happens after downtime or under a badly
+skewed clock. That second is not about typing and is not configurable: platforms split one thing into several messages, Telegram sends a
+multi-photo album as one update per photo, and without a floor a post would arrive as a photo
+followed by a separate turn carrying the rest. Those parts land milliseconds apart.
+
 ## Operator controls
 
 None of the above takes the operator out of the loop. A decision the agent made can be undone from

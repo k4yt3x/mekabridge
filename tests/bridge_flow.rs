@@ -298,6 +298,10 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
 /// A channel that records what it was asked to send and never talks to a network.
 struct MockChannel {
     id: ChannelId,
+    /// Whether this stands in for a platform that reports somebody else typing. Off by default,
+    /// matching Telegram, which is the shape most of these tests want. Flipped after construction
+    /// rather than passed in, so the harness constructors do not grow an eighth argument for it.
+    typing_status: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<(String, String)>>,
     reactions: Mutex<Vec<(String, String, Option<String>)>>,
     activities: Mutex<Vec<Activity>>,
@@ -314,9 +318,16 @@ impl MockChannel {
             .len()
     }
 
+    /// Stand in for a platform that does report typing, the way Discord does.
+    fn report_typing(&self) {
+        self.typing_status
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn new(id: &str) -> Self {
         Self {
             id: ChannelId::new(id),
+            typing_status: std::sync::atomic::AtomicBool::new(false),
             sent: Mutex::new(Vec::new()),
             reactions: Mutex::new(Vec::new()),
             activities: Mutex::new(Vec::new()),
@@ -361,6 +372,7 @@ impl Channel for MockChannel {
             edit: true,
             admin: true,
             presence: false,
+            typing_status: self.typing_status.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -543,7 +555,7 @@ batch_max_messages = 32
 max_queue_depth = 64
 turn_retries = {retries}
 typing_indicator = {typing}
-# Scaled down from the shipped 2s/6s so the suite exercises the same logic without sleeping through
+# Scaled down from the shipped 3s/30s so the suite exercises the same logic without sleeping through
 # a real settle window on every test.
 settle = "150ms"
 settle_max = "600ms"
@@ -558,7 +570,19 @@ allowed_users = [1]
 "#,
         database.display()
     );
-    Config::from_toml(&raw, std::path::Path::new("/tmp/config.toml")).expect("valid config")
+    let mut config =
+        Config::from_toml(&raw, std::path::Path::new("/tmp/config.toml")).expect("valid config");
+    // Not reachable from the file format on purpose, so it is scaled down here instead. At the
+    // shipped second the suite would sleep through a real floor on every test that waits for a
+    // turn, which is most of them.
+    //
+    // Not scaled down as far as the settle window, though. The floor is measured from the
+    // platform's send time, so it only coalesces a burst if the writer persists every part of it
+    // within the floor. At 20ms a loaded machine could claim the first message before the rest
+    // were written, which made the album and batching tests fail under load rather than reporting
+    // a real defect.
+    config.bridge.coalesce_floor = Duration::from_millis(100);
+    config
 }
 
 fn message(text: &str, external_id: &str) -> InboundEvent {
@@ -714,15 +738,18 @@ impl Harness {
         let shutdown = CancellationToken::new();
         let wake = Arc::new(Notify::new());
         let (sender, receiver) = mpsc::channel(16);
+        let typing = Arc::new(inbound::TypingState::default());
 
         tokio::spawn({
             let store = store.clone();
             let config = Arc::clone(&config);
             let wake = Arc::clone(&wake);
-            async move { inbound::writer(store, config, receiver, wake).await }
+            let typing = Arc::clone(&typing);
+            async move { inbound::writer(store, config, receiver, wake, typing).await }
         });
         tokio::spawn({
             let context = DrainContext {
+                typing,
                 store: store.clone(),
                 config: Arc::clone(&config),
                 meka: meka.clone(),
@@ -991,12 +1018,255 @@ async fn messages_that_arrive_together_are_batched_into_one_turn() {
     );
 }
 
+/// Alice has started composing in `mock:1`, as the connector reports it. The id matches the sender
+/// of `message`, since a conversation is only held for whoever's message is already waiting.
+fn typing() -> InboundEvent {
+    InboundEvent::Typing {
+        conversation: ConversationId::parse("mock:1").expect("valid"),
+        author: "1".to_string(),
+        timestamp: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn a_chat_somebody_is_still_typing_in_waits_for_them() {
+    // The point of the whole capability. The quiet period is 150ms here and the message would
+    // otherwise be claimed the moment it expires; a typing notice has to hold it open past that,
+    // which is what makes a second sentence land in the same turn as the first.
+    let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
+    harness
+        .sender
+        .send(message("hey", "1"))
+        .await
+        .expect("queued");
+    harness.sender.send(typing()).await.expect("queued");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        harness.turns().is_empty(),
+        "somebody is still typing, so nothing should have been claimed: {:?}",
+        harness.turns()
+    );
+
+    harness
+        .sender
+        .send(message("can you check the deploy logs", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+    let turns = harness.turns();
+    assert!(
+        turns[0].contains("hey") && turns[0].contains("deploy logs"),
+        "both messages belong in one turn:\n{}",
+        turns[0]
+    );
+}
+
+#[tokio::test]
+async fn sending_the_message_ends_the_wait_for_it() {
+    // Neither platform reports that somebody stopped typing: the client just hides the indicator
+    // when the message lands. So the message itself has to end the hold. Without that every
+    // Discord message would be held until its author's last notice aged out, which is the whole
+    // of the wait rather than a bound on it, and the feature would make the bridge slower than
+    // having no debounce at all.
+    let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
+    harness.sender.send(typing()).await.expect("queued");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sent = tokio::time::Instant::now();
+    harness
+        .sender
+        .send(message("one finished thought", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+    // settle_max is 600ms here, so anything at or past that is the ceiling rescuing a stuck hold
+    // rather than the rule working.
+    assert!(
+        sent.elapsed() < Duration::from_millis(500),
+        "a finished message must not wait out the typing it produced, waited {:?}",
+        sent.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_chat_held_for_typing_does_not_hold_up_another() {
+    // A typing hold makes the drain loop's own wait long, and a wait nothing can interrupt is a
+    // wait every other conversation shares. That is the fault splitting readiness per conversation
+    // was meant to end, and a long hold is exactly where it would come back.
+    let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
+    harness
+        .sender
+        .send(message("hold this one", "held-1"))
+        .await
+        .expect("queued");
+    harness.sender.send(typing()).await.expect("queued");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let sent = tokio::time::Instant::now();
+    let mut elsewhere = message("are you there?", "other-1");
+    if let InboundEvent::Message(inner) = &mut elsewhere {
+        inner.conversation = ConversationId::parse("mock:-100").expect("valid");
+    }
+    harness.sender.send(elsewhere).await.expect("queued");
+    harness
+        .wait_for("the other chat's turn", |harness| {
+            harness
+                .turns()
+                .iter()
+                .any(|turn| turn.contains("are you there?"))
+        })
+        .await;
+    // Tight on purpose. With the wake branch this is the 100ms floor plus scheduling; without it
+    // the loop sleeps however long the held chat asked for, which the harness ceiling caps at
+    // roughly 450ms here and which in production is the full typing TTL.
+    assert!(
+        sent.elapsed() < Duration::from_millis(250),
+        "an unrelated chat must not wait behind a typing hold, waited {:?}",
+        sent.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn typing_does_not_hold_a_chat_past_the_ceiling() {
+    // Somebody who opens a compose box and walks away, or a client that stops sending the notice
+    // without sending anything. Without the ceiling a conversation could be held indefinitely by a
+    // signal that is only ever a heartbeat.
+    let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
+    harness
+        .sender
+        .send(message("hey", "1"))
+        .await
+        .expect("queued");
+    for _ in 0..8 {
+        harness.sender.send(typing()).await.expect("queued");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // settle_max is 600ms in the harness, so the ceiling is well past by now.
+    let turns = harness.turns();
+    assert!(
+        !turns.is_empty(),
+        "the ceiling has to win over a notice nobody stops sending"
+    );
+}
+
+#[tokio::test]
+async fn a_platform_that_cannot_report_typing_does_not_hold_a_message() {
+    // The whole point of gating the quiet period on the capability. Telegram has no typing update
+    // of any kind, so any wait there is a guess, and a guess long enough to catch somebody typing a
+    // second sentence is far too long to impose on somebody who only ever meant to send one. The
+    // harness settle is 150ms; the floor is 20ms.
+    let harness = Harness::start(1, 0).await;
+    let sent = tokio::time::Instant::now();
+    harness
+        .sender
+        .send(message("one complete question", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+    assert!(
+        sent.elapsed() < Duration::from_millis(150),
+        "a chat nobody can be seen typing in must not wait out the quiet period"
+    );
+}
+
+#[tokio::test]
+async fn the_parts_of_one_split_post_arrive_together() {
+    // The floor's reason for existing, and nothing to do with typing. Telegram sends a multi-photo
+    // album as one update per photo and the bridge has no album assembly of its own, so without a
+    // floor the agent gets a photo and then a separate turn carrying the rest. Milliseconds apart,
+    // which is why the floor is sized against the wire rather than against people.
+    let harness = Harness::start(1, 0).await;
+    for index in 0..3 {
+        let mut event = message("", &index.to_string());
+        if let InboundEvent::Message(inner) = &mut event {
+            inner.group_id = Some("album-1".to_string());
+        }
+        harness.sender.send(event).await.expect("queued");
+    }
+
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let turns = harness.turns();
+    assert_eq!(turns.len(), 1, "one post is one turn, got {turns:#?}");
+    assert_eq!(
+        turns[0].matches("album: album-1").count(),
+        3,
+        "every part of the post has to be in it:\n{}",
+        turns[0]
+    );
+}
+
+#[tokio::test]
+async fn one_chat_mid_burst_does_not_hold_up_another() {
+    // Readiness used to be one window over the whole queue, so any conversation still receiving
+    // deferred delivery for every other conversation. With a quiet period long enough to be useful
+    // that would mean a busy room stalling a direct message.
+    let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
+
+    let busy = tokio::spawn({
+        let sender = harness.sender.clone();
+        async move {
+            for index in 0..40 {
+                let mut event = message(&format!("chatter {index}"), &format!("busy-{index}"));
+                if let InboundEvent::Message(inner) = &mut event {
+                    inner.conversation = ConversationId::parse("mock:-100").expect("valid");
+                }
+                if sender.send(event).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+    });
+
+    // Long enough that the busy conversation is unmistakably mid-burst.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let sent = tokio::time::Instant::now();
+    harness
+        .sender
+        .send(message("are you there?", "quiet-1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the quiet chat's turn", |harness| {
+            harness
+                .turns()
+                .iter()
+                .any(|turn| turn.contains("are you there?"))
+        })
+        .await;
+    busy.abort();
+
+    assert!(
+        sent.elapsed() < Duration::from_millis(400),
+        "a quiet chat must not wait on a busy one, waited {:?}",
+        sent.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
-    // The case debouncing exists for: somebody types a thought across three messages. Without a
-    // quiet period the first one starts a turn on its own and the agent answers "hey" before it has
-    // read the question.
+    // The case the quiet period exists for: somebody types a thought across three messages, and
+    // without it the first starts a turn on its own and the agent answers "hey" before it has read
+    // the question. Only available where the platform reports typing, because only there does the
+    // wait end when the person stops rather than when a guessed timer does.
     let harness = Harness::start(1, 0).await;
+    harness.channel.report_typing();
     for (index, text) in [
         "hey",
         "can you check the deploy logs",
@@ -1010,7 +1280,8 @@ async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
             .send(message(text, &index.to_string()))
             .await
             .expect("queued");
-        // Comfortably inside the harness's 150ms settle, the way a person's messages are inside 2s.
+        // Comfortably inside the harness's 150ms settle, the way a person's messages are inside
+        // the shipped window.
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
 
@@ -1033,6 +1304,9 @@ async fn a_chat_that_never_goes_quiet_is_released_by_the_ceiling() {
     // A steady stream keeps resetting the quiet period, so without a ceiling the batch would be
     // deferred indefinitely and the agent would never hear anything at all.
     let harness = Harness::start(1, 0).await;
+    // The ceiling only binds where something is holding the conversation in the first place, which
+    // on a platform that cannot report typing is nothing at all.
+    harness.channel.report_typing();
     let sender = harness.sender.clone();
     let chatter = tokio::spawn(async move {
         for index in 0..40 {
@@ -1091,7 +1365,10 @@ async fn queued_messages_survive_a_restart() {
             .enqueue("mock:1", "1", &payload, Utc::now(), 64)
             .await
             .expect("enqueued");
-        store.claim_batch(10).await.expect("claimed");
+        store
+            .claim_batch(&["mock:1".to_string()], 10)
+            .await
+            .expect("claimed");
         assert_eq!(store.pending_count().await.expect("count"), 0);
     }
 
@@ -1116,6 +1393,7 @@ async fn queued_messages_survive_a_restart() {
             config: Arc::clone(&config),
             meka: meka.clone(),
             channels: Arc::clone(&channels),
+            typing: Arc::new(inbound::TypingState::default()),
             runner: TurnRunner::new(
                 meka,
                 channels,

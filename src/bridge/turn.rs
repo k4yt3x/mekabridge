@@ -391,6 +391,7 @@ mod tests {
                 member_rights: false,
                 member_roles: false,
                 typing_indicator: true,
+                typing_status: false,
                 files: true,
                 photos: true,
                 reactions: true,

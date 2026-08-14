@@ -68,13 +68,19 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 |-----|---------|---------|
 | `owner_conversation` | none | Conversation that receives operator notices, e.g. `telegram:123456789` |
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
-| `settle` | `2s` | Quiet period a chat must go through before its messages reach the agent. Without it the first message of a burst starts a turn on its own. `0s` disables debouncing entirely |
-| `settle_max` | `6s` | Ceiling on that wait. In a chat busy enough that messages keep landing inside the settle window, this is what releases every batch, so it is felt as constant latency |
+| `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
+| `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
 | `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and when the turn ends |
 | `typing_max` | `[meka].turn_timeout` | Ceiling on how long that state is held for one turn. A safety net: the indicator already stops on a reply and at the end of the turn |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
+
+`settle` and `settle_max` only apply where the platform tells the bridge that somebody is typing. Discord does. Telegram has no such update at all: the Bot API lets a bot *send* a chat action and never receive one, so there a message starts a turn as soon as it arrives.
+
+That split is deliberate. Without the signal any wait is a guess, and there is no number that works: two seconds is nowhere near long enough for somebody to type a second sentence, and a number long enough for that is a long time to make somebody wait who only ever meant to send one message. So the wait exists only where it can end when the person actually stops.
+
+Every conversation is also held for one second regardless, which is not configurable. It exists for the wire rather than for people: platforms split one thing into several messages, Telegram's multi-photo albums above all, and without it a post arrives as one photo followed by a separate turn carrying the rest. Those parts land milliseconds apart, so a second is generous. See [Group attention](../usage/group-attention.md).
 
 `typing_max` is worth raising rather than lowering. Neither Telegram nor Discord limits how long an indicator may be renewed, so holding one costs a single cheap call every few seconds. A ceiling shorter than a turn is the worst of both: it stops while the agent is still working, and a chat that has been quiet for minutes reads as a bot that has died rather than one that is busy.
 

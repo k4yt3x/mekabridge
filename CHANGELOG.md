@@ -17,9 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** a Telegram message now starts a turn as it arrives. The Bot API reports no typing.
+- `settle` applies only where the platform reports typing, and is now `3s`; `settle_max` is `30s`.
+- Discord holds a chat while the person whose message is waiting is still composing more.
+- Every chat is held 1s regardless, so the parts of a split post arrive as one turn. Not tunable.
 - `woke you:` is stated on every message from a group, including the ones nothing addressed.
 - A muted conversation's envelope block names the two things that do wake the agent there.
-- A lapsed policy's notice now wakes the agent, instead of being filed where nothing reads it.
 
 ### Removed
 
@@ -28,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A chat mid-burst delayed delivery for every other chat; readiness is now per conversation.
+- A lapsed policy's notice was filed where nothing would read it, so the agent was never told.
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
 - A list written with blank lines between its items was packed as tight as one without.
 - A second paragraph inside a list item was joined to its bullet, reading as a broken item.

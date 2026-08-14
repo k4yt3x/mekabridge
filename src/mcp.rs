@@ -3199,6 +3199,7 @@ mod tests {
     fn telegram_capabilities(admin_tools: bool) -> ChannelCapabilities {
         ChannelCapabilities {
             presence: false,
+            typing_status: false,
             typing_indicator: true,
             files: true,
             photos: true,
@@ -3214,6 +3215,7 @@ mod tests {
         ChannelCapabilities {
             member_rights: false,
             member_roles: admin_tools,
+            typing_status: true,
             ..telegram_capabilities(admin_tools)
         }
     }

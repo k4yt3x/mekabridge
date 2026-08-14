@@ -40,9 +40,113 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// minutes costs a handful of rejected requests rather than thousands.
 const DEFER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long after the last notice somebody still counts as typing.
+///
+/// Discord repeats its notice about every ten seconds while a person keeps going, so this is that
+/// heartbeat plus enough slack to survive one being late or dropped. Erring long costs a moment of
+/// extra wait; erring short would release mid-sentence, which is the thing being fixed.
+const TYPING_TTL: Duration = Duration::from_secs(12);
+
+/// Ceiling on how many conversations are remembered as having somebody mid-thought.
+///
+/// Far above the number that can have messages waiting at once, since the queue itself is capped.
+const LATEST_SENDER_MAX: usize = 4096;
+
 /// Length of the per-turn fence marker. Six hex characters is 24 bits, which is far more than
 /// enough against a user guessing it inside a single turn.
 const NONCE_BYTES: usize = 3;
+
+/// Who is currently composing, by conversation.
+///
+/// In memory only, and deliberately: it decides how long a conversation waits before its messages
+/// are claimed, and after a restart nothing is mid-sentence as far as this process knows, so the
+/// floor alone is the right answer. Written by the inbound writer and read by the drain loop, which
+/// already share state this way.
+#[derive(Debug, Default)]
+pub struct TypingState {
+    inner: std::sync::Mutex<Typing>,
+}
+
+/// The two halves of "is the person mid-thought still going".
+#[derive(Debug, Default)]
+struct Typing {
+    /// Last notice per conversation and author. Keyed as text rather than by [`ConversationId`],
+    /// which does not borrow as one, so a lookup costs a hash rather than a walk of the map.
+    seen: std::collections::HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    /// Who most recently had a message queued in each conversation.
+    ///
+    /// A conversation is held for that person alone. Holding it for anybody who happens to be
+    /// typing would mean a mention in a busy room waiting out the ceiling because the room is
+    /// busy, which is the opposite of what this is for.
+    latest: std::collections::HashMap<String, String>,
+}
+
+impl TypingState {
+    /// Record that somebody is composing, and forget anybody who has since stopped.
+    ///
+    /// Pruned on write rather than on a timer, so the map cannot outgrow the number of people
+    /// typing right now, and no task exists solely to clean it.
+    fn note(&self, conversation: &ConversationId, author: &str, at: chrono::DateTime<chrono::Utc>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.seen.retain(|_, last| *last > Self::cutoff());
+        // Clamped so a platform reporting a time ahead of this host's cannot leave an entry that
+        // never ages out and holds a conversation for good.
+        let at = at.min(chrono::Utc::now());
+        inner
+            .seen
+            .insert((conversation.as_str().to_string(), author.to_string()), at);
+    }
+
+    /// Note that a message from `author` has been queued, which is the only "they stopped" signal
+    /// either platform gives.
+    ///
+    /// Neither sends an event when somebody stops typing: the client simply hides the indicator
+    /// when the message lands. Without treating the message itself as the end of composing, every
+    /// message would be held until its author's last notice aged out, which is the whole of the
+    /// wait rather than a bound on it.
+    fn queued(&self, conversation: &ConversationId, author: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .seen
+            .remove(&(conversation.as_str().to_string(), author.to_string()));
+        // Bounded by dropping the lot, the same rule the store's policy cache uses. An entry is
+        // only needed between a message being queued and its conversation being claimed, and
+        // losing one means a chat is not held for typing, which releases sooner rather than later.
+        if inner.latest.len() >= LATEST_SENDER_MAX {
+            inner.latest.clear();
+        }
+        inner
+            .latest
+            .insert(conversation.as_str().to_string(), author.to_string());
+    }
+
+    /// Whether the person whose message is waiting has started composing again.
+    fn active(&self, conversation_id: &str) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            // A poisoned lock means a writer panicked holding it. Reporting "nobody is typing"
+            // releases the conversation, which is the direction that keeps messages moving.
+            return false;
+        };
+        let Some(author) = inner.latest.get(conversation_id) else {
+            return false;
+        };
+        inner
+            .seen
+            .get(&(conversation_id.to_string(), author.clone()))
+            .is_some_and(|last| *last > Self::cutoff())
+    }
+
+    /// The instant before which a notice is too old to mean anybody is still going.
+    fn cutoff() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::from_std(TYPING_TTL).unwrap_or_default()
+    }
+}
 
 /// Persist events from every channel into the queue.
 ///
@@ -52,34 +156,46 @@ pub async fn writer(
     config: Arc<Config>,
     mut events: mpsc::Receiver<InboundEvent>,
     wake_drain: Arc<Notify>,
+    typing: Arc<TypingState>,
 ) {
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
-        // A retraction never reaches the queue, the envelope, or the agent. It exists so the
-        // bridge's own record of a chat does not outlive the chat: without it, `read_history` would
-        // keep handing back a message its author deleted, and on a platform that reports deletions
-        // there is no excuse for that.
-        let InboundEvent::Message(message) = &mut event else {
-            let InboundEvent::Retraction { message_id, .. } = &event else {
+        // Only a message is ever queued. The other two are handled here and go no further, so this
+        // is one exhaustive match rather than a let-else with a fallback: a variant added later has
+        // to be given a decision rather than falling into a catch-all that silently drops it.
+        let message = match &mut event {
+            InboundEvent::Message(message) => message,
+            // A retraction exists so the bridge's own record of a chat does not outlive the chat.
+            // Without it `read_history` would keep handing back a message its author deleted, and
+            // on a platform that reports deletions there is no excuse for that.
+            InboundEvent::Retraction { message_id, .. } => {
+                match store
+                    .forget_message(conversation.as_str(), message_id)
+                    .await
+                {
+                    Ok(true) => tracing::debug!(
+                        conversation = %conversation,
+                        message_id = %message_id,
+                        "dropped a message its author deleted"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => tracing::error!(
+                        conversation = %conversation,
+                        "failed to drop a deleted message: {}",
+                        error
+                    ),
+                }
                 continue;
-            };
-            match store
-                .forget_message(conversation.as_str(), message_id)
-                .await
-            {
-                Ok(true) => tracing::debug!(
-                    conversation = %conversation,
-                    message_id = %message_id,
-                    "dropped a message its author deleted"
-                ),
-                Ok(false) => {}
-                Err(error) => tracing::error!(
-                    conversation = %conversation,
-                    "failed to drop a deleted message: {}",
-                    error
-                ),
             }
-            continue;
+            // Held in memory only. It decides how long a conversation waits before its messages are
+            // claimed, so it never needs to survive a restart: after one, nothing is mid-sentence
+            // as far as this process knows, and the floor alone is the right answer.
+            InboundEvent::Typing {
+                author, timestamp, ..
+            } => {
+                typing.note(&conversation, author, *timestamp);
+                continue;
+            }
         };
         let disposition = match gate(&store, &config, message).await {
             Ok(disposition) => disposition,
@@ -128,6 +244,10 @@ pub async fn writer(
             tracing::error!(conversation = %conversation, "failed to record a message: {}", error);
         }
 
+        // Taken while the message is still borrowed, since the queue path below serializes the
+        // whole event and cannot hold that borrow at the same time.
+        let sender_id = message.sender.id.clone();
+
         // A withheld message stops before the queue. It is recorded, so the agent can read it when
         // something finally does wake this conversation, but it consumes no queue depth and costs
         // no provider turn.
@@ -151,7 +271,14 @@ pub async fn writer(
                 .await;
 
             match outcome {
-                Ok(EnqueueOutcome::Queued) => wake_drain.notify_one(),
+                Ok(EnqueueOutcome::Queued) => {
+                    // Whoever sent this is no longer composing it. Neither platform says so: the
+                    // client just hides the indicator when the message lands. Without treating the
+                    // message as the end, it would be held until its author's last notice aged out,
+                    // which is the whole of the wait rather than a bound on it.
+                    typing.queued(&conversation, &sender_id);
+                    wake_drain.notify_one();
+                }
                 Ok(EnqueueOutcome::Duplicate) => {
                     tracing::debug!(
                         conversation = %conversation,
@@ -538,6 +665,8 @@ pub struct DrainContext {
     pub identities: Arc<tokio::sync::OnceCell<ChannelIdentities>>,
     /// Guards the one-per-process reconciliation of the session's permission level.
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
+    /// Who is composing right now, so a conversation can be held until they stop.
+    pub typing: Arc<TypingState>,
 }
 
 /// Claim batches and run turns until `shutdown` fires.
@@ -563,20 +692,32 @@ pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: Canc
             if shutdown.is_cancelled() {
                 return;
             }
-            // Let a burst finish before claiming any of it. Without this the first fragment of a
-            // thought starts a turn on its own and the agent answers before reading the rest.
-            if let Some(delay) = settle_delay(&context).await {
+            // Which conversations have settled, and when to look again for those that have not.
+            // Decided per conversation because the rule differs per conversation: a chat on a
+            // platform that reports typing waits for the person to stop, and one on a platform
+            // that cannot report it waits only for the wire.
+            let Readiness { ready, retry_in } = readiness(&context).await;
+            if ready.is_empty() {
+                let Some(delay) = retry_in else {
+                    break;
+                };
+                // Woken as well as timed. The delay is how long the *soonest* conversation needs,
+                // which under a typing hold can be the whole TTL, and without this branch a message
+                // arriving in any other conversation would sit unlooked-at for that long. That is
+                // the same one-chat-holds-another fault that splitting readiness per conversation
+                // was meant to end.
                 tokio::select! {
                     () = shutdown.cancelled() => return,
+                    () = wake.notified() => {}
                     () = tokio::time::sleep(delay) => {}
                 }
                 // Round again rather than claiming straight away: more may have arrived while
-                // waiting, which extends the quiet period afresh.
+                // waiting, which starts the quiet period afresh.
                 continue;
             }
             let batch = match context
                 .store
-                .claim_batch(context.config.bridge.batch_max_messages)
+                .claim_batch(&ready, context.config.bridge.batch_max_messages)
                 .await
             {
                 Ok(batch) => batch,
@@ -604,44 +745,115 @@ struct TurnWindow {
     ended_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// How long to hold off before claiming, or `None` to claim now.
+/// What the drain loop should do this round.
+struct Readiness {
+    /// Conversations whose waiting messages may be claimed now.
+    ready: Vec<String>,
+    /// How long until the soonest unready conversation could become ready, or `None` when nothing
+    /// is waiting at all. Only meaningful when `ready` is empty, since otherwise the loop claims
+    /// and comes straight back.
+    retry_in: Option<Duration>,
+}
+
+/// Decide which conversations have settled, and when to look again at those that have not.
 ///
-/// Returns `None` both when nothing is waiting and when the wait is over, because the caller treats
-/// those the same: go look at the queue.
+/// Three rules, applied per conversation. The floor is unconditional and exists for the wire rather
+/// than for people. The quiet period only applies where the platform can say whether somebody is
+/// still typing, because without that signal it is a guess, and a guess long enough to catch
+/// somebody composing is far too long to impose on somebody who only ever meant to send one
+/// message. The ceiling bounds the whole thing.
 ///
 /// Timestamps here are the platform's own send times, not when the row was written, which is what
 /// makes a backlog replayed after a restart release immediately instead of being debounced as
 /// though it had just arrived. The cost is a dependence on the two clocks roughly agreeing; both
 /// directions of skew degrade safely, into either no debounce or one full quiet period.
-async fn settle_delay(context: &DrainContext) -> Option<Duration> {
-    let settle = context.config.bridge.settle;
-    let settle_max = context.config.bridge.settle_max;
-    if settle.is_zero() {
-        return None;
-    }
-
-    let window = match context.store.pending_window().await {
-        Ok(window) => window,
+async fn readiness(context: &DrainContext) -> Readiness {
+    let windows = match context.store.pending_windows().await {
+        Ok(windows) => windows,
         Err(error) => {
             // Delivering promptly beats stalling on a query the next round will retry anyway.
-            tracing::error!("could not read the pending window: {}", error);
-            return None;
+            tracing::error!("could not read the pending windows: {}", error);
+            return Readiness {
+                ready: Vec::new(),
+                retry_in: Some(DRAIN_POLL_INTERVAL),
+            };
         }
     };
-    let (oldest, newest) = window?;
+    if windows.is_empty() {
+        return Readiness {
+            ready: Vec::new(),
+            retry_in: None,
+        };
+    }
 
+    let floor = context.config.bridge.coalesce_floor;
+    let settle = context.config.bridge.settle;
+    let settle_max = context.config.bridge.settle_max;
     let now = chrono::Utc::now();
     // Clamped because a platform clock ahead of this host's would otherwise read as negative.
     let elapsed =
         |since: chrono::DateTime<chrono::Utc>| (now - since).to_std().unwrap_or(Duration::ZERO);
-    let quiet_for = elapsed(newest);
-    let waited = elapsed(oldest);
 
-    if quiet_for >= settle || waited >= settle_max {
-        return None;
+    // Every conversation below either becomes ready or sets `soonest`, and an empty queue returned
+    // above, so the caller is never handed nothing to do and no time to do it at.
+    let mut ready = Vec::new();
+    let mut soonest: Option<Duration> = None;
+    for window in windows {
+        let waited = elapsed(window.oldest);
+        // The ceiling wins over everything else, including the floor, so a conversation nobody
+        // stops typing in cannot hold its own messages forever. It also releases a backlog replayed
+        // after downtime at once, since those carry their original send times.
+        //
+        // The cost is that a conversation whose oldest message is already past the ceiling skips
+        // the floor, so a split post arriving with timestamps that old is not held together. That
+        // needs a clock skewed by more than the ceiling or a delivery delayed by as much, and the
+        // parts still all reach the agent, the later ones flagged `late:`.
+        if waited >= settle_max {
+            ready.push(window.conversation_id);
+            continue;
+        }
+        let quiet_for = elapsed(window.newest);
+        // Under the ceiling the floor always applies. Beyond it a conversation is held while
+        // somebody is composing, and for the quiet period after they stop, both only where the
+        // platform reports typing: without that signal there is nothing to wait on and any wait is
+        // a guess.
+        let hold = if !settle.is_zero() && reports_typing(context, &window.conversation_id) {
+            if context.typing.active(&window.conversation_id) {
+                // Nothing to count down to yet: look again on the next tick, and let the ceiling
+                // be what eventually forces the issue.
+                let remaining = TYPING_TTL.min(settle_max.saturating_sub(waited));
+                soonest = Some(soonest.map_or(remaining, |soonest| soonest.min(remaining)));
+                continue;
+            }
+            floor.max(settle)
+        } else {
+            floor
+        };
+        let remaining = hold.saturating_sub(quiet_for);
+        if remaining > Duration::ZERO {
+            // Never past the ceiling, or a conversation that keeps being typed in would be
+            // reported as due later than the moment it is actually released.
+            let remaining = remaining.min(settle_max.saturating_sub(waited));
+            soonest = Some(soonest.map_or(remaining, |soonest| soonest.min(remaining)));
+            continue;
+        }
+        ready.push(window.conversation_id);
     }
-    // Whichever expires first: the quiet period, or the ceiling on the oldest message.
-    Some((settle - quiet_for).min(settle_max - waited))
+    Readiness {
+        ready,
+        retry_in: soonest,
+    }
+}
+
+/// Whether the platform behind this conversation says when somebody is typing.
+///
+/// A conversation whose channel cannot be resolved is treated as not reporting it, which releases
+/// sooner. That is the safe direction: the alternative holds messages for a channel nobody can ask
+/// about, and the id came out of the queue rather than from a user, so it should always resolve.
+fn reports_typing(context: &DrainContext, conversation_id: &str) -> bool {
+    ConversationId::parse(conversation_id)
+        .and_then(|conversation| context.channels.get(conversation.channel()).cloned())
+        .is_some_and(|channel| channel.capabilities().typing_status)
 }
 
 /// Hand one batch to the agent and record what happened to it.

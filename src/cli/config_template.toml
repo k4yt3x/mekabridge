@@ -32,15 +32,16 @@ permission = "read"
 batch_max_messages = 32
 max_queue_depth = 256
 
-# How long a chat must go quiet before its messages are handed to the agent. Without this the first
-# message of a burst starts a turn on its own, and the agent answers "hey" before it has read the
-# question that followed.
-# Set to "0s" to hand every message over the moment it lands.
-settle = "2s"
-# Ceiling on that wait. In a chat busy enough that messages keep landing inside the settle window
-# this is what actually releases each batch, so it reads as constant added latency rather than an
-# occasional delay. Keep it modest.
-settle_max = "6s"
+# How long a chat goes quiet for before its messages are handed to the agent, ON PLATFORMS THAT
+# REPORT TYPING. Discord does; Telegram has no such update, so nothing there is ever held for this
+# and a message starts a turn as soon as it lands. Where the signal exists the chat is held while
+# somebody is still going and for this long after they stop, so the agent reads a whole thought
+# rather than answering "hey" before the question arrives.
+# Set to "0s" to be answered mid-sentence rather than wait.
+settle = "3s"
+# Ceiling on that wait, so a compose box somebody opened and walked away from cannot strand a
+# message. Only reached where typing is reported, since nowhere else is a chat held this long.
+settle_max = "30s"
 
 # Messages of missed context printed alongside a mention in a muted chat. A bare "what do you think
 # about that?" is meaningless on its own, and a tool call to fetch the antecedent costs a whole model

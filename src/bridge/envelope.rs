@@ -104,9 +104,10 @@ impl Envelope<'_> {
             let _ = writeln!(out, "--- message {} of {count} ---", index + 1);
             match event {
                 InboundEvent::Message(message) => self.render_message(message, &mut out),
-                // Never queued, so never rendered. Handled by the writer, which drops the recorded
-                // copy and stops there.
-                InboundEvent::Retraction { .. } => {}
+                // Neither is ever queued, so neither is ever rendered. Both are handled by the
+                // writer and go no further: a retraction drops the recorded copy, and a typing
+                // notice only decides how long this conversation waits to be claimed.
+                InboundEvent::Retraction { .. } | InboundEvent::Typing { .. } => {}
             }
         }
         out

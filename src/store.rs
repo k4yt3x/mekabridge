@@ -150,6 +150,16 @@ impl Policy {
     }
 }
 
+/// When one conversation's waiting messages arrived, as the span the drain loop decides on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWindow {
+    pub conversation_id: String,
+    /// Bounds how long delivery may be deferred.
+    pub oldest: DateTime<Utc>,
+    /// Says whether a burst is still in progress.
+    pub newest: DateTime<Utc>,
+}
+
 /// What a conversation, or the whole bridge, is holding for the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnseenSummary {
@@ -883,42 +893,37 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Atomically take up to `limit` pending messages and mark them in flight.
+    /// Oldest and newest arrival times per conversation with something waiting.
     ///
-    /// Claiming and marking happen in one transaction so two drain loops (or a drain loop racing a
-    /// restart) cannot hand the same message to two turns.
-    /// Oldest and newest arrival times among the pending rows, or `None` when nothing is waiting.
+    /// Grouped rather than aggregated across the whole queue because the rule that decides when a
+    /// conversation is ready differs by conversation: a platform that reports typing holds one
+    /// until the person stops, and a platform that cannot report it holds one barely at all. A
+    /// single window over every pending row would mean one chat's burst deferring every other
+    /// chat's delivery, which it did until this was split.
     ///
     /// `min`/`max` over the stored RFC 3339 text rather than over parsed dates. That is sound here
     /// because every row is written by [`Store::enqueue`] with a fixed `+00:00` offset and
     /// zero-padded fields, so byte order and chronological order agree, including between a
     /// timestamp with fractional seconds and one without.
     ///
-    /// The drain loop debounces on this: the newest tells it whether a burst is still in progress,
-    /// and the oldest bounds how long that may defer delivery. Derived from the queue rather than
-    /// from in-memory state so the behaviour is the same on the first message after a restart.
-    pub async fn pending_window(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        let window = self
+    /// Derived from the queue rather than from in-memory state so the behaviour is the same on the
+    /// first message after a restart.
+    pub async fn pending_windows(&self) -> Result<Vec<PendingWindow>> {
+        let rows: Vec<(String, String, String)> = self
             .connection
             .call(move |connection| {
-                connection
-                    .query_row(
-                        "SELECT min(received_at), max(received_at)
-                         FROM inbound_queue WHERE state = 'pending'",
-                        [],
-                        |row| {
-                            Ok(row
-                                .get::<_, Option<String>>(0)?
-                                .zip(row.get::<_, Option<String>>(1)?))
-                        },
-                    )
-                    .optional()
+                let mut statement = connection.prepare(
+                    "SELECT conversation_id, min(received_at), max(received_at)
+                     FROM inbound_queue
+                     WHERE state = 'pending'
+                     GROUP BY conversation_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
             })
-            .await?
-            .flatten();
-        let Some((oldest, newest)) = window else {
-            return Ok(None);
-        };
+            .await?;
         let parse = |raw: &str| {
             DateTime::parse_from_rfc3339(raw)
                 .map(|value| value.with_timezone(&Utc))
@@ -927,24 +932,55 @@ impl Store {
                     message: format!("{raw:?} is not an RFC 3339 timestamp: {error}"),
                 })
         };
-        Ok(Some((parse(&oldest)?, parse(&newest)?)))
+        rows.into_iter()
+            .map(|(conversation_id, oldest, newest)| {
+                Ok(PendingWindow {
+                    conversation_id,
+                    oldest: parse(&oldest)?,
+                    newest: parse(&newest)?,
+                })
+            })
+            .collect()
     }
 
-    pub async fn claim_batch(&self, limit: usize) -> Result<Vec<QueuedMessage>> {
+    /// Atomically take up to `limit` pending messages from `ready` and mark them in flight.
+    ///
+    /// Claiming and marking happen in one transaction so two drain loops (or a drain loop racing a
+    /// restart) cannot hand the same message to two turns.
+    ///
+    /// A batch may still span conversations, which is what makes several chats that all became
+    /// ready together cost one turn rather than one each. `ready` narrows which are eligible, not
+    /// how many may share a batch.
+    pub async fn claim_batch(&self, ready: &[String], limit: usize) -> Result<Vec<QueuedMessage>> {
+        // SQLite does accept `IN ()` and evaluates it false, so this is for the round trip rather
+        // than for correctness: nothing being ready is by far the most common tick, and there is no
+        // reason to reach the database to be told so.
+        if ready.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ready: Vec<String> = ready.to_vec();
         let limit = limit as i64;
         let batch = self
             .connection
             .call(move |connection| {
+                let placeholders = std::iter::repeat_n("?", ready.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let transaction = connection.transaction()?;
                 let claimed = {
-                    let mut statement = transaction.prepare(
+                    let mut statement = transaction.prepare(&format!(
                         "SELECT seq, conversation_id, external_id, payload, received_at, attempts
                          FROM inbound_queue
-                         WHERE state = 'pending'
+                         WHERE state = 'pending' AND conversation_id IN ({placeholders})
                          ORDER BY seq
-                         LIMIT ?1",
-                    )?;
-                    let rows = statement.query_map([limit], row_to_queued)?;
+                         LIMIT ?"
+                    ))?;
+                    // Bound in order, the limit last, matching the placeholder order above.
+                    let mut values: Vec<&dyn rusqlite::ToSql> =
+                        ready.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    values.push(&limit);
+                    let rows =
+                        statement.query_map(rusqlite::params_from_iter(values), row_to_queued)?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
                 for message in &claimed {
@@ -1710,6 +1746,22 @@ mod tests {
         }
     }
 
+    /// Claim from every conversation with something waiting.
+    ///
+    /// What `claim_batch` meant before readiness became per conversation. These tests are about
+    /// queue mechanics rather than about which chats have settled, so they say "all of them" once
+    /// here instead of naming ids at twenty call sites.
+    async fn claim_all(store: &Store, limit: usize) -> Vec<QueuedMessage> {
+        let ready: Vec<String> = store
+            .pending_windows()
+            .await
+            .expect("windows")
+            .into_iter()
+            .map(|window| window.conversation_id)
+            .collect();
+        store.claim_batch(&ready, limit).await.expect("claim")
+    }
+
     #[tokio::test]
     async fn when_the_agent_last_spoke_survives_a_restart() {
         // The address book orders on this and reports it, so a restart losing it would put a
@@ -2320,7 +2372,7 @@ mod tests {
         assert_eq!(outcome, EnqueueOutcome::Queued);
         assert_eq!(store.pending_count().await.expect("count"), 1);
 
-        let batch = store.claim_batch(10).await.expect("claim");
+        let batch = claim_all(&store, 10).await;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].payload, "{\"text\":\"hi\"}");
         assert_eq!(store.pending_count().await.expect("count"), 0);
@@ -2344,7 +2396,7 @@ mod tests {
         // The drain loop must still see it; an inspection command that consumed rows would strand
         // undelivered messages.
         assert_eq!(store.pending_count().await.expect("count"), 1);
-        assert_eq!(store.claim_batch(10).await.expect("claim").len(), 1);
+        assert_eq!(claim_all(&store, 10).await.len(), 1);
     }
 
     #[tokio::test]
@@ -2363,10 +2415,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pending_window_spans_oldest_to_newest() {
+    async fn a_pending_window_spans_oldest_to_newest() {
         let store = store_with_conversation().await;
         assert!(
-            store.pending_window().await.expect("query").is_none(),
+            store.pending_windows().await.expect("query").is_empty(),
             "an empty queue has no window to debounce against"
         );
 
@@ -2381,13 +2433,79 @@ mod tests {
             .await
             .expect("second");
 
-        let (oldest, newest) = store
-            .pending_window()
+        let windows = store.pending_windows().await.expect("query");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].conversation_id, "telegram:123");
+        assert_eq!(windows[0].oldest.timestamp(), first.timestamp());
+        assert_eq!(windows[0].newest.timestamp(), last.timestamp());
+    }
+
+    #[tokio::test]
+    async fn each_conversation_gets_its_own_window() {
+        // The reason this is grouped at all. One window over the whole queue meant a chat still
+        // mid-burst deferred delivery for every other chat, which on a platform holding for
+        // somebody to stop typing would be a busy room stalling a direct message.
+        let store = store_with_conversation().await;
+        let old = now() - chrono::Duration::seconds(30);
+        store
+            .enqueue("telegram:123", "m1", "a", old, 10)
             .await
-            .expect("query")
-            .expect("rows are pending");
-        assert_eq!(oldest.timestamp(), first.timestamp());
-        assert_eq!(newest.timestamp(), last.timestamp());
+            .expect("first");
+        store
+            .enqueue("telegram:999", "m2", "b", now(), 10)
+            .await
+            .expect("second");
+
+        let mut windows = store.pending_windows().await.expect("query");
+        windows.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        assert_eq!(windows.len(), 2, "got {windows:?}");
+        assert_eq!(windows[0].newest.timestamp(), old.timestamp());
+        assert_ne!(
+            windows[0].newest.timestamp(),
+            windows[1].newest.timestamp(),
+            "one chat's arrival must not be reported as another's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_that_is_not_ready_is_left_alone() {
+        // The claim narrows to the conversations the drain loop decided had settled. Without that
+        // it would take the oldest rows in the queue whatever it had just concluded about them.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("first");
+        store
+            .enqueue("telegram:999", "m2", "b", now(), 10)
+            .await
+            .expect("second");
+
+        let batch = store
+            .claim_batch(&["telegram:999".to_string()], 10)
+            .await
+            .expect("claim");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].conversation_id, "telegram:999");
+        assert_eq!(
+            store.pending_count().await.expect("count"),
+            1,
+            "the other conversation stays pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn claiming_nothing_is_not_an_error() {
+        // By far the most common tick, since usually nothing has settled yet. Note this passes
+        // either way: SQLite accepts `IN ()` and evaluates it false, so the early return is an
+        // optimisation and this test only pins that an empty ask is answered rather than refused.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        assert!(store.claim_batch(&[], 10).await.expect("claim").is_empty());
+        assert_eq!(store.pending_count().await.expect("count"), 1);
     }
 
     #[tokio::test]
@@ -2399,8 +2517,8 @@ mod tests {
             .enqueue("telegram:123", "m1", "a", now(), 10)
             .await
             .expect("enqueue");
-        store.claim_batch(10).await.expect("claim");
-        assert!(store.pending_window().await.expect("query").is_none());
+        claim_all(&store, 10).await;
+        assert!(store.pending_windows().await.expect("query").is_empty());
     }
 
     #[tokio::test]
@@ -2439,7 +2557,7 @@ mod tests {
 
         // In-flight rows still count as waiting, otherwise a slow turn would let the queue grow
         // without bound.
-        store.claim_batch(2).await.expect("claim");
+        claim_all(&store, 2).await;
         let still_full = store
             .enqueue("telegram:123", "m3", "a", now(), 2)
             .await
@@ -2462,7 +2580,7 @@ mod tests {
                 .await
                 .expect("enqueue");
         }
-        let batch = store.claim_batch(3).await.expect("claim");
+        let batch = claim_all(&store, 3).await;
         let payloads: Vec<&str> = batch
             .iter()
             .map(|message| message.payload.as_str())
@@ -2483,7 +2601,7 @@ mod tests {
             .expect("enqueue");
 
         for _ in 0..5 {
-            let batch = store.claim_batch(10).await.expect("claim");
+            let batch = claim_all(&store, 10).await;
             assert_eq!(batch.len(), 1, "the message must stay claimable");
             assert_eq!(batch[0].attempts, 0, "a deferral is not an attempt");
             let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
@@ -2492,7 +2610,7 @@ mod tests {
         }
 
         // And the budget is still intact for a genuine failure afterwards.
-        let batch = store.claim_batch(10).await.expect("claim");
+        let batch = claim_all(&store, 10).await;
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
         let outcome = store
             .fail_batch(&sequences, "provider 502", 1)
@@ -2512,7 +2630,7 @@ mod tests {
             .enqueue("telegram:123", "m1", "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = store.claim_batch(10).await.expect("claim");
+        let batch = claim_all(&store, 10).await;
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
 
         let first = store
@@ -2523,7 +2641,7 @@ mod tests {
         assert!(first.exhausted.is_empty());
         assert_eq!(store.pending_count().await.expect("count"), 1);
 
-        let batch = store.claim_batch(10).await.expect("reclaim");
+        let batch = claim_all(&store, 10).await;
         assert_eq!(batch[0].attempts, 1);
         let second = store
             .fail_batch(&sequences, "provider 502", 1)
@@ -2542,7 +2660,7 @@ mod tests {
             .enqueue("telegram:123", "m1", "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = store.claim_batch(10).await.expect("claim");
+        let batch = claim_all(&store, 10).await;
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
         let outcome = store.fail_batch(&sequences, "boom", 0).await.expect("fail");
         assert_eq!(outcome.exhausted.len(), 1);
@@ -2556,7 +2674,7 @@ mod tests {
             .enqueue("telegram:123", "m1", "a", now(), 10)
             .await
             .expect("enqueue");
-        store.claim_batch(10).await.expect("claim");
+        claim_all(&store, 10).await;
         assert_eq!(store.pending_count().await.expect("count"), 0);
 
         // Simulates a crash between claiming a batch and completing its turn.
@@ -2663,7 +2781,7 @@ mod tests {
             )
             .await
             .expect("enqueue");
-        let batch = store.claim_batch(1).await.expect("claim");
+        let batch = claim_all(&store, 1).await;
         store
             .complete_batch(&[batch[0].seq])
             .await

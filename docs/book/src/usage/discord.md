@@ -66,6 +66,20 @@ Nor does an ordinary message, however soon after the agent last spoke there. Unt
 
 Everything withheld is still recorded, and the mention that wakes the agent arrives with a count of what it missed and the last few messages. Use `mekabridge policy set discord:<id> active` to hear a channel in full, or `block` to record nothing at all. The agent can follow a channel on past a mention itself; see [Group attention](./group-attention.md).
 
+## Waiting for somebody to finish
+
+Discord reports when a person is typing, so a conversation is held while they are still composing
+and for `[bridge].settle` after they stop, capped by `[bridge].settle_max`. Somebody typing a
+thought across three messages therefore gets one turn rather than three.
+
+This needs `GUILD_MESSAGE_TYPING` and `DIRECT_MESSAGE_TYPING`, which the bridge requests
+unconditionally. Both are unprivileged, so unlike Message Content they need no toggle in the
+Developer Portal and cannot close the gateway with a `4014`. The bot's own indicator is ignored, or
+a chat would be held open for as long as the agent was working in it.
+
+Telegram has no equivalent and is not held at all; see [Group attention](./group-attention.md) for
+why the two platforms differ.
+
 ## What the agent sees
 
 ```

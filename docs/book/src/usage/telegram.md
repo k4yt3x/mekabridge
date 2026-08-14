@@ -117,6 +117,23 @@ Every message in a private chat is addressed to the agent, since there is nobody
 
 The bot's username is read once at startup, so renaming it in @BotFather needs a restart before mentions are recognised again.
 
+## Messages are not held back
+
+Telegram has no way to tell a bot that somebody is typing: the Bot API lets a bot *send* a chat
+action and never receive one. So a message here starts a turn as soon as it arrives, rather than
+waiting to see whether more is coming. `[bridge].settle` does not apply.
+
+The trade is that two messages a few seconds apart produce two turns, and the agent may answer the
+first before reading the second. If the second lands while the agent is still working on the first, it
+arrives flagged `late:`, so the agent knows its reply was written without it and can revise with
+`edit_message`. The alternative was a fixed wait on every
+message, which is a long time to sit still for somebody who only ever meant to send one. See
+[Group attention](./group-attention.md).
+
+Everything is still held for one second, which is not configurable and is not about typing: an
+album arrives as one update per photo, and without that floor a post would reach the agent as a
+photo followed by a separate turn carrying the rest.
+
 ## Muting and blocking a chat
 
 `mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.

@@ -480,6 +480,19 @@ pub enum InboundEvent {
         message_id: String,
         timestamp: DateTime<Utc>,
     },
+    /// Somebody is composing in this conversation.
+    ///
+    /// Never queued and never shown to the agent. It exists so a conversation can be held until the
+    /// person stops rather than until a guessed timer expires, which is the only honest way to
+    /// batch a thought typed across several messages. Only platforms that report typing produce
+    /// these, and it is advisory: losing one costs a slightly early release and nothing else.
+    Typing {
+        conversation: ConversationId,
+        /// Platform-native id of whoever is composing. The hold is tied to the person whose
+        /// message is already waiting, so anybody else typing in a busy room does not delay it.
+        author: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl InboundEvent {
@@ -487,22 +500,29 @@ impl InboundEvent {
     pub const fn conversation(&self) -> &ConversationId {
         match self {
             Self::Message(message) => &message.conversation,
-            Self::Retraction { conversation, .. } => conversation,
+            Self::Retraction { conversation, .. } | Self::Typing { conversation, .. } => {
+                conversation
+            }
         }
     }
 
     /// Identifier unique within the conversation, used for deduplication.
+    ///
+    /// Only a queued event has one, and only [`Self::Message`] is ever queued. The others answer
+    /// with what identifies them for their own handling: a retraction names the message it
+    /// retracts, and a notice that somebody is typing names nothing at all.
     pub fn external_id(&self) -> &str {
         match self {
             Self::Message(message) => &message.external_id,
             Self::Retraction { message_id, .. } => message_id,
+            Self::Typing { .. } => "",
         }
     }
 
     pub const fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::Message(message) => message.timestamp,
-            Self::Retraction { timestamp, .. } => *timestamp,
+            Self::Retraction { timestamp, .. } | Self::Typing { timestamp, .. } => *timestamp,
         }
     }
 }
@@ -780,6 +800,14 @@ pub struct ChannelCapabilities {
     /// The channel reports whether people are online. Off unless the platform does presence at all
     /// and the operator enabled it, since on Discord it costs a privileged intent.
     pub presence: bool,
+    /// The platform tells the bridge when somebody *else* is typing.
+    ///
+    /// The receive side, and nothing to do with [`Self::typing_indicator`], which is the send
+    /// side. This is what decides whether a conversation is worth holding for somebody to
+    /// finish composing: with the signal the wait ends when they stop, and without it any wait
+    /// is a guess, and a guess long enough to catch somebody mid-sentence is far too long to
+    /// impose on somebody who only ever meant to send one message.
+    pub typing_status: bool,
     /// Privileges live on roles, and a person is granted a role. Discord's model, and the reason
     /// this is not one `admin` flag: synthesising a role to satisfy a requested list of rights, or
     /// guessing which role a right belongs to, is exactly the kind of invention that would make

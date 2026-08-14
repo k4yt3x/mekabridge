@@ -113,6 +113,7 @@ const WANTED_EVENTS: EventTypeFlags = EventTypeFlags::READY
     .union(EventTypeFlags::MESSAGE_UPDATE)
     .union(EventTypeFlags::MESSAGE_DELETE)
     .union(EventTypeFlags::MESSAGE_DELETE_BULK)
+    .union(EventTypeFlags::TYPING_START)
     .union(EventTypeFlags::GUILD_CREATE)
     .union(EventTypeFlags::GUILD_UPDATE)
     .union(EventTypeFlags::GUILD_DELETE)
@@ -222,9 +223,15 @@ impl DiscordChannel {
     /// along on every guild message, and the REST member lookup works without it, so requesting a
     /// second privileged intent would buy nothing this connector uses.
     const fn intents(&self) -> Intents {
+        // The two typing intents are unprivileged, so unlike `MESSAGE_CONTENT` and
+        // `GUILD_PRESENCES` they need no portal toggle and cannot close the gateway with a 4014.
+        // They are what lets a conversation be held until somebody stops composing rather than
+        // until a guessed timer expires, which is a distinction Telegram cannot offer at all.
         let base = Intents::GUILDS
             .union(Intents::GUILD_MESSAGES)
-            .union(Intents::DIRECT_MESSAGES);
+            .union(Intents::DIRECT_MESSAGES)
+            .union(Intents::GUILD_MESSAGE_TYPING)
+            .union(Intents::DIRECT_MESSAGE_TYPING);
         let base = if self.message_content {
             base.union(Intents::MESSAGE_CONTENT)
         } else {
@@ -787,6 +794,31 @@ impl DiscordChannel {
                     }
                 }
             }
+            Event::TypingStart(typing) => {
+                // The bot's own indicator comes back over the gateway like anybody else's. Left
+                // unfiltered it would hold a conversation open for as long as the bridge kept
+                // showing that the agent was working, which is exactly the wrong direction: the
+                // chat would go quiet while the bridge waited on itself.
+                if self.identity.get() == Some(&typing.user_id) {
+                    return;
+                }
+                let conversation =
+                    ConversationId::new(&self.id, &typing.channel_id.to_string(), None);
+                // `try_send` rather than `send`: a busy server produces a lot of these and they are
+                // advisory, so dropping one when the writer is behind costs a slightly early
+                // release. Blocking the gateway task behind the durable writer would cost real
+                // messages.
+                if sink
+                    .try_send(InboundEvent::Typing {
+                        conversation,
+                        author: typing.user_id.to_string(),
+                        timestamp: Utc::now(),
+                    })
+                    .is_err()
+                {
+                    tracing::trace!(channel = %self.id, "dropped a typing notice; the writer is behind");
+                }
+            }
             Event::GuildUpdate(guild) => self.names.rename_guild(guild.id, &guild.name),
             Event::GuildDelete(guild) => {
                 self.names.remove_guild(guild.id);
@@ -1219,6 +1251,7 @@ impl Channel for DiscordChannel {
             edit: true,
             admin: self.admin_tools,
             presence: self.presence,
+            typing_status: true,
             // Discord grants privileges through roles only. There is no per-member permission set
             // to hand a named list of rights to.
             member_rights: false,
@@ -2345,6 +2378,79 @@ mod tests {
         let channel = identified();
         let message = message(serde_json::json!({"guild_id": null}));
         assert!(channel.addressed(&message, Some(ChannelType::Private)));
+    }
+
+    /// A `TYPING_START` as the gateway delivers it.
+    fn typing_start(user_id: u64) -> Event {
+        Event::TypingStart(Box::new(
+            twilight_model::gateway::payload::incoming::TypingStart {
+                channel_id: Id::new(555),
+                guild_id: Some(Id::new(900)),
+                member: None,
+                timestamp: 1_760_000_000,
+                user_id: Id::new(user_id),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn somebody_typing_is_reported_so_the_chat_can_wait_for_them() {
+        let channel = identified();
+        let (sender, mut receiver) = mpsc::channel(4);
+        channel.handle(typing_start(1), &sender).await;
+
+        let event = receiver.try_recv().expect("a typing notice is reported");
+        let InboundEvent::Typing { conversation, .. } = event else {
+            panic!("expected a typing notice, got {event:?}");
+        };
+        assert_eq!(conversation.as_str(), "discord:555");
+    }
+
+    #[tokio::test]
+    async fn the_bots_own_typing_is_not_reported_back_to_itself() {
+        // The gateway echoes our own indicator like anybody else's, and the bridge raises one for
+        // the whole of every turn. Unfiltered, a chat would be held open for as long as the agent
+        // was working on it and then held again by the next turn, which from the outside looks
+        // exactly like the bridge having stalled.
+        let channel = identified();
+        let (sender, mut receiver) = mpsc::channel(4);
+        channel.handle(typing_start(99), &sender).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "the bot's own typing must not hold a conversation open"
+        );
+    }
+
+    #[test]
+    fn typing_events_are_asked_for_from_the_gateway() {
+        // The intent decides whether Discord sends these at all; this flag decides whether the
+        // shard hands them to `handle`. Both are needed, and the handler tests call `handle`
+        // directly, so without this assertion they would keep passing while the event never
+        // arrived in production and every chat released on the floor alone.
+        assert!(WANTED_EVENTS.contains(EventTypeFlags::TYPING_START));
+    }
+
+    #[tokio::test]
+    async fn the_typing_intents_are_requested_and_are_not_privileged() {
+        // Unprivileged, so unlike MESSAGE_CONTENT they need no portal toggle and cannot close the
+        // gateway with a 4014. Asserted because getting this wrong fails at startup for every
+        // deployment rather than degrading.
+        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        let intents = channel.intents();
+        assert!(intents.contains(Intents::GUILD_MESSAGE_TYPING));
+        assert!(intents.contains(Intents::DIRECT_MESSAGE_TYPING));
+
+        // The fixture asks for `MESSAGE_CONTENT` and nothing else privileged, so that is the whole
+        // of what may appear here. Asserted as an equality rather than as an absence, or a future
+        // privileged intent added alongside these would slip through.
+        let privileged = Intents::GUILD_MEMBERS
+            .union(Intents::GUILD_PRESENCES)
+            .union(Intents::MESSAGE_CONTENT);
+        assert_eq!(
+            intents.intersection(privileged),
+            Intents::MESSAGE_CONTENT,
+            "the typing intents must not drag a privileged one along with them"
+        );
     }
 
     #[tokio::test]

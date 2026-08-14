@@ -54,7 +54,7 @@ the whole surface works at `read`:
 | Sending | `send_message`, `send_file`, `react`, `edit_message`, `delete_message` |
 | Attachments | `view_attachment`, `download_attachment` |
 | Address book | `list_conversations`, `get_conversation` |
-| Attention | `mute`, `unmute`, `block`, `unblock` |
+| Attention | `mute`, `unmute`, `block`, `unblock`, `unseen` |
 | History | `read_history`, `search_history` |
 | Moderation | `moderate_member`, `set_member_rights`, `set_member_roles`, `pin_message`, `set_chat`, `member`, `list_members` |
 

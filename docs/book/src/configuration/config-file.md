@@ -74,7 +74,6 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `turn_retries` | `1` | Extra attempts for a batch whose turn failed |
 | `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and when the turn ends |
 | `typing_max` | `[meka].turn_timeout` | Ceiling on how long that state is held for one turn. A safety net: the indicator already stops on a reply and at the end of the turn |
-| `mute_followup` | `5m` | How long a muted conversation goes on waking the agent for everything after the agent's own last message there |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
 
 `typing_max` is worth raising rather than lowering. Neither Telegram nor Discord limits how long an indicator may be renewed, so holding one costs a single cheap call every few seconds. A ceiling shorter than a turn is the worst of both: it stops while the agent is still working, and a chat that has been quiet for minutes reads as a bot that has died rather than one that is busy.
@@ -83,7 +82,7 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 
 When the queue is full, further messages are dropped and counted, and the next envelope tells the agent how many it did not see. Nothing is discarded silently.
 
-`mute_followup` is measured from the agent's own outbound message and is deliberately not extended by inbound traffic. Without it, answering a mention and then being asked a follow-up without a second mention leaves the exchange dead halfway through; extended by inbound traffic instead, a busy chat would never leave the window once the agent had spoken in it once.
+`mute_followup` was removed in 0.7.0, and a config still setting it is refused at startup by name. That is deliberate: a knob that silently stopped doing anything would leave an operator reading their own config as the explanation for behaviour it no longer controls. Delete the line. A muted conversation now wakes the agent only when somebody names it or replies to something it said, and following a conversation on is the agent's own call. See [Group attention](../usage/group-attention.md).
 
 `mute_context` trades a few lines of envelope against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `read_history` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
 

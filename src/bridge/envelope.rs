@@ -125,8 +125,8 @@ impl Envelope<'_> {
             // entirely.
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken for mentions in {}. Nothing else has been said \
-                 there since you last looked.",
+                "[mekabridge] You are only woken in {} by somebody naming you or replying to \
+                 something you said. Nothing has been said there since you last looked.",
                 missed.conversation
             );
             return;
@@ -139,7 +139,8 @@ impl Envelope<'_> {
         if missed.muted {
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken for mentions in {}. {} {noun} you have not seen \
+                "[mekabridge] You are only woken in {} by somebody naming you or replying to \
+                 something you said; nothing else there reaches you. {} {noun} you have not seen \
                  were said there; read_history and search_history reach all of them.",
                 missed.conversation, missed.count
             );
@@ -227,11 +228,13 @@ impl Envelope<'_> {
         let _ = writeln!(out, "chat: {}", format_chat(message));
         let _ = writeln!(out, "at: {}", message.timestamp.to_rfc3339());
 
-        // Under mention-only the agent is woken by an event it cannot otherwise identify, and
-        // "mentioned by name" and "replied to" call for different answers. Only said when there is
-        // something to say: in a chat it hears in full every message is addressed, and the line
-        // would be noise on all of them.
-        if message.addressed && message.chat_kind != ChatKind::Direct {
+        // Stated on every message from a chat that is not one-to-one, including the ones
+        // nothing addressed. Printing it only for a mention made its absence the signal, and an
+        // absent line is not one: overheard chatter and a chat being heard in full rendered
+        // identically, so nothing in the envelope distinguished a message that wanted an answer
+        // from one that merely happened in front of the agent. Skipped in a direct chat, where
+        // there is only ever one answer and it would be noise on every message.
+        if message.chat_kind != ChatKind::Direct {
             let _ = writeln!(out, "woke you: {}", describe_wake(message));
         }
 
@@ -319,15 +322,22 @@ fn format_identities(identities: &[(String, Option<String>)]) -> Option<String> 
     Some(named.join(", "))
 }
 
-/// Why this message counted as addressed to the agent.
+/// Why the agent is being shown this message.
 ///
-/// The connector decides *whether*, and reports one bit. This says what it most likely was, from
-/// what the envelope already carries, and is deliberately hedged where it cannot know: guessing
-/// confidently would be worse than saying "you were named or replied to".
+/// Derived rather than carried, because with mention-only meaning exactly that there is nothing
+/// left to carry: a message nothing addressed can only have been delivered by the conversation
+/// being heard in full, since that is the sole remaining path through the gate. The reason a
+/// message arrived is what this reports, which is why a policy changed between queueing and
+/// delivery does not make it wrong.
+///
+/// The connector decides *whether* a message was addressed, and reports one bit. The wording for
+/// that case is deliberately hedged where it cannot know which signal fired: guessing confidently
+/// would be worse than saying "you were named or replied to".
 fn describe_wake(message: &InboundMessage) -> &'static str {
-    match &message.reply_to {
-        Some(_) => "you were named, or this replies to something you said",
-        None => "you were named",
+    match (message.addressed, &message.reply_to) {
+        (true, Some(_)) => "you were named, or this replies to something you said",
+        (true, None) => "you were named",
+        (false, _) => "nothing here named you; this chat was being heard in full when it arrived",
     }
 }
 
@@ -536,11 +546,33 @@ mod tests {
     }
 
     #[test]
-    fn overheard_chatter_carries_no_wake_line() {
+    fn a_message_nothing_addressed_says_so_rather_than_going_unexplained() {
+        // The line used to be printed only for a mention, which made its absence the signal for
+        // "this was not for you". An absent line is not a signal: a message the agent is hearing
+        // because the room is heard in full rendered exactly like one somebody sent it, and the
+        // agent had nothing to tell them apart by.
         let mut message = message("unrelated");
         message.chat_kind = ChatKind::Group;
         message.addressed = false;
-        assert!(!render(vec![message]).contains("woke you:"));
+        let rendered = render(vec![message]);
+        assert!(
+            rendered.contains("woke you: nothing here named you"),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn every_message_from_a_group_says_why_it_is_being_seen() {
+        // The value of the line is that it is exhaustive. One message in a batch without it would
+        // put the agent back to reading absence.
+        let mut named = message("@bot thoughts?");
+        named.chat_kind = ChatKind::Group;
+        named.addressed = true;
+        let mut overheard = message("unrelated");
+        overheard.chat_kind = ChatKind::Group;
+        overheard.addressed = false;
+        let rendered = render(vec![named, overheard]);
+        assert_eq!(rendered.matches("woke you:").count(), 2, "got {rendered}");
     }
 
     #[test]
@@ -605,7 +637,7 @@ mod tests {
                     ],
                 },
             ]);
-        assert!(rendered.contains("only woken for mentions in telegram:-100"));
+        assert!(rendered.contains("only woken in telegram:-100 by somebody naming you"));
         assert!(rendered.contains("23 messages you have not seen"));
         assert!(
             rendered.contains("read_history"),
@@ -640,7 +672,7 @@ mod tests {
             recent: vec![missed_message("Alice", "you missed this")],
         }]);
         assert!(
-            !rendered.contains("only woken for mentions"),
+            !rendered.contains("You are only woken in"),
             "the conversation is no longer muted:\n{rendered}"
         );
         assert!(rendered.contains("4 messages in telegram:-100 were recorded"));
@@ -655,8 +687,25 @@ mod tests {
             count: 0,
             recent: Vec::new(),
         }]);
-        assert!(rendered.contains("only woken for mentions in telegram:-100"));
-        assert!(rendered.contains("Nothing else has been said"));
+        assert!(rendered.contains("only woken in telegram:-100 by somebody naming you"));
+        assert!(rendered.contains("Nothing has been said"));
+    }
+
+    #[test]
+    fn a_muted_conversation_says_that_nothing_else_will_wake_it() {
+        // The consequence, not just the rule. Naming the two things that do wake it matters as
+        // much: a reply the client marked as one reaches the agent, and somebody answering it in
+        // ordinary prose does not, which is not a distinction anybody would guess.
+        let rendered = render_with_missed(vec![message("@bot ping")], vec![MissedContext {
+            conversation: ConversationId::parse("telegram:-100").expect("valid"),
+            muted: true,
+            count: 3,
+            recent: vec![missed_message("Alice", "carrying on")],
+        }]);
+        assert!(
+            rendered.contains("nothing else there reaches you"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]

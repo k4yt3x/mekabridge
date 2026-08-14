@@ -42,12 +42,6 @@ settle = "2s"
 # occasional delay. Keep it modest.
 settle_max = "6s"
 
-# How long a conversation goes on waking the agent for everything after the agent's own last message
-# there. Without it, answering a mention and then being asked a follow-up without a second mention
-# leaves the exchange dead halfway through. Measured from the agent's send, so a chat it stops
-# answering goes quiet again on its own.
-mute_followup = "5m"
-
 # Messages of missed context printed alongside a mention in a muted chat. A bare "what do you think
 # about that?" is meaningless on its own, and a tool call to fetch the antecedent costs a whole model
 # round trip. Set to 0 to make the agent ask instead.

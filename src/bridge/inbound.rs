@@ -92,6 +92,15 @@ pub async fn writer(
                     "could not read the conversation's policy: {}",
                     error
                 );
+                // Said to the agent as well as logged, because the envelope is about to tell it
+                // this is a chat it hears in full. That is what is happening, but it is not what
+                // anybody decided, and without this the agent would take a database fault for a
+                // setting and answer a muted room as though it had been invited to.
+                message.notes.push(
+                    "the bridge could not read this chat's attention settings, so it is being \
+                     heard in full until it can"
+                        .to_string(),
+                );
                 Disposition::Deliver
             }
         };
@@ -202,13 +211,20 @@ async fn gate(
     let now = chrono::Utc::now();
     let record = store.policy(conversation.as_str()).await?;
 
+    // Whether a lapsed decision left a notice on this message. It has to survive the match below,
+    // because a notice on a message nobody is woken for is a notice nobody reads.
+    let mut announced = false;
     let policy = match record {
         Some(record) if record.expired(now) => {
+            // Computed before the announcement, which borrows the message mutably, and needed by
+            // it: a lapsing decision does not restore whatever preceded it, it falls
+            // through to here.
+            let fallback = config.bridge.default_policy.for_kind(message.chat_kind);
             // Read back uncounted through `expire_policy` rather than reused from above: the record
             // in hand came through a cache that deliberately does not see drop counts, and the
             // count is the whole of what the agent is being told.
             if let Some(lapsed) = store.expire_policy(conversation.as_str()).await? {
-                announce_expiry(message, &lapsed);
+                announced = announce_expiry(message, &lapsed, fallback);
                 tracing::info!(
                     conversation = %conversation,
                     policy = lapsed.policy.as_str(),
@@ -216,7 +232,7 @@ async fn gate(
                     "a conversation policy expired"
                 );
             }
-            config.bridge.default_policy.for_kind(message.chat_kind)
+            fallback
         }
         Some(record) => record.policy,
         None => config.bridge.default_policy.for_kind(message.chat_kind),
@@ -233,26 +249,26 @@ async fn gate(
             Ok(Disposition::Discard)
         }
         Policy::Mute if message.addressed => Ok(Disposition::Deliver),
+        // A decision the agent made has just lapsed, and this is the message that discovered it.
+        // Withholding it would file the notice into the history, where nothing will read it, and
+        // leave the agent believing it can still hear a room it cannot. That is the exact
+        // confusion the notice exists to prevent, so it is worth the one turn. Expiries are rare
+        // by construction: only an explicitly timed decision has one at all.
+        Policy::Mute if announced => Ok(Disposition::Deliver),
+        // Mention-only means mention-only. There was once a window here that went on delivering
+        // everything for a few minutes after the agent spoke, on the theory that an exchange
+        // already under way should carry on without a second mention. In a busy room it delivered
+        // the room: the agent was woken by conversations it had no part in, each arriving in an
+        // envelope indistinguishable from one addressed to it, and every reply it was nudged into
+        // making pushed the window out again. Following a conversation on is the agent's call to
+        // make now, either by hearing the chat in full for a while or by arranging its own
+        // look-back, and both of those it can say out loud.
         Policy::Mute => {
-            // An exchange the agent is already in carries on without a second mention, which is
-            // what stops "@bot what do you think?" followed by "no, the other one"
-            // dying halfway through. Measured from the agent's own last message and
-            // deliberately not extended by inbound traffic, so a chat it has stopped
-            // answering goes quiet again on its own.
-            let following_up = store
-                .last_outbound_at(conversation.as_str())
-                .await?
-                .and_then(|at| now.signed_duration_since(at).to_std().ok())
-                .is_some_and(|since| since < config.bridge.mute_followup);
-            if following_up {
-                Ok(Disposition::Deliver)
-            } else {
-                tracing::trace!(
-                    conversation = %conversation,
-                    "withholding a message from a muted conversation"
-                );
-                Ok(Disposition::Withhold)
-            }
+            tracing::trace!(
+                conversation = %conversation,
+                "withholding a message from a muted conversation"
+            );
+            Ok(Disposition::Withhold)
         }
     }
 }
@@ -261,11 +277,26 @@ async fn gate(
 ///
 /// The wording differs by policy on purpose. Under a block the messages are gone and saying so is
 /// the whole of it; under a mute they were recorded, so the note points at the tool that reaches
-/// them, or the agent will assume the same thing happened to both.
-fn announce_expiry(message: &mut crate::channel::InboundMessage, lapsed: &PolicyRecord) {
+/// them, or the agent will assume the same thing happened to both. Under an `active` set for a
+/// while nothing was missed at all, and the news is the other direction: the agent has stopped
+/// hearing a room it asked to hear, which without this reads as the room having gone quiet.
+///
+/// `fallback` is what the conversation reverts to, which is not the policy that preceded the one
+/// lapsing. Only the `active` wording needs it, and only because "you are back on mentions only"
+/// would be a lie in a deployment whose groups default to being heard in full.
+///
+/// Returns whether anything was said, which the caller uses to make sure the message carrying it is
+/// actually delivered. Reported rather than recomputed at the call site so the two cannot disagree
+/// about which cases produce a notice.
+fn announce_expiry(
+    message: &mut crate::channel::InboundMessage,
+    lapsed: &PolicyRecord,
+    fallback: Policy,
+) -> bool {
     let Some(until) = lapsed.until else {
-        return;
+        return false;
     };
+    let before = message.notes.len();
     let until = until.to_rfc3339();
     match lapsed.policy {
         Policy::Block if lapsed.dropped > 0 => {
@@ -284,8 +315,19 @@ fn announce_expiry(message: &mut crate::channel::InboundMessage, lapsed: &Policy
             "you had muted this chat until {until}; anything said meanwhile was recorded, and \
              read_history will show it"
         )),
-        Policy::Block | Policy::Active => {}
+        // Nothing observable changed, so there is nothing to report.
+        Policy::Active if fallback == Policy::Active => {}
+        Policy::Active => message.notes.push(format!(
+            "you had been hearing this chat in full until {until}; it now {}",
+            match fallback {
+                Policy::Mute => "wakes you for mentions only",
+                Policy::Block => "will not reach you at all",
+                Policy::Active => "is heard in full",
+            }
+        )),
+        Policy::Block => {}
     }
+    message.notes.len() > before
 }
 
 /// Collect what each muted conversation in this batch said while the agent was not listening.
@@ -1273,6 +1315,77 @@ mod tests {
             .await
             .expect("registers");
         assert!(store.attachment("1").await.expect("query").is_none());
+    }
+
+    fn lapsed(policy: Policy, dropped: u64) -> PolicyRecord {
+        PolicyRecord {
+            conversation_id: "telegram:1".to_string(),
+            policy,
+            until: Some(Utc::now()),
+            reason: None,
+            dropped,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_listening_window_closing_is_announced() {
+        // The agent asked to hear a room in full and has now stopped. Nothing was withheld, so
+        // there is no backlog to hint at it, and from the inside a room it can no longer hear is
+        // indistinguishable from a room that went quiet.
+        let mut message = event_with(Vec::new());
+        announce_expiry(&mut message, &lapsed(Policy::Active, 0), Policy::Mute);
+        assert_eq!(message.notes.len(), 1, "got {:?}", message.notes);
+        assert!(
+            message.notes[0].contains("hearing this chat in full")
+                && message.notes[0].contains("mentions only"),
+            "got {:?}",
+            message.notes
+        );
+    }
+
+    #[test]
+    fn a_listening_window_closing_onto_a_room_already_heard_in_full_says_nothing() {
+        // Where the default for the kind is `active`, the expiry changed nothing anyone can
+        // observe, and "you now hear this in full" would read as news.
+        let mut message = event_with(Vec::new());
+        announce_expiry(&mut message, &lapsed(Policy::Active, 0), Policy::Active);
+        assert!(message.notes.is_empty(), "got {:?}", message.notes);
+    }
+
+    #[test]
+    fn a_lapsed_mute_points_at_what_can_still_be_read() {
+        // The distinction from a block is the whole of the note: under a mute the messages are
+        // still there, and without being told the agent assumes they went the same way.
+        let mut message = event_with(Vec::new());
+        announce_expiry(&mut message, &lapsed(Policy::Mute, 0), Policy::Mute);
+        assert!(
+            message.notes[0].contains("read_history"),
+            "got {:?}",
+            message.notes
+        );
+    }
+
+    #[test]
+    fn a_lapsed_block_admits_what_cannot_be_recovered() {
+        let mut message = event_with(Vec::new());
+        announce_expiry(&mut message, &lapsed(Policy::Block, 4), Policy::Mute);
+        assert!(
+            message.notes[0].contains("cannot be recovered"),
+            "got {:?}",
+            message.notes
+        );
+    }
+
+    #[test]
+    fn an_indefinite_decision_being_lifted_announces_nothing() {
+        // There is no expiry to report, because nothing expired: the agent lifted it by hand and
+        // already knows.
+        let mut message = event_with(Vec::new());
+        let mut record = lapsed(Policy::Mute, 0);
+        record.until = None;
+        announce_expiry(&mut message, &record, Policy::Mute);
+        assert!(message.notes.is_empty(), "got {:?}", message.notes);
     }
 
     #[test]

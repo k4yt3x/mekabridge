@@ -18,6 +18,7 @@
 - [Telegram](./usage/telegram.md)
 - [Discord](./usage/discord.md)
 - [MCP Tools](./usage/mcp-tools.md)
+- [Group Attention](./usage/group-attention.md)
 - [Security](./usage/security.md)
 - [Operations](./usage/operations.md)
 

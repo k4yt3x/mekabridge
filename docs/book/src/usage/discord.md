@@ -59,11 +59,12 @@ What wakes the agent in a muted channel:
 
 - Being **@mentioned by name**.
 - A **reply** to one of its messages. Discord adds the bot to the message's mention list when the reply keeps its ping, and the bridge also treats a reply with the ping turned off as addressing it.
-- Its **own recent message** in that channel, within `[bridge].mute_followup`, so answering a mention does not need a second one to carry on.
 
 What deliberately does not: `@everyone`, `@here`, and role pings. Those are broadcasts rather than address, and counting them would make one `@everyone` in a large server the cheapest possible way for anybody to force a turn.
 
-Everything withheld is still recorded, and the mention that wakes the agent arrives with a count of what it missed and the last few messages. Use `mekabridge policy set discord:<id> active` to hear a channel in full, or `block` to record nothing at all.
+Nor does an ordinary message, however soon after the agent last spoke there. Until 0.7.0 a five-minute window followed the agent's own message and delivered everything said in the channel meanwhile, which in a busy channel meant delivering the channel.
+
+Everything withheld is still recorded, and the mention that wakes the agent arrives with a count of what it missed and the last few messages. Use `mekabridge policy set discord:<id> active` to hear a channel in full, or `block` to record nothing at all. The agent can follow a channel on past a mention itself; see [Group attention](./group-attention.md).
 
 ## What the agent sees
 
@@ -88,7 +89,7 @@ a19f4c>>>
 - **`from`** uses the sender's nickname in that server when they have one, falling back to their display name and then their handle.
 - **`roles`** is what they hold in this server, which is the difference between a stranger and a moderator. Discord supplies it on every message, so it costs nothing.
 - **`chat`** names the channel and the server. A thread reads `#deploys › rollback tonight in Acme Corp`, so the agent can tell a tangent from the room it came out of.
-- **`woke you`** appears only where the agent is not woken for everything, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest.
+- **`woke you`** appears on every message from a channel rather than a direct message, including ones nothing addressed, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest.
 - **`admitted`** gains two grants on Discord. `role allowlist` means the sender holds a role you allowed, so an operator granted access deliberately but nobody looked at the account. `server allowlist` means neither the person nor the channel was allowlisted, only the server they are both in. The clause after the semicolon is a separate fact: whether the sender is on `allowed_users`, which on Discord admits direct messages only and so never appears as the grant here.
 
 ### Mentions are resolved to names

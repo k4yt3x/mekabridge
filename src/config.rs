@@ -102,14 +102,6 @@ pub struct BridgeConfig {
     pub typing_max: Duration,
     /// What happens to a conversation nobody has ruled on, decided by its chat kind.
     pub default_policy: DefaultPolicy,
-    /// How long after the agent's own message a muted conversation goes on waking it for
-    /// everything.
-    ///
-    /// Without this, answering a mention and then being asked a follow-up without a second mention
-    /// leaves the conversation dead mid-sentence. Measured from the agent's last outbound message
-    /// and deliberately not extended by inbound traffic, or a busy chat would never leave the
-    /// window once the agent had spoken in it once.
-    pub mute_followup: Duration,
     /// Messages of missed context rendered into the envelope when a muted conversation wakes.
     ///
     /// A mention in a busy chat is usually meaningless on its own, and a tool round trip to
@@ -462,8 +454,6 @@ struct FileBridge {
     typing_max: Option<Duration>,
     #[serde(default)]
     default_policy: FileDefaultPolicy,
-    #[serde(default = "default_mute_followup", with = "humantime_serde")]
-    mute_followup: Duration,
     #[serde(default = "default_mute_context")]
     mute_context: usize,
 }
@@ -957,7 +947,6 @@ impl FileConfig {
                     group: self.bridge.default_policy.group,
                     channel: self.bridge.default_policy.channel,
                 },
-                mute_followup: self.bridge.mute_followup,
                 mute_context: self.bridge.mute_context,
             },
             mcp,
@@ -1028,7 +1017,6 @@ impl Default for FileBridge {
             typing_indicator: true,
             typing_max: None,
             default_policy: FileDefaultPolicy::default(),
-            mute_followup: default_mute_followup(),
             mute_context: default_mute_context(),
         }
     }
@@ -1163,12 +1151,6 @@ const fn default_direct_policy() -> Policy {
 /// what is addressed to it, and can read the rest when it needs to.
 const fn default_group_policy() -> Policy {
     Policy::Mute
-}
-
-/// Long enough to carry an exchange that has already started, short enough that a chat the agent
-/// stopped answering goes quiet again on its own.
-const fn default_mute_followup() -> Duration {
-    Duration::from_secs(5 * 60)
 }
 
 /// Enough to make sense of "what do you think about that?" without paying a tool round trip for the
@@ -1437,7 +1419,6 @@ token = \"meka-token\"
         assert_eq!(config.bridge.default_policy.group, Policy::Mute);
         assert_eq!(config.bridge.default_policy.channel, Policy::Mute);
         assert_eq!(config.bridge.default_policy.direct, Policy::Active);
-        assert_eq!(config.bridge.mute_followup, Duration::from_secs(300));
         assert_eq!(config.bridge.mute_context, 5);
     }
 
@@ -1479,10 +1460,14 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn mute_defaults_carry_an_exchange_without_a_second_mention() {
-        let config = parse(MINIMAL).expect("valid");
-        assert_eq!(config.bridge.mute_followup, Duration::from_secs(300));
-        assert_eq!(config.bridge.mute_context, 5);
+    fn a_config_still_setting_mute_followup_is_refused() {
+        // Held to the same standard as any other key that does not exist. A knob that silently
+        // stopped doing anything would leave an operator reading their own config as the
+        // explanation for behaviour it no longer controls, and looking for the fault somewhere
+        // else entirely.
+        let raw = format!("{MINIMAL}\n[bridge]\nmute_followup = \"5m\"\n");
+        let error = parse(&raw).expect_err("a key that no longer exists must be refused");
+        assert!(error.to_string().contains("mute_followup"), "got: {error}");
     }
 
     #[test]

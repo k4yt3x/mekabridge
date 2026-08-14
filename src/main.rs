@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     match cli.run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             // Configuration failures happen before the tracing subscriber exists, so the error is
             // printed here rather than logged. The source chain carries the actionable detail.

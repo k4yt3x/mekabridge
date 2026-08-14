@@ -563,6 +563,92 @@ pub async fn policy_clear(config: &Config, conversation: &str) -> Result<()> {
     Ok(())
 }
 
+/// Report what the agent has not been shown, as an exit code and one line.
+///
+/// Built to be a scheduled job's gate, which is why it owns its exit code rather than reporting
+/// through `Result` like every other subcommand. A gate distinguishes only "fired" from "did not",
+/// so a failure that exits the same way as an honest "nothing new" produces a watcher that goes
+/// silent and stays silent. 2 keeps those apart.
+///
+/// The line on stdout is the other half: a gate watching for it to change needs it to change when
+/// and only when something was said, which is what [`crate::store::UnseenSummary::line`] is for.
+pub fn unseen(config_path: Option<&Path>, conversation: Option<&str>) -> std::process::ExitCode {
+    /// Could not answer, which is not the same as nothing to report.
+    const UNAVAILABLE: u8 = 2;
+    /// Nothing waiting, the conventional "no match" of a predicate.
+    const NOTHING: u8 = 1;
+
+    let answer = super::block_on(async {
+        // Checked rather than passed through, because an id the store simply does not match reads
+        // as an empty room. A gate built around a typo would then decline to fire for as long as
+        // anybody left it running.
+        let parsed = match conversation.map(crate::channel::ConversationId::parse) {
+            Some(None) => {
+                return Err(BridgeError::command(format!(
+                    "{:?} is not a conversation id; expected something like \
+                     `telegram:-1001234567890`",
+                    conversation.unwrap_or_default()
+                )));
+            }
+            other => other.flatten(),
+        };
+        let config = Config::load(config_path)?;
+        // The other half of the same mistake, and the one that survives a well-formed id: a channel
+        // segment naming nothing configured can never match a row. The `unseen` tool refuses this
+        // through the channel registry, and a gate reading the exit code deserves the same answer
+        // from out here.
+        if let Some(parsed) = &parsed
+            && !config
+                .channels
+                .iter()
+                .any(|channel| channel.id == parsed.channel())
+        {
+            return Err(BridgeError::command(format!(
+                "no channel named {:?} is configured, so {} can never match anything",
+                parsed.channel(),
+                parsed
+            )));
+        }
+        let store = Store::open(&config.storage.path).await?;
+        let summary = store.unseen_summary(conversation).await?;
+        // A well-formed id for a chat nothing has arrived from yet is not an error: watching a
+        // room before it has said anything is the point. Still worth a word, because it is also
+        // what a mistyped id looks like, and the two are otherwise identical from out here. On
+        // stderr, which a gate ignores and a person running this by hand will want.
+        if let Some(conversation) = conversation
+            && summary.count == 0
+            && store.conversation(conversation).await?.is_none()
+        {
+            eprintln!(
+                "mekabridge: nothing has ever been recorded from {conversation}, so this will \
+                 report nothing until something is"
+            );
+        }
+        Ok(summary)
+    });
+    match answer {
+        Ok(summary) => {
+            // Split across the two streams because a gate and a person want different answers and
+            // only one of them can have stdout. A watcher comparing output needs a value that
+            // moves when the chat does and at no other time, which the backlog is not: it falls to
+            // zero on every ordinary turn, and a watcher would fire on that and announce news the
+            // agent had just been handed. The count is the useful answer for anybody reading, and
+            // it is on stderr, which a gate ignores and a terminal shows.
+            println!("{}", summary.marker());
+            eprintln!("{}", summary.line());
+            if summary.count > 0 {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::from(NOTHING)
+            }
+        }
+        Err(error) => {
+            eprintln!("mekabridge: {error}");
+            std::process::ExitCode::from(UNAVAILABLE)
+        }
+    }
+}
+
 /// Print what a conversation has said, for checking what history actually holds.
 pub async fn history_show(
     config: &Config,

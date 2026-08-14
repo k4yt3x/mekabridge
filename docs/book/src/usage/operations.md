@@ -160,6 +160,10 @@ against `https://api.telegram.org/`, since plain `curl` hides it by falling back
 
 The other two causes are the agent having muted or blocked the chat itself (same `policy list`, then `policy clear`), and Telegram privacy mode, which withholds the messages before the bridge ever sees them. `mekabridge doctor` reports privacy mode.
 
+**The agent answers a mention and then ignores the reply to it.** Working as configured since 0.7.0. A muted conversation wakes the agent for a mention or a reply to something it said, and for nothing else; the five-minute window that used to follow the agent's own message is gone. `mekabridge unseen <id>` shows what is piling up unheard. The agent can follow a conversation on by unmuting the chat for a while or scheduling its own look-back, both covered in [Group attention](./group-attention.md).
+
+**A watcher the agent set up never fires.** Run its gate command by hand and check the exit code: `mekabridge unseen <id>` exits `2` when it could not answer, which is distinct from `1` for a quiet room precisely so this is diagnosable. A malformed conversation id is a `2`. A well-formed id for a chat nothing has ever arrived from exits `1` and says so on stderr.
+
 **The agent answers a mention without the context around it.** Check `[bridge].mute_context`, which is how many preceding messages are printed alongside a mention in a muted chat. At `0` the agent has to call `read_history` itself. Check also that `[storage].history_retention` is not `0s`, which records nothing at all, and that Telegram privacy mode is off, which would mean there was nothing to record.
 
 **A moderation call fails.** The bot needs to be an administrator of that specific chat with the matching right. Have the agent call `member` with no `user_id` to see what it actually holds there. Telegram also refuses any action against another administrator.

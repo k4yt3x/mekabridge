@@ -28,6 +28,7 @@ With no subcommand, mekabridge runs the daemon.
 | `policy set <id> <active\|mute\|block> [--duration 30m] [--reason X]` | Override the default for one conversation |
 | `policy clear <id>` | Drop a conversation's own policy so it follows the default again |
 | `history <id> [--limit N] [--search WORDS]` | What a conversation said, including what the agent was never woken for |
+| `unseen [<id>]` | What the agent has not been shown, as a line and an exit code. Built to gate a scheduled job |
 | `session show` | The bound session and what meka says about it |
 | `session reset --yes` | Forget the binding so the next message starts a fresh session |
 | `cancel` | Cancel the turn currently running |
@@ -63,3 +64,5 @@ The `policy` commands exist because the agent rules on conversations itself. One
 ```bash
 mekabridge doctor && systemctl restart mekabridge
 ```
+
+`unseen` is the exception, because its exit code is its answer: `0` when something is waiting, `1` when nothing is, and `2` when the question could not be answered at all. The third exists so a watcher gating on it cannot mistake a broken command for a quiet room. See [Group attention](../usage/group-attention.md).

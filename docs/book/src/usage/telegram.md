@@ -45,7 +45,7 @@ attachment: photo, image/jpeg, 2.1 MiB [417]
 
 Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` always appear; the rest show up when they apply.
 
-- **`woke you`** appears in a group the agent is not woken for everything in, saying what pulled it in. It is absent in a direct chat, where every message is addressed to it anyway.
+- **`woke you`** appears on every message from a chat that is not one-to-one, including ones nothing addressed, saying what pulled it in. It is absent in a direct chat, where every message is addressed to it anyway.
 
 - **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
 - **`admitted`** carries two facts. First the grant that let the message through: `user allowlist` (a direct message from somebody you named), `chat allowlist` (the room is allowed), or `open channel` (nothing was checked). Then, separately, whether the sender's own account is on `allowed_users` at all. Since that list reaches direct messages only, somebody you named writing in an allowlisted group is admitted *by the group*, and the second clause is what still identifies them. The bridge reports both; what to make of them belongs in the agent's instructions.
@@ -119,7 +119,7 @@ The bot's username is read once at startup, so renaming it in @BotFather needs a
 
 ## Muting and blocking a chat
 
-`mute` turns a chat down to mentions only; `block` stops it reaching the agent at all and keeps nothing. Both can carry a duration. `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
+`mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
 
 ## Formatting
 

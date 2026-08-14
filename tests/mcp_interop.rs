@@ -19,7 +19,7 @@ use mekabridge::{
     mcp::{
         ChatSettings, ConversationSummary, DownloadedAttachment, HistoryEntry, MemberAction,
         MemberCoverage, MemberInfo, MemberListing, MemberRight, OutboundSink, Policy, SendOptions,
-        SinkError, ToolSurface, ViewedAttachment, serve,
+        SinkError, ToolSurface, UnseenSummary, ViewedAttachment, serve,
     },
 };
 use rmcp2::{
@@ -288,6 +288,14 @@ impl OutboundSink for RecordingSink {
         Ok(previous)
     }
 
+    async fn unseen(&self, _conversation: Option<&str>) -> Result<UnseenSummary, SinkError> {
+        Ok(UnseenSummary {
+            count: 0,
+            newest: None,
+            latest: None,
+        })
+    }
+
     async fn read_history(
         &self,
         conversation: &str,
@@ -487,6 +495,7 @@ async fn turning_off_admin_tools_removes_exactly_those() {
         "send_message",
         "unblock",
         "unmute",
+        "unseen",
         "view_attachment",
     ]);
 
@@ -523,6 +532,7 @@ async fn all_tools_are_visible_to_an_older_client() {
         "set_member_roles",
         "unblock",
         "unmute",
+        "unseen",
         "view_attachment",
     ]);
 

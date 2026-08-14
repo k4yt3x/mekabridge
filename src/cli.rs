@@ -7,7 +7,7 @@
 
 pub mod commands;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -104,6 +104,16 @@ pub enum Command {
         /// Only show messages matching these words.
         #[arg(long)]
         search: Option<String>,
+    },
+
+    /// Report what the agent has not been shown, for use as a scheduled job's gate.
+    ///
+    /// Exits 0 when something is waiting, 1 when nothing is, and 2 when the question could not be
+    /// answered. The three are distinct on purpose: a watcher that treats a failure as "nothing
+    /// new" goes quiet exactly like a room that has, and stays quiet until somebody notices.
+    Unseen {
+        /// Conversation id, for example `telegram:-1001234567890`. Omit to ask about every chat.
+        conversation: Option<String>,
     },
 
     /// Inspect or reset the agent's session.
@@ -245,7 +255,23 @@ pub enum ConfigCommand {
 
 impl Cli {
     /// Execute the selected subcommand.
-    pub fn run(self) -> Result<()> {
+    ///
+    /// The exit code is part of the interface for [`Command::Unseen`] and nothing else, which is
+    /// why it is returned rather than left to the caller to derive from `Ok`/`Err`.
+    pub fn run(self) -> Result<ExitCode> {
+        // Answered before anything else, because its failures have to be told apart from its
+        // answers. Everything below reports failure by returning `Err`, which the binary turns
+        // into exit 1, and exit 1 is this command's way of saying "nothing new".
+        if let Some(Command::Unseen { conversation }) = &self.command {
+            return Ok(commands::unseen(
+                self.config.as_deref(),
+                conversation.as_deref(),
+            ));
+        }
+        self.run_command().map(|()| ExitCode::SUCCESS)
+    }
+
+    fn run_command(self) -> Result<()> {
         let config_path = self.config.clone();
         match self.command {
             Some(Command::Config { command }) => match command {
@@ -332,8 +358,9 @@ async fn dispatch(command: Command, config: Config) -> Result<()> {
             SessionCommand::Reset { yes } => commands::session_reset(&config, yes).await,
         },
         Command::Cancel => commands::cancel(&config).await,
-        // Handled before dispatch so they do not need a config or a runtime.
-        Command::Run | Command::Config { .. } => Ok(()),
+        // Handled before dispatch: the first two need no config or runtime, and `Unseen` owns its
+        // own exit code and so cannot report through this function's `Result`.
+        Command::Run | Command::Config { .. } | Command::Unseen { .. } => Ok(()),
     }
 }
 
@@ -348,7 +375,7 @@ fn resolve_config_path(override_path: Option<&std::path::Path>) -> Result<PathBu
 ///
 /// Created here rather than with `#[tokio::main]` so `mekabridge config path`, which touches
 /// nothing async, does not pay for a thread pool.
-fn block_on<F: Future<Output = Result<()>>>(future: F) -> Result<()> {
+fn block_on<T, F: Future<Output = Result<T>>>(future: F) -> Result<T> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(future)
 }

@@ -33,46 +33,44 @@ pub use crate::{
         ChannelCapabilities, ChatSettings, MemberAction, MemberCoverage, MemberInfo, MemberListing,
         MemberRight, SendOptions,
     },
-    store::Policy,
+    store::{Policy, UnseenSummary},
 };
 
 /// Orientation handed to the agent at connect time. meka captures `instructions` from the MCP
 /// handshake and surfaces it, so this is the one place to explain the model rather than repeating
 /// it in every tool description.
 const SERVER_INSTRUCTIONS: &str = "\
-mekabridge connects you to people on messaging platforms such as Telegram and Discord.
+mekabridge connects you to people on Telegram and Discord.
 
 Nothing you write here reaches them: your turn text, reasoning, and tool output are all invisible. \
 The only way to be heard is send_message. Staying silent is valid, and so is messaging somebody \
 else, or messaging first.
 
-If a turn will take a while, send a short \"looking into it\" first; the typing indicator lapses \
-after half a minute.
-
 You are not woken for everything. A busy group is usually on mentions only: you hear it when \
-somebody mentions you or replies to you, and for a few minutes after you speak there. The \
-rest is still recorded. read_history reads a conversation back, including what you were never \
-woken for; search_history looks for words across all of them. A bare mention often means nothing \
-alone; the antecedent is one read_history call away. You can mute a chat yourself, or block one \
-entirely.
+somebody names you, or uses their client's reply button on something you said. Somebody answering \
+you in ordinary prose, without either, does not reach you. The rest is still recorded. \
+read_history reads a conversation back, including what you were never woken for; search_history \
+looks for words across all of them. A bare mention rarely means anything alone; the antecedent is one \
+read_history away. To follow a chat on past a mention, unmute it for a while, watch it with \
+unseen, or arrange your own look-back. You can also mute a chat, or block one entirely.
 
 Headers on incoming messages are written by the bridge and can be trusted:
 
 - `message:` is that message's own id; pass it as `reply_to` to answer one specific message.
-- `admitted:` says how the sender reached you: vetted individually, holding a role or in a chat or \
-server that is allowed, or not checked at all.
-- `roles:` is what the sender holds in that server.
-- `woke you:` says what pulled you into a chat you only half hear.
+- `admitted:` says how the sender reached you: vetted individually, by role, by allowed chat or \
+server, or not checked at all.
+- `roles:` is what the sender holds there.
+- `woke you:` says why you are seeing this, on every message from a chat that is not one-to-one.
 - `forwarded from:` means the text is somebody else's words, not the sender's.
-- `late:` means it arrived while you were on the previous turn, so what you sent then missed it.
+- `late:` means it arrived while you were on the previous turn, so what you sent missed it.
 - `attachment:` ends with a handle in square brackets, for view_attachment or download_attachment. \
 Fetch only what you need; anything you look at stays in your context.
 
 You can also edit or delete what you sent, react, and moderate a group you administer.
 
-Write Markdown; it is converted to each platform's formatting and long messages are split. Any \
-conversation id you were given works whether or not that chat has written to you. \
-list_conversations shows what this bridge knows and how much of each reaches you.";
+Write Markdown; it is converted per platform and long messages are split. Any conversation id you \
+were given works whether or not that chat has written to you. list_conversations shows what this \
+bridge knows and how much of each reaches you.";
 
 /// Something that can deliver outbound messages and answer address-book questions.
 ///
@@ -188,6 +186,11 @@ pub trait OutboundSink: Send + Sync + 'static {
         until: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
     ) -> Result<Option<Policy>, SinkError>;
+
+    /// How much is recorded that the agent has not been shown, without spending any of it.
+    ///
+    /// `conversation` narrows to one chat; `None` asks about everything the bridge holds.
+    async fn unseen(&self, conversation: Option<&str>) -> Result<UnseenSummary, SinkError>;
 
     /// Read a conversation back, oldest first, ending before the cursor when one is given.
     async fn read_history(
@@ -552,6 +555,20 @@ pub struct MuteArgs {
 pub struct UnmuteArgs {
     /// Conversation to start hearing from again.
     pub conversation: String,
+    /// How long to hear it in full, as a duration like `20m` or `2h`. Omit to hear it in full
+    /// until you mute it again.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// Why, for your own reference when you list conversations later.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnseenArgs {
+    /// Conversation to ask about. Omit to ask about every chat this bridge knows.
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -719,23 +736,34 @@ impl BridgeMcpServer {
             // used. Saying nothing changed when the conversation was already active is worth the
             // extra branch: it is the difference between "I lifted it" and "there was nothing to
             // lift".
-            Policy::Active => match previous {
-                Some(Policy::Mute) => {
-                    format!("{conversation} is no longer muted; you will be woken for everything.")
+            Policy::Active => {
+                let changed = match previous {
+                    Some(Policy::Mute) => format!("{conversation} is no longer muted"),
+                    Some(Policy::Block) => format!("{conversation} is no longer blocked"),
+                    Some(Policy::Active) => {
+                        format!("{conversation} was already set to wake you for everything")
+                    }
+                    None => format!(
+                        "{conversation} had no setting of its own, and an explicit one may differ \
+                         from the default for this kind of chat"
+                    ),
+                };
+                match until {
+                    // What it goes back to matters more than when, and is not obvious: an
+                    // expiring `active` does not restore whatever was there before, it falls
+                    // through to the default for the chat's kind.
+                    // What it reverts to is deliberately not named. This has no idea what kind
+                    // of chat it is, and the default for each kind is the operator's to set, so
+                    // "back to mentions only" would be a guess dressed as a fact.
+                    Some(until) => format!(
+                        "{changed}. You will be woken for everything there until {}, after which \
+                         it falls back to whatever this deployment's default is for a chat of its \
+                         kind. list_conversations reports where it lands.",
+                        until.to_rfc3339()
+                    ),
+                    None => format!("{changed}. You will be woken for everything there."),
                 }
-                Some(Policy::Block) => {
-                    format!(
-                        "{conversation} is no longer blocked; you will be woken for everything."
-                    )
-                }
-                Some(Policy::Active) => {
-                    format!("{conversation} was already set to wake you for everything.")
-                }
-                None => format!(
-                    "{conversation} had no setting of its own and now wakes you for everything, \
-                     which may differ from the default for this kind of chat."
-                ),
-            },
+            }
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
@@ -1358,13 +1386,15 @@ impl BridgeMcpServer {
     /// Stop being woken by everything a conversation says.
     #[tool(
         description = "Turn a conversation down to mentions only, the way you would mute a busy \
-                       group on your own phone. You are still woken when somebody mentions you or \
-                       replies to you, and for a few minutes after you have spoken there so a \
-                       back-and-forth is not cut off. Everything else is recorded rather than \
+                       group on your own phone. You are woken when somebody names you or uses \
+                       their client's reply button on something you said, and for nothing else \
+                       there: somebody answering you in ordinary prose, without either, does not \
+                       reach you. Everything else is recorded rather than \
                        discarded: read_history and search_history reach it, and you are told how \
                        much you missed when something does wake you. `duration` is something like \
-                       `2h` or `7d`; omit it to leave it muted until you unmute. Use block instead \
-                       if you want a chat to stop reaching you at all.",
+                       `2h` or `7d`; omit it to leave it muted until you unmute. To follow a \
+                       conversation on, unmute it for a while, or arrange your own look-back. Use \
+                       block instead if you want a chat to stop reaching you at all.",
         annotations(
             title = "Mute conversation",
             read_only_hint = true,
@@ -1386,8 +1416,13 @@ impl BridgeMcpServer {
 
     /// Start being woken by a conversation again.
     #[tool(
-        description = "Hear everything from a conversation again, undoing a mute. Anything said \
-                       while it was muted was recorded and is still readable with read_history.",
+        description = "Hear everything from a conversation again, undoing a mute. `duration` is \
+                       something like `20m` or `2h`: use it when you have been pulled into a \
+                       discussion and want the whole of it for a while without having to remember \
+                       to mute the chat afterwards. When it lapses the conversation goes back to \
+                       this deployment's default for a chat of its kind. Omit it to \
+                       hear the chat in full until you mute it again. Anything said while it was \
+                       muted was recorded and is still readable with read_history.",
         annotations(
             title = "Unmute conversation",
             read_only_hint = true,
@@ -1398,8 +1433,13 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<UnmuteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.rule(Policy::Active, &args.conversation, None, None)
-            .await
+        self.rule(
+            Policy::Active,
+            &args.conversation,
+            args.duration.as_deref(),
+            args.reason.as_deref(),
+        )
+        .await
     }
 
     /// Stop hearing a conversation at all.
@@ -1432,7 +1472,9 @@ impl BridgeMcpServer {
     /// Start hearing a blocked conversation again.
     #[tool(
         description = "Lift a block so a conversation can reach you again. What was said while it \
-                       was blocked is gone; this only affects what arrives from now on.",
+                       was blocked is gone; this only affects what arrives from now on. \
+                       `duration` bounds how long you hear it in full, after which it goes back to \
+                       the default for its kind rather than back to being blocked.",
         annotations(
             title = "Unblock conversation",
             read_only_hint = true,
@@ -1443,8 +1485,39 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<UnmuteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.rule(Policy::Active, &args.conversation, None, None)
-            .await
+        self.rule(
+            Policy::Active,
+            &args.conversation,
+            args.duration.as_deref(),
+            args.reason.as_deref(),
+        )
+        .await
+    }
+
+    /// Report what is waiting without spending it.
+    #[tool(
+        description = "How many recorded messages you have not been shown, and when the most \
+                       recent of them arrived. Asking does not count as having seen them, so \
+                       read_history still returns them afterwards. Built to be polled: the answer \
+                       is one short line that changes only when something new has been said, so a \
+                       scheduled job can watch a chat with it and spend a turn only once the chat \
+                       has actually moved. Omit `conversation` to ask about every chat at once.",
+        annotations(
+            title = "Unseen messages",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn unseen(
+        &self,
+        Parameters(args): Parameters<UnseenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.sink.unseen(args.conversation.as_deref()).await {
+            Ok(summary) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                summary.line(),
+            )])),
+            Err(error) => Ok(sink_failure(&error)),
+        }
     }
 
     /// Read a conversation back.
@@ -2008,6 +2081,30 @@ mod tests {
             Ok(previous)
         }
 
+        async fn unseen(&self, conversation: Option<&str>) -> Result<UnseenSummary, SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            let matching: Vec<&HistoryEntry> = self
+                .history
+                .iter()
+                .filter(|entry| conversation.is_none_or(|id| entry.conversation == id))
+                .collect();
+            Ok(UnseenSummary {
+                count: matching.len() as u64,
+                latest: matching
+                    .iter()
+                    .filter_map(|entry| chrono::DateTime::parse_from_rfc3339(&entry.timestamp).ok())
+                    .map(|at| at.with_timezone(&chrono::Utc))
+                    .max(),
+                newest: matching
+                    .iter()
+                    .filter_map(|entry| chrono::DateTime::parse_from_rfc3339(&entry.timestamp).ok())
+                    .map(|at| at.with_timezone(&chrono::Utc))
+                    .max(),
+            })
+        }
+
         async fn read_history(
             &self,
             conversation: &str,
@@ -2510,12 +2607,49 @@ mod tests {
         let result = server
             .unmute(Parameters(UnmuteArgs {
                 conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
             }))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
         let text = text_of(&result);
         assert!(text.contains("had no setting of its own"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn hearing_a_chat_in_full_can_be_asked_for_by_the_hour() {
+        // Being pulled into a live discussion is the case this exists for. Without an expiry the
+        // agent has to remember to mute the room afterwards, and a turn that fails or forgets
+        // leaves a busy group waking it for every message indefinitely.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .unmute(Parameters(UnmuteArgs {
+                conversation: "telegram:-100".to_string(),
+                duration: Some("20m".to_string()),
+                reason: Some("design discussion".to_string()),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+
+        let recorded = sink.policies.lock().expect("lock");
+        let (conversation, policy, until, reason) = &recorded[0];
+        assert_eq!(conversation, "telegram:-100");
+        assert_eq!(*policy, Policy::Active);
+        assert!(until.is_some(), "a duration has to reach the store");
+        assert_eq!(reason.as_deref(), Some("design discussion"));
+
+        // What it reverts to is the part the agent cannot infer: an expiring `active` does not
+        // restore the mute that preceded it, it falls through to the default for the kind. Which
+        // default that is stays unnamed, because this call site has no idea what kind of chat it
+        // is and the per-kind defaults are the operator's to set.
+        let text = text_of(&result);
+        assert!(text.contains("falls back to"), "got: {text}");
+        assert!(
+            !text.contains("mentions only"),
+            "the tool cannot know the chat's kind, so it must not name the default: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2532,6 +2666,8 @@ mod tests {
         let result = server
             .unmute(Parameters(UnmuteArgs {
                 conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
             }))
             .await
             .expect("tool runs");
@@ -2556,11 +2692,80 @@ mod tests {
         let result = server
             .unblock(Parameters(UnmuteArgs {
                 conversation: "telegram:1".to_string(),
+                duration: None,
+                reason: None,
             }))
             .await
             .expect("tool runs");
         assert!(text_of(&result).contains("no longer blocked"));
         assert_eq!(sink.policies.lock().expect("lock")[0].1, Policy::Active);
+    }
+
+    fn history_entry(conversation: &str, message_id: &str, text: &str) -> HistoryEntry {
+        HistoryEntry {
+            conversation: conversation.to_string(),
+            message_id: message_id.to_string(),
+            sender: "Alice".to_string(),
+            sender_id: Some("111".to_string()),
+            text: text.to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            // Derived from the id so entries in one test are distinguishable by time.
+            timestamp: format!("2026-08-11T09:3{message_id}:00+00:00"),
+            cursor: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn asking_what_is_unseen_answers_in_one_comparable_line() {
+        // The tool exists to be gated on, so the shape of the answer is the contract: one line, no
+        // prose that varies, and a timestamp rather than anything relative.
+        let (server, _sink) = server_with(FakeSink {
+            history: vec![history_entry("telegram:1", "1", "the deploy is stuck")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .unseen(Parameters(UnseenArgs {
+                conversation: Some("telegram:1".to_string()),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let text = text_of(&result);
+        assert_eq!(text.lines().count(), 1, "got: {text}");
+        assert!(text.starts_with("1 unseen, newest "), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn asking_what_is_unseen_with_no_conversation_covers_everything() {
+        let (server, _sink) = server_with(FakeSink {
+            history: vec![
+                history_entry("telegram:1", "1", "one"),
+                history_entry("telegram:2", "2", "two"),
+            ],
+            ..FakeSink::default()
+        });
+        let result = server
+            .unseen(Parameters(UnseenArgs { conversation: None }))
+            .await
+            .expect("tool runs");
+        assert!(text_of(&result).starts_with("2 unseen"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_quiet_chat_says_nothing_is_waiting_rather_than_failing() {
+        // A watcher polls this constantly, and the quiet answer is by far the common one. An error
+        // here would look to the caller exactly like the bridge being down.
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .unseen(Parameters(UnseenArgs {
+                conversation: Some("telegram:1".to_string()),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(text_of(&result), "0 unseen");
     }
 
     #[tokio::test]
@@ -3095,6 +3300,7 @@ mod tests {
             "set_member_roles",
             "unblock",
             "unmute",
+            "unseen",
             "view_attachment",
         ]);
         for tool in &tools {

@@ -83,7 +83,7 @@ The agent's own messages anywhere, and anyone's in a group where it is an admini
 
 ## `mute`, `unmute`, `block`, and `unblock`
 
-How much of a conversation reaches the agent. All four take the same arguments; `unmute` and `unblock` take only `conversation`.
+How much of a conversation reaches the agent. All four take the same arguments.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
@@ -91,7 +91,7 @@ How much of a conversation reaches the agent. All four take the same arguments; 
 | `duration` | string, optional | `30m`, `2h`, `7d`. Omit to leave it until changed |
 | `reason` | string, optional | Recorded alongside, shown when listing |
 
-**`mute`** turns a conversation down to mentions only. The agent is still woken when somebody mentions it or replies to it, and for `mute_followup` after it has spoken there. Everything else is received and **recorded**, so `read_history` and `search_history` reach it, and the next thing that does wake the conversation says how much accumulated.
+**`mute`** turns a conversation down to mentions only. The agent is woken when somebody names it, or uses their client's reply button on something it said, and for nothing else: somebody answering it in ordinary prose, without either, does not reach it. Everything else is received and **recorded**, so `read_history` and `search_history` reach it, and the next thing that does wake the conversation says how much accumulated.
 
 **`block`** stops a conversation reaching the agent at all. Nothing is delivered and nothing is kept, so unlike a mute there is no way to read afterwards what was said; the agent is only told how many messages went. It is the heavier of the two and belongs on a chat there is no reason to read later.
 
@@ -101,12 +101,31 @@ Muting a one-to-one chat is refused: every message there is addressed to the age
 
 `unmute` and `unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `mekabridge policy clear`.
 
+`duration` on `unmute` is how the agent joins a discussion it has been pulled into without having to remember to mute the room afterwards. When it lapses the conversation falls back to the configured default for its kind rather than to whatever preceded it, and the agent is told: the message that discovers the expiry is delivered even if nothing in it addresses the agent, because a notice nobody is woken for is a notice nobody reads. See [Group attention](./group-attention.md).
+
 A decision the agent made can only be undone by the agent or by an operator. That matters if it silences the conversation you would use to ask it to stop:
 
 ```console
 $ mekabridge policy list
 $ mekabridge policy clear telegram:-1001234567890
 ```
+
+## `unseen`
+
+How much is recorded that the agent has not been shown, and when the most recent of it arrived.
+
+| Argument | Type | Meaning |
+|----------|------|---------|
+| `conversation` | string, optional | Chat to ask about. Omit for every chat at once |
+
+Asking does not count as having seen anything, so `read_history` still returns the same messages
+afterwards.
+
+The tool answers with the backlog, which is what the agent wants to read. It is deliberately **not**
+the value a watcher should compare: a backlog falls to zero every time an ordinary turn sweeps the
+conversation, so a watcher gating on it would fire on the sweep and announce news the agent had just
+been handed. `mekabridge unseen` prints a separate watcher-facing marker for that, which moves only
+when something new is said. See [Group attention](./group-attention.md).
 
 ## `read_history` and `search_history`
 

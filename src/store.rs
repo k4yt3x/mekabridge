@@ -150,8 +150,46 @@ impl Policy {
     }
 }
 
-/// An explicit policy decision about one conversation, as read back from the store.
-///
+/// What a conversation, or the whole bridge, is holding for the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnseenSummary {
+    /// Recorded messages the agent has not been shown.
+    pub count: u64,
+    /// When the most recent of those was sent, or `None` when there are none.
+    pub newest: Option<DateTime<Utc>>,
+    /// When the most recent message was recorded at all, shown or not.
+    ///
+    /// Separate from [`Self::newest`] because the two answer different questions and only this one
+    /// can be watched. See [`Self::marker`].
+    pub latest: Option<DateTime<Utc>>,
+}
+
+impl UnseenSummary {
+    /// The value a watcher compares, which moves when and only when something new was said.
+    ///
+    /// Deliberately not the backlog. A count of unseen messages falls to zero every time an
+    /// ordinary turn sweeps the conversation, so a watcher comparing successive readings would
+    /// fire on the sweep and spend a turn announcing news that had already been delivered. The
+    /// newest recorded timestamp is indifferent to whether anything has been shown, so it changes
+    /// on a new message and on nothing else.
+    ///
+    /// Two things can still move it backwards, and both are real news of a kind: the author
+    /// deleting the newest message, and retention pruning the last of them.
+    pub fn marker(&self) -> String {
+        self.latest.map_or_else(|| "never".to_string(), to_rfc3339)
+    }
+
+    /// The human and agent facing answer: how far behind, and since when.
+    ///
+    /// Not what a watcher should compare, for the reason given on [`Self::marker`].
+    pub fn line(&self) -> String {
+        match self.newest {
+            Some(newest) => format!("{} unseen, newest {}", self.count, to_rfc3339(newest)),
+            None => format!("{} unseen", self.count),
+        }
+    }
+}
+
 /// Absence is meaningful: a conversation with no record follows the configured default for its chat
 /// kind, so this type says "somebody ruled on this one" rather than "this one has a policy".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,12 +339,6 @@ pub struct Store {
     connection: tokio_rusqlite::Connection,
     /// Shared across clones, so a policy written through any handle is seen by every other.
     policies: Arc<RwLock<PolicyCache>>,
-    /// When the agent last sent to each conversation, which the follow-up window is measured from.
-    ///
-    /// Exact rather than time-bounded, unlike [`Store::policies`]: `touch_outbound` is the only
-    /// thing that moves this value and it runs in this process, so nothing can change it behind
-    /// the cache's back. A cold start reads through once per conversation and never again.
-    outbound: Arc<RwLock<HashMap<String, Option<DateTime<Utc>>>>>,
 }
 
 impl Store {
@@ -354,7 +386,6 @@ impl Store {
         Ok(Self {
             connection,
             policies: Arc::default(),
-            outbound: Arc::default(),
         })
     }
 
@@ -562,10 +593,6 @@ impl Store {
     /// insert-time detail. See [`Store::upsert_conversation`] for the inbound direction, which does
     /// know the title and kind and is allowed to update them.
     pub async fn touch_outbound(&self, record: ConversationRecord) -> Result<()> {
-        // Kept back from the closure, which takes the record by value, so the cache below can be
-        // refreshed with what was actually written.
-        let id = record.id.clone();
-        let last_outbound_at = record.last_outbound_at;
         self.connection
             .call(move |connection| {
                 connection.execute(
@@ -596,51 +623,7 @@ impl Store {
                 Ok(())
             })
             .await?;
-        if let Ok(mut cache) = self.outbound.write() {
-            cache.insert(id, last_outbound_at);
-        }
         Ok(())
-    }
-
-    /// When the agent last sent to a conversation, which the follow-up window is measured from.
-    ///
-    /// Reads through the cache [`Store::touch_outbound`] maintains, so the common answer costs a
-    /// hash lookup. This runs on every message a muted conversation withholds, which is the busiest
-    /// path in the bridge.
-    pub async fn last_outbound_at(&self, conversation_id: &str) -> Result<Option<DateTime<Utc>>> {
-        if let Ok(cache) = self.outbound.read()
-            && let Some(cached) = cache.get(conversation_id)
-        {
-            return Ok(*cached);
-        }
-        let at = self
-            .connection
-            .call({
-                let conversation_id = conversation_id.to_string();
-                move |connection| {
-                    connection
-                        .query_row(
-                            "SELECT last_outbound_at FROM conversations WHERE id = ?1",
-                            [conversation_id],
-                            |row| row.get::<_, Option<String>>(0),
-                        )
-                        .optional()
-                }
-            })
-            .await?
-            .flatten()
-            .as_deref()
-            .map(parse_rfc3339)
-            .transpose()?;
-        if let Ok(mut cache) = self.outbound.write() {
-            // Same overflow rule as the policy cache: bounded by dropping the lot, at the cost of
-            // one read each the next time those conversations are heard from.
-            if cache.len() >= POLICY_CACHE_MAX_ENTRIES {
-                cache.clear();
-            }
-            cache.insert(conversation_id.to_string(), at);
-        }
-        Ok(at)
     }
 
     /// Rule on a conversation until `until`, or indefinitely when it is `None`.
@@ -1373,6 +1356,50 @@ impl Store {
         Ok(marked)
     }
 
+    /// How much is owed to the agent, without spending any of it.
+    ///
+    /// The read-only half of [`Store::take_unseen`], which exists because the obvious way to answer
+    /// this question is to ask for the backlog, and asking for the backlog consumes it. A caller
+    /// that only wants to know whether to look would otherwise leave the turn it triggers with
+    /// nothing to read.
+    ///
+    /// Three answers from one snapshot, because a caller comparing readings taken separately could
+    /// see a message land between them: the backlog, when the newest of it arrived, and when
+    /// anything was last recorded here at all. The third is the only one a watcher can compare;
+    /// see [`UnseenSummary::marker`].
+    ///
+    /// `MAX` over the stored text is the same lexical-ordering trick the rest of this module
+    /// relies on: RFC 3339 with a fixed `+00:00` offset sorts as text exactly as it does as time.
+    /// Chrono varies the fractional-second precision per row, which does not break it, because
+    /// `+` and `.` both sort below every digit.
+    pub async fn unseen_summary(&self, conversation_id: Option<&str>) -> Result<UnseenSummary> {
+        /// Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
+        const COLUMNS: &str = "COUNT(CASE WHEN seen = 0 THEN 1 END),
+                               MAX(CASE WHEN seen = 0 THEN timestamp END),
+                               MAX(timestamp)";
+        let conversation_id = conversation_id.map(str::to_string);
+        let (count, newest, latest): (i64, Option<String>, Option<String>) = self
+            .connection
+            .call(move |connection| match conversation_id {
+                Some(conversation_id) => connection.query_row(
+                    &format!("SELECT {COLUMNS} FROM messages WHERE conversation_id = ?1"),
+                    [conversation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ),
+                None => {
+                    connection.query_row(&format!("SELECT {COLUMNS} FROM messages"), [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                }
+            })
+            .await?;
+        Ok(UnseenSummary {
+            count: count.max(0) as u64,
+            newest: newest.as_deref().map(parse_rfc3339).transpose()?,
+            latest: latest.as_deref().map(parse_rfc3339).transpose()?,
+        })
+    }
+
     /// Drop recorded messages older than `before`. The FTS index follows through its triggers.
     pub async fn prune_messages(&self, before: DateTime<Utc>) -> Result<usize> {
         let before = to_rfc3339(before);
@@ -1684,11 +1711,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_follow_up_window_is_read_from_disk_on_a_cold_start() {
-        // The cache `touch_outbound` maintains is per process, so a restart has to fall back to the
-        // stored column. It matters on upgrade: a group the agent spoke in minutes before the
-        // restart keeps waking it until the window closes, rather than going quiet the instant the
-        // new binary comes up.
+    async fn when_the_agent_last_spoke_survives_a_restart() {
+        // The address book orders on this and reports it, so a restart losing it would put a
+        // conversation the agent has only ever written to at the bottom of a list it belongs at the
+        // top of.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.db");
         let sent_at = now();
@@ -1700,22 +1726,12 @@ mod tests {
         }
 
         let reopened = Store::open(&path).await.expect("reopens");
-        assert_eq!(
-            reopened
-                .last_outbound_at("telegram:-100")
-                .await
-                .expect("read"),
-            Some(sent_at),
-            "a restart must not silently close an open follow-up window"
-        );
-        assert_eq!(
-            reopened
-                .last_outbound_at("telegram:-999")
-                .await
-                .expect("read"),
-            None,
-            "a conversation never written to has no window at all"
-        );
+        let record = reopened
+            .conversation("telegram:-100")
+            .await
+            .expect("read")
+            .expect("the conversation is on file");
+        assert_eq!(record.last_outbound_at, Some(sent_at));
     }
 
     #[tokio::test]
@@ -2076,6 +2092,142 @@ mod tests {
         assert_eq!(count, 10, "the agent is told everything it missed");
         let texts: Vec<&str> = context.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(texts, vec!["line 7", "line 8", "line 9"]);
+    }
+
+    #[tokio::test]
+    async fn asking_what_is_unseen_does_not_spend_it() {
+        // The whole reason this exists alongside `take_unseen`. A watcher asks on a timer, and if
+        // asking consumed the backlog the turn it went on to trigger would find an empty room.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .record_message(message("telegram:1", "1", "the deploy is stuck"))
+            .await
+            .expect("record");
+
+        let first = store
+            .unseen_summary(Some("telegram:1"))
+            .await
+            .expect("summary");
+        assert_eq!(first.count, 1);
+        let again = store
+            .unseen_summary(Some("telegram:1"))
+            .await
+            .expect("summary");
+        assert_eq!(again, first, "asking twice must give the same answer");
+
+        let (count, _) = store
+            .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 5)
+            .await
+            .expect("take");
+        assert_eq!(count, 1, "the backlog is still there for the turn to read");
+    }
+
+    #[tokio::test]
+    async fn the_watcher_marker_moves_when_a_chat_does_and_not_otherwise() {
+        // A watcher fires on this string changing, so a new message has to change it and nothing
+        // else may. Both halves matter and the second is the one that costs turns: firing on
+        // something other than a message sends the agent to read a room that has not moved.
+        let store = Store::open_in_memory().await.expect("opens");
+        let marker = async || store.unseen_summary(None).await.expect("summary").marker();
+
+        let quiet = marker().await;
+        assert_eq!(quiet, "never", "a bridge that has heard nothing says so");
+
+        let mut first = message("telegram:1", "1", "one");
+        first.timestamp = now();
+        store.record_message(first).await.expect("record");
+        let after_one = marker().await;
+        assert_ne!(quiet, after_one, "a new message has to register");
+
+        assert_eq!(marker().await, after_one, "a quiet room must not fire");
+
+        // The one that used to fire wrongly. An ordinary turn sweeps the backlog to zero, which
+        // moved a count-carrying marker and sent the watcher to announce news the agent had just
+        // been handed.
+        store
+            .mark_seen("telegram:1", now() + chrono::Duration::hours(1))
+            .await
+            .expect("mark seen");
+        assert_eq!(
+            marker().await,
+            after_one,
+            "being shown the backlog is not news of a new message"
+        );
+
+        let mut second = message("telegram:2", "2", "two");
+        second.timestamp = now() + chrono::Duration::seconds(30);
+        store.record_message(second).await.expect("record");
+        assert_ne!(
+            marker().await,
+            after_one,
+            "a message in another chat still has to register on a bridge-wide watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_marker_and_the_backlog_answer_different_questions() {
+        // The count is what a person wants and the marker is what a watcher can use. Keeping both
+        // is the point: collapsing them either fires spuriously or reports nothing useful.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .record_message(message("telegram:1", "1", "one"))
+            .await
+            .expect("record");
+        store
+            .mark_seen("telegram:1", now() + chrono::Duration::hours(1))
+            .await
+            .expect("mark seen");
+
+        let summary = store
+            .unseen_summary(Some("telegram:1"))
+            .await
+            .expect("summary");
+        assert_eq!(summary.count, 0, "it has been shown");
+        assert_eq!(
+            summary.newest, None,
+            "so there is no unseen message to date"
+        );
+        assert!(
+            summary.latest.is_some(),
+            "but the chat has still said something, which is what a watcher tracks"
+        );
+        assert_eq!(summary.line(), "0 unseen");
+        assert_ne!(summary.marker(), "never");
+    }
+
+    #[tokio::test]
+    async fn unseen_can_be_asked_about_one_chat_or_all_of_them() {
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .record_message(message("telegram:1", "1", "one"))
+            .await
+            .expect("record");
+        store
+            .record_message(message("telegram:2", "2", "two"))
+            .await
+            .expect("record");
+
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            1
+        );
+        assert_eq!(store.unseen_summary(None).await.expect("summary").count, 2);
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:999"))
+                .await
+                .expect("summary"),
+            UnseenSummary {
+                count: 0,
+                newest: None,
+                latest: None
+            },
+            "a chat nothing has arrived from is empty, not an error"
+        );
     }
 
     #[tokio::test]

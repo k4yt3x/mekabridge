@@ -7,11 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `unseen`, reporting what the agent has not been shown without spending it. Tool and CLI alike.
+- `mekabridge unseen` exits 0, 1, or 2, so a gate can tell a failure from a quiet room.
+- `mekabridge unseen` prints a watcher marker on stdout that moves only when a chat does.
+- `unmute` and `unblock` take a `duration`, for joining a discussion without having to leave it.
+- A Group Attention page, covering what wakes the agent and what it can arrange for itself.
+
+### Changed
+
+- `woke you:` is stated on every message from a group, including the ones nothing addressed.
+- A muted conversation's envelope block names the two things that do wake the agent there.
+- A lapsed policy's notice now wakes the agent, instead of being filed where nothing reads it.
+
+### Removed
+
+- **Breaking:** `[bridge].mute_followup`; a config still setting it is refused by name at startup.
+- The agent is no longer told to send a holding reply for a slow turn; the indicator now lasts.
+
 ### Fixed
 
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
 - A list written with blank lines between its items was packed as tight as one without.
 - A second paragraph inside a list item was joined to its bullet, reading as a broken item.
+- The agent was told the typing indicator lapses after 30 seconds, untrue since 0.5.0.
+- The agent was told a reply to it would not wake a muted chat, when on both platforms it does.
 
 ## [0.6.0] - 2026-08-12
 

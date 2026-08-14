@@ -37,7 +37,7 @@ use crate::{
         ToolSurface, ViewedAttachment, serve,
     },
     meka::MekaClient,
-    store::{Policy, Store},
+    store::{Policy, Store, UnseenSummary},
 };
 
 /// Buffer between the channel pollers and the durable writer.
@@ -1024,6 +1024,21 @@ impl OutboundSink for BridgeSink {
             ),
         }
         Ok(existing.map(|record| record.policy))
+    }
+
+    async fn unseen(
+        &self,
+        conversation: Option<&str>,
+    ) -> std::result::Result<UnseenSummary, SinkError> {
+        // Parsed rather than trusted, so an id naming no configured channel is refused instead of
+        // quietly matching nothing, which from the caller's side is indistinguishable from a room
+        // that has gone quiet. `resolve` does not rewrite the id, so the string reaching the store
+        // is the one the caller passed.
+        let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
+        self.store
+            .unseen_summary(conversation.as_ref().map(ConversationId::as_str))
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))
     }
 
     async fn read_history(

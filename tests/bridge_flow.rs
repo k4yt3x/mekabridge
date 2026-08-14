@@ -1576,9 +1576,65 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
 }
 
 #[tokio::test]
-async fn a_muted_conversation_keeps_answering_for_a_while_after_the_agent_speaks() {
-    // Without this an exchange dies mid-sentence: the agent answers a mention, the person replies
-    // without mentioning it again, and it never sees the reply.
+async fn a_listening_window_closing_actually_reaches_the_agent() {
+    // The notice is written onto the message that discovers the expiry, and that message is
+    // usually one nothing addressed, in a room that has just gone back to mentions only. Filed
+    // rather than delivered, it lands in the history where nothing will read it, and the agent
+    // goes on believing it can hear a room it cannot. That is the exact confusion the notice
+    // exists to prevent, so discovering an expiry has to be able to wake the agent by itself.
+    let harness = Harness::start(1, 0).await;
+    // What `unmute(duration)` leaves behind once the window has closed.
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            Policy::Active,
+            Some(Utc::now() - chrono::Duration::minutes(1)),
+            Some("design discussion"),
+            Utc::now() - chrono::Duration::minutes(21),
+        )
+        .await
+        .expect("policy");
+
+    harness
+        .sender
+        .send(group_message("unrelated chatter", "1", false))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn carrying the expiry notice", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+    let envelope = &harness.turns()[0];
+    assert!(
+        envelope.contains("hearing this chat in full") && envelope.contains("mentions only"),
+        "the agent has to be told its window closed:\n{envelope}"
+    );
+
+    // And the room really is back on mentions only afterwards, rather than having been reopened by
+    // the delivery.
+    harness
+        .sender
+        .send(group_message("more chatter", "2", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "only the message that found the expiry is owed a turn: {:?}",
+        harness.turns()
+    );
+}
+
+#[tokio::test]
+async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() {
+    // There was a window here: for five minutes after the agent's own message, everything said in
+    // the room woke it. In a busy chat that delivered the room, in envelopes indistinguishable
+    // from a message addressed to the agent, and each reply it was nudged into making pushed the
+    // window out again. Mention-only now means exactly that. Following a conversation on is
+    // something the agent asks for rather than something it is handed.
     let harness = Harness::start(1, 0).await;
     harness
         .store
@@ -1586,7 +1642,8 @@ async fn a_muted_conversation_keeps_answering_for_a_while_after_the_agent_speaks
         .await
         .expect("mute");
 
-    // What `note_sent` does after the agent's own message lands.
+    // What `note_sent` does after the agent's own message lands, so this is the most favourable
+    // possible moment for the old window: it opened a heartbeat ago.
     harness
         .store
         .touch_outbound(ConversationRecord {
@@ -1609,52 +1666,21 @@ async fn a_muted_conversation_keeps_answering_for_a_while_after_the_agent_speaks
         .send(message("no, I meant the other one", "1"))
         .await
         .expect("queued");
-    harness
-        .wait_for("the follow-up turn", |harness| !harness.turns().is_empty())
-        .await;
-    assert!(
-        harness.turns()[0].contains("the other one"),
-        "a reply inside the window must land without a second mention"
-    );
-}
-
-#[tokio::test]
-async fn a_follow_up_window_that_has_closed_stops_waking_the_agent() {
-    let harness = Harness::start(1, 0).await;
-    harness
-        .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
-        .await
-        .expect("mute");
-    // Backdated well past the configured window rather than sleeping through a real one.
-    harness
-        .store
-        .touch_outbound(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: None,
-            kind: ChatKind::Unknown.as_str().to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: None,
-            last_outbound_at: Some(Utc::now() - chrono::Duration::hours(2)),
-        })
-        .await
-        .expect("outbound");
-
-    harness
-        .sender
-        .send(message("unrelated chatter", "1"))
-        .await
-        .expect("queued");
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
         harness.turns().is_empty(),
-        "a chat the agent stopped answering has to go quiet again: {:?}",
+        "speaking in a muted chat must not open it up again: {:?}",
         harness.turns()
     );
+
+    // Withheld, not discarded. The distinction is the whole reason this is tolerable: the agent
+    // was not interrupted, and the message is still there for it to find.
+    let (owed, _) = harness
+        .store
+        .take_unseen("mock:1", Utc::now(), 10)
+        .await
+        .expect("read");
+    assert_eq!(owed, 1, "the message has to survive for read_history");
 }
 
 #[tokio::test]

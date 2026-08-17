@@ -63,6 +63,7 @@ And point meka at the bridge's MCP endpoint:
 name = "mekabridge"
 transport = "http"
 url = "http://127.0.0.1:9100/mcp"
+required = true
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
@@ -75,7 +76,7 @@ mekabridge          # first
 meka serve          # second
 ```
 
-meka retries a failed MCP connect in the background with backoff, so starting them the other way round recovers on its own. It just takes a few minutes, during which `[mcp].strict` makes meka refuse every turn, so the order above avoids a window where nothing works for no visible reason.
+meka retries a failed MCP connect in the background with backoff, so starting them the other way round recovers on its own. It just takes a few minutes, during which `required = true` makes meka refuse turns rather than run them without the bridge's tools. Leave it out and that window is silent: the agent reads each message and has nothing to answer with.
 
 ## 5. Say something
 

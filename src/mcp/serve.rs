@@ -3,8 +3,8 @@
 //!
 //! The HTTP listener is bound before the bridge needs meka for anything, so a port conflict fails
 //! startup outright. meka retries a failed MCP connect in the background with backoff, so a meka
-//! that boots first recovers on its own; until it does, `[mcp].strict` refuses turns, which is why
-//! coming up promptly still matters.
+//! that boots first recovers on its own; until it does, a server entry marked `required` refuses
+//! turns rather than running them toolless, which is why coming up promptly still matters.
 
 use std::sync::Arc;
 

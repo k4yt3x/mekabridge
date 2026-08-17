@@ -1472,11 +1472,27 @@ impl Channel for DiscordChannel {
         if let Some(flags) = self.outbound_flags() {
             request = request.flags(flags);
         }
-        let body = caption.and_then(|caption| {
-            render::to_markdown(caption, render::MESSAGE_LIMIT)
-                .into_iter()
-                .next()
-        });
+        // Refused rather than truncated, for the same reason as Telegram's: the caption belongs to
+        // the file and cannot be continued, so dropping everything past the first part loses it
+        // silently while still reporting success.
+        let body = match caption {
+            None => None,
+            Some(caption) => {
+                let mut bodies = render::to_markdown(caption, render::MESSAGE_LIMIT);
+                if bodies.len() > 1 {
+                    return Err(ChannelError::Delivery {
+                        channel: self.id.as_str().to_string(),
+                        message: format!(
+                            "the caption is longer than the {} characters Discord allows on a \
+                             message. Shorten it, or send the file with a short caption and the \
+                             rest as a message.",
+                            render::MESSAGE_LIMIT
+                        ),
+                    });
+                }
+                bodies.pop()
+            }
+        };
         if let Some(body) = &body {
             request = request.content(body);
         }

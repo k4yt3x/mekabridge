@@ -10,40 +10,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `unseen`, reporting what the agent has not been shown without spending it. Tool and CLI alike.
-- `mekabridge unseen` exits 0, 1, or 2, so a gate can tell a failure from a quiet room.
-- `mekabridge unseen` prints a watcher marker on stdout that moves only when a chat does.
+- `mekabridge unseen` exits 0, 1 or 2, and prints a marker that moves only when a chat does.
 - `unmute` and `unblock` take a `duration`, for joining a discussion without having to leave it.
 - A Group Attention page, covering what wakes the agent and what it can arrange for itself.
 - **Breaking:** a chat whose message could not be delivered is told so, in one line and no detail.
-- The owner is told which chats lost what, after how many attempts, and the error verbatim.
+- The owner gets the detail: which chats lost what, after how many attempts, and the error verbatim.
 - Both notices are held to one per chat per 15 minutes; the owner's counts what it swallowed.
 - `[bridge].notify_failures` turns the chat's notice off, leaving the owner's and the logs.
+- A compaction is logged at warn: it is where the agent's memory of other chats becomes a summary.
 
 ### Changed
 
 - **Breaking:** a Telegram message now starts a turn as it arrives. The Bot API reports no typing.
+- **Breaking:** the typing indicator shows only while the model is writing a message.
+- **Breaking:** `typing_max` defaults to `2m` rather than the turn budget, which could never fire.
+- **Breaking:** moderation, delete and rename tools need meka's `write`; talking still needs `read`.
 - `settle` applies only where the platform reports typing, and is now `3s`; `settle_max` is `30s`.
 - Discord holds a chat while the person whose message is waiting is still composing more.
 - Every chat is held 1s regardless, so the parts of a split post arrive as one turn. Not tunable.
 - `woke you:` is stated on every message from a group, including the ones nothing addressed.
 - A muted conversation's envelope block names the two things that do wake the agent there.
 - `turn_retries` defaults to `3`, now that the attempts are spaced out rather than instant.
-- A `provider` error is no longer retried on read-only calls; meka means it as one it cannot repair.
-- A turn that failed after the agent had sent or run something is no longer retried at all.
+- A turn that failed after the agent had sent or run something is no longer retried.
 - An error needing an operator is given up on at once instead of spending the whole budget.
+- A `provider` error is no longer retried on read-only calls; meka means it as one it cannot repair.
+- `list_members` clamps its `limit` before the connector sees it, as the other limits already did.
+- The inbound buffer is 8 rather than 64, bounding how many messages a hard kill can lose.
 
 ### Removed
 
 - **Breaking:** `[bridge].mute_followup`; a config still setting it is refused by name at startup.
-- The agent is no longer told to send a holding reply for a slow turn; the indicator now lasts.
+- The agent is no longer told to send a holding reply for a slow turn; that is its call to make.
 
 ### Fixed
 
-- A failed batch was retried instantly, so a rate limit consumed every attempt in seconds.
-- A message that ran out of attempts stayed marked seen, so nothing would ever surface it again.
+- A dropped turn stream is rejoined rather than guessed at, so its outcome is known.
+- A turn that already acted is never replayed, whether it failed, was cancelled or lost its stream.
+- Events the bridge knows it missed no longer count as proof that the agent did nothing.
+- A submission meka never accepted no longer spends the backlog or the overflow notice it reported.
+- A batch stranded by a hard kill says it was interrupted rather than arriving as new work.
+- A message that ran out of attempts is owed to the agent again rather than left marked seen.
+- A message recorded while a turn ran is no longer marked seen without ever having been shown.
+- A failed batch waits between attempts, so a rate limit no longer spends them all in seconds.
+- meka being unreachable is retried rather than written off on the first attempt.
+- A reply containing a run longer than the platform limit hung the splitter; it now splits.
+- A long reply is no longer split into bodies the platform refuses, so none arrives half sent.
+- Telegram's 4096 is counted in UTF-16 units, so an emoji-heavy reply is no longer refused whole.
+- A caption longer than the platform allows is refused rather than silently truncated.
+- Only the first message of a turn drew a typing indicator; every later one was suppressed.
+- A crash part-way through a migration no longer leaves a database that will not open again.
+- Concurrent opens no longer race the migration or the WAL pragma, so neither fails to start.
+- Queue retention is measured from delivery, so an edited old message keeps its duplicate guard.
+- A delivered row can no longer be re-failed or released back into the queue and handed out twice.
+- One vanished row no longer strands the rest of its batch in flight and reorders a conversation.
+- An envelope header can no longer be forged from a name, by newline or Unicode line separator.
+- The fence marker around user text is redacted however it is spelled.
+- A `duration` far enough in the future panicked and hung the tool call; it is refused now.
+- Two attachments on one Discord message no longer overwrite each other's file.
+- An image is screened against the size meka will really show, and says to download it instead.
+- `doctor` reads meka's degraded readiness and fails on what it names, rather than exiting 0.
+- Requests have deadlines, so a connection that goes silent without closing no longer wedges a turn.
 - A 429 or 5xx without a Problem Detail body, as a reverse proxy sends, was never retried.
 - A chat mid-burst delayed delivery for every other chat; readiness is now per conversation.
 - A lapsed policy's notice was filed where nothing would read it, so the agent was never told.
+- The docs said `[mcp].strict` defaults to on. It does not, so the samples now set `required`.
+- `read_history` and `search_history` overstated what a block hides and what the history holds.
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
 - A list written with blank lines between its items was packed as tight as one without.
 - A second paragraph inside a list item was joined to its bullet, reading as a broken item.

@@ -642,11 +642,28 @@ impl Channel for TelegramChannel {
         }
 
         let file = InputFile::file(path);
-        // Captions have their own, much smaller limit than messages.
-        let caption_body = caption.and_then(|caption| {
-            let (bodies, _) = self.render(caption, render::CAPTION_LIMIT);
-            bodies.into_iter().next()
-        });
+        // Captions have their own, much smaller limit than messages, and unlike a message a caption
+        // cannot be continued: it belongs to the file. Taking the first part and dropping the rest
+        // lost the difference silently and still reported success, so a caption that does not fit
+        // is refused and the agent is told the limit it has to write to.
+        let caption_body = match caption {
+            None => None,
+            Some(caption) => {
+                let (mut bodies, _) = self.render(caption, render::CAPTION_LIMIT);
+                if bodies.len() > 1 {
+                    return Err(ChannelError::Delivery {
+                        channel: self.id.as_str().to_string(),
+                        message: format!(
+                            "the caption is longer than the {} characters Telegram allows on a \
+                             file. Shorten it, or send the file with a short caption and the rest \
+                             as a message.",
+                            render::CAPTION_LIMIT
+                        ),
+                    });
+                }
+                bodies.pop()
+            }
+        };
         let parse_mode =
             matches!(self.parse_mode, TelegramParseMode::Html).then_some(ParseMode::Html);
 

@@ -58,9 +58,19 @@ enum FailureKind {
     /// meka's bucket for an upstream failure its own agent loop has already tried and failed to
     /// repair. More attempts would only delay the notice saying an operator is needed.
     Unrepairable,
+    /// What meka sends when it stops a turn whose stream nobody is watching any more: a
+    /// `turn.cancelled` with `reason: "client"`, not an error. The work stopped partway.
+    Cancelled,
+    /// The same, but the agent had already sent something when it was stopped.
+    CancelledAfterActing,
     /// The agent called a send tool and then the turn died. Nothing may be retried: the work is
     /// done and a second attempt would repeat it with the agent having no memory of the first.
     AfterActing,
+    /// meka's own broadcast to this client overran, so it cancelled the turn and said how many
+    /// events it had dropped. Deliberately carries no `tool_call.executing`: the send is exactly
+    /// what went missing, which is the point. Counting the absence as "the agent did nothing" is
+    /// what would hand the batch back for a second delivery.
+    Lagged,
 }
 
 /// What the stub meka observed, so tests can assert on the envelope the agent would have seen.
@@ -86,16 +96,75 @@ struct MekaRecorder {
     /// Turns to answer with a stream that stops before any terminal event, simulating a dropped
     /// connection while the turn keeps running server-side.
     truncate_first: Mutex<usize>,
+    /// `Last-Event-ID` values seen on the rejoin endpoint, so a test can assert the bridge resumed
+    /// from the right place rather than replaying the turn from the start.
+    rejoins: Mutex<Vec<Option<u64>>>,
+    /// A `turn_id` for the rejoin endpoint to report, when it should differ from the original.
+    /// meka retains only the most recent turn, so a rejoin landing after a newer one started gets
+    /// that turn instead, and identifies it on the `turn.started` it re-issues.
+    rejoin_turn_id: Mutex<Option<String>>,
+    /// Whether the rejoin reports a replay hole, which meka does when its ring no longer reaches
+    /// the client's `Last-Event-ID`.
+    rejoin_gap: Mutex<bool>,
+    /// Whether the rejoined stream ends in a failure rather than a clean finish. Only then does a
+    /// hole in the accounting decide anything: it is what `had_side_effects` reads to choose
+    /// between handing the batch back and calling it spent.
+    rejoin_fails: Mutex<bool>,
+    /// Whether the truncated stream carries a completed `send_message` before it stops.
+    truncate_after_sending: Mutex<bool>,
+    /// Whether the rejoin endpoint refuses. Inverted so the default matches a real meka, which
+    /// has the endpoint; setting it models one too old to, or a turn no longer joinable.
+    rejoin_unavailable: Mutex<bool>,
+    /// Rejoin requests to answer with a transient 503 before serving the real stream, standing in
+    /// for a proxy recycling a worker. Distinct from `rejoin_unavailable`, which is meka saying
+    /// there is nothing to join: here the turn is alive and the request simply did not arrive.
+    rejoin_stumbles: Mutex<usize>,
+    /// Whether the turn's only assistant text is meka's empty-response stand-in, delivered on the
+    /// rejoined stream. The ordinary shape of a turn that answered: the agent replies through
+    /// `send_message` and writes no text of its own, so meka's last round has nothing in it.
+    stand_in_after_rejoin: Mutex<bool>,
+    /// Whether the turn's stream carries a frame this build cannot parse: a known event name with
+    /// a payload that is not what its shape says. A contract mismatch rather than a lost
+    /// connection.
+    garbled_frame: Mutex<bool>,
+    /// `POST /cancel` calls, so a test can assert the bridge stopped a turn it walked away from.
+    cancels: Mutex<usize>,
+    /// What `GET /v1/health/ready` answers with: the status line and the HTTP code.
+    readiness: Mutex<Option<(u16, String)>>,
     /// What `GET /v1/sessions/{id}` reports for `turn_in_flight`.
     turn_in_flight: Mutex<bool>,
     /// Turns to refuse with a `turn-in-flight` 409, as meka does while it runs a turn of its own.
     busy_first: Mutex<usize>,
+    /// Turns to refuse with meka's concurrency-limit 429, as it does when its process-wide guard
+    /// is full. Distinct from `busy_first`, which is the 409 for a turn already running on
+    /// *this* session: both refuse before the turn exists, but only the 409 was ever treated
+    /// as a refusal.
+    limit_first: Mutex<usize>,
     /// Turns to answer with meka's empty-response stand-in and no tool calls.
     empty_first: Mutex<usize>,
     /// How long a turn takes to answer. The default of zero makes the suite fast; a test that
     /// needs something to happen *during* a turn sets it, since otherwise the turn is over
     /// before the test can act.
     turn_delay: Mutex<Duration>,
+    /// Emit a `send_message` tool call, holding the stream open for this long between
+    /// `tool_call.composing` and `tool_call.executing`. Zero emits no tool call at all.
+    ///
+    /// The gap has to be real rather than two events in one chunk: the bridge raises the typing
+    /// indicator on the first and drops it on the second, so with no wall-clock between them there
+    /// is nothing for a test to observe and nothing a person would see either.
+    compose_for: Mutex<Duration>,
+    /// How many chunks of the current streamed turn have gone out, so a test can wait for the
+    /// event it actually cares about rather than for the handler being entered. `turns` is pushed
+    /// at the top of the handler, so waiting on it is waiting for t=0.
+    streamed: Mutex<usize>,
+    /// Which tool that call names. Anything other than a send tool is the "agent is off reading
+    /// files" case, which must draw nothing.
+    compose_tool: Mutex<String>,
+    /// Whether the composing call is abandoned and replaced by a different one, which is what a
+    /// caller sees when meka retries the provider round. `tool_call.composing` deliberately does
+    /// not mark the attempt as having produced output, so the whole window it opens is one meka
+    /// will retry from; the event already sent cannot be withdrawn, and the retry mints fresh ids.
+    compose_retry: Mutex<bool>,
 }
 
 async fn create_session() -> impl IntoResponse {
@@ -158,6 +227,28 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
             false
         }
     };
+    let should_limit = {
+        let mut remaining = recorder
+            .limit_first
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *remaining > 0 {
+            *remaining -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if should_limit {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+            r#"{"type":"https://meka.so/errors/concurrency-limit","title":"Concurrency limit",
+                "status":429,"detail":"the server is at its turn limit","retry_after":0.05}"#
+                .to_string(),
+        )
+            .into_response();
+    }
     if should_refuse {
         return (
             axum::http::StatusCode::CONFLICT,
@@ -183,6 +274,24 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         tokio::time::sleep(delay).await;
     }
 
+    // A frame this build cannot parse. It has to be invalid JSON outright: every field accessor in
+    // the parser is lenient, defaulting a missing or wrongly-typed member rather than failing, so a
+    // payload of the wrong *shape* still parses. Rejoining replays this out of meka's ring and
+    // fails on it identically every time, so it must not go down that path.
+    if *recorder
+        .garbled_frame
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "retry: 3000\n\n\
+             event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
+             event: turn.finished\nid: 1\ndata: {\"stop_reason\":\n\n"
+                .to_string(),
+        )
+            .into_response();
+    }
     let should_truncate = {
         let mut remaining = recorder
             .truncate_first
@@ -202,12 +311,38 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
             .turn_in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        // Optionally with a send already made, which is what decides whether the batch may be
+        // handed over again at all.
+        let sent = if *recorder
+            .truncate_after_sending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            "event: tool_call.executing\nid: 2\n\
+             data: {\"id\":\"c1\",\"name\":\"mcp__mekabridge__send_message\",\
+             \"input\":{},\"display_summary\":null}\n\n"
+        } else {
+            ""
+        };
+        // Suppressed when the stand-in is the point: text from before the drop would be prepended
+        // to it and stop it matching, which is not how a turn that wrote nothing looks.
+        let opening = if *recorder
+            .stand_in_after_rejoin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            String::new()
+        } else {
+            "event: assistant_text.delta\nid: 1\ndata: {\"text\":\"partial\"}\n\n".to_string()
+        };
         return (
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-            "retry: 3000\n\n\
-             event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
-             event: assistant_text.delta\nid: 1\ndata: {\"text\":\"partial\"}\n\n"
-                .to_string(),
+            format!(
+                "retry: 3000\n\n\
+                 event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
+                 {opening}\
+                 {sent}"
+            ),
         )
             .into_response();
     }
@@ -256,6 +391,23 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         }
     };
 
+    let compose_for = *recorder
+        .compose_for
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let compose_tool = {
+        let name = recorder
+            .compose_tool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if name.is_empty() {
+            "mcp__mekabridge__send_message".to_string()
+        } else {
+            name
+        }
+    };
+
     let stream = if should_fail {
         let kind = *recorder
             .failure
@@ -264,13 +416,35 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         // The tool call is what makes the bridge treat the batch as spent: it counts sends off the
         // event stream, not off anything reaching a channel, so this is enough to stand in for an
         // agent that had already answered somebody when the turn died.
-        let acted = if kind == FailureKind::AfterActing {
+        let acted = if matches!(
+            kind,
+            FailureKind::AfterActing | FailureKind::CancelledAfterActing
+        ) {
             "event: tool_call.executing\nid: 1\n\
              data: {\"id\":\"c1\",\"name\":\"mcp__mekabridge__send_message\"}\n\n"
         } else {
             ""
         };
-        let error = if kind == FailureKind::Unrepairable {
+        if matches!(
+            kind,
+            FailureKind::Cancelled | FailureKind::CancelledAfterActing
+        ) {
+            return (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    "retry: 3000\n\n\
+                     event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
+                     {acted}\
+                     event: turn.cancelled\nid: 2\ndata: {{\"reason\":\"client\"}}\n\n"
+                ),
+            )
+                .into_response();
+        }
+        let error = if kind == FailureKind::Lagged {
+            "{\"type\":\"https://meka.so/errors/sse-lag\",\"title\":\"Event stream lagged\",\
+             \"status\":500,\"detail\":\"SSE consumer fell behind; 12 event(s) were dropped. \
+             Retry the turn.\"}"
+        } else if kind == FailureKind::Unrepairable {
             "{\"type\":\"https://meka.so/errors/provider\",\"title\":\"Provider failed\",\
              \"status\":502,\"detail\":\"upstream refused\"}"
         } else {
@@ -284,6 +458,75 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
              {acted}\
              event: turn.failed\nid: 2\ndata: {{\"error\":{error}}}\n\n"
         )
+    } else if !compose_for.is_zero() {
+        // Split across two chunks with the wait between them, so the composing window has real
+        // duration on the wire the way it does against a model writing a long message.
+        let head = "retry: 3000\n\n\
+             event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
+             event: assistant_text.delta\nid: 1\ndata: {\"text\":\"on it\"}\n\n";
+        let composing = format!(
+            "event: tool_call.composing\nid: 2\ndata: {{\"id\":\"c1\",\"name\":\"{compose_tool}\"}}\n\n"
+        );
+        let executing = format!(
+            "event: tool_call.executing\nid: 3\n\
+             data: {{\"id\":\"c1\",\"name\":\"{compose_tool}\",\
+             \"input\":{{}},\"display_summary\":null}}\n\n\
+             event: tool_call.completed\nid: 4\ndata: {{\"id\":\"c1\",\"is_error\":false}}\n\n"
+        );
+        // Its own chunk, after another wait. Packed together with the executing event, the turn
+        // ended microseconds after the indicator should have stopped, so a test could not tell the
+        // two causes apart and an indicator held to the end of the turn looked identical.
+        let finished = "event: turn.finished\nid: 5\ndata: {\"stop_reason\":\"end_turn\",\
+             \"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n"
+            .to_string();
+        // Three phases with a real wait between each: the agent working before it writes anything,
+        // the window in which it writes, and the message being handed over. A test can observe the
+        // indicator's absence, presence and absence again against wall-clock rather than against
+        // event ordering inside one chunk.
+        *recorder
+            .streamed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        let chunks = if *recorder
+            .compose_retry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            // The call being written is abandoned and a different one takes its place, which is
+            // what meka's own retry looks like from here: no closing event for `c1`, ever.
+            let retried = "event: tool_call.composing\nid: 3\n\
+                 data: {\"id\":\"c2\",\"name\":\"read_file\"}\n\n"
+                .to_string();
+            let ran = "event: tool_call.executing\nid: 4\n\
+                 data: {\"id\":\"c2\",\"name\":\"read_file\",\
+                 \"input\":{},\"display_summary\":null}\n\n"
+                .to_string();
+            vec![head.to_string(), composing, retried, ran, finished]
+        } else {
+            vec![head.to_string(), composing, executing, finished]
+        };
+        let body = axum::body::Body::from_stream(futures::stream::unfold(
+            (0_usize, chunks, Arc::clone(&recorder)),
+            move |(step, chunks, recorder)| async move {
+                let chunk = chunks.get(step)?.clone();
+                if step > 0 {
+                    tokio::time::sleep(compose_for).await;
+                }
+                *recorder
+                    .streamed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = step + 1;
+                Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
+                    (step + 1, chunks, recorder),
+                ))
+            },
+        ));
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response();
     } else {
         "retry: 3000\n\n\
          event: turn.started\nid: 0\ndata: {\"turn_id\":\"t\",\"session_id\":\"s\"}\n\n\
@@ -300,8 +543,154 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         .into_response()
 }
 
-async fn cancel_turn() -> impl IntoResponse {
+/// `GET /v1/sessions/{id}/stream`: what a client does after its connection drops.
+///
+/// Answers with the tail the truncated stream never sent, resumed after `Last-Event-ID`, which is
+/// what real meka replays from its per-turn ring.
+async fn rejoin_turn(
+    State(recorder): State<Arc<MekaRecorder>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let resume_from = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    recorder
+        .rejoins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(resume_from);
+
+    // Not a Problem Detail: a 503 from something in front of meka, which is what a worker recycle
+    // looks like. meka itself is still holding the turn open for its reattach grace.
+    let stumbled = {
+        let mut remaining = recorder
+            .rejoin_stumbles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *remaining > 0 {
+            *remaining -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if stumbled {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "upstream temporarily unavailable",
+        )
+            .into_response();
+    }
+
+    if *recorder
+        .rejoin_unavailable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+            r#"{"type":"https://meka.so/errors/not-found","title":"Not found",
+                "status":404,"detail":"no turn stream to join on this session"}"#,
+        )
+            .into_response();
+    }
+
+    // The turn is over as far as the stub is concerned, so nothing is left running.
+    *recorder
+        .turn_in_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    let turn_id = recorder
+        .rejoin_turn_id
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| "t".to_string());
+    // meka's wording for a ring that no longer reaches the client's position.
+    let gap = if *recorder
+        .rejoin_gap
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        "event: notice\ndata: {\"level\":\"warn\",\"text\":\"Replay buffer does not reach your \
+         Last-Event-ID; some events were dropped.\"}\n\n"
+    } else {
+        ""
+    };
+    let terminal = if *recorder
+        .rejoin_fails
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        "event: turn.failed\nid: 3\ndata: {\"error\":{\"type\":\
+         \"https://meka.so/errors/internal\",\"title\":\"Internal server error\",\
+         \"status\":500,\"detail\":\"provider temporarily unavailable\"}}\n\n"
+    } else {
+        "event: turn.finished\nid: 3\ndata: {\"stop_reason\":\"end_turn\",\
+         \"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n"
+    };
+    // meka's stand-in for a round that produced no content at all, which is what the last round of
+    // a turn that answered through a tool call looks like.
+    let tail = if *recorder
+        .stand_in_after_rejoin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        "event: assistant_text.delta\nid: 2\n\
+         data: {\"text\":\"[The model returned an empty response.]\"}\n\n"
+    } else {
+        "event: assistant_text.delta\nid: 2\ndata: {\"text\":\" and the rest\"}\n\n"
+    };
+    // Opens with the synthesised `turn.started` real meka sends on a resume: `resumed: true` and
+    // deliberately no `id:`, so a client cannot rewind its position past the replay.
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "retry: 3000\n\n\
+             event: turn.started\n\
+             data: {{\"turn_id\":\"{turn_id}\",\"session_id\":\"s\",\"resumed\":true}}\n\n\
+             {gap}\
+             {tail}\
+             {terminal}"
+        ),
+    )
+        .into_response()
+}
+
+async fn cancel_turn(State(recorder): State<Arc<MekaRecorder>>) -> impl IntoResponse {
+    *recorder
+        .cancels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
     axum::http::StatusCode::NO_CONTENT
+}
+
+/// `GET /v1/health/ready`. meka answers 503 with the *same* body it sends on 200, naming which
+/// subsystem is the blocker, rather than a Problem Detail.
+async fn ready(State(recorder): State<Arc<MekaRecorder>>) -> axum::response::Response {
+    let answer = recorder
+        .readiness
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match answer {
+        Some((status, body)) => (
+            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        None => axum::Json(serde_json::json!({
+            "status": "ok",
+            "session_db": true,
+            "provider_configured": true,
+            "mcp_servers_healthy": true,
+        }))
+        .into_response(),
+    }
 }
 
 async fn get_session(
@@ -334,8 +723,10 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", axum::routing::get(get_session))
         .route("/v1/sessions/{id}/turn", post(submit_turn))
+        .route("/v1/sessions/{id}/stream", axum::routing::get(rejoin_turn))
         .route("/v1/sessions/{id}/cancel", post(cancel_turn))
         .route("/v1/info", axum::routing::get(info))
+        .route("/v1/health/ready", axum::routing::get(ready))
         .with_state(recorder);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -562,6 +953,24 @@ fn sink_with_storage(
     attachment_dir: std::path::PathBuf,
     presence: Arc<Presence>,
 ) -> BridgeSink {
+    sink_against_meka(
+        store,
+        channels,
+        attachment_dir,
+        presence,
+        ([127, 0, 0, 1], 1).into(),
+    )
+}
+
+/// The same, pointed at a meka that answers, so the vision probe succeeds and `view_attachment`
+/// reaches the code that decides between an image and a description.
+fn sink_against_meka(
+    store: Store,
+    channels: Arc<ChannelRegistry>,
+    attachment_dir: std::path::PathBuf,
+    presence: Arc<Presence>,
+    meka_address: SocketAddr,
+) -> BridgeSink {
     let storage = StorageConfig {
         path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
         attachment_dir,
@@ -571,7 +980,7 @@ fn sink_with_storage(
     };
     let meka = MekaClient::new(
         &config_for(
-            ([127, 0, 0, 1], 1).into(),
+            meka_address,
             std::path::Path::new("/tmp/mekabridge-unused.db"),
             0,
             false,
@@ -703,6 +1112,11 @@ struct Setup {
     /// two apart; see [`Setup::patient`].
     settle: Duration,
     settle_max: Duration,
+    /// Far below the shipped four seconds, so a test can tell an indicator that was stopped from
+    /// one that is still being renewed. At the default no refresh tick lands inside a window a
+    /// test would care to sample, which is how two typing tests came to pass against the very
+    /// regressions they were written for.
+    typing_refresh: Duration,
     /// Whether the bridge announces a turn in the originating chats. Off for most of the suite, so
     /// it is not measuring presence it does not care about.
     typing_indicator: bool,
@@ -722,6 +1136,7 @@ impl Default for Setup {
             coalesce_floor: Duration::from_millis(100),
             settle: Duration::from_millis(150),
             settle_max: Duration::from_millis(600),
+            typing_refresh: Duration::from_millis(100),
             typing_indicator: false,
             turn_timeout: "20s".to_string(),
             history_retention: Duration::from_secs(86_400),
@@ -803,6 +1218,23 @@ impl Harness {
     /// one was applied at all.
     async fn start_patient() -> Self {
         Self::start_all(1, 0, 0, 0, 0, Setup::patient()).await
+    }
+
+    /// A harness whose turns call `tool`, holding the composing window open for `window` so a test
+    /// can see what the indicator does during it and either side.
+    async fn start_composing(tool: &str, window: Duration) -> Self {
+        let harness = Self::start_with_typing().await;
+        *harness
+            .recorder
+            .compose_for
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = window;
+        *harness
+            .recorder
+            .compose_tool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = tool.to_string();
+        harness
     }
 
     async fn start_with_typing() -> Self {
@@ -891,6 +1323,7 @@ impl Harness {
             config.bridge.coalesce_floor = setup.coalesce_floor;
             config.bridge.settle = setup.settle;
             config.bridge.settle_max = setup.settle_max;
+            config.bridge.typing_refresh = setup.typing_refresh;
             config.storage.history_retention = setup.history_retention;
         }
 
@@ -927,6 +1360,7 @@ impl Harness {
                     channels,
                     // From the config rather than pinned off, so a test can exercise presence.
                     config.bridge.typing_indicator,
+                    config.bridge.typing_refresh,
                     config.bridge.typing_max,
                     Arc::new(Presence::default()),
                 ),
@@ -1227,6 +1661,71 @@ fn attempts_at(harness: &Harness, conversation: &str) -> usize {
         .iter()
         .filter(|envelope| envelope.contains(&format!("conversation: {conversation}")))
         .count()
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_is_not_counted_as_delivered() {
+    // The second door into the same silent loss the rejoin closed. meka stops a turn whose stream
+    // has had no subscriber for `[serve].stream_reattach_grace` and reports it as a cancellation
+    // with `reason: "client"`, so a rejoin landing after the kill gets `turn.cancelled` back. That
+    // is a turn stopped partway through work nobody has seen, and filing it as a success loses the
+    // message exactly as surely as reading an idle session as a finished turn did. At
+    // `stream_reattach_grace = "0s"`, which meka offers, every dropped stream ends this way.
+    let harness = Harness::start_failing(0, FailureKind::Cancelled, Setup::default()).await;
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the cancelled turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(
+        stats.done, 0,
+        "a turn that was stopped partway must not be counted as delivered: {stats:?}"
+    );
+    // And the message is still owed to the agent rather than gone.
+    let summary = harness
+        .store
+        .unseen_summary(Some("mock:1"))
+        .await
+        .expect("summary");
+    assert_eq!(
+        summary.count, 1,
+        "the message must survive the cancellation"
+    );
+}
+
+#[tokio::test]
+async fn a_cancellation_after_the_agent_acted_is_not_replayed() {
+    // The other half, and the reason the fix is not simply "cancelled means requeue". A turn that
+    // had already sent something when it was stopped is spent, for the same reason a failed one is:
+    // handing the batch back repeats work the agent cannot remember doing.
+    let harness =
+        Harness::start_failing(3, FailureKind::CancelledAfterActing, Setup::default()).await;
+    harness
+        .sender
+        .send(message("do the thing", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the cancelled turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        harness.attempts(),
+        1,
+        "a cancellation that interrupted a send must not be tried again"
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.done, 1, "and the batch is accounted for: {stats:?}");
+    assert_eq!(stats.pending, 0);
 }
 
 #[tokio::test]
@@ -1974,6 +2473,7 @@ async fn queued_messages_survive_a_restart() {
                 meka,
                 channels,
                 false,
+                Duration::from_secs(4),
                 Duration::from_secs(30),
                 Arc::new(Presence::default()),
             ),
@@ -2217,9 +2717,105 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
 }
 
 #[tokio::test]
-async fn a_chat_waiting_on_someone_elses_turn_is_told_the_agent_is_busy() {
-    // meka only refuses because it is running a turn, and a backgrounded tool call delivers its
-    // outcome as one. The agent is working; the chat should not look dead while it does.
+async fn the_indicator_is_up_only_while_the_model_writes_the_message() {
+    // The whole point of the rework. The indicator used to be raised on `turn.started` and held for
+    // the life of the turn, so a chat saw "typing" through a dozen tool calls and however long the
+    // agent spent reading. It now tracks the one interval meka can actually vouch for: between
+    // `tool_call.composing` and `tool_call.executing` on a send call.
+    let harness =
+        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(900)).await;
+    harness
+        .sender
+        .send(message("what did the log say?", "1"))
+        .await
+        .expect("queued");
+
+    // The turn is under way and the model is talking, but not yet writing a message.
+    harness
+        .wait_for("the turn to start", |harness| harness.attempts() > 0)
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        harness.channel.activity_count(),
+        0,
+        "the indicator went up before the model had started writing anything"
+    );
+
+    harness
+        .wait_for("the indicator during composition", |harness| {
+            harness.channel.activity_count() > 0
+        })
+        .await;
+
+    // And it stops when the arguments are finished, rather than running on to the end of the turn.
+    // The stub holds the stream open for another window after `tool_call.executing` before sending
+    // `turn.finished`, and the harness renews every 100ms, so an indicator still up here would tick
+    // several times inside the sample. Waiting on the chunk count rather than on `turns()`, which
+    // the stub pushes at the top of the handler and is therefore true from t=0.
+    harness
+        .wait_for("the arguments to be written", |harness| {
+            *harness
+                .recorder
+                .streamed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                >= 3
+        })
+        .await;
+    let settled = harness.channel.activity_count();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        harness.channel.activity_count(),
+        settled,
+        "the indicator kept refreshing after the message was written"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_writes_no_message_shows_nothing() {
+    // A question the agent answers by doing nothing, or a mention in a group it decides not to
+    // join. Under the old rule this still drew a typing indicator for as long as the turn ran,
+    // which promised a reply that was never coming.
+    // A turn with real duration that calls a tool which is not a send. Duration matters: the stub
+    // otherwise answers in microseconds, and the old raise-on-`turn.started` behaviour would have
+    // had no time to draw anything either, so the test would pass against the code it rules out.
+    let harness = Harness::start_composing("read_file", Duration::from_millis(700)).await;
+    harness
+        .sender
+        .send(message("just so you know", "1"))
+        .await
+        .expect("queued");
+
+    // Waiting for the whole stream, not for the handler being entered. `turns()` is pushed at the
+    // top of the handler, so the original `wait_for` returned at t=0 and the assertion ran before
+    // the stub had reached its `tool_call.composing` chunk at all: the test passed against a build
+    // with the send-tool guard deleted, which is the one regression it exists to catch.
+    harness
+        .wait_for("the whole turn to stream", |harness| {
+            *harness
+                .recorder
+                .streamed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                >= 4
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(
+        harness.channel.activity_count(),
+        0,
+        "a turn that never wrote a message must not claim it was typing one"
+    );
+}
+
+#[tokio::test]
+async fn a_chat_waiting_on_someone_elses_turn_is_left_alone() {
+    // The inverse of what this used to assert. meka refuses because it is running some turn, and
+    // the agent is genuinely working, but not on a message to this chat: it may be finishing a
+    // scheduled job for somebody else entirely. Claiming otherwise is the kind of almost-true
+    // signal that teaches people to ignore the indicator. What still has to hold is that the wait
+    // costs nothing: the batch lands as soon as meka frees up.
     //
     // `turn_in_flight` is deliberately left false throughout, which is what the real meka reports
     // while it refuses: the field tracks a counter only `POST /turn` bumps, and the refusal comes
@@ -2238,10 +2834,13 @@ async fn a_chat_waiting_on_someone_elses_turn_is_told_the_agent_is_busy() {
         .expect("queued");
 
     harness
-        .wait_for("the indicator to go up while meka is busy", |harness| {
-            harness.channel.activity_count() > 0
-        })
+        .wait_for("the first refusal", |harness| harness.attempts() > 0)
         .await;
+    assert_eq!(
+        harness.channel.activity_count(),
+        0,
+        "nothing may be shown in a chat that is waiting on an unrelated turn"
+    );
 
     harness
         .wait_for("the batch to land once meka frees up", |harness| {
@@ -2287,15 +2886,13 @@ async fn a_session_that_refuses_while_reporting_itself_idle_is_retried_on_a_time
         "{submissions} submissions in three seconds of refusals: the bridge is spinning on the \
          409 rather than waiting the other turn out"
     );
-    let activities = harness.channel.activity_count();
-    assert!(
-        activities <= 4,
-        "{activities} typing actions in three seconds: a refused submission is queueing indicators \
-         faster than the platform will drain them"
-    );
-    assert!(
-        activities > 0,
-        "the chat was left silent while meka was busy with a turn of its own"
+    // Zero rather than "not many". The field failure was an indicator storm, and the indicator no
+    // longer goes up on this path at all: it means the model is writing a message to this chat, and
+    // somebody else's turn is the furthest thing from that.
+    assert_eq!(
+        harness.channel.activity_count(),
+        0,
+        "a refused submission must not announce anything in the chat"
     );
 }
 
@@ -2543,12 +3140,77 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
 
     // Withheld, not discarded. The distinction is the whole reason this is tolerable: the agent
     // was not interrupted, and the message is still there for it to find.
-    let (owed, _) = harness
+    let (owed, ..) = harness
         .store
         .take_unseen("mock:1", Utc::now(), 10)
         .await
         .expect("read");
     assert_eq!(owed, 1, "the message has to survive for read_history");
+}
+
+#[tokio::test]
+async fn a_refusal_that_is_not_the_409_does_not_spend_the_backlog_either() {
+    // The sibling below covers meka's `turn-in-flight` 409, which was the only refusal ever
+    // excepted. It is far from the only one: a meka restarting refuses the socket, its
+    // process-wide guard answers 429, a rotated token answers 401, a proxy answers 502. Each of
+    // those reaches nobody, and each spent the backlog anyway -- so the retry told the agent
+    // "nothing has been said there since you last looked" about a chat with four messages waiting,
+    // and they were then gone from `unseen` and from every future lookback with nothing to point
+    // at them.
+    // Enough retries to outlast the refusals, so the batch reaches meka on a later attempt and the
+    // envelope is rebuilt. A budget that exhausts first would fail the batch outright and never
+    // show what the second envelope said.
+    let harness = Harness::start_full(5, 0, 0, 0).await;
+    harness.store.note_dropped(3).await.expect("shed three");
+    *harness
+        .recorder
+        .limit_first
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 2;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+    for index in 0..4 {
+        harness
+            .sender
+            .send(message(&format!("while muted {index}"), &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(harness.turns().is_empty(), "a mute withholds all four");
+
+    let mut mention = message("@bot what do you make of that?", "9");
+    if let InboundEvent::Message(inner) = &mut mention {
+        inner.addressed = true;
+    }
+    harness.sender.send(mention).await.expect("queued");
+
+    harness
+        .wait_for("the batch to land once the limit clears", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+
+    let turns = harness.turns();
+    let envelope = turns.first().expect("one turn");
+    assert!(
+        envelope.contains("while muted 3"),
+        "the backlog was spent by a submission meka never accepted:\n{envelope}"
+    );
+    // The queue-overflow counter rides the same envelope and is taken the same way, so it is lost
+    // on the same paths. Reported here rather than in its own test because it needs exactly this
+    // setup: a rendered envelope that never reached anybody.
+    assert!(
+        envelope.contains("could not be queued"),
+        "the overflow notice died with the discarded envelope:\n{envelope}"
+    );
+    assert!(
+        !envelope.contains("Nothing has been said"),
+        "the agent was told an active chat had gone quiet:\n{envelope}"
+    );
 }
 
 #[tokio::test]
@@ -2900,27 +3562,18 @@ async fn a_forgotten_session_is_replaced_and_the_batch_is_replayed() {
 }
 
 #[tokio::test]
-async fn a_dropped_stream_does_not_resubmit_the_turn() {
-    // The turn was accepted and keeps running server-side, so resubmitting would duplicate a reply
-    // the user is about to receive. The bridge waits for the session to go idle instead.
+async fn a_dropped_stream_is_rejoined_rather_than_resubmitted() {
+    // Resubmitting would duplicate a reply the user is about to receive, so the bridge rejoins the
+    // turn instead and reads how it actually ended. Rejoining is also what keeps the turn alive:
+    // meka stops a turn whose stream has had no subscriber for `[serve].stream_reattach_grace`, so
+    // a client that answers a dropped connection by polling gets the turn killed under it and is
+    // then told the session is idle, which reads exactly like the turn having finished.
     let harness = Harness::start_full(1, 0, 0, 1).await;
     harness
         .sender
         .send(message("are you there?", "1"))
         .await
         .expect("queued");
-
-    harness
-        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
-        .await;
-
-    // The bridge is now polling. Report the turn as finished.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    *harness
-        .recorder
-        .turn_in_flight
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -2942,12 +3595,583 @@ async fn a_dropped_stream_does_not_resubmit_the_turn() {
         "the turn must not be resubmitted: {:?}",
         harness.turns()
     );
+    // Resumed after the last id it was actually handed, not from the start of the turn. The
+    // truncated stream ended on `id: 1`, so replaying from zero would show the agent its own
+    // opening events twice.
+    let rejoins = harness
+        .recorder
+        .rejoins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(rejoins, vec![Some(1)], "rejoined from the wrong position");
     let stats = harness.store.queue_stats().await.expect("stats");
     assert_eq!(
         stats.failed, 0,
-        "an interrupted turn is not a delivery failure"
+        "an interrupted turn that was rejoined is not a delivery failure"
     );
     assert_eq!(stats.pending, 0);
+}
+
+#[tokio::test]
+async fn a_turn_that_already_answered_is_not_replayed_when_the_rejoin_fails() {
+    // Arm ordering, which is easy to get wrong and silent when it is. Every dropped stream
+    // satisfies `turn_outcome_unknown`, so with that arm first the "the agent already acted" guard
+    // was unreachable and a turn that had answered somebody was handed back to answer again. The
+    // counters are a floor here rather than an estimate: the drop truncated them, so a send they
+    // *do* show certainly happened.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    *harness
+        .recorder
+        .truncate_after_sending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    *harness
+        .recorder
+        .rejoin_unavailable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "a batch whose turn had already sent was submitted again: {:?}",
+        harness.turns()
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.done, 1, "and it is accounted for rather than owed");
+}
+
+#[tokio::test]
+async fn rejoining_a_different_turn_is_refused() {
+    // meka retains only the most recent turn's stream. A rejoin landing after our turn ended and a
+    // newer one started -- a scheduled job, or a backgrounded tool call delivering its outcome --
+    // gets that turn instead, and every one of its ids is above our resume point, so nothing is
+    // filtered. Accepting it would count another turn's sends as ours and read its terminal as this
+    // batch's outcome. meka identifies which turn on the `turn.started` it re-issues.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    *harness
+        .recorder
+        .rejoin_turn_id
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("a-different-turn".to_string());
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    // Refused, so the outcome stays unknown and the batch is owed rather than closed against work
+    // done for somebody else.
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(
+        stats.done, 0,
+        "another turn's outcome was accepted as this batch's: {stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejoin_that_reports_a_hole_does_not_replay_the_batch() {
+    // meka's replay ring is bounded, so a resume can come back saying events are gone rather than
+    // handing over a transcript that silently skips. Those events can include a send, which makes
+    // the counters understate what the turn did. Read literally they would say "nothing happened,
+    // safe to retry", and the agent would repeat work it cannot remember doing.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    *harness
+        .recorder
+        .rejoin_gap
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    // The hole only decides anything on a turn that failed: a clean finish marks the batch done
+    // whatever the counters say, so a test against one cannot see the flag at all.
+    *harness
+        .recorder
+        .rejoin_fails
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "a turn whose accounting had a hole was replayed: {:?}",
+        harness.turns()
+    );
+}
+
+#[tokio::test]
+async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
+    // The still frame is what "show me" resolves to for a video, and it is tens of kilobytes. The
+    // pre-fetch size check reads `record.bytes`, which is the size of the *main* file, so checking
+    // one against the other refused every video over the ceiling on the strength of a number
+    // describing something else: "what is in this clip?" answered "too large to show inline" while
+    // the frame that would have answered it sat one fetch away.
+    let recorder = Arc::new(MekaRecorder::default());
+    let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&directory.path().join("state.db"))
+        .await
+        .expect("store");
+    store
+        .upsert_conversation(ConversationRecord {
+            id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            platform: "telegram".to_string(),
+            chat: "1".to_string(),
+            thread: None,
+            title: Some("Alice".to_string()),
+            kind: "direct".to_string(),
+            created_at: Utc::now(),
+            last_inbound_at: Some(Utc::now()),
+            last_outbound_at: None,
+        })
+        .await
+        .expect("conversation");
+
+    let channel = Arc::new(MockChannel::new("mock"));
+    channel.put_file("AgACthumb", ONE_PIXEL_PNG.to_vec());
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+
+    let handle = store
+        .register_attachment(mekabridge::store::AttachmentRecord {
+            id: "mock:1:1:0".to_string(),
+            conversation_id: "mock:1".to_string(),
+            channel_id: "mock".to_string(),
+            kind: "video".to_string(),
+            file_ref: "AgACvideo".to_string(),
+            thumb_ref: Some("AgACthumb".to_string()),
+            file_name: Some("clip.mp4".to_string()),
+            media_type: Some("video/mp4".to_string()),
+            // Well past `MAX_VIEW_BYTES`, which is the whole point: the thumbnail is not.
+            bytes: Some(12 * 1024 * 1024),
+            path: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("registers");
+
+    let sink = sink_against_meka(
+        store.clone(),
+        channels,
+        directory.path().to_path_buf(),
+        Arc::new(Presence::default()),
+        address,
+    );
+    let viewed = sink.view_attachment(&handle).await.expect("resolves");
+    shutdown.cancel();
+
+    match viewed {
+        // The note is what says this is a frame rather than the file, which is the whole reason a
+        // preview is allowed to stand in for something that cannot be shown.
+        ViewedAttachment::Image { note, .. } => {
+            assert!(note.is_some(), "a still frame must arrive with its caveat");
+        }
+        other => panic!("the preview frame was refused on the video's size: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn meka_being_unreachable_is_retried_rather_than_given_up_on() {
+    // The case the whole backoff exists for, and the one nothing covered. Every other failure test
+    // scripts an HTTP-level Problem Detail, so which *errors* reach `Retry::Never` was never
+    // checked -- and that arm passes `max_attempts = 0`, marking the row `failed` on its first
+    // attempt: unseen, the chat apologised to, the owner told a message could not be delivered.
+    // Classifying a transport error as permanent therefore declares every queued message
+    // undeliverable within a second of meka restarting, while the suite stays green and
+    // `architecture.md` promises three waits of 10s, 20s and 40s.
+    let harness = Harness::start_full(3, 0, 0, 0).await;
+    // Stop the stub so the connection itself is refused, which is what a restarting meka looks
+    // like from here. Nothing is scripted to fail: the failure is the socket.
+    harness.meka_shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+
+    // Waiting for evidence that an attempt was actually made and charged, rather than for a fixed
+    // interval: on a loaded machine a bare sleep can end before the drain loop has tried anything,
+    // and the assertion below would then hold for the wrong reason.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let attempted = loop {
+        let pending = harness.store.peek_pending(10).await.expect("peek");
+        if let Some(row) = pending.first()
+            && row.attempts > 0
+        {
+            break true;
+        }
+        let stats = harness.store.queue_stats().await.expect("stats");
+        if stats.failed > 0 {
+            break false;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no attempt was ever charged against the batch"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    assert!(
+        attempted,
+        "meka being unreachable spent the entire retry budget at once"
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(stats.failed, 0, "the batch was written off: {stats:?}");
+    assert!(
+        harness.channel.sent().is_empty(),
+        "a chat was apologised to before the attempts had run out: {:?}",
+        harness.channel.sent()
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_frame_stops_the_turn_instead_of_rejoining_it() {
+    // A frame this build cannot parse is a contract mismatch, not a lost connection, and the two
+    // want opposite handling. Rejoining replays the same frame out of meka's ring and fails on it
+    // identically, five times over. And walking away without cancelling leaves the turn running
+    // server-side, still able to send messages that nothing here will ever account for -- this was
+    // the one give-up path that did exactly that.
+    let harness = Harness::start_full(1, 0, 0, 0).await;
+    *harness
+        .recorder
+        .garbled_frame
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the garbled turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let rejoins = harness
+        .recorder
+        .rejoins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    assert_eq!(rejoins, 0, "a frame that cannot be parsed was rejoined");
+    let cancels = *harness
+        .recorder
+        .cancels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        cancels > 0,
+        "the turn was left running after the bridge stopped reading it"
+    );
+}
+
+#[tokio::test]
+async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
+    // meka answers 503 with the same body it sends on 200, naming which subsystem is the blocker,
+    // and not as a Problem Detail. Handed to the shared decode path that becomes "unexpected body",
+    // retried on the way, so the one response worth reading is the one that could not be read.
+    let recorder = Arc::new(MekaRecorder::default());
+    *recorder
+        .readiness
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+        503,
+        r#"{"status":"degraded","session_db":false,"provider_configured":true,
+            "mcp_servers_healthy":true}"#
+            .to_string(),
+    ));
+    let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = config_for(address, &directory.path().join("state.db"), 1, false, "30s");
+    let meka = mekabridge::meka::MekaClient::new(&config.meka).expect("client");
+
+    let ready = meka
+        .ready()
+        .await
+        .expect("meka's own 503 carries an answer");
+    assert_eq!(ready.status, "degraded");
+    assert!(
+        !ready.session_db,
+        "the blocker meka named was lost on the way"
+    );
+    assert!(ready.provider_configured);
+
+    // A 503 that is *not* meka's own answer is a different thing entirely: something in front of
+    // meka, which is worth retrying rather than reporting as a considered verdict.
+    *recorder
+        .readiness
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((503, "<html>502 Bad Gateway</html>".to_string()));
+    meka.ready()
+        .await
+        .expect_err("a proxy's 503 is not a readiness answer");
+
+    // The one that actually gets through the door: a load balancer answering in JSON. Every field
+    // of `ReadyStatus` defaults, so requiring merely a non-empty `status` accepted this and turned
+    // it into a confident report that every subsystem was down.
+    *recorder
+        .readiness
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+        503,
+        r#"{"status":"Service Unavailable","message":"no healthy upstream"}"#.to_string(),
+    ));
+    meka.ready()
+        .await
+        .expect_err("a proxy's JSON 503 was read as meka's own diagnosis");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_hole_in_the_accounting_beats_the_empty_response_shortcut() {
+    // The empty-response path hands a batch straight back, with no wait, on the grounds that the
+    // turn is provably inert. A rejoin that outran meka's replay ring destroys the proof: only the
+    // tail comes back, so the tool call that sent the reply is not in the counters, and the last
+    // round's stand-in is the only text there is. Both readings are true at once, and whichever the
+    // caller consults first decides -- so the guard on the failure path is worth nothing unless the
+    // success path asks the same question.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    for flag in [
+        &harness.recorder.rejoin_gap,
+        &harness.recorder.stand_in_after_rejoin,
+    ] {
+        *flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
+    harness
+        .sender
+        .send(message("did that go through?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "a turn whose accounting had a hole was replayed as an empty response: {:?}",
+        harness.turns()
+    );
+}
+
+#[tokio::test]
+async fn a_lagged_stream_does_not_have_its_counters_believed() {
+    // `sse-lag` is meka saying it dropped events out of *this* client's view before cancelling the
+    // turn, and it names how many. The events it dropped can include the `tool_call.executing` for
+    // a send, so the counters read off that stream describe a turn that did less than it did.
+    // Classifying the error as retryable and then trusting those counters is the combination that
+    // hands the batch back: `had_side_effects` sees zero sends, and the agent answers a second time
+    // with no memory of the first.
+    let harness = Harness::start_failing(3, FailureKind::Lagged, Setup::default()).await;
+    harness
+        .sender
+        .send(message("did you get that?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the lagged turn", |harness| !harness.turns().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "a turn whose events meka admits dropping was replayed: {:?}",
+        harness.turns()
+    );
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(
+        stats.done, 1,
+        "and it is closed against work that may have happened, not left owed: {stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejoin_that_stumbles_is_tried_again_rather_than_abandoned() {
+    // The rejoin request is the one call that had no retry of its own, so a single 502 from a proxy
+    // recycling a worker gave up on a turn that was alive and mid-work -- and cancelled it on the
+    // way out. meka holds the turn open for `[serve].stream_reattach_grace`, thirty seconds by
+    // default, so there is budget here for several attempts.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    *harness
+        .recorder
+        .rejoin_stumbles
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 2;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let stats = harness.store.queue_stats().await.expect("stats");
+        if stats.done == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the batch was never accounted for; stats {stats:?}, turns {:?}",
+            harness.turns()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "the turn was resubmitted rather than rejoined: {:?}",
+        harness.turns()
+    );
+    let rejoins = harness
+        .recorder
+        .rejoins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    assert_eq!(
+        rejoins, 3,
+        "the two refusals should have been ridden out, then the stream joined"
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_composing_call_still_closes_the_indicator() {
+    // meka emits `tool_call.composing` without marking the attempt as having produced output, on
+    // purpose: a call whose arguments never finish is still safe to retry. That makes the composing
+    // window exactly the window meka retries, and a retry comes back with fresh ids -- so the
+    // `executing` matching the id that opened the window never arrives. Waiting for it left the
+    // indicator refreshing until the turn ended, which is the behaviour this whole rework removed.
+    let harness =
+        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(700)).await;
+    *harness
+        .recorder
+        .compose_retry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    harness
+        .sender
+        .send(message("write me something long", "1"))
+        .await
+        .expect("queued");
+
+    // Up while the send call is being written, which is the part that must keep working.
+    harness
+        .wait_for("the indicator during composition", |harness| {
+            harness.channel.activity_count() > 0
+        })
+        .await;
+
+    // The replacement call has been announced and has begun running. Nothing is being written to
+    // anybody now, so nothing should still be claiming otherwise.
+    harness
+        .wait_for("the call that replaced it", |harness| {
+            *harness
+                .recorder
+                .streamed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                >= 4
+        })
+        .await;
+    let settled = harness.channel.activity_count();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        harness.channel.activity_count(),
+        settled,
+        "the indicator went on refreshing for a call the model had abandoned"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_cannot_be_rejoined_is_never_called_delivered() {
+    // The regression this exists for. meka used to let a disconnected turn run to completion, so a
+    // session that had gone idle afterwards really had finished the work, and the bridge marked the
+    // batch delivered on that basis. meka now stops the agent loop once nobody has been subscribed
+    // for `[serve].stream_reattach_grace`, so idle-after-a-drop usually means the turn was killed
+    // partway. Marking that delivered loses the message silently: never retried, never counted as
+    // unseen, nobody told.
+    // Every turn truncates, so there is no successful retry to hide the outcome behind.
+    let harness = Harness::start_full(1, 0, 0, 100).await;
+    *harness
+        .recorder
+        .rejoin_unavailable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the truncated turn", |harness| !harness.turns().is_empty())
+        .await;
+    // What the old code waited for and read as success.
+    *harness
+        .recorder
+        .turn_in_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+
+    harness
+        .wait_for("the attempts to run out", |harness| {
+            harness.turns().len() >= 2
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let stats = harness.store.queue_stats().await.expect("stats");
+    assert_eq!(
+        stats.done, 0,
+        "a turn nobody could confirm was counted as delivered"
+    );
+    assert_eq!(stats.failed, 1, "and it has to end up somewhere: {stats:?}");
+    // Which is the half that matters. Marked delivered, the message is gone; failed, it is put
+    // back among what the agent has not seen and somebody is told.
+    let summary = harness
+        .store
+        .unseen_summary(Some("mock:1"))
+        .await
+        .expect("summary");
+    assert_eq!(
+        summary.count, 1,
+        "the message must still be owed to the agent"
+    );
 }
 
 #[tokio::test]

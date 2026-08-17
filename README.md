@@ -52,6 +52,7 @@ scopes = ["sessions:r", "sessions:w"]
 name = "mekabridge"
 transport = "http"
 url = "http://127.0.0.1:9100/mcp"
+required = true
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
@@ -62,7 +63,7 @@ mekabridge
 meka serve
 ```
 
-meka retries a failed MCP connect in the background, so the wrong order recovers on its own within a few minutes. Until it does, `[mcp].strict` makes meka refuse every turn, so starting the bridge first still saves you a confusing window.
+meka retries a failed MCP connect in the background, so the wrong order recovers on its own within a few minutes. Set `required = true` on the server entry, as above: it is what makes meka refuse turns while the bridge is unreachable instead of running them with no way to reply. It is not the default.
 
 ## Tools the agent gets
 

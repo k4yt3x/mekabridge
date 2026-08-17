@@ -33,7 +33,17 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_003.sql"),
     include_str!("store/schema_004.sql"),
     include_str!("store/schema_005.sql"),
+    include_str!("store/schema_006.sql"),
+    include_str!("store/schema_007.sql"),
 ];
+
+/// Attempts at the WAL pragma before giving up, and how long to wait between them.
+///
+/// Small: the window is one process finishing its own journal-mode change on a database neither has
+/// opened before, which is microseconds. Bounded rather than unbounded because a genuinely stuck
+/// lock should fail the start rather than hang it.
+const WAL_PRAGMA_ATTEMPTS: u32 = 50;
+const WAL_PRAGMA_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How long a resolved policy is reused before the store is consulted again.
 ///
@@ -280,6 +290,13 @@ pub struct QueuedMessage {
     pub payload: String,
     pub received_at: DateTime<Utc>,
     pub attempts: u32,
+    /// Whether crash recovery put this row back, as opposed to a failed turn.
+    ///
+    /// A failed turn was watched, so the bridge knows whether the agent acted and refuses to
+    /// replay a batch that may already have been answered. A row stranded by a hard kill has
+    /// no such answer, so it is handed over again with the uncertainty stated rather than
+    /// hidden.
+    pub recovered: bool,
 }
 
 /// What happened to an [`Store::enqueue`] call.
@@ -384,20 +401,75 @@ impl Store {
     async fn prepare(connection: tokio_rusqlite::Connection) -> Result<Self> {
         connection
             .call(|connection| {
-                // WAL lets `mekabridge status` read while the daemon writes. `busy_timeout` covers
-                // the brief writer lock rather than surfacing SQLITE_BUSY to the caller.
-                connection.pragma_update(None, "journal_mode", "WAL")?;
-                connection.pragma_update(None, "foreign_keys", "ON")?;
+                // `busy_timeout` first, so everything after it waits rather than failing. WAL lets
+                // `mekabridge status` read while the daemon writes.
                 connection.pragma_update(None, "busy_timeout", 5_000)?;
+                connection.pragma_update(None, "foreign_keys", "ON")?;
+                // Retried by hand, because the busy handler `busy_timeout` installs is not
+                // consulted for a journal-mode change: it takes an exclusive lock
+                // and returns `SQLITE_BUSY` immediately if anyone else holds one.
+                // Two processes opening a *new* database at the same moment
+                // therefore raced here and one failed to start, which is exactly the
+                // upgrade the migration loop below was hardened for. Only the first open of a given
+                // file can collide; against an existing WAL database the pragma is a no-op.
+                let mut attempt = 0;
+                loop {
+                    match connection.pragma_update(None, "journal_mode", "WAL") {
+                        Ok(()) => break,
+                        Err(error) if attempt < WAL_PRAGMA_ATTEMPTS => {
+                            tracing::debug!("retrying the WAL pragma: {}", error);
+                            attempt += 1;
+                            std::thread::sleep(WAL_PRAGMA_BACKOFF);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
 
                 let version: u32 =
                     connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 let mut applied = version as usize;
+                if applied > MIGRATIONS.len() {
+                    // Written by a newer build. Running against a schema this code does not know is
+                    // worse than refusing: the loop below simply does not execute, so it would open
+                    // silently and query tables whose shape has moved underneath it.
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(format!(
+                            "the database is at schema version {applied}, newer than the {} this \
+                             build knows. It was written by a later mekabridge; upgrade rather \
+                             than rolling back.",
+                            MIGRATIONS.len()
+                        )),
+                    ));
+                }
                 while applied < MIGRATIONS.len() {
                     let statement = MIGRATIONS.get(applied).copied().unwrap_or_default();
-                    connection.execute_batch(statement)?;
+                    // The statements and the version bump go together or not at all.
+                    // `execute_batch` is not transactional on its own, and
+                    // neither was the `pragma_update` after it, so a crash in
+                    // either place left a schema that was half applied and a version
+                    // saying it had not been. Every later start then failed on the work already
+                    // done -- `duplicate column name` -- and the bridge never ran again without
+                    // somebody editing the database by hand. SQLite's DDL is transactional, so this
+                    // costs nothing.
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    // Re-read inside the lock. The version was last read before this loop, so two
+                    // processes opening the database at the same moment after an upgrade both saw
+                    // the old one; the transaction serialises them but the loser still ran a batch
+                    // the winner had already committed, and failed on `duplicate column name` --
+                    // the very error this transaction exists to prevent. systemd starting the
+                    // daemon while an operator runs `doctor` is enough to reach it.
+                    let current: u32 =
+                        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                    if current as usize > applied {
+                        applied = current as usize;
+                        continue;
+                    }
+                    transaction.execute_batch(statement)?;
+                    transaction.pragma_update(None, "user_version", (applied + 1) as i64)?;
+                    transaction.commit()?;
                     applied += 1;
-                    connection.pragma_update(None, "user_version", applied as i64)?;
                 }
                 Ok(())
             })
@@ -763,7 +835,8 @@ impl Store {
             .call({
                 let conversation_id = conversation_id.clone();
                 move |connection| {
-                    let transaction = connection.transaction()?;
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let record = transaction
                         .query_row(
                             "SELECT conversation_id, mode, until, reason, dropped, created_at
@@ -872,7 +945,8 @@ impl Store {
         let outcome = self
             .connection
             .call(move |connection| {
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let waiting: i64 = transaction.query_row(
                     "SELECT COUNT(*) FROM inbound_queue WHERE state IN ('pending', 'in_flight')",
                     [],
@@ -982,10 +1056,12 @@ impl Store {
                 let placeholders = std::iter::repeat_n("?", ready.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let claimed = {
                     let mut statement = transaction.prepare(&format!(
-                        "SELECT seq, conversation_id, external_id, payload, received_at, attempts
+                        "SELECT seq, conversation_id, external_id, payload, received_at, attempts,
+                                recovered
                          FROM inbound_queue
                          WHERE state = 'pending' AND conversation_id IN ({placeholders})
                          ORDER BY seq
@@ -1022,7 +1098,8 @@ impl Store {
             .connection
             .call(move |connection| {
                 let mut statement = connection.prepare(
-                    "SELECT seq, conversation_id, external_id, payload, received_at, attempts
+                    "SELECT seq, conversation_id, external_id, payload, received_at, attempts,
+                                recovered
                      FROM inbound_queue
                      WHERE state = 'pending'
                      ORDER BY seq
@@ -1038,13 +1115,17 @@ impl Store {
     /// Mark a batch as delivered.
     pub async fn complete_batch(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
+        let completed_at = to_rfc3339(Utc::now());
         self.connection
             .call(move |connection| {
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for sequence in sequences {
                     transaction.execute(
-                        "UPDATE inbound_queue SET state = 'done', last_error = NULL WHERE seq = ?1",
-                        [sequence],
+                        "UPDATE inbound_queue
+                         SET state = 'done', last_error = NULL, completed_at = ?2
+                         WHERE seq = ?1 AND state = 'in_flight'",
+                        rusqlite::params![sequence, &completed_at],
                     )?;
                 }
                 transaction.commit()?;
@@ -1064,10 +1145,12 @@ impl Store {
         let sequences = sequences.to_vec();
         self.connection
             .call(move |connection| {
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for sequence in sequences {
                     transaction.execute(
-                        "UPDATE inbound_queue SET state = 'pending' WHERE seq = ?1",
+                        "UPDATE inbound_queue SET state = 'pending'
+                         WHERE seq = ?1 AND state = 'in_flight'",
                         [sequence],
                     )?;
                 }
@@ -1097,33 +1180,56 @@ impl Store {
     ) -> Result<FailureOutcome> {
         let sequences = sequences.to_vec();
         let error = error.to_string();
+        let completed_at = to_rfc3339(Utc::now());
         let retry_at = retry_at.map(to_rfc3339);
         let outcome = self
             .connection
             .call(move |connection| {
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let mut retrying = Vec::new();
                 let mut exhausted = Vec::new();
                 for sequence in sequences {
-                    transaction.execute(
+                    // Guarded like the state writes below. Unguarded, a row that is no longer in
+                    // flight was still charged an attempt, and the exhausted arm then told the
+                    // owner a message was permanently lost while the row sat in `pending` waiting
+                    // to be delivered.
+                    let charged = transaction.execute(
                         "UPDATE inbound_queue
                          SET attempts = attempts + 1, last_error = ?2, not_before = ?3
-                         WHERE seq = ?1",
+                         WHERE seq = ?1 AND state = 'in_flight'",
                         rusqlite::params![sequence, error, retry_at],
                     )?;
-                    let attempts: u32 = transaction.query_row(
-                        "SELECT attempts FROM inbound_queue WHERE seq = ?1",
-                        [sequence],
-                        |row| row.get(0),
-                    )?;
+                    if charged == 0 {
+                        continue;
+                    }
+                    // `optional` rather than `?`: a sequence that is gone yields
+                    // `QueryReturnedNoRows`, which rolled back the whole transaction and left every
+                    // *other* row in the batch stuck `in_flight` until the next restart. Those rows
+                    // are invisible to `pending_windows`, so newer messages in the same
+                    // conversation are then delivered ahead of them.
+                    // `complete_batch` already skips silently; the
+                    // asymmetry was the bug. Reachable from `mekabridge queue clear` against a
+                    // running bridge.
+                    let Some(attempts) = transaction
+                        .query_row(
+                            "SELECT attempts FROM inbound_queue WHERE seq = ?1",
+                            [sequence],
+                            |row| row.get::<_, u32>(0),
+                        )
+                        .optional()?
+                    else {
+                        continue;
+                    };
                     if attempts > max_attempts {
                         transaction.execute(
-                            "UPDATE inbound_queue SET state = 'failed' WHERE seq = ?1",
-                            [sequence],
+                            "UPDATE inbound_queue SET state = 'failed', completed_at = ?2
+                             WHERE seq = ?1 AND state = 'in_flight'",
+                            rusqlite::params![sequence, &completed_at],
                         )?;
                         let message = transaction.query_row(
                             "SELECT seq, conversation_id, external_id, payload, received_at,
-                                    attempts
+                                    attempts, recovered
                              FROM inbound_queue WHERE seq = ?1",
                             [sequence],
                             row_to_queued,
@@ -1131,7 +1237,8 @@ impl Store {
                         exhausted.push(message);
                     } else {
                         transaction.execute(
-                            "UPDATE inbound_queue SET state = 'pending' WHERE seq = ?1",
+                            "UPDATE inbound_queue SET state = 'pending'
+                             WHERE seq = ?1 AND state = 'in_flight'",
                             [sequence],
                         )?;
                         retrying.push(sequence);
@@ -1153,7 +1260,13 @@ impl Store {
             .connection
             .call(|connection| {
                 connection.execute(
-                    "UPDATE inbound_queue SET state = 'pending' WHERE state = 'in_flight'",
+                    // The attempt is charged and the row flagged. Charged because a batch whose
+                    // turn kills the process would otherwise be replayed for ever, its counter
+                    // never moving. Flagged because nothing else can tell this apart from an
+                    // ordinary requeue afterwards, and the agent is owed the difference.
+                    "UPDATE inbound_queue
+                     SET state = 'pending', attempts = attempts + 1, recovered = 1
+                     WHERE state = 'in_flight'",
                     [],
                 )
             })
@@ -1223,7 +1336,10 @@ impl Store {
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "DELETE FROM inbound_queue WHERE state = 'done' AND received_at < ?1",
+                    // `coalesce` so rows written before `completed_at` existed keep their old
+                    // behaviour rather than becoming immortal.
+                    "DELETE FROM inbound_queue
+                     WHERE state = 'done' AND coalesce(completed_at, received_at) < ?1",
                     [before],
                 )
             })
@@ -1356,19 +1472,26 @@ impl Store {
         conversation_id: &str,
         through: DateTime<Utc>,
         context: usize,
-    ) -> Result<(u64, Vec<MessageRecord>)> {
+    ) -> Result<(u64, Vec<MessageRecord>, i64)> {
         let conversation_id = conversation_id.to_string();
         let through = to_rfc3339(through);
         let context = context.min(i64::MAX as usize) as i64;
-        let (count, mut records) = self
+        let (count, mut records, watermark) = self
             .connection
             .call(move |connection| {
+                // Deferred rather than immediate: nothing here writes since `mark_seen` was split
+                // out, so taking the write lock would only invent a `SQLITE_BUSY` this cannot hit.
                 let transaction = connection.transaction()?;
-                let count: i64 = transaction.query_row(
-                    "SELECT COUNT(*) FROM messages
+                // Counted and watermarked in one statement so the ceiling describes exactly the
+                // rows counted. `MAX(id)` rather than the timestamp asked for: ids are assigned at
+                // insert, so a row written while the turn runs is always above this, whereas its
+                // timestamp can easily be at or below -- Telegram stamps to whole seconds, and an
+                // edit carries the *original* message's time, which may be weeks old.
+                let (count, watermark): (i64, Option<i64>) = transaction.query_row(
+                    "SELECT COUNT(*), MAX(id) FROM messages
                      WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2",
                     rusqlite::params![&conversation_id, &through],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let records = {
                     let mut statement = transaction.prepare(
@@ -1386,11 +1509,11 @@ impl Store {
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
                 transaction.commit()?;
-                Ok((count.max(0) as u64, records))
+                Ok((count.max(0) as u64, records, watermark.unwrap_or(0)))
             })
             .await?;
         records.reverse();
-        Ok((count, records))
+        Ok((count, records, watermark))
     }
 
     /// Mark everything a conversation withheld up to `through` as accounted for.
@@ -1399,7 +1522,24 @@ impl Store {
     /// actually reached meka. Marking at read time meant a submission meka refused threw the
     /// envelope away *and* the count, and the retry then told the agent nothing had been said in a
     /// chat where thirty messages were waiting.
-    pub async fn mark_seen(&self, conversation_id: &str, through: DateTime<Utc>) -> Result<usize> {
+    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is.
+    ///
+    /// The timestamp is the ceiling that was asked about; the id is the high-water mark of the rows
+    /// that answered. Keyed on the timestamp alone, a row written between the count and this call
+    /// with a time at or below the ceiling is marked without ever being shown, and that is not a
+    /// narrow window: Telegram stamps to whole seconds so a burst shares one, and an edit carries
+    /// the *original* message's time, so an edit of anything older lands inside it. Keyed on the id
+    /// alone, the same edit sweeps in the other direction: recorded out of timestamp order it has a
+    /// low id and a high timestamp, so it was never counted and is marked anyway.
+    ///
+    /// Either way the message ends up absent from `unseen`, from the missed-context lookback, and
+    /// from the CLI predicate, with nothing but `read_history` over the right window to find it.
+    pub async fn mark_seen(
+        &self,
+        conversation_id: &str,
+        through_id: i64,
+        through: DateTime<Utc>,
+    ) -> Result<usize> {
         let conversation_id = conversation_id.to_string();
         let through = to_rfc3339(through);
         let marked = self
@@ -1407,8 +1547,8 @@ impl Store {
             .call(move |connection| {
                 connection.execute(
                     "UPDATE messages SET seen = 1
-                     WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2",
-                    rusqlite::params![&conversation_id, &through],
+                     WHERE conversation_id = ?1 AND seen = 0 AND id <= ?2 AND timestamp <= ?3",
+                    rusqlite::params![&conversation_id, through_id, &through],
                 )
             })
             .await?;
@@ -1659,7 +1799,8 @@ impl Store {
         let paths = self
             .connection
             .call(move |connection| {
-                let transaction = connection.transaction()?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let paths = {
                     let mut statement = transaction.prepare(
                         "SELECT path FROM attachments
@@ -1768,6 +1909,7 @@ fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
         payload: row.get(3)?,
         received_at: parse_rfc3339(&received_at)?,
         attempts: row.get(5)?,
+        recovered: row.get::<_, i64>(6).unwrap_or(0) != 0,
     })
 }
 
@@ -2187,7 +2329,7 @@ mod tests {
             record.timestamp = now() + chrono::Duration::seconds(index);
             store.record_message(record).await.expect("record");
         }
-        let (count, context) = store
+        let (count, context, _) = store
             .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 3)
             .await
             .expect("take");
@@ -2217,7 +2359,7 @@ mod tests {
             .expect("summary");
         assert_eq!(again, first, "asking twice must give the same answer");
 
-        let (count, _) = store
+        let (count, ..) = store
             .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 5)
             .await
             .expect("take");
@@ -2247,7 +2389,7 @@ mod tests {
         // moved a count-carrying marker and sent the watcher to announce news the agent had just
         // been handed.
         store
-            .mark_seen("telegram:1", now() + chrono::Duration::hours(1))
+            .mark_seen("telegram:1", i64::MAX, now() + chrono::Duration::hours(1))
             .await
             .expect("mark seen");
         assert_eq!(
@@ -2276,7 +2418,7 @@ mod tests {
             .await
             .expect("record");
         store
-            .mark_seen("telegram:1", now() + chrono::Duration::hours(1))
+            .mark_seen("telegram:1", i64::MAX, now() + chrono::Duration::hours(1))
             .await
             .expect("mark seen");
 
@@ -2340,7 +2482,7 @@ mod tests {
             .await
             .expect("record");
         let through = now() + chrono::Duration::hours(1);
-        let (count, _) = store
+        let (count, _, watermark) = store
             .take_unseen("telegram:1", through, 5)
             .await
             .expect("take");
@@ -2348,17 +2490,17 @@ mod tests {
 
         // Reading is not spending. The backlog is only marked once a turn carrying it has actually
         // been accepted, so until then the same count comes back.
-        let (count, _) = store
+        let (count, ..) = store
             .take_unseen("telegram:1", through, 5)
             .await
             .expect("take");
         assert_eq!(count, 1, "reading it again must not consume it");
 
         store
-            .mark_seen("telegram:1", through)
+            .mark_seen("telegram:1", watermark, through)
             .await
             .expect("mark seen");
-        let (count, context) = store
+        let (count, context, _) = store
             .take_unseen("telegram:1", through, 5)
             .await
             .expect("take");
@@ -2379,17 +2521,95 @@ mod tests {
         store.record_message(later).await.expect("record");
 
         let cutoff = now() + chrono::Duration::minutes(1);
-        let (count, _) = store
+        let (count, _, watermark) = store
             .take_unseen("telegram:1", cutoff, 5)
             .await
             .expect("take");
         assert_eq!(count, 1);
-        store.mark_seen("telegram:1", cutoff).await.expect("mark");
-        let (count, _) = store
+        store
+            .mark_seen("telegram:1", watermark, cutoff)
+            .await
+            .expect("mark");
+        let (count, ..) = store
             .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 5)
             .await
             .expect("take");
         assert_eq!(count, 1, "the later one is still owed");
+    }
+
+    #[tokio::test]
+    async fn a_message_recorded_out_of_order_is_not_marked_seen_either() {
+        // The other door into the same silent loss. Keying on the row id alone closes the mid-turn
+        // window and opens this one: an edit carries its *original* message's timestamp, so it is
+        // recorded with a low id and a high time. It falls outside the ceiling, so it is never
+        // counted or shown, and inside the watermark, so it is marked anyway.
+        let store = Store::open_in_memory().await.expect("opens");
+        let ceiling = now();
+
+        // Recorded first, so it has the lower id, but stamped after the ceiling: an ordinary
+        // message that arrived while an older edit was still being processed.
+        let mut later = message("telegram:1", "1", "after the ceiling");
+        later.timestamp = ceiling + chrono::Duration::minutes(5);
+        store.record_message(later).await.expect("record");
+
+        // An edit of something old: higher id, lower timestamp, so it is what sets the watermark.
+        let mut edit = message("telegram:1", "2", "edit of an old message");
+        edit.timestamp = ceiling - chrono::Duration::hours(1);
+        store.record_message(edit).await.expect("record");
+
+        let (count, _, watermark) = store
+            .take_unseen("telegram:1", ceiling, 5)
+            .await
+            .expect("take");
+        assert_eq!(count, 1, "only the edit is inside the ceiling");
+
+        store
+            .mark_seen("telegram:1", watermark, ceiling)
+            .await
+            .expect("mark seen");
+
+        let summary = store.unseen_summary(None).await.expect("summary");
+        assert_eq!(
+            summary.count, 1,
+            "a message above the ceiling was marked seen because its id was below the watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_recorded_while_the_turn_ran_is_not_marked_seen() {
+        // The watermark used to be the timestamp the caller asked about, and everything at or below
+        // it was marked seen when the turn ended. Anything written in between with a time inside
+        // that range was marked without ever being shown: gone from `unseen`, from the lookback,
+        // and from the CLI predicate. Not a narrow window either. Telegram stamps to whole seconds
+        // so a burst shares one, and an edit carries the *original* message's time, so an edit of
+        // anything older lands inside it however long the turn took.
+        let store = Store::open_in_memory().await.expect("opens");
+        let asked_about = now();
+        let mut first = message("telegram:1", "1", "before the turn");
+        first.timestamp = asked_about;
+        store.record_message(first).await.expect("record");
+
+        let (count, _, watermark) = store
+            .take_unseen("telegram:1", asked_about, 5)
+            .await
+            .expect("take");
+        assert_eq!(count, 1);
+
+        // Arrives while the turn is running, sharing the second the count was taken at.
+        let mut during = message("telegram:1", "2", "arrived mid-turn");
+        during.timestamp = asked_about;
+        store.record_message(during).await.expect("record");
+
+        store
+            .mark_seen("telegram:1", watermark, asked_about)
+            .await
+            .expect("mark seen");
+
+        let summary = store.unseen_summary(None).await.expect("summary");
+        assert_eq!(
+            summary.count, 1,
+            "a message written while the turn ran was marked seen without ever being shown"
+        );
     }
 
     async fn store_with_conversation() -> Store {
@@ -2911,6 +3131,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_recovered_from_a_crash_is_marked_and_charged() {
+        // The two ways a row returns to the queue are not the same, and only one of them is
+        // understood. A failed turn was watched, so the bridge knows whether the agent acted. A row
+        // stranded by a hard kill was in the hands of a turn nobody saw the end of: replaying it
+        // silently presents work that may already be done as though it were new, and with the
+        // attempt uncharged a batch that kills the process is replayed for ever.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "a", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let claimed = claim_all(&store, 1).await;
+        assert!(!claimed.first().expect("claimed").recovered);
+
+        let reset = store.reset_in_flight().await.expect("recover");
+        assert_eq!(reset, 1);
+
+        let back = claim_all(&store, 1).await;
+        let row = back.first().expect("reclaimed");
+        assert!(
+            row.recovered,
+            "a row stranded by a crash is indistinguishable from an ordinary retry"
+        );
+        assert_eq!(
+            row.attempts, 1,
+            "the interrupted attempt was not charged, so a poison batch replays without bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_row_cannot_be_released_or_failed_back_into_the_queue() {
+        // Every terminal write is guarded on the row still being in flight. Unguarded, a `done` row
+        // could be released to `pending` and handed to the agent a second time, or re-failed --
+        // which marks a delivered message unseen and tells the owner it was lost. The drain loop is
+        // serial so no live path does this today, but the store is the wrong place to rely on that:
+        // a second process, or `mekabridge queue clear`, reaches these directly.
+        let store = store_with_conversation().await;
+        store
+            .enqueue("telegram:123", "a", "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let batch = claim_all(&store, 1).await;
+        let seq = batch.first().expect("claimed").seq;
+        store.complete_batch(&[seq]).await.expect("complete");
+
+        store.release_batch(&[seq]).await.expect("release");
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!(
+            stats.done, 1,
+            "a delivered row was released back to pending"
+        );
+        assert_eq!(stats.pending, 0);
+
+        let outcome = store
+            .fail_batch(&[seq], "boom", 0, None)
+            .await
+            .expect("fail");
+        assert!(
+            outcome.exhausted.is_empty(),
+            "a delivered message was reported to the owner as permanently lost"
+        );
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!(stats.done, 1, "a delivered row was re-failed");
+        assert_eq!(stats.failed, 0);
+
+        // And the other direction: a row released back to the queue must not then be completable.
+        // Without the guard on `complete_batch` a late completion from an abandoned attempt marks a
+        // message delivered while it is still waiting to be delivered, and it is never sent.
+        store
+            .enqueue("telegram:123", "b", "b", now(), 10)
+            .await
+            .expect("enqueue");
+        let batch = claim_all(&store, 1).await;
+        let seq = batch.first().expect("claimed").seq;
+        store.release_batch(&[seq]).await.expect("release");
+        store.complete_batch(&[seq]).await.expect("complete");
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!(
+            stats.pending, 1,
+            "a row waiting in the queue was marked delivered: {stats:?}"
+        );
+        assert_eq!(stats.done, 1, "and nothing new was counted as delivered");
+    }
+
+    #[tokio::test]
+    async fn one_vanished_row_does_not_strand_the_rest_of_its_batch() {
+        // `fail_batch` used to `?` on a row that had gone, rolling back the whole transaction and
+        // leaving every other row in the batch `in_flight`. Those are invisible to
+        // `pending_windows`, so newer messages in the same conversation are delivered ahead of them
+        // until the next restart -- a real ordering violation on top of the stall. Reachable from
+        // `mekabridge queue clear` against a running bridge.
+        let store = store_with_conversation().await;
+        for id in ["a", "b"] {
+            store
+                .enqueue("telegram:123", id, id, now(), 10)
+                .await
+                .expect("enqueue");
+        }
+        let batch = claim_all(&store, 10).await;
+        assert_eq!(batch.len(), 2);
+        let live = batch.first().expect("first").seq;
+        let vanished = batch.get(1).expect("second").seq;
+        store.clear_queue().await.expect("clear");
+        store
+            .enqueue("telegram:123", "a", "a", now(), 10)
+            .await
+            .expect("re-enqueue");
+        let restored = claim_all(&store, 10).await;
+        let live = restored.first().map_or(live, |row| row.seq);
+
+        store
+            .fail_batch(&[live, vanished], "boom", 3, None)
+            .await
+            .expect("a missing row must not abort the batch");
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!(
+            stats.in_flight, 0,
+            "a live row was stranded in flight by a sibling that had gone: {stats:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn prune_delivered_only_removes_completed_rows() {
         let store = store_with_conversation().await;
         store
@@ -2940,7 +3282,29 @@ mod tests {
             .expect("complete");
         store.reset_in_flight().await.expect("reset");
 
-        let pruned = store.prune_delivered(now()).await.expect("prune");
+        // Both rows carry a 30-day-old `received_at`, because that is the platform's send time and
+        // an edit inherits the original message's. Retention is measured from delivery instead, so
+        // a row completed a moment ago survives a prune at the retention boundary however old the
+        // message it carries. Keyed on `received_at`, a delivered edit of an old message was swept
+        // within the hour, and those rows are what makes duplicate detection survive a restart:
+        // once one is gone the unique key has nothing to conflict with and a replayed update is
+        // delivered a second time.
+        let pruned = store
+            .prune_delivered(now() - chrono::Duration::days(7))
+            .await
+            .expect("prune");
+        assert_eq!(
+            pruned, 0,
+            "a row delivered moments ago was pruned on the age of the message it carried"
+        );
+
+        // Past the boundary measured from delivery, it does go. Anchored to the real clock rather
+        // than this module's fixed `now()`, because `completed_at` is stamped when the row actually
+        // completes and the fixture date sits in the past.
+        let pruned = store
+            .prune_delivered(Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .expect("prune");
         assert_eq!(pruned, 1);
         assert_eq!(store.pending_count().await.expect("count"), 1);
     }
@@ -3081,6 +3445,65 @@ mod tests {
         assert!(
             still_expired.is_empty(),
             "rows must be deleted, not just read"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_openers_racing_the_same_upgrade_both_survive() {
+        // What a real upgrade looks like: systemd starts the daemon while an operator runs
+        // `doctor`. The version was read once before the loop, so both saw the old one; the
+        // transaction serialised them but the loser still ran a batch the winner had
+        // committed and failed on `duplicate column name` -- the very error the transaction
+        // was added to prevent.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        let connection = tokio_rusqlite::Connection::open(&path)
+            .await
+            .expect("opens");
+        connection
+            .call(|connection| {
+                connection.execute_batch(include_str!("store/schema_001.sql"))?;
+                connection.pragma_update(None, "user_version", 1_i64)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("build a version 1 database");
+        connection.close().await.expect("closes");
+
+        let opens = (0..4).map(|_| Store::open(&path));
+        for outcome in futures::future::join_all(opens).await {
+            outcome.expect("every opener must survive the race");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_database_from_a_later_release_is_refused_rather_than_opened() {
+        // Running against a schema this build does not know is worse than refusing: the migration
+        // loop simply does not execute, so it would open silently and query tables whose shape has
+        // moved underneath it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        drop(Store::open(&path).await.expect("builds"));
+        let connection = tokio_rusqlite::Connection::open(&path)
+            .await
+            .expect("opens");
+        connection
+            .call(|connection| {
+                connection.pragma_update(None, "user_version", 99_i64)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("stamp a future version");
+        connection.close().await.expect("closes");
+
+        let refused = Store::open(&path).await;
+        let message = refused
+            .err()
+            .map(|error| error.to_string())
+            .expect("a newer schema must not open");
+        assert!(
+            message.contains("newer than"),
+            "the refusal did not say why: {message}"
         );
     }
 

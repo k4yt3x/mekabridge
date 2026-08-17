@@ -51,9 +51,9 @@ RestartSec=5s
 WantedBy=multi-user.target
 ```
 
-`Requires=` plus `After=` means meka starts after the bridge and is stopped if the bridge is. meka does recover on its own from a bridge that was missing at boot, retrying in the background with backoff, so this is about avoiding the window rather than avoiding a permanent break: while the server is disconnected, `[mcp].strict` makes meka refuse every turn.
+`Requires=` plus `After=` means meka starts after the bridge and is stopped if the bridge is. meka does recover on its own from a bridge that was missing at boot, retrying in the background with backoff, so this is about avoiding the window rather than avoiding a permanent break: while the server is disconnected, `required = true` makes meka refuse turns rather than run them with no way to reply.
 
-Restarting the bridge alone is safe at any point. The transport closes from a connected state, so meka reconnects immediately rather than waiting on the cold-start backoff.
+Restarting the bridge alone is safe at any point, but meka's reconnect is lazy: it is driven by the next tool call that finds the transport closed, not by the restart.
 
 ## Shutdown
 
@@ -63,13 +63,17 @@ A turn already running is allowed to complete. Cutting it off would leave its ba
 
 ## Crash recovery
 
-Every inbound message is written to SQLite before it is acknowledged, so a `kill -9` with a full queue loses nothing. On start, rows left in flight are returned to pending:
+Every inbound message is written to SQLite before the agent is woken for it, so a crash mid-turn loses no work: on start, rows left in flight are returned to pending.
 
 ```
 WARN mekabridge::bridge: recovered messages that were in flight when the bridge last stopped count=3
 ```
 
-Delivered rows are kept for seven days rather than deleted immediately, because they are what makes duplicate detection work across a restart: Telegram replays updates whose offset was never committed.
+Delivered rows are kept for seven days rather than deleted immediately, because they are what makes duplicate detection work across a restart: Telegram resends any update whose offset was never confirmed, and without a record of having delivered one the bridge cannot tell it from a message it has never seen.
+
+**There is one window a hard kill can still lose.** Telegram's client library confirms a batch's offset as soon as the batch arrives, before the bridge has stored any of it, so a small number of messages can be acknowledged to Telegram and not yet written. The buffer between the pollers and the writer bounds that number at eight, and blocking the poller when it is full is what stops the confirmation going out any earlier. In practice this only bites on `SIGKILL`, an OOM kill, or power loss: `SIGTERM` drains, and an idle bridge has nothing in flight. Those messages are lost outright rather than recorded as unseen, which makes it the one loss path here that leaves no trace. Closing it fully means the bridge driving `getUpdates` itself, from the highest id it has actually stored.
+
+Discord has no equivalent window, because its gateway replays from a sequence number on resume. It has the opposite gap: nothing backfills messages sent while the connection was down.
 
 ## Logs worth knowing
 
@@ -85,7 +89,12 @@ Delivered rows are kept for seven days rather than deleted immediately, because 
 | `recovered messages that were in flight` | The previous run died mid-turn |
 | `meka no longer knows session ...` | The session was deleted in meka; a replacement is created and the agent's memory is gone |
 | `meka asked for permission` | Unexpected: sessions declare they cannot answer prompts, so meka should deny without asking |
-| `lost the turn stream` | The connection to meka dropped; the bridge waits for the turn to finish rather than resubmitting |
+| `the turn was cancelled ... having done nothing` | meka stopped the turn before the agent had acted, most often because the stream went away for longer than `[serve].stream_reattach_grace`. The batch goes back to the queue |
+| `the turn was cancelled ... after the agent had already acted` | Stopped partway through work that had real effects. Not retried, for the same reason a failure after a send is not |
+| `lost the turn stream ...; rejoining it` | The connection to meka dropped and is being resumed from the last event seen. The turn keeps running and nothing is delivered twice |
+| `could not rejoin the turn stream ...; trying again` | The rejoin request itself failed. Retried while meka still holds the turn open; only repeated lines are a concern |
+| `lost the turn stream and could not rejoin it` | Resuming failed too, so what the turn did is unknown. The batch goes back to the queue, which may deliver the same messages twice |
+| `meka notice: Replay buffer ...` or `Fell behind ...` | The rejoin could not replay everything, so some events are gone. The batch is closed rather than retried; the owner is told only if the turn then failed as well |
 | `the agent viewed an attachment` | An image was fetched and passed to the model. `preview=true` means it was a still frame, not the file |
 | `the agent downloaded an attachment` | A file was written to `[storage].attachment_dir` |
 | `the agent turned a conversation down` | Muted or blocked. `mekabridge policy clear` undoes it |

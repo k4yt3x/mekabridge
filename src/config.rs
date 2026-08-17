@@ -44,6 +44,25 @@ const DEFAULT_COALESCE_FLOOR: Duration = Duration::from_secs(1);
 /// wondering.
 const DEFAULT_RETRY_BASE: Duration = Duration::from_secs(10);
 
+/// How often the typing indicator is renewed while it is up.
+///
+/// Telegram clears the status after about five seconds and Discord after ten, so this has to sit
+/// under the shorter of the two to look continuous on both. Absent from the file format for the
+/// same reason as the other two constants here: it describes what the platforms do, not anything an
+/// operator has a preference about.
+const DEFAULT_TYPING_REFRESH: Duration = Duration::from_secs(4);
+
+/// Ceiling on one composing window, when the operator has not pinned `[bridge].typing_max`.
+///
+/// Sized for the thing the indicator now tracks: a model writing one message's arguments, which
+/// takes seconds and not minutes even for a long reply. It used to follow `[meka].turn_timeout`,
+/// thirty minutes, which was correct while the indicator covered a whole turn. Under the current
+/// design that made it unable to fire at all, and it is the only thing that closes a window whose
+/// closing event never comes: a stream going quiet after `tool_call.composing` emits neither of the
+/// events that would end it, and the rejoin spends minutes trying to get back on. Two minutes is
+/// generous against real composition and still short enough that a chat is not lied to for long.
+const DEFAULT_TYPING_MAX: Duration = Duration::from_secs(120);
+
 /// Ceiling on `[bridge].mute_context`. The lookback is charged to every turn a muted conversation
 /// wakes, so a generous setting quietly turns "only wake me for mentions" back into "send me the
 /// whole chat".
@@ -121,6 +140,9 @@ pub struct BridgeConfig {
     /// out of quota, and a second attempt in the same second lands in the same window as the
     /// first.
     pub turn_retries: u32,
+    /// How often the typing indicator is renewed while the model writes a message. See
+    /// [`BridgeConfig::retry_base`] for why this is not in the file format either.
+    pub typing_refresh: Duration,
     /// How long the first of those attempts waits, doubling thereafter.
     ///
     /// Absent from the file format for the same reason as [`BridgeConfig::coalesce_floor`]: it
@@ -137,15 +159,18 @@ pub struct BridgeConfig {
     /// instead.
     pub notify_failures: bool,
     pub typing_indicator: bool,
-    /// Ceiling on how long the typing indicator is held for one turn.
+    /// Ceiling on how long the typing indicator is held for one composing window.
     ///
-    /// A safety net rather than a schedule: the indicator already stops when the agent replies and
-    /// when the turn ends, so this only fires if a turn outlives both. Defaults to
-    /// `[meka].turn_timeout`, which is the longest a turn can run, so in practice it never fires.
+    /// It used to default to `[meka].turn_timeout`, which was right while the indicator covered a
+    /// whole turn and is wrong now that it covers one message being written. Under the current
+    /// design this is not a safety net that never fires, it is the *only* thing that closes a
+    /// window whose closing event never arrives: a stream that goes quiet after
+    /// `tool_call.composing` produces neither an `executing` nor another `composing`, and the
+    /// rejoin can spend minutes trying to get back on. Left at the turn budget, a chat sat
+    /// showing "typing" for half an hour and then fell silent with no message.
     ///
-    /// Worth raising rather than lowering. A cap shorter than a turn is the worst of both: the
-    /// indicator stops while the agent is still working, and a chat that has gone quiet for
-    /// minutes reads as a bot that has died rather than one that is busy.
+    /// So it is a short fixed default now, sized for the longest a model plausibly spends writing
+    /// one message's arguments rather than for the longest a turn may run.
     pub typing_max: Duration,
     /// What happens to a conversation nobody has ruled on, decided by its chat kind.
     pub default_policy: DefaultPolicy,
@@ -1012,14 +1037,13 @@ impl FileConfig {
                 batch_max_messages: self.bridge.batch_max_messages,
                 coalesce_floor: DEFAULT_COALESCE_FLOOR,
                 retry_base: DEFAULT_RETRY_BASE,
+                typing_refresh: DEFAULT_TYPING_REFRESH,
                 settle: self.bridge.settle,
                 settle_max: self.bridge.settle_max,
                 turn_retries: self.bridge.turn_retries,
                 notify_failures: self.bridge.notify_failures,
                 typing_indicator: self.bridge.typing_indicator,
-                // Follows the turn budget unless pinned, so the indicator lasts exactly as long as
-                // the work does rather than lapsing partway through a long turn.
-                typing_max: self.bridge.typing_max.unwrap_or(self.meka.turn_timeout),
+                typing_max: self.bridge.typing_max.unwrap_or(DEFAULT_TYPING_MAX),
                 default_policy: DefaultPolicy {
                     direct: self.bridge.default_policy.direct,
                     group: self.bridge.default_policy.group,
@@ -1370,22 +1394,45 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn the_typing_ceiling_follows_the_turn_budget_by_default() {
-        // A ceiling shorter than a turn is the failure this defaults away from: the indicator stops
-        // while the agent is still working, and the chat reads as a dead bot rather than a busy
-        // one.
+    fn the_typing_ceiling_is_sized_for_one_message_not_a_whole_turn() {
+        // It followed `[meka].turn_timeout`, which reads sensibly and was right while the indicator
+        // covered a whole turn. Once it covered only the window in which a message is written, that
+        // default made it unable to ever fire -- and it is the sole backstop for a window whose
+        // closing event never arrives, so a stalled stream showed "typing" for half an hour.
         let config = parse(MINIMAL).expect("valid");
-        assert_eq!(
-            config.bridge.typing_max, config.meka.turn_timeout,
-            "unpinned, the indicator lasts exactly as long as a turn can"
+        assert_eq!(config.bridge.typing_max, Duration::from_secs(120));
+        assert!(
+            config.bridge.typing_max < config.meka.turn_timeout,
+            "a ceiling at the turn budget cannot close a window that outlives its events"
         );
 
+        // Raising `turn_timeout` must not drag it back up with it.
         let raw = MINIMAL.replace(
             "token = \"meka-token\"",
-            "token = \"meka-token\"\nturn_timeout = \"5m\"",
+            "token = \"meka-token\"\nturn_timeout = \"45m\"",
         );
         let config = parse(&raw).expect("valid");
-        assert_eq!(config.bridge.typing_max, Duration::from_secs(300));
+        assert_eq!(config.bridge.typing_max, Duration::from_secs(120));
+
+        // And an operator who pins it is still obeyed.
+        let raw = format!("{MINIMAL}\n[bridge]\ntyping_max = \"45s\"\n");
+        let config = parse(&raw).expect("valid");
+        assert_eq!(config.bridge.typing_max, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn the_shipped_refresh_interval_is_the_one_the_docs_promise() {
+        // Both platforms drop a typing status about five seconds after the call that set it, so the
+        // renewal has to be under that or the indicator visibly stutters. The suite otherwise pins
+        // only its own scaled-down value, which left the shipped number free to drift to anything
+        // at all while every test went on passing and the documented "four seconds" quietly became
+        // false.
+        let config = parse(MINIMAL).expect("valid");
+        assert_eq!(config.bridge.typing_refresh, Duration::from_secs(4));
+        assert!(
+            config.bridge.typing_refresh < Duration::from_secs(5),
+            "a refresh at or past the platforms' own timeout cannot hold the indicator up"
+        );
     }
 
     #[test]

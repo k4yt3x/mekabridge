@@ -19,6 +19,17 @@ pub enum TurnEvent {
     Thinking {
         text: String,
     },
+    /// The model has begun writing a tool call's arguments.
+    ///
+    /// The only thing on the stream that separates the agent writing a message from the agent doing
+    /// anything else. Assistant text is narration around a call rather than the reply itself, and
+    /// by [`TurnEvent::ToolCallStarted`] the arguments are already finished. Carries no input,
+    /// because none has streamed yet: which conversation a message is for is not known until
+    /// the call runs.
+    ToolCallComposing {
+        id: String,
+        name: String,
+    },
     ToolCallStarted {
         id: String,
         name: String,
@@ -31,6 +42,17 @@ pub enum TurnEvent {
     Notice {
         level: String,
         text: String,
+    },
+    /// The conversation was summarised and part of the window replaced.
+    ///
+    /// The one event on the stream that is not additive. It matters more here than to a client
+    /// rendering a transcript: this bridge owns one permanent session shared by everyone on every
+    /// platform, so a compaction is the moment its memory of people who are not in the current
+    /// conversation becomes a summary.
+    ContextCompacted {
+        source: String,
+        replaced_count: u64,
+        generation: u64,
     },
     /// Emitted when a gated tool needs approval. The bridge does not offer an approval UI, so this
     /// only ever means the session was configured at `ask`, where the turn will stall for 60
@@ -105,6 +127,12 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
+    let number = |key: &str| -> u64 {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    };
 
     let parsed = match event_name {
         "turn.started" => TurnEvent::Started {
@@ -116,6 +144,10 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
         },
         "thinking.delta" => TurnEvent::Thinking {
             text: string("text"),
+        },
+        "tool_call.composing" => TurnEvent::ToolCallComposing {
+            id: string("id"),
+            name: string("name"),
         },
         "tool_call.executing" => TurnEvent::ToolCallStarted {
             id: string("id"),
@@ -132,6 +164,11 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
         "notice" => TurnEvent::Notice {
             level: string("level"),
             text: string("text"),
+        },
+        "context.compacted" => TurnEvent::ContextCompacted {
+            source: string("source"),
+            replaced_count: number("replaced_count"),
+            generation: number("generation"),
         },
         "permission_required" => TurnEvent::PermissionRequired {
             request_id: string("request_id"),
@@ -227,6 +264,35 @@ mod tests {
             }
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_the_composing_window() {
+        // The pair the typing indicator is drawn between. `tool_call.composing` carries no input
+        // because none has streamed; `tool_call.executing` closes it on the same id.
+        let event = parse(
+            "tool_call.composing",
+            r#"{"id":"tu_1","name":"mcp__mekabridge__send_message"}"#,
+        )
+        .expect("parses")
+        .expect("event");
+        assert_eq!(event, TurnEvent::ToolCallComposing {
+            id: "tu_1".to_string(),
+            name: "mcp__mekabridge__send_message".to_string()
+        });
+    }
+
+    #[test]
+    fn parses_a_compaction() {
+        let data = r#"{"source":"summarizer","replaced_count":42,"generation":3}"#;
+        let event = parse("context.compacted", data)
+            .expect("parses")
+            .expect("event");
+        assert_eq!(event, TurnEvent::ContextCompacted {
+            source: "summarizer".to_string(),
+            replaced_count: 42,
+            generation: 3
+        });
     }
 
     #[test]

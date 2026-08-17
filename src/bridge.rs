@@ -3,7 +3,8 @@
 //! The MCP listener is bound first, before any channel connects or the queue starts moving, so a
 //! port conflict is a startup failure rather than a bridge that runs with no way for the agent to
 //! answer anybody. meka retries a failed MCP connect in the background, so the bridge no longer has
-//! to be up before meka; being up first still avoids the window where `[mcp].strict` refuses turns.
+//! to be up before meka; being up first still avoids the window in which meka, unless its entry for
+//! this bridge is marked `required`, runs turns with no tool to answer anybody.
 
 pub mod envelope;
 pub mod inbound;
@@ -42,10 +43,22 @@ use crate::{
 
 /// Buffer between the channel pollers and the durable writer.
 ///
-/// Backpressure here is deliberate. When the writer falls behind, blocking the poller is correct:
-/// Telegram retains undelivered updates, whereas an unbounded in-memory buffer would lose them on a
-/// crash, which is exactly what the durable queue exists to prevent.
-const EVENT_BUFFER: usize = 64;
+/// Backpressure here is deliberate, and this number is a durability bound rather than a throughput
+/// knob. teloxide advances its `getUpdates` offset the moment a batch arrives, before yielding a
+/// single update, and issues the confirming request once its own buffer has drained into this
+/// channel. Blocking the poller when this is full is therefore what stops that confirmation going
+/// out: whatever is sitting here unwritten when it does is acknowledged to Telegram and will never
+/// be sent again. So the depth of this channel *is* the number of messages a hard kill can lose.
+///
+/// Small for that reason. It was 64, chosen as a throughput buffer before anyone worked out what it
+/// bounded. The remaining window is closed only by driving `getUpdates` from the highest id
+/// actually written, which means owning the poll loop rather than using teloxide's listener.
+///
+/// Not zero, and not one: Discord's typing notices ride the same channel on a `try_send` and are
+/// dropped when it is full, so a depth that a normal burst of messages fills would stop the settle
+/// window working. Eight is past that and still small enough that what a crash costs is a rounding
+/// error beside everything else it costs.
+const EVENT_BUFFER: usize = 8;
 
 /// How long shutdown waits for an in-flight turn before giving up on it.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,7 +69,8 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How long delivered queue rows are kept.
 ///
 /// They are not deleted on completion because they are what makes duplicate detection survive a
-/// restart: Telegram replays updates whose offset was never committed.
+/// restart: Telegram resends any update whose offset was never confirmed, and the bridge cannot
+/// tell one of those from a message it has never seen without a record of having delivered it.
 const DELIVERED_RETENTION: chrono::Duration = chrono::Duration::days(7);
 
 /// Media types meka will pass through to the provider as an image, from its
@@ -67,10 +81,16 @@ const VIEWABLE_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", 
 /// meka's ceiling on a base64 image in an MCP tool result, from its `MAX_MCP_IMAGE_BYTES`.
 const MAX_VIEW_BASE64_BYTES: usize = 10 * 1024 * 1024;
 
-/// Ceiling on the raw bytes fetched for a view, sized so the base64 form stays under
-/// [`MAX_VIEW_BASE64_BYTES`] with room to spare. Independent of `attachment_max_bytes`, which
-/// bounds what may be written to disk rather than what may be shown.
-const MAX_VIEW_BYTES: u64 = 7 * 1024 * 1024;
+/// Ceiling on the raw bytes fetched for a view. Independent of `attachment_max_bytes`, which bounds
+/// what may be written to disk rather than what may be shown.
+///
+/// This is meka's *second* image ceiling, `image::MAX_IMAGE_RAW_BYTES`: the decoded size it will
+/// hand a provider, checked separately from [`MAX_VIEW_BASE64_BYTES`] and far tighter. Sized off
+/// the base64 one alone, this sat at nearly twice what meka accepts, so a five-megabyte screenshot
+/// passed every check here and was then replaced on meka's side by a line of text saying it was
+/// suppressed. That is the outcome the screening exists to avoid: the agent is better told the file
+/// is too big to show than handed a picture with nothing in it.
+const MAX_VIEW_BYTES: u64 = 3_750_000;
 
 /// Run the bridge until a shutdown signal arrives.
 pub async fn run(config: Config) -> Result<()> {
@@ -195,6 +215,7 @@ pub async fn run(config: Config) -> Result<()> {
                 meka.clone(),
                 Arc::clone(&channels),
                 config.bridge.typing_indicator,
+                config.bridge.typing_refresh,
                 config.bridge.typing_max,
                 Arc::clone(&presence),
             ),
@@ -849,6 +870,25 @@ impl OutboundSink for BridgeSink {
             )));
         };
 
+        // Answered before fetching where the size is already known. A connector refusing an
+        // oversize file returns its own wording, which names a byte ceiling no operator
+        // configured and says nothing about `download_attachment`; the branch below that
+        // *does* say it only fires on the base64 form, which is the looser of meka's two
+        // limits and so never first.
+        //
+        // Only when the file itself is what will be fetched. `record.bytes` is the size of the main
+        // file, and a preview fetches the thumbnail instead -- tens of kilobytes for a still frame.
+        // Checking one against the other rejected every video over the ceiling on the strength of a
+        // number describing something else, so "what is in this clip?" answered "too large to show"
+        // while the frame that would have answered it sat one fetch away.
+        if !preview && record.bytes.is_some_and(|bytes| bytes > MAX_VIEW_BYTES) {
+            return Ok(ViewedAttachment::Description(format!(
+                "This {} is {}, too large to show inline. Use download_attachment to get the file \
+                 itself.",
+                record.kind,
+                describe_file(&record)
+            )));
+        }
         let fetched = channel
             .fetch(&file_ref, MAX_VIEW_BYTES)
             .await
@@ -1256,10 +1296,22 @@ fn sanitize_file_stem(file_ref: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .take(48)
         .collect();
+    // Truncation alone is not enough to keep two refs apart. A Discord ref is three snowflakes and
+    // runs past 48 characters, and the part that differs between two attachments of the *same*
+    // message is the attachment id at the end, which is exactly what the cut removes. Two images on
+    // one post therefore produced the same stem and, with the same extension, the same path: the
+    // second overwrote the first, `download_attachment` handed back the wrong bytes with no error,
+    // and sweeping either deleted both. The suffix is derived from the whole ref, so it survives
+    // whatever the prefix loses.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in file_ref.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
     if cleaned.is_empty() {
-        format!("attachment-{}", Utc::now().timestamp_millis())
+        format!("attachment-{hash:016x}")
     } else {
-        cleaned
+        format!("{cleaned}-{hash:016x}")
     }
 }
 
@@ -1301,6 +1353,82 @@ impl BridgeSink {
                 None => "indefinite".to_string(),
             }),
             unseen,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_BUFFER, MAX_VIEW_BASE64_BYTES, MAX_VIEW_BYTES, sanitize_file_stem};
+
+    #[test]
+    fn two_attachments_on_one_message_get_different_paths() {
+        // A Discord file ref is three snowflakes and runs well past the 48 characters the stem
+        // keeps, and the part that differs between two attachments of the *same* message is the id
+        // at the end -- exactly what the truncation removes. Two screenshots on one post therefore
+        // produced the same stem, and with the same extension the same path: the second overwrote
+        // the first, `download_attachment` returned the wrong bytes with no error at all, and
+        // sweeping either deleted both.
+        let first =
+            sanitize_file_stem("1183429847290374144/1183429847290374145/1183429847290374146");
+        let second =
+            sanitize_file_stem("1183429847290374144/1183429847290374145/1183429847290374147");
+        assert_ne!(
+            first, second,
+            "two attachments on one message collided on the same file name"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "pinning a shipped constant against an external contract is the point"
+    )]
+    fn the_view_ceiling_matches_what_meka_will_actually_accept() {
+        // meka applies two image ceilings, and the tighter is the decoded one it hands a provider,
+        // `image::MAX_IMAGE_RAW_BYTES`. Sized off the base64 one alone this sat at nearly twice
+        // what meka accepts, so an image passed every check here and was replaced on meka's side by
+        // a line of text saying it was suppressed -- which is the outcome the screening exists to
+        // avoid. meka's check is `>`, so equality passes.
+        const MEKA_MAX_IMAGE_RAW_BYTES: u64 = 3_750_000;
+        assert!(
+            MAX_VIEW_BYTES <= MEKA_MAX_IMAGE_RAW_BYTES,
+            "fetching up to {MAX_VIEW_BYTES} bytes hands meka more than it will show"
+        );
+        // And the base64 form of a file at the ceiling still fits the looser limit, which is what
+        // makes the check on the encoded size a backstop rather than the deciding one.
+        assert!(
+            MAX_VIEW_BYTES.div_ceil(3) * 4 <= MAX_VIEW_BASE64_BYTES as u64,
+            "the raw ceiling encodes past the base64 one"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "pinning a shipped constant against an external contract is the point"
+    )]
+    fn the_inbound_buffer_stays_small_enough_to_be_a_durability_bound() {
+        // This number is how many messages a hard kill can lose, because the poller blocking on a
+        // full channel is what holds back the offset confirmation. It was 64, picked as a
+        // throughput buffer before anyone worked out what it bounded.
+        assert!(
+            EVENT_BUFFER <= 8,
+            "a buffer of {EVENT_BUFFER} is that many messages lost on a `kill -9`"
+        );
+        // Not so small that Discord's typing `try_send` is starved by an ordinary burst.
+        assert!(EVENT_BUFFER >= 4);
+    }
+
+    #[test]
+    fn a_stem_stays_inside_the_attachment_directory() {
+        // The reason the filter exists: Telegram file ids really do contain `/` and `-`.
+        for hostile in ["../../etc/passwd", "..", "a/b\\c", "\u{0}"] {
+            let stem = sanitize_file_stem(hostile);
+            assert!(
+                !stem.contains(['/', '\\', '.']),
+                "{hostile:?} produced a stem with a path separator in it: {stem:?}"
+            );
         }
     }
 }

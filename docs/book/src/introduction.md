@@ -29,7 +29,7 @@ The bridge reports facts and supplies capabilities; who counts as trusted, and w
 
 meka and mekabridge each act as the other's client. meka calls the bridge's MCP tools to send messages; the bridge calls meka's HTTP API to run turns.
 
-> **Start the bridge first where you can.** meka retries a failed MCP connect in the background, so the wrong order heals itself within a few minutes, but `[mcp].strict` makes meka refuse turns until it does. See [meka Integration](./usage/meka-integration.md).
+> **Start the bridge first where you can**, and set `required = true` on meka's server entry for it. meka retries a failed MCP connect in the background, so the wrong order heals itself within a few minutes; without `required` it runs turns meanwhile, with no tool to answer anybody. See [meka Integration](./usage/meka-integration.md).
 
 ## Status
 

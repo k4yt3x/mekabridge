@@ -73,8 +73,8 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a batch waiting out a retry |
 | `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
 | `turn_retries` | `3` | Extra attempts for a batch whose turn failed, waiting 10s, 20s then 40s between them |
-| `typing_indicator` | `true` | Show a typing state in originating chats when a turn starts. Stops once the agent replies there, and when the turn ends |
-| `typing_max` | `[meka].turn_timeout` | Ceiling on how long that state is held for one turn. A safety net: the indicator already stops on a reply and at the end of the turn |
+| `typing_indicator` | `true` | Show a typing state in the originating chats while the model is writing a message, and at no other time |
+| `typing_max` | `2m` | Ceiling on how long one such window may last. Not a safety net: it is the only thing that closes a window whose closing event never arrives |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
 
 `settle` and `settle_max` only apply where the platform tells the bridge that somebody is typing. Discord does. Telegram has no such update at all: the Bot API lets a bot *send* a chat action and never receive one, so there a message starts a turn as soon as it arrives.
@@ -83,7 +83,15 @@ That split is deliberate. Without the signal any wait is a guess, and there is n
 
 Every conversation is also held for one second regardless, which is not configurable. It exists for the wire rather than for people: platforms split one thing into several messages, Telegram's multi-photo albums above all, and without it a post arrives as one photo followed by a separate turn carrying the rest. Those parts land milliseconds apart, so a second is generous. See [Group attention](../usage/group-attention.md).
 
-`typing_max` is worth raising rather than lowering. Neither Telegram nor Discord limits how long an indicator may be renewed, so holding one costs a single cheap call every few seconds. A ceiling shorter than a turn is the worst of both: it stops while the agent is still working, and a chat that has been quiet for minutes reads as a bot that has died rather than one that is busy.
+The indicator tracks one thing: the interval in which the model is writing the arguments to a send tool, which meka opens with `tool_call.composing`. It is not raised while the agent reads, searches, thinks, or waits on a turn somebody else started, and a turn that never writes a message never draws one at all. The window is closed by the next tool call meka announces, whichever one that is, rather than by the one that opened it: meka can retry a provider round mid-arguments, and the retry comes back with different call ids, so the closing event for the original never arrives.
+
+That is narrower than it used to be. The indicator previously went up when a turn started and stayed up for its whole length, which for a turn spent on a dozen tool calls was a claim that a reply was seconds away for minutes at a time. The cost of the change is that a long turn now looks like silence; the benefit is that when the indicator is up it is true.
+
+Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-api` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn was submitted for rather than the message's eventual target; those are the same thing unless one batch spanned several chats.
+
+`typing_max` used to follow `[meka].turn_timeout`, which was right while the indicator covered a whole turn and wrong once it covered only the writing of one message. A window is normally closed by the next tool call meka announces, but a stream that goes quiet after `tool_call.composing` produces no such event, and the rejoin can spend minutes trying to get back on. At the turn budget the ceiling could never fire, so a chat showed "typing" for half an hour and then fell silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
+
+How often the indicator is renewed is not configurable: Telegram clears the status after about five seconds and Discord after ten, so the interval is fixed at four to look continuous on both.
 
 A message that runs out of attempts produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
 

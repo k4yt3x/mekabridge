@@ -135,7 +135,9 @@ It is an enum rather than a bare message so a scheduler, waking the agent on a t
 | meka unreachable, 5xx, 429 | The batch is retried up to `[bridge].turn_retries`, waiting 10s, 20s then 40s. Past that it is marked failed, put back among what the agent has not seen, and both the chat and the owner are told |
 | An error only an operator can clear (auth, a malformed request) | Given up on at once rather than spending the budget on attempts that cannot succeed |
 | A turn fails after the agent has sent or run something | Not retried at all: the work is done and a second attempt would repeat it with the agent unable to remember the first |
-| Stream drops after the turn started | The turn keeps running server-side, so the bridge polls `turn_in_flight` and marks the batch delivered rather than resubmitting a duplicate |
+| Stream drops after the turn started | The bridge rejoins the turn with `Last-Event-ID` and reads how it actually ended. Rejoining is also what keeps it alive: meka stops a turn whose stream has had no subscriber for `[serve].stream_reattach_grace` |
+| meka cancels the turn | Not a success. A turn stopped for want of a listener is reported as a cancellation rather than an error, so it is treated as undelivered unless the agent had already acted |
+| The turn cannot be rejoined | Its outcome is unknown, so the batch is requeued rather than assumed delivered. That may deliver the same messages twice, which is the lesser of the two: assuming otherwise loses them silently |
 | A turn is already in flight on submit | Some turn is running, possibly one meka started for itself. The batch is held and resubmitted on a timer until it clears, without spending an attempt |
 | An attachment is too large to view, or the profile has no vision | `view_attachment` returns a description naming the file and pointing at `download_attachment`, rather than failing |
 | meka reports the session is gone | A replacement session is created and the same batch is replayed into it, once |

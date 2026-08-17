@@ -13,7 +13,7 @@ description = "mekabridge"
 scopes = ["sessions:r", "sessions:w"]
 ```
 
-`sessions:w` covers creating sessions, submitting turns, and cancelling. `sessions:r` covers reading session metadata, which `mekabridge doctor` and `session show` use.
+`sessions:w` covers creating sessions, submitting turns, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **rejoining a turn's event stream**. Both are required: without `sessions:r` the bridge submits turns normally and then cannot recover from a dropped connection, so every blip ends a turn that was running fine.
 
 ### An MCP server entry
 
@@ -22,6 +22,7 @@ scopes = ["sessions:r", "sessions:w"]
 name = "mekabridge"
 transport = "http"
 url = "http://127.0.0.1:9100/mcp"
+required = true
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
@@ -46,8 +47,8 @@ Leave the rest deferred; they are used rarely enough that keeping the tools arra
 ## Permissions
 
 meka resolves each MCP tool's required permission through a five-step chain. With no override, the
-tool's own `readOnlyHint` decides, and **every tool this bridge exposes is annotated read-only**, so
-the whole surface works at `read`:
+tool's own `readOnlyHint` decides. Almost every tool here is annotated read-only, so the
+conversational surface works at `read`:
 
 | Group | Tools |
 |-------|-------|
@@ -62,9 +63,11 @@ The moderation group is present only when a channel has `admin_tools` on, which 
 [Security](./security.md). A test asserts the exact set in both configurations, because conditional
 registration is the one thing that can silently drop a tool.
 
-Read-only here means what the hint means: none of these change anything on the machine meka runs on.
-`openWorldHint: true` carries the caveat that most of them act outside it. `download_attachment` is
-the one that genuinely writes, into `[storage].attachment_dir` and nowhere else, bounded by
+Taken literally, `readOnlyHint` asks whether a tool changes the machine meka runs on, and by that
+reading every tool here qualifies, moderation included. That is not a useful line for a bridge, so
+the one drawn here is what a tool can do to *other people*: see below for the five that cannot be
+read-only under it. `openWorldHint: true` carries the caveat that most of them act outside the
+machine. `download_attachment` writes, into `[storage].attachment_dir` and nowhere else, bounded by
 `attachment_max_bytes` and swept on a timer; annotating it otherwise would put it at `write`, where
 a bridge at `read` could receive a document and never be able to open it.
 
@@ -79,12 +82,30 @@ It also would not contain anything. meka grants `fetch_url` at `read`, so an age
 already push arbitrary bytes to any host on the internet. These tools reach only conversations on your
 allowlist, so they are strictly more constrained than a tool meka already treats as read-only.
 
+**Five tools are the exception and need `write`:** `moderate_member`, `delete_message`,
+`set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody
+else's account or on the room itself: a ban with `revoke_messages` erases everything a person ever
+posted, `delete_message` removes other people's messages where the bot moderates, the two rights
+tools change privileges, and `set_chat` rewrites the group's name and description. A `read` session
+can talk; it cannot ban. Raise `[session].permission` to `"write"` if you want the agent moderating,
+or grant them individually with `tool_permissions`.
+
+The line is what a tool can do to other people, not whether it changes anything at all. `mute` and
+`block` modify plenty, but only this bridge's own record of what it forwards, and the agent can lift
+either itself, so they stay read-only.
+
 If you want sends gated anyway, invert it on meka's side:
 
 ```toml
 [mcp.servers.tool_permissions]
 send_message = "write"
 ```
+
+There is one other way to end up there by accident. meka only honours `readOnlyHint` while the
+server entry's `trust_read_only_hint` is on, which is its default; set it to `false` and *every*
+tool here falls back to `write`. A session left at `read` then denies each one in turn, so the agent
+reads everything and answers nothing, with the refusal visible only inside the tool result. If you
+want that hardening, raise `[session].permission` to `write` alongside it.
 
 Do not run the session at `ask`. meka checks the session level before dispatch, so at `ask` every
 call is prompted including read-only ones, and this bridge answers no prompts.
@@ -95,26 +116,29 @@ Start mekabridge first, then `meka serve`, where you have the choice.
 
 meka connects to its MCP servers at startup and retries a failed connect in the background with
 backoff, from five seconds up to five minutes, so the wrong order recovers on its own. What it costs
-you is the interval: with `[mcp].strict` at its default of `true`, every turn is rejected while a
-configured MCP server is not connected, so a meka that came up first will refuse work for up to a few
-minutes with no obvious cause.
+you is the interval, and what that interval looks like depends on one setting.
 
-Restarting the bridge alone is fine at any point. The transport closes from a `Connected` state, so
-meka's reconnect fires immediately rather than waiting on the cold-start backoff.
+**Set `required = true` on the bridge's server entry**, as the samples above do. Without it a meka
+that came up first runs turns anyway, with none of this bridge's tools registered: the agent is
+handed the message, has no `send_message` to answer with, and says nothing. Nothing above `debug`
+records it, and meka's readiness probe still reports healthy, because that probe only considers a
+*required* server's failure worth reporting. With it, meka refuses the turn instead, the bridge sees
+the refusal and backs off, and the messages wait in the queue until the connection is up.
+
+`[mcp].strict` sets the default for `required` across every server, and it defaults to **`false`**,
+so leaving both unset is the silent case above rather than the safe one. Per-server is the better
+knob: whether a missing server should stop a turn is a property of that server, not of the
+installation.
+
+Restarting the bridge alone is fine, but meka's reconnect is lazy rather than immediate: nothing
+watches a server that is still marked `Connected`, and the reconnect is triggered by the next tool
+call that finds the transport closed. So the first tool call after a bridge restart pays for it, and
+until one happens meka goes on reporting the server as connected. `POST /v1/mcp/mekabridge/reconnect`
+forces the issue if the entry has actually gone `Failed`.
 
 `mekabridge doctor` reads meka's readiness probe and reports when meka sees an unhealthy MCP server,
-which is usually this and usually resolves itself.
-
-If you would rather meka tolerate a missing bridge outright:
-
-```toml
-[mcp]
-strict = false
-```
-
-Turns then run without the bridge's tools, which means the agent reads messages and has no way to
-answer them. Useful for keeping meka usable from the REPL while the bridge is down, not much use to
-the bridge itself.
+which is usually this and usually resolves itself. Note that with `required` unset it will not see
+this bridge's own disconnection at all.
 
 ### With systemd
 

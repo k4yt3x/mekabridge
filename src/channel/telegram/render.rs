@@ -44,9 +44,15 @@ fn visible_length(html: &str) -> usize {
                         break;
                     }
                 }
+                // An entity renders as one BMP character, so one unit.
                 count += 1;
             }
-            _ if !in_tag => count += 1,
+            // Telegram measures a message the way it measures entity offsets, in UTF-16 code
+            // units, so anything outside the BMP costs two. Counted as characters, an emoji-heavy
+            // reply was split at 4096 characters and rejected at 8192 units -- and because the
+            // splitter aims at the limit exactly, it failed on the *first* part, so nothing arrived
+            // at all.
+            _ if !in_tag => count += character.len_utf16(),
             _ => {}
         }
     }
@@ -171,6 +177,29 @@ fn escape_attribute(text: &str, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_budget_is_counted_the_way_telegram_counts_it() {
+        // Telegram measures a message in UTF-16 code units, the same unit its entity offsets use,
+        // so anything outside the BMP costs two. Counted as characters an emoji-heavy reply was cut
+        // at 4096 characters and refused at 8192 units, and because the splitter aims at the limit
+        // exactly it failed on the *first* part, so nothing arrived at all.
+        let emoji = "\u{1f600}";
+        assert_eq!(emoji.chars().count(), 1, "one character");
+        assert_eq!(visible_length(emoji), 2, "but two of what Telegram counts");
+        // Markup is still free, and an entity still costs the one character it renders as.
+        assert_eq!(visible_length("<b>hi</b>"), 2);
+        assert_eq!(visible_length("&amp;"), 1);
+
+        let chunks = to_html(&emoji.repeat(40), 20);
+        for chunk in &chunks {
+            let units: usize = chunk.chars().map(char::len_utf16).sum();
+            assert!(
+                units <= 20,
+                "a chunk of {units} UTF-16 units was emitted against a limit of 20: {chunk:?}"
+            );
+        }
+    }
+
     use super::*;
 
     fn render(markdown: &str) -> String {
@@ -462,7 +491,6 @@ mod tests {
         assert!(chunks.len() > 1);
         for chunk in &chunks {
             assert!(visible_length(chunk) <= 100);
-            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
         }
     }
 
@@ -470,8 +498,17 @@ mod tests {
     fn emoji_are_not_split_apart() {
         let markdown = "🎉🎊".repeat(200);
         let chunks = to_html(&markdown, 50);
+        // Guarded: `for` over an empty vector asserts nothing, and the length check below is the
+        // only thing here that a wrong measure would trip.
+        assert!(
+            !chunks.is_empty(),
+            "the emoji vanished instead of splitting"
+        );
         for chunk in &chunks {
-            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+            assert!(
+                visible_length(chunk) <= 50,
+                "a chunk ran past the limit: {chunk:?}"
+            );
             assert!(!chunk.contains('\u{fffd}'), "replacement char in {chunk}");
         }
     }

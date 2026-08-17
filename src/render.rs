@@ -127,19 +127,67 @@ pub fn into_messages(
     let limit = limit.max(1);
     let blocks = parse_blocks(markdown);
     let mut budget = limit;
+    // The rendering at the full budget, kept for the case where shrinking never succeeds.
+    //
+    // Some overflow does not shrink. A link target is copied into every piece the splitter cuts, so
+    // the widest body stays the same size however small the budget gets, and the loop runs it down
+    // to one visible character per message. That does nothing for the offending block and chops
+    // every *other* block in the document into single characters: a page of prose next to one long
+    // URL came out as a thousand one-letter messages, each of which the connector dutifully sends.
+    //
+    // When shrinking cannot win, the best thing to cut up is therefore the *least* cut rendering
+    // there is. Its blocks are whole and only the irreducible body needs hard-splitting, so the
+    // damage stays where the problem is.
+    let mut whole: Option<Vec<String>> = None;
     loop {
         let rendered: Vec<String> = group_blocks(blocks.clone(), budget)
             .iter()
             .map(|group| emit(group))
             .collect();
         let worst = rendered.iter().map(|body| measure(body)).max().unwrap_or(0);
-        // At a budget of one visible character per message there is nothing left to give up.
-        if worst <= limit || budget <= 1 {
-            return rendered
+        let fits = worst <= limit;
+        // At one visible character per message there is nothing left to give up.
+        if fits || budget <= 1 {
+            let shrunk: Vec<String> = rendered
                 .into_iter()
                 .filter(|body| !body.trim().is_empty())
                 .collect();
+            // Nothing was ever cut, so this is the whole document at the full budget and there is
+            // nothing to compare it against.
+            let Some(whole) = whole else {
+                return shrunk;
+            };
+            let bodies: Vec<String> = whole
+                .into_iter()
+                .filter(|body| !body.trim().is_empty())
+                .collect();
+            // Out of budget and still over. Returning as-is meant handing the connector a body the
+            // platform refuses outright -- twilight rejects it client-side, Telegram answers 400 --
+            // and since the parts before it have already been sent, the reply arrives half
+            // delivered. Cutting is worse markup than the splitter wanted and better than a message
+            // nobody receives; it only happens for content that cannot be broken at all, such as a
+            // single link longer than the whole limit.
+            // Filtered again on the way out: `hard_split`'s trailing remainder is whatever is left
+            // past the last cut, which can be nothing but whitespace, and a blank body is refused
+            // by the platform and aborts the rest of the send.
+            let cut: Vec<String> = bodies
+                .into_iter()
+                .flat_map(|body| hard_split(&body, limit, &measure))
+                .filter(|body| !body.trim().is_empty())
+                .collect();
+            // Fitting is not the same as being worth sending, and this is the comparison that says
+            // so. Some overflow does not shrink: a link target is copied into every piece the
+            // splitter cuts, so the budget falls until the link is alone in its message and *then*
+            // fits -- at one visible character each, which chops the rest of the document into
+            // single letters. Thirty-six thousand characters of prose beside one 1995-character URL
+            // came out as 28,817 messages, and the connector sends every one of them. Checking only
+            // whether the widest body fits cannot see that, because it does fit.
+            if fits && shrunk.len() <= cut.len() {
+                return shrunk;
+            }
+            return cut;
         }
+        whole = whole.or(Some(rendered));
         // Shrink the budget for the whole document rather than for the group that overflowed.
         // Regrouping one group in isolation also fits, but it packs the overflow into a full
         // message and a stray remainder, so a long reply arrives as alternating walls and single
@@ -150,6 +198,33 @@ pub fn into_messages(
             .unwrap_or(1)
             .clamp(1, budget - 1);
     }
+}
+
+/// Last resort: cut a body that no amount of regrouping brought under the limit.
+///
+/// Measured with the emitter's own `measure`, since that is the only thing that knows how the
+/// platform counts, and stepped one character at a time because the relationship between characters
+/// and whatever it counts is the emitter's business. Only ever reached for something indivisible.
+fn hard_split(body: &str, limit: usize, measure: &impl Fn(&str) -> usize) -> Vec<String> {
+    if measure(body) <= limit {
+        return vec![body.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for character in body.chars() {
+        let mut candidate = current.clone();
+        candidate.push(character);
+        if !current.is_empty() && measure(&candidate) > limit {
+            parts.push(std::mem::take(&mut current));
+            current.push(character);
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 /// Split Markdown into plain-text messages, leaving the source formatting untouched.
@@ -649,6 +724,10 @@ fn split_pre(language: &Option<String>, text: &str, limit: usize) -> Vec<Block> 
 
 /// Split a run of spans, preferring span boundaries and falling back to cutting inside one.
 fn split_spans(spans: Vec<Span>, limit: usize) -> Vec<Vec<Span>> {
+    // Never zero. At zero the budget can never grow, because flushing sets the length back to a
+    // limit that is still zero, and the loop below has no other way to make room. Callers arrive
+    // through `into_messages`, which already clamps, so this only holds the invariant locally.
+    let limit = limit.max(1);
     let mut groups: Vec<Vec<Span>> = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_length = 0_usize;
@@ -671,10 +750,30 @@ fn split_spans(spans: Vec<Span>, limit: usize) -> Vec<Vec<Span>> {
             }
             let (head, tail) = split_at_visible(&remaining.text, available);
             if head.trim().is_empty() {
-                // No usable break within the budget; start a new message rather than emitting a
-                // fragment made only of whitespace.
-                groups.push(std::mem::take(&mut current));
-                current_length = 0;
+                if !current.is_empty() {
+                    // No usable break within the budget; start a new message rather than emitting a
+                    // fragment made only of whitespace.
+                    groups.push(std::mem::take(&mut current));
+                    current_length = 0;
+                    continue;
+                }
+                // Nothing to flush, so flushing achieves nothing: the group is already empty and
+                // the budget is already the whole limit, which made the next pass
+                // identical to this one. That spun forever without consuming a
+                // byte, allocating, or reaching an await, so the task could not
+                // even be cancelled and the worker thread was gone for good.
+                //
+                // Dropping the leading whitespace is what makes progress here, and it is the right
+                // rendering anyway, since no message wants to begin with it. `head` is non-empty
+                // and entirely whitespace, so the text does start with some and
+                // this always shortens it. The equality check is a backstop rather
+                // than a live branch: it costs a comparison and it means a future
+                // change to `split_at_visible` cannot bring the hang back.
+                let trimmed = remaining.text.trim_start();
+                if trimmed.len() == remaining.text.len() {
+                    break;
+                }
+                remaining.text = trimmed.to_string();
                 continue;
             }
             current.push(Span {
@@ -853,6 +952,120 @@ mod tests {
     fn a_zero_limit_does_not_loop_forever() {
         let chunks = into_messages("hello world", 0, debug_emit, count_chars);
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn a_span_too_long_to_break_does_not_spin() {
+        // Run on its own thread with a deadline, because the regression is a loop with no
+        // allocation and no yield: called directly it would hang the suite rather than fail it. A
+        // plain thread rather than `spawn_blocking`, because dropping a tokio runtime waits for its
+        // blocking tasks, so the panic would land and then teardown would hang anyway. The test
+        // harness exits the process when it finishes, so the spinning thread is abandoned.
+        //
+        // Driven straight at `split_spans` because the state that triggers it is precise: an empty
+        // group, and a span whose first `available` characters are all whitespace. Reaching it
+        // through `into_messages` needs the budget already shrunk to near nothing, which happens
+        // when a span is cheap to measure but expensive to emit -- a Markdown link whose URL runs
+        // past the platform limit is the real-world case, and it took a whole reply down with it.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(split_spans(vec![Span::plain(" now")], 1));
+        });
+        let groups = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("split_spans spun on a span it could not break");
+        let text: String = groups
+            .iter()
+            .flat_map(|group| group.iter().map(|span| span.text.as_str()))
+            .collect();
+        assert_eq!(
+            text, "now",
+            "the text was dropped instead of split: {groups:?}"
+        );
+    }
+
+    /// Emitter that charges for its own markup, as Discord's does: a link's target counts against
+    /// the limit. `debug_emit` drops targets entirely, so with it the budget never shrinks and the
+    /// give-up path this exercises is unreachable.
+    fn link_emit(blocks: &[Block]) -> String {
+        let mut out = String::new();
+        for block in blocks {
+            match block {
+                Block::Text { spans, .. } | Block::Heading { spans, .. } => {
+                    for span in spans {
+                        match &span.link {
+                            Some(target) => {
+                                out.push('[');
+                                out.push_str(&span.text);
+                                out.push_str("](");
+                                out.push_str(target);
+                                out.push(')');
+                            }
+                            None => out.push_str(&span.text),
+                        }
+                    }
+                }
+                Block::Pre { text, .. } => {
+                    out.push_str("```\n");
+                    out.push_str(text);
+                    out.push_str("\n```");
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nothing_over_the_limit_is_ever_returned() {
+        // The splitter gave up once the budget hit one and returned whatever it had, even when that
+        // was still over. The platform then refuses the body outright -- twilight rejects it before
+        // it leaves the process, Telegram answers 400 -- and the parts before it have already been
+        // sent, so the reply lands half delivered with no record of where it stopped.
+        // A target that lands *just under* the limit rather than over it. This is the case that
+        // actually floods: the budget falls until the link is alone in its message and then fits,
+        // so a check on whether the widest body fits never fires, and every other block has been
+        // chopped to single characters by then. An unbreakable run that is merely *over* the limit
+        // exercises the other arm and cannot see this.
+        let snug = format!("[t](https://e.test/{})", "y".repeat(80));
+        assert_eq!(
+            snug.chars().count(),
+            100,
+            "the emitted link must be exactly the limit"
+        );
+        let unbreakable = "x".repeat(300);
+        // Prose alongside the link matters: the link is what stops the budget shrinking, and the
+        // prose is what gets chopped into single characters when it runs to the floor.
+        let prose = "the quick brown fox jumps over the lazy dog. ".repeat(14);
+        for markdown in [
+            format!("{prose}{snug}\n\n{prose}"),
+            format!("{prose}[the docs](https://example.test/{unbreakable})\n\n{prose}"),
+            format!("- [x]({unbreakable})\n- second item"),
+            format!("see {unbreakable} now"),
+            format!("`{unbreakable}`"),
+        ] {
+            let chunks = into_messages(&markdown, 100, link_emit, count_chars);
+            assert!(!chunks.is_empty(), "{markdown:?} rendered to nothing");
+            // Bounding the count as well as each length. Keeping every chunk under the limit is
+            // trivially satisfied by chopping the whole document into single characters, which is
+            // what happens when the overflow is a constant per-piece cost the budget cannot shrink
+            // away, and the connector then sends every one of them.
+            assert!(
+                chunks.iter().all(|chunk| !chunk.trim().is_empty()),
+                "{markdown:?} produced a blank message, which the platform refuses"
+            );
+            assert!(
+                chunks.len() <= 20,
+                "{markdown:?} produced {} chunks, so the reply arrives as a flood",
+                chunks.len()
+            );
+            for chunk in &chunks {
+                assert!(
+                    count_chars(chunk) <= 100,
+                    "a chunk of {} characters was emitted against a limit of 100",
+                    count_chars(chunk)
+                );
+            }
+        }
     }
 
     #[test]

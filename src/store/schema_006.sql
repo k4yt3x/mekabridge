@@ -1,0 +1,12 @@
+-- When a queue row reached a terminal state, as opposed to when the platform says its message was
+-- sent.
+--
+-- `received_at` carries the platform's own timestamp, and an edit inherits the *original* message's
+-- time, which can be weeks old. Retention keyed on that deleted a delivered edit within the hour
+-- instead of after seven days, and those rows are what makes duplicate detection survive a restart:
+-- once the row is gone, `UNIQUE (conversation_id, external_id)` has nothing to conflict with and a
+-- replayed update is queued and delivered a second time.
+--
+-- Null for rows that predate this column. Those are pruned on `received_at` as before, which is the
+-- old behaviour for old rows and correct for every row written since.
+ALTER TABLE inbound_queue ADD COLUMN completed_at TEXT;

@@ -107,7 +107,7 @@ Delivery is unaffected either way. What changes is that a muted conversation has
 
 ## What the agent can reach on your machine
 
-The bridge runs at meka's `read` permission by default, which is enough for every tool here because they change nothing locally. Two things to know:
+The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` or `set_chat`: those are annotated as destructive and need `write`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename. Raise `[session].permission` if you want it moderating. Three things to know:
 
 - **`send_file` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config and its database. Anyone who can talk the agent into a `send_file` call can exfiltrate those.
 - **`download_attachment` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.

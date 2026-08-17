@@ -1,8 +1,8 @@
 # mekabridge configuration.
 #
 # Start mekabridge before `meka serve` where you can. meka retries a failed MCP connect in the
-# background, so the wrong order recovers on its own, but until it does `[mcp].strict` makes meka
-# refuse every turn.
+# background, so the wrong order recovers on its own, but until it does meka runs turns without this
+# bridge's tools unless its server entry is marked `required = true`.
 
 [meka]
 # Where `meka serve` is listening.
@@ -82,6 +82,7 @@ channel = "mute"
 #   name = "mekabridge"
 #   transport = "http"
 #   url = "http://127.0.0.1:9100/mcp"
+#   required = true
 #   eager_load_tools = ["send_message", "list_conversations"]
 #
 # Without `eager_load_tools`, meka defers MCP tools and the agent pays an extra round trip before

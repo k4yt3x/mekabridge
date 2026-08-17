@@ -287,7 +287,9 @@ Only two things are refused here: an id that is not well formed, and one naming 
 
 ## Permission level
 
-Every tool is annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, so the alternative would place them at `write`, where a bridge running at `read` would understand every message and be unable to answer any of them.
+Most tools are annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, and gating replying behind `write` would leave a bridge running at `read` understanding every message and unable to answer any of them.
+
+Five are the exception and need `write`: `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `mute` and `block` modify plenty, but only this bridge's own record of what it forwards.
 
 `download_attachment` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
 

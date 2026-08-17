@@ -545,14 +545,27 @@ async fn all_tools_are_visible_to_an_older_client() {
             tool.name
         );
         // meka resolves each tool's required permission from `readOnlyHint` when config does not
-        // override it. Every tool here is read-only on purpose: the send tools change nothing on
-        // the machine, and classifying them as writes would leave a bridge run at `read` unable to
-        // answer anybody. The annotation has to survive the version gap intact for that to hold.
+        // override it, so the annotation has to survive the version gap intact or the permission
+        // model changes silently. The conversational surface is read-only on purpose -- classifying
+        // the send tools as writes would leave a bridge at `read` unable to answer anybody -- while
+        // the five that take irreversible action on somebody else's account ask for `write`.
+        const NEEDS_WRITE: &[&str] = &[
+            "delete_message",
+            "moderate_member",
+            "set_member_rights",
+            "set_member_roles",
+            "set_chat",
+        ];
         let read_only = tool
             .annotations
             .as_ref()
             .and_then(|annotations| annotations.read_only_hint);
-        assert_eq!(read_only, Some(true), "readOnlyHint for {}", tool.name);
+        assert_eq!(
+            read_only,
+            Some(!NEEDS_WRITE.contains(&tool.name.as_ref())),
+            "readOnlyHint for {}",
+            tool.name
+        );
     }
 
     client.cancel().await.expect("clean shutdown");

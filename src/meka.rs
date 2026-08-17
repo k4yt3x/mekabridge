@@ -26,6 +26,44 @@ use crate::{
     meka::sse::TurnEvent,
 };
 
+/// How many separate drops one turn may ride out before its outcome is called unknown.
+///
+/// Generous because each rejoin is one cheap request against a turn that is still running and still
+/// costing provider tokens, and because a rejoin that succeeds is the bridge working rather than
+/// struggling: a half-hour turn over a domestic connection can legitimately need several. Bounded
+/// at all only because a stream that dies the instant it opens would otherwise spin. The turn
+/// timeout is the real backstop.
+const MAX_REJOINS: u32 = 20;
+
+/// How many requests may be spent getting back on after a single drop.
+///
+/// This is the budget that has to fit inside meka's `[serve].stream_reattach_grace`, since none of
+/// these attempts is resetting that clock. At [`REJOIN_RETRY_DELAY`] apart it spends a few seconds
+/// against a default of thirty.
+const MAX_REJOIN_ATTEMPTS: u32 = 5;
+
+/// Longest silence tolerated on an open response before it is treated as dead.
+///
+/// Applies to the gap between reads, not to the whole response, so a turn that runs for half an
+/// hour is unaffected: meka sends a keep-alive comment every twenty seconds on both SSE endpoints,
+/// and this is three of those. It is what turns a connection that stopped speaking without closing
+/// into an error the rejoin can act on.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Ceiling on one request that is not a stream.
+///
+/// Every one of these is a small JSON round trip that meka answers immediately or not at all, so
+/// the generous figure is about a loaded server rather than a slow reply. Separate from
+/// [`STREAM_READ_TIMEOUT`] because that one only bounds silence: a peer trickling a byte a minute
+/// would satisfy it forever, and `doctor` should not hang on that.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait before asking again when the rejoin request itself fails.
+///
+/// Small deliberately. The whole per-drop budget has to fit inside `[serve].stream_reattach_grace`,
+/// which meka defaults to thirty seconds.
+const REJOIN_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Problem Detail (RFC 9457) as returned by every meka error response.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -38,11 +76,11 @@ pub struct ProblemDetail {
     pub instance: Option<String>,
     /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
     ///
-    /// meka sends this on its concurrency-limit 429 and nowhere else. What it does *not* send it
-    /// on is the case that matters most: `RetryableProvider` carries the provider's own
-    /// `Retry-After` and then drops it at the boundary that turns an error into a Problem
-    /// Detail, so a rate limit arrives here with the one number that is not a guess already
-    /// discarded.
+    /// meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
+    /// cap. What it does *not* send it on is the case that matters most: `RetryableProvider`
+    /// carries the provider's own `Retry-After` and then drops it at the boundary that turns
+    /// an error into a Problem Detail, so a rate limit arrives here with the one number that
+    /// is not a guess already discarded.
     pub retry_after: Option<f64>,
 }
 
@@ -54,11 +92,13 @@ impl ProblemDetail {
             "auth" => ProblemKind::Auth,
             "auth-scope" => ProblemKind::AuthScope,
             "session-not-found" => ProblemKind::SessionNotFound,
+            "not-found" => ProblemKind::NotFound,
             "session-locked" => ProblemKind::SessionLocked,
             "turn-in-flight" => ProblemKind::TurnInFlight,
             "turn-cancelled" => ProblemKind::TurnCancelled,
             "concurrency-limit" => ProblemKind::ConcurrencyLimit,
             "sse-lag" => ProblemKind::SseLag,
+            "stream-detached" => ProblemKind::StreamDetached,
             "provider" => ProblemKind::Provider,
             "invalid-body" => ProblemKind::InvalidBody,
             "payload-too-large" => ProblemKind::PayloadTooLarge,
@@ -89,11 +129,17 @@ pub enum ProblemKind {
     Auth,
     AuthScope,
     SessionNotFound,
+    /// Something other than a session was not there: for this bridge, a turn stream with nothing
+    /// joinable. Distinct from [`Self::SessionNotFound`], which is the cue to build a new session.
+    NotFound,
     SessionLocked,
     TurnInFlight,
     TurnCancelled,
     ConcurrencyLimit,
     SseLag,
+    /// A rejoined stream ended with no outcome recorded for the turn. Arrives only inside a
+    /// terminal `turn.failed`, never as an HTTP response.
+    StreamDetached,
     Provider,
     InvalidBody,
     PayloadTooLarge,
@@ -113,11 +159,18 @@ pub enum MekaError {
     #[error("meka returned HTTP {status} with an unexpected body: {body}")]
     UnexpectedStatus { status: u16, body: String },
 
-    /// The turn was accepted and then the connection failed.
+    /// The turn was accepted, the connection failed, and rejoining it did not work either.
     ///
-    /// meka keeps running the turn regardless: it holds the runtime lock and the spawned task
-    /// completes. Every stream-level failure lands here because the stream only exists after the
-    /// submission was accepted, so there is no case where this means "the turn never happened".
+    /// Every stream-level failure lands here because the stream only exists after the submission
+    /// was accepted, so this never means "the turn never happened". What it does *not* mean any
+    /// more is that the turn will *finish*. meka once let a disconnected turn run to completion; it
+    /// now stops the agent loop once its stream has had no subscriber for
+    /// `[serve].stream_reattach_grace`. That check happens at a provider-round boundary rather than
+    /// on a clock, so a turn sitting inside one long tool call is not stopped until the call
+    /// returns. Either way the turn is normally still running and still able to send when this is
+    /// returned, which is why the rejoin gives up by cancelling it rather than leaving it be.
+    /// Treating a session that goes idle afterwards as one whose turn finished is how a message
+    /// gets marked delivered without ever having been answered.
     #[error("the turn stream was interrupted after the turn had started: {reason}")]
     StreamInterrupted { reason: String },
 
@@ -147,7 +200,18 @@ impl MekaError {
             Self::Problem(problem) => match problem.kind() {
                 ProblemKind::ConcurrencyLimit
                 | ProblemKind::Internal
-                | ProblemKind::SessionLocked => true,
+                | ProblemKind::SessionLocked
+                // meka emits this when its broadcast to *this* client fell behind, then cancels
+                // the turn and says "Retry the turn" in the detail: nothing about it says the work
+                // would fail again. Classified here for callers that ask, but the turn path does
+                // not reach this. It marks the counters incomplete first, on the grounds that the
+                // events meka dropped may have included a send, and a turn that may have acted is
+                // closed out rather than offered again.
+                | ProblemKind::SseLag
+                // The turn ran and meka cannot say how it ended. Worth another attempt for the
+                // same reason a dropped stream is: the alternative is calling a message delivered
+                // on the strength of not knowing.
+                | ProblemKind::StreamDetached => true,
                 // A `type` this build has never heard of, where the status is the only thing left
                 // to go on. Reading those as permanent is a trap rather than a conservative
                 // default: this bridge asks meka to give `RetryableProvider` an arm of its own
@@ -193,6 +257,14 @@ impl MekaError {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::SessionNotFound)
     }
 
+    /// Whether meka says there is no turn stream to join on a session that does exist.
+    ///
+    /// The session is fine; the turn's stream is simply over. Worth telling apart from a rejoin
+    /// that failed on the way, because there is nothing left to cancel.
+    pub fn is_stream_missing(&self) -> bool {
+        matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::NotFound)
+    }
+
     /// Whether meka rejected the submission because a turn is already running on the session.
     ///
     /// This can only happen before the turn is accepted, so the batch was never handed over.
@@ -200,13 +272,33 @@ impl MekaError {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::TurnInFlight)
     }
 
-    /// Whether the turn was accepted and may still be running server-side despite this error.
+    /// Whether the turn was accepted and its outcome is unknown rather than failed.
     ///
-    /// A dropped stream does not cancel the turn: meka keeps the runtime lock and the spawned task
-    /// runs to completion. Resubmitting would duplicate a reply the user is about to receive, so
-    /// the caller should wait for the session to go idle rather than retry.
-    pub const fn turn_may_still_be_running(&self) -> bool {
-        matches!(self, Self::StreamInterrupted { .. })
+    /// The turn ran. Whether it finished, and what it did before the connection went, cannot be
+    /// established from here: [`MekaClient::run_turn`] has already tried the one thing that would
+    /// have answered it, which is rejoining the stream. Resubmitting may duplicate work the agent
+    /// already did; not resubmitting may drop a message nobody ever answered.
+    ///
+    /// `stream-detached` is meka saying the same thing in its own words: a rejoin succeeded, the
+    /// stream ended, and the task that would have recorded an outcome is gone. Classifying it by
+    /// its status instead happens to land in the same place today, and would stop doing so the
+    /// moment meka decided that a turn nobody can report on is a 4xx.
+    pub fn turn_outcome_unknown(&self) -> bool {
+        match self {
+            Self::StreamInterrupted { .. } => true,
+            Self::Problem(problem) => problem.kind() == ProblemKind::StreamDetached,
+            _ => false,
+        }
+    }
+
+    /// Whether this error means events went missing from the caller's view of the stream.
+    ///
+    /// meka says so outright with `sse-lag`: its broadcast to this client overran and it names how
+    /// many events were dropped before cancelling the turn. Anything counted off that stream is a
+    /// floor rather than a total, so a caller asking "did the agent already send something" cannot
+    /// read its own zero as an answer.
+    pub fn dropped_events(&self) -> bool {
+        matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::SseLag)
     }
 }
 
@@ -238,10 +330,13 @@ pub struct ServerInfo {
     pub model: Option<String>,
     /// Whether the active provider profile can look at images at all.
     ///
-    /// The bridge attaches nothing to a turn, so this gates `view_attachment` instead: with vision
-    /// off, meka would replace the image block in the tool result with a placeholder, and
-    /// returning a description that names the file is more use to the agent than a picture it
-    /// cannot see.
+    /// The bridge attaches nothing to a turn, so this gates `view_attachment` instead. Worth being
+    /// precise about why, because the obvious reason is wrong: meka checks `vision` only on the
+    /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
+    /// provider whatever the setting says. So this check is not belt and braces over one of
+    /// meka's, it is the only thing standing between a non-vision profile and an image block
+    /// committed to the session's history, which the provider then rejects on every later
+    /// request in that session.
     pub vision: bool,
 }
 
@@ -287,7 +382,14 @@ impl MekaClient {
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             // No overall request timeout: a streaming turn legitimately runs for minutes, and the
-            // per-turn budget is applied around the stream instead.
+            // per-turn budget is applied around the stream instead. `read_timeout` is the one that
+            // works on a stream, because it bounds the gap between reads rather than the whole
+            // response, and meka sends a keep-alive comment every twenty seconds on both of its SSE
+            // endpoints. Without it a connection that goes silent without closing -- a NAT dropping
+            // state, a machine pulled off the network -- is indistinguishable from a turn thinking,
+            // and the drain loop waits out the entire turn budget for a stream that will never
+            // speak again.
+            .read_timeout(STREAM_READ_TIMEOUT)
             .build()
             .map_err(|error| MekaError::Build(error.to_string()))?;
         Ok(Self {
@@ -337,6 +439,7 @@ impl MekaClient {
             .http
             .post(self.endpoint("/v1/sessions")?)
             .bearer_auth(self.token.expose())
+            .timeout(REQUEST_TIMEOUT)
             .json(&body)
             .send()
             .await?;
@@ -359,6 +462,7 @@ impl MekaClient {
             .http
             .patch(url)
             .bearer_auth(self.token.expose())
+            .timeout(REQUEST_TIMEOUT)
             .json(&serde_json::json!({ "permission": permission.as_str() }))
             .send()
             .await?;
@@ -382,9 +486,80 @@ impl MekaClient {
     }
 
     /// `GET /v1/health/ready`.
+    ///
+    /// The only endpoint here whose failure status carries an answer rather than an error. meka
+    /// replies 503 with the same `ReadyStatus` body it sends on 200, naming which subsystem is the
+    /// blocker, and not a Problem Detail. Handing that to the shared decode path turned the one
+    /// response worth reading into "unexpected body", retried three times on the way, so `doctor`
+    /// could report that the probe had failed but never which dependency was down.
     pub async fn ready(&self) -> Result<ReadyStatus> {
         let url = self.endpoint("/v1/health/ready")?;
-        self.get_with_retries(url).await
+        let mut attempt = 0;
+        loop {
+            let result = async {
+                let response = self
+                    .http
+                    .get(url.clone())
+                    .bearer_auth(self.token.expose())
+                    .timeout(REQUEST_TIMEOUT)
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    let body = response.text().await?;
+                    // A 503 that is not meka's own answer came from something in between, a proxy
+                    // while meka restarts, and is the transient case worth retrying.
+                    //
+                    // Told apart by the two words meka can put in `status`, not merely by it being
+                    // present. Every field here defaults, so requiring a non-empty string admitted
+                    // any JSON object carrying one: a load balancer's
+                    // `{"status":"Service Unavailable","message":...}` parsed into all three flags
+                    // false, and `doctor` reported a fabricated "session database unreachable" and
+                    // exited non-zero on the one command run to find out what is actually wrong.
+                    return match serde_json::from_str::<ReadyStatus>(&body) {
+                        Ok(ready) if ready.status == "ok" || ready.status == "degraded" => {
+                            Ok(ready)
+                        }
+                        _ => Err(MekaError::UnexpectedStatus {
+                            status: 503,
+                            // Capped like every other error body. A proxy answering with a full
+                            // HTML page would otherwise carry the whole thing into the log line.
+                            body: body.chars().take(256).collect(),
+                        }),
+                    };
+                }
+                decode(response).await
+            }
+            .await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if attempt >= self.max_retries || !error.is_retryable() {
+                        return Err(error);
+                    }
+                    backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Stop a turn this call has given up on, best effort.
+    ///
+    /// Every give-up path goes through here. Left alone the turn keeps running, keeps spending
+    /// provider tokens, and keeps able to send messages nothing on this side will account for, so
+    /// trying and failing is strictly better than not trying; the call is idempotent server-side.
+    ///
+    /// The hazard, in one place rather than repeated at each caller: **meka scopes cancellation to
+    /// the session, not to the turn.** Whatever token that session currently holds is the one that
+    /// fires, and meka's own scheduled work publishes into the same slot. Each call here is made
+    /// while this bridge has good reason to believe its turn is the one running, which is nearly
+    /// certain the instant a stream dies and less so the longer giving up took. A cancel that lands
+    /// after meka has moved on stops something the bridge never started. Nothing in meka's API can
+    /// currently tell the two apart; a `turn_id` on the cancel endpoint would.
+    async fn abandon_turn(&self, session_id: Uuid, why: &str) {
+        if let Err(error) = self.cancel_turn(session_id).await {
+            tracing::warn!("{why}, and the turn could not be cancelled: {error}");
+        }
     }
 
     /// `POST /v1/sessions/{id}/cancel`. Idempotent server-side, so a retry is safe.
@@ -396,6 +571,7 @@ impl MekaClient {
                 .http
                 .post(url.clone())
                 .bearer_auth(self.token.expose())
+                .timeout(REQUEST_TIMEOUT)
                 .send()
                 .await;
             let outcome = match response {
@@ -416,30 +592,6 @@ impl MekaClient {
         }
     }
 
-    /// Poll the session until no turn is running, or `budget` elapses.
-    ///
-    /// Returns whether the session actually went idle. Used after a dropped stream, where the turn
-    /// is still running and resubmitting would duplicate a reply the user is about to receive.
-    pub async fn wait_until_idle(&self, session_id: Uuid, budget: Duration) -> Result<bool> {
-        const POLL_INTERVAL: Duration = Duration::from_secs(2);
-        let deadline = tokio::time::Instant::now() + budget;
-        loop {
-            match self.session(session_id).await {
-                Ok(info) if !info.turn_in_flight => return Ok(true),
-                Ok(_) => {}
-                // A session that no longer exists cannot be running a turn.
-                Err(error) if error.is_session_missing() => return Err(error),
-                Err(error) => {
-                    tracing::debug!("while waiting for the session to go idle: {}", error);
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
     async fn get_with_retries<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
         let mut attempt = 0;
         loop {
@@ -448,6 +600,7 @@ impl MekaClient {
                     .http
                     .get(url.clone())
                     .bearer_auth(self.token.expose())
+                    .timeout(REQUEST_TIMEOUT)
                     .send()
                     .await?;
                 decode(response).await
@@ -491,7 +644,7 @@ impl MekaClient {
         &self,
         session_id: Uuid,
         message: &str,
-    ) -> Result<impl Stream<Item = Result<TurnEvent>> + Send + use<>> {
+    ) -> Result<impl Stream<Item = Result<StreamItem>> + Send + use<>> {
         let url = self.endpoint(&format!("/v1/sessions/{session_id}/turn"))?;
         let response = self
             .http
@@ -506,49 +659,37 @@ impl MekaClient {
         if !response.status().is_success() {
             return Err(problem_from(response).await);
         }
+        Ok(events_from(response))
+    }
 
-        let events = response.bytes_stream();
-        let stream = futures::stream::unfold(
-            (
-                Box::pin(eventsource_stream::Eventsource::eventsource(events)),
-                false,
-            ),
-            |(mut events, finished)| async move {
-                if finished {
-                    return None;
-                }
-                loop {
-                    let next = events.next().await;
-                    match next {
-                        None => return None,
-                        Some(Err(error)) => {
-                            return Some((
-                                Err(MekaError::StreamInterrupted {
-                                    reason: error.to_string(),
-                                }),
-                                (events, true),
-                            ));
-                        }
-                        Some(Ok(frame)) => match sse::parse(&frame.event, &frame.data) {
-                            Ok(None) => continue,
-                            Ok(Some(event)) => {
-                                let terminal = event.is_terminal();
-                                return Some((Ok(event), (events, terminal)));
-                            }
-                            Err(error) => {
-                                return Some((
-                                    Err(MekaError::StreamInterrupted {
-                                        reason: format!("event {:?}: {error}", frame.event),
-                                    }),
-                                    (events, true),
-                                ));
-                            }
-                        },
-                    }
-                }
-            },
-        );
-        Ok(stream)
+    /// `GET /v1/sessions/{id}/stream`: rejoin the turn already running on this session.
+    ///
+    /// Two things happen at once here, and the second is the reason this exists. meka replays what
+    /// was missed after `resume_from` and then follows the live turn, so the caller learns how the
+    /// turn actually ended rather than inferring it. And *being subscribed at all* is what keeps
+    /// the turn alive: meka stops the agent loop once its stream has had no subscriber for
+    /// `[serve].stream_reattach_grace`, on the reasoning that nobody is listening. A client that
+    /// answers a dropped connection by polling instead of rejoining is the case that reasoning
+    /// describes, so it gets its turn killed roughly thirty seconds later.
+    ///
+    /// The resumed stream opens with a synthesised `turn.started` carrying no id. That is
+    /// deliberate on meka's side, so a resume cannot move the caller's position backwards before
+    /// the replay has run, and it is why [`StreamItem::id`] is an `Option`.
+    async fn reattach_turn(
+        &self,
+        session_id: Uuid,
+        resume_from: Option<u64>,
+    ) -> Result<impl Stream<Item = Result<StreamItem>> + Send + use<>> {
+        let url = self.endpoint(&format!("/v1/sessions/{session_id}/stream"))?;
+        let mut request = self.http.get(url).bearer_auth(self.token.expose());
+        if let Some(resume_from) = resume_from {
+            request = request.header("Last-Event-ID", resume_from.to_string());
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(problem_from(response).await);
+        }
+        Ok(events_from(response))
     }
 
     /// Run a turn to completion, handing every event to `observer`.
@@ -556,6 +697,14 @@ impl MekaClient {
     /// Applies the configured turn timeout around the whole stream. On timeout the turn is
     /// cancelled server-side so meka is not left burning provider tokens for a stream nobody is
     /// reading.
+    ///
+    /// A connection that drops partway is rejoined rather than abandoned, a bounded number of
+    /// times. That is not only about learning how the turn ended: meka stops a turn whose stream
+    /// has had no subscriber for `[serve].stream_reattach_grace`, checked when the agent loop
+    /// next comes round, so a client that gives up on the connection is also giving up on the
+    /// turn, and would then be told the session had gone idle as though the work had finished.
+    /// `observer` sees the replayed events exactly once, because the rejoin resumes strictly
+    /// after the last id already delivered.
     pub async fn run_turn<F>(
         &self,
         session_id: Uuid,
@@ -567,11 +716,123 @@ impl MekaClient {
     {
         let stream = self.open_turn(session_id, message).await?;
         let drive = async {
-            let mut stream = Box::pin(stream);
-            while let Some(event) = stream.next().await {
-                let event = event?;
-                observer(&event);
-                match event {
+            let mut stream = Box::pin(stream)
+                as std::pin::Pin<Box<dyn Stream<Item = Result<StreamItem>> + Send>>;
+            let mut resume_from: Option<u64> = None;
+            let mut rejoins = 0_u32;
+            // The turn this call is following. meka retains only the most recent turn's stream, so
+            // a rejoin that lands after a newer one started -- a scheduled job, or a backgrounded
+            // tool call delivering its outcome -- hands back *that* turn instead. Its ids are all
+            // above `resume_from`, being session-scoped, so nothing is filtered and its events
+            // would be counted as this turn's and its terminal read as this turn's outcome. meka
+            // documents the id on the re-issued `turn.started` as the only way to tell.
+            let mut following: Option<String> = None;
+            loop {
+                let item = match stream.next().await {
+                    Some(Ok(item)) => item,
+                    // A frame this build cannot parse is a contract mismatch, not a dropped
+                    // connection. Rejoining replays the same frame out of the ring and fails
+                    // identically every time, so it is reported rather than retried.
+                    Some(Err(MekaError::Decode(reason))) => {
+                        // Stopped for the same reason the other give-up paths stop it: the turn is
+                        // still running and can still send messages nothing here will account for.
+                        // This was the one exit that walked away and left it going.
+                        self.abandon_turn(session_id, "a frame could not be parsed")
+                            .await;
+                        return Err(MekaError::Decode(reason));
+                    }
+                    other => {
+                        let reason = match other {
+                            Some(Err(error)) => error.to_string(),
+                            _ => "the stream ended without a terminal event".to_string(),
+                        };
+                        // Two budgets, because they bound two different things. `attempts` is the
+                        // requests spent getting back on after *this* drop, which is what has to
+                        // fit inside meka's reattach grace; it starts fresh each time, since a
+                        // successful attach resets that clock on meka's side. `rejoins` is the
+                        // drops ridden out over the whole turn, which only bounds a connection that
+                        // dies the instant it opens. Sharing one counter between them meant a long
+                        // turn that had been rejoined cleanly four times had no allowance left for
+                        // the fifth drop, and one transient 502 there cancelled a healthy turn.
+                        let mut attempts = 0_u32;
+                        let resumed = loop {
+                            if rejoins >= MAX_REJOINS || attempts >= MAX_REJOIN_ATTEMPTS {
+                                // Left alone, the turn keeps running until its grace expires and
+                                // can still send messages nobody is accounted for. This is the call
+                                // most exposed to the session-scope hazard in `abandon_turn`: more
+                                // time has passed here than on any other give-up path.
+                                self.abandon_turn(session_id, "the rejoin budget ran out")
+                                    .await;
+                                return Err(MekaError::StreamInterrupted { reason });
+                            }
+                            attempts += 1;
+                            tracing::warn!(
+                                resume_from,
+                                attempt = attempts,
+                                rejoins,
+                                "lost the turn stream ({reason}); rejoining it"
+                            );
+                            match self.reattach_turn(session_id, resume_from).await {
+                                Ok(resumed) => {
+                                    rejoins += 1;
+                                    break resumed;
+                                }
+                                // The request itself failed on something transient. Round again;
+                                // the bound at the top of this loop is what stops it.
+                                Err(error) if error.is_retryable() => {
+                                    tracing::warn!(
+                                        "could not rejoin the turn stream ({error}); trying again"
+                                    );
+                                    tokio::time::sleep(REJOIN_RETRY_DELAY).await;
+                                }
+                                // Nothing to rejoin, or meka is unreachable. Report the
+                                // interruption rather than the rejoin's own error: the caller's
+                                // question is what happened to the turn, and the answer is still
+                                // that it is unknown.
+                                Err(error) => {
+                                    tracing::warn!("could not rejoin the turn stream: {}", error);
+                                    // A 404 means the stream is already over, so there is nothing
+                                    // left to stop, and cancelling anyway is not free: meka scopes
+                                    // cancel to the session rather than to a turn, so it would fire
+                                    // at whatever that session is running now, which may be a
+                                    // scheduled job this bridge never started.
+                                    if !error.is_stream_missing() {
+                                        self.abandon_turn(session_id, "the rejoin was refused")
+                                            .await;
+                                    }
+                                    return Err(MekaError::StreamInterrupted { reason });
+                                }
+                            }
+                        };
+                        stream = Box::pin(resumed);
+                        continue;
+                    }
+                };
+                if let TurnEvent::Started { turn_id, .. } = &item.event
+                    && !turn_id.is_empty()
+                {
+                    match &following {
+                        None => following = Some(turn_id.clone()),
+                        Some(following) if following != turn_id => {
+                            return Err(MekaError::StreamInterrupted {
+                                reason: format!(
+                                    "rejoined turn {turn_id} rather than {following}, so the \
+                                     stream for this turn is gone"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                }
+                observer(&item.event);
+                // Only after the event has been handed over, and only when it carries one. `max`
+                // rather than assignment because ids arriving in order is a property of meka's
+                // emitter rather than something guaranteed at this end, and resuming from anything
+                // lower than what the observer has seen would replay it.
+                if let Some(id) = item.id {
+                    resume_from = Some(resume_from.map_or(id, |last| last.max(id)));
+                }
+                match item.event {
                     TurnEvent::Finished {
                         stop_reason,
                         refusal_text,
@@ -594,24 +855,88 @@ impl MekaClient {
                     _ => {}
                 }
             }
-            Err(MekaError::StreamInterrupted {
-                reason: "the stream ended without a terminal event".to_string(),
-            })
         };
 
         match tokio::time::timeout(self.turn_timeout, drive).await {
             Ok(result) => result,
             Err(_elapsed) => {
-                if let Err(error) = self.cancel_turn(session_id).await {
-                    tracing::warn!(
-                        "turn timed out and the follow-up cancel also failed: {}",
-                        error
-                    );
-                }
+                self.abandon_turn(session_id, "the turn ran past its budget")
+                    .await;
                 Err(MekaError::Timeout(self.turn_timeout))
             }
         }
     }
+}
+
+/// One event off a turn's SSE stream, with the id needed to resume after it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamItem {
+    /// `None` only until the first id of a connection has been seen.
+    ///
+    /// Not "whenever meka omits one", which is the obvious reading and is wrong:
+    /// `eventsource-stream` implements the spec's persistent last-event-ID buffer, so an event
+    /// sent without an `id:` line is reported carrying the previous one. meka does send
+    /// several that way, including the synthesised `turn.started` that opens a resumed stream
+    /// and the notice about a replay hole. Inheriting the previous id is harmless here, since
+    /// resuming from it is idempotent.
+    pub id: Option<u64>,
+    pub event: TurnEvent,
+}
+
+/// Turn an SSE response body into parsed events, tagged with their ids.
+///
+/// Shared by the initial submission and the rejoin, which differ only in how the response was
+/// obtained: the wire format either side of a dropped connection is the same stream.
+fn events_from(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<StreamItem>> + Send + use<> {
+    let events = response.bytes_stream();
+    futures::stream::unfold(
+        (
+            Box::pin(eventsource_stream::Eventsource::eventsource(events)),
+            false,
+        ),
+        |(mut events, finished)| async move {
+            if finished {
+                return None;
+            }
+            loop {
+                let next = events.next().await;
+                match next {
+                    None => return None,
+                    Some(Err(error)) => {
+                        return Some((
+                            Err(MekaError::StreamInterrupted {
+                                reason: error.to_string(),
+                            }),
+                            (events, true),
+                        ));
+                    }
+                    Some(Ok(frame)) => match sse::parse(&frame.event, &frame.data) {
+                        Ok(None) => continue,
+                        Ok(Some(event)) => {
+                            let terminal = event.is_terminal();
+                            let id = frame.id.trim().parse::<u64>().ok();
+                            return Some((Ok(StreamItem { id, event }), (events, terminal)));
+                        }
+                        // `Decode` rather than `StreamInterrupted`: a frame this build cannot
+                        // parse is a contract mismatch, not a lost connection, and the difference
+                        // decides what happens next. Rejoining replays the same frame out of meka's
+                        // ring and fails on it identically every time.
+                        Err(error) => {
+                            return Some((
+                                Err(MekaError::Decode(format!(
+                                    "event {:?}: {error}",
+                                    frame.event
+                                ))),
+                                (events, true),
+                            ));
+                        }
+                    },
+                }
+            }
+        },
+    )
 }
 
 /// Decode a successful JSON body, or convert an error response into a [`MekaError::Problem`].
@@ -720,6 +1045,72 @@ mod tests {
         // Where a provider rate limit or overload lands once meka's own retries are spent: its
         // `RetryableProvider` has no arm in the Problem Detail mapping and falls through to this.
         assert!(MekaError::Problem(problem("https://meka.so/errors/internal")).is_retryable());
+    }
+
+    #[test]
+    fn the_read_timeout_leaves_room_for_mekas_keep_alive() {
+        // meka sends a keep-alive comment every twenty seconds on both SSE endpoints, and that is
+        // the only traffic a turn spending ten minutes inside one tool call produces. Set at or
+        // under that interval this stops being a liveness check and becomes a timer that kills
+        // every long turn, which would look exactly like a flaky network rather than a
+        // config mistake.
+        const MEKA_KEEP_ALIVE: Duration = Duration::from_secs(20);
+        assert!(
+            STREAM_READ_TIMEOUT >= MEKA_KEEP_ALIVE * 2,
+            "a read timeout of {STREAM_READ_TIMEOUT:?} gives meka's {MEKA_KEEP_ALIVE:?} keep-alive \
+             no margin"
+        );
+        // The rejoin budget has to fit inside meka's reattach grace, which defaults to thirty
+        // seconds, or the bridge spends the whole window it is trying to beat.
+        const MEKA_REATTACH_GRACE: Duration = Duration::from_secs(30);
+        assert!(
+            REJOIN_RETRY_DELAY * MAX_REJOIN_ATTEMPTS < MEKA_REATTACH_GRACE,
+            "the per-drop rejoin budget outlives the turn it is trying to catch"
+        );
+    }
+
+    #[test]
+    fn a_lagged_stream_admits_its_own_counters_are_short() {
+        // meka drops events out of one client's view and names how many before cancelling the turn.
+        // The ones it drops can be the `tool_call.executing` for a send, so a caller counting sends
+        // off that stream has to know its total is a floor. Only `sse-lag` says this; the ordinary
+        // failures leave the counting intact.
+        assert!(MekaError::Problem(problem("https://meka.so/errors/sse-lag")).dropped_events());
+        assert!(!MekaError::Problem(problem("https://meka.so/errors/internal")).dropped_events());
+        assert!(
+            !MekaError::StreamInterrupted {
+                reason: "reset".to_string()
+            }
+            .dropped_events()
+        );
+    }
+
+    #[test]
+    fn a_detached_stream_is_an_unknown_outcome_rather_than_a_failure() {
+        // meka's own words for it are "the turn's stream closed without recording an outcome",
+        // which is the same thing a dropped connection leaves behind. Routing it by status instead
+        // lands in the same place only for as long as the status stays 5xx.
+        assert!(
+            MekaError::Problem(problem("https://meka.so/errors/stream-detached"))
+                .turn_outcome_unknown()
+        );
+        assert!(
+            !MekaError::Problem(problem("https://meka.so/errors/internal")).turn_outcome_unknown()
+        );
+    }
+
+    #[test]
+    fn a_missing_stream_is_told_apart_from_a_missing_session() {
+        // Different remedies. No session means build one; no stream means the turn is simply over,
+        // and cancelling anyway would fire at whatever that session is running now, which meka
+        // scopes per session rather than per turn.
+        let missing_stream = MekaError::Problem(problem("https://meka.so/errors/not-found"));
+        assert!(missing_stream.is_stream_missing());
+        assert!(!missing_stream.is_session_missing());
+        let missing_session =
+            MekaError::Problem(problem("https://meka.so/errors/session-not-found"));
+        assert!(!missing_session.is_stream_missing());
+        assert!(missing_session.is_session_missing());
     }
 
     #[test]

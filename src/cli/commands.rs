@@ -20,6 +20,74 @@ use crate::{
 /// Starter config written by `mekabridge config init`.
 const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
+/// One line `doctor` prints, and whether it counts against the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    Ok(String),
+    Warn(String),
+    Fail(String),
+}
+
+/// Decide what meka's readiness answer means.
+///
+/// Pure, and separate from [`doctor`], so it can be tested at all. `doctor` talks to the store, to
+/// meka, and to every configured channel, so its exit status says only that *something* is wrong:
+/// a test asserting `is_err()` against a readiness body passes just as well when the readiness
+/// checks are deleted, because a channel with a placeholder token fails alongside them.
+/// How many failures and warnings a set of checks contributes.
+///
+/// Shared with [`doctor`] rather than reimplemented there, so a test can assert on the arithmetic
+/// that decides the exit code. `doctor` itself is untestable end to end: it talks to the store, to
+/// meka, and to every configured channel, so its exit status says only that *something* is wrong.
+pub fn verdict(checks: &[Check]) -> (usize, usize) {
+    let failures = checks
+        .iter()
+        .filter(|check| matches!(check, Check::Fail(_)))
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|check| matches!(check, Check::Warn(_)))
+        .count();
+    (failures, warnings)
+}
+
+pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
+    let mut checks = Vec::new();
+    // meka answers 503 with this same body, naming which subsystem is the blocker, so a readiness
+    // that is not `ok` has to count against the run.
+    if ready.status == "ok" {
+        checks.push(Check::Ok(format!("readiness: {}", ready.status)));
+    } else {
+        checks.push(Check::Warn(format!("readiness: {}", ready.status)));
+    }
+    if !ready.session_db {
+        // meka could not read its own session store, so no turn can run and nothing here recovers
+        // on its own.
+        checks.push(Check::Fail(
+            "meka cannot reach its session database; no turn can run".to_string(),
+        ));
+    }
+    if !ready.provider_configured {
+        // Likewise terminal: without a provider meka cannot serve a single turn. Reported as a
+        // warning, `doctor` exited 0 against it, which is the opposite of what a gate wants.
+        checks.push(Check::Fail(
+            "meka reports no provider is configured; no turn can run".to_string(),
+        ));
+    }
+    if !ready.mcp_servers_healthy {
+        // Usually meka having started before this bridge was listening, which it retries out of on
+        // its own, so a warning. Worth saying that this flag only counts servers meka was told are
+        // required: with the entry for this bridge left at the default, meka reports itself healthy
+        // while running turns that have no way to answer anybody, and this line never appears.
+        checks.push(Check::Warn(
+            "meka reports an unhealthy required MCP server. If that is this bridge, it should \
+             reconnect on its own within a few minutes; turns are refused until it does."
+                .to_string(),
+        ));
+    }
+    checks
+}
+
 /// Report on every moving part, in the order a failure would bite.
 ///
 /// Returns an error when something is broken badly enough that the bridge would not work, so this
@@ -129,29 +197,23 @@ pub async fn doctor(config: &Config) -> Result<()> {
     }
     match meka.ready().await {
         Ok(ready) => {
-            println!("  ok     readiness: {}", ready.status);
-            if !ready.provider_configured {
-                println!("  warn   meka reports no provider is configured; turns will fail");
-                warnings += 1;
+            let checks = assess_readiness(&ready);
+            for check in &checks {
+                match check {
+                    Check::Ok(line) => println!("  ok     {line}"),
+                    Check::Warn(line) => println!("  warn   {line}"),
+                    Check::Fail(line) => println!("  fail   {line}"),
+                }
             }
-            if !ready.mcp_servers_healthy {
-                // The usual cause is meka having started before this bridge was listening. meka
-                // retries a failed cold start in the background with backoff, so this clears on its
-                // own; it is reported because `[mcp].strict` refuses turns until it does.
-                println!(
-                    "  warn   meka reports an unhealthy MCP server. If that is this bridge, it \
-                     should reconnect on its own within a few minutes; turns are refused until it \
-                     does when [mcp].strict is on."
-                );
-                warnings += 1;
-            }
+            let (failed, warned) = verdict(&checks);
+            failures += failed;
+            warnings += warned;
         }
         Err(error) => {
             println!("  warn   readiness probe failed: {error}");
             warnings += 1;
         }
     }
-
     println!("session");
     let store = Store::open(&config.storage.path).await.ok();
     let bound = match &store {
@@ -334,7 +396,8 @@ pub async fn doctor(config: &Config) -> Result<()> {
 /// Why a permission level will not work for this bridge, or `None` if it will.
 ///
 /// `read` and `write` both work: the send tools are annotated read-only, so replying sits at meka's
-/// `read` level and only file-modifying tools need `write`.
+/// `read` level. Only the five tools that act irreversibly on somebody else's account need `write`,
+/// and a bridge that never moderates does not need it at all.
 ///
 /// `ask` does not, and the reason is not obvious. meka compares the *session* level against `Ask`
 /// before dispatching any tool, so at `ask` every call is prompted, read-only ones included. This
@@ -796,6 +859,88 @@ fn describe_age(at: chrono::DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        cli::commands::{Check, assess_readiness},
+        meka::ReadyStatus,
+    };
+
+    fn readiness(status: &str, session_db: bool, provider: bool, mcp: bool) -> ReadyStatus {
+        ReadyStatus {
+            status: status.to_string(),
+            session_db,
+            provider_configured: provider,
+            mcp_servers_healthy: mcp,
+        }
+    }
+
+    #[test]
+    fn a_meka_that_cannot_serve_a_turn_fails_rather_than_warns() {
+        // `doctor` doubles as a deployment gate, so what it does with a degraded readiness is its
+        // exit code. Both of these mean no turn can run and neither clears on its own, and both
+        // were reported as warnings, which exits 0.
+        assert!(
+            assess_readiness(&readiness("degraded", false, true, true))
+                .iter()
+                .any(|check| matches!(check, Check::Fail(_))),
+            "an unreachable session database was not a failure"
+        );
+        assert!(
+            assess_readiness(&readiness("degraded", true, false, true))
+                .iter()
+                .any(|check| matches!(check, Check::Fail(_))),
+            "no configured provider was not a failure"
+        );
+        // An unhealthy MCP server is the one that does clear on its own, so it stays a warning.
+        let mcp_down = assess_readiness(&readiness("degraded", true, true, false));
+        assert!(
+            mcp_down
+                .iter()
+                .all(|check| !matches!(check, Check::Fail(_)))
+        );
+        assert!(mcp_down.iter().any(|check| matches!(check, Check::Warn(_))),);
+    }
+
+    #[test]
+    fn a_failing_check_is_what_makes_doctor_exit_non_zero() {
+        // `assess_readiness` is well covered, but what `doctor` *does* with a `Fail` is the whole
+        // point: it is the deployment gate's exit code. Counting one as a warning leaves the gate
+        // green against a meka that cannot serve a turn, which is the bug the extraction was made
+        // to fix and the one line the extraction does not itself cover.
+        let checks = assess_readiness(&readiness("degraded", false, false, false));
+        let failures = checks
+            .iter()
+            .filter(|check| matches!(check, Check::Fail(_)))
+            .count();
+        assert!(failures >= 2, "got {checks:?}");
+        assert_eq!(
+            verdict(&checks),
+            (failures, 2),
+            "the counts `doctor` adds up must match the checks it was handed"
+        );
+        // A healthy answer contributes to neither, so nothing else in `doctor` can be nudged into
+        // failing by a readiness that is fine.
+        assert_eq!(
+            verdict(&assess_readiness(&readiness("ok", true, true, true))),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn a_healthy_readiness_counts_against_nothing() {
+        assert_eq!(assess_readiness(&readiness("ok", true, true, true)), vec![
+            Check::Ok("readiness: ok".to_string())
+        ]);
+        // A status meka itself never sends still has to register: reading the body rather than the
+        // status is what made the answer legible, and printing it under `ok` regardless would let a
+        // gate go green against a meka that said it was degraded.
+        assert!(
+            assess_readiness(&readiness("degraded", true, true, true))
+                .iter()
+                .any(|check| matches!(check, Check::Warn(_))),
+            "a degraded readiness was reported as ok"
+        );
+    }
+
     use super::*;
 
     #[test]

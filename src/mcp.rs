@@ -530,6 +530,14 @@ pub struct ListMembersArgs {
 /// caller that wanted a thousand names can ask for them.
 const DEFAULT_MEMBER_PAGE: usize = 50;
 
+/// Ceiling on `list_members`, for the same reason [`MAX_CONVERSATION_LIMIT`] exists.
+///
+/// The connectors bound their own paging -- Discord caps at its own maximum and Telegram ignores
+/// the argument -- so this changes nothing today. It was the one limit that reached the sink
+/// verbatim, which is a gap rather than a bug only for as long as that stays true of every
+/// connector.
+const MAX_MEMBER_LIMIT: usize = 1000;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentArgs {
     /// The handle shown in square brackets on an `attachment:` line, for example `417`.
@@ -982,7 +990,8 @@ impl BridgeMcpServer {
                        correct yourself.",
         annotations(
             title = "Delete message",
-            read_only_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         )
     )]
@@ -1013,7 +1022,8 @@ impl BridgeMcpServer {
                        and no bot can act on another administrator.",
         annotations(
             title = "Moderate member",
-            read_only_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         )
     )]
@@ -1068,7 +1078,8 @@ impl BridgeMcpServer {
                        member. You can only grant privileges you hold yourself.",
         annotations(
             title = "Set member rights",
-            read_only_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         )
     )]
@@ -1110,7 +1121,8 @@ impl BridgeMcpServer {
                        manage-roles permission, and you cannot grant a role above your own.",
         annotations(
             title = "Set member roles",
-            read_only_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         )
     )]
@@ -1174,7 +1186,8 @@ impl BridgeMcpServer {
                        some platforms.",
         annotations(
             title = "Set chat details",
-            read_only_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         )
     )]
@@ -1263,7 +1276,9 @@ impl BridgeMcpServer {
             .list_members(
                 &args.conversation,
                 args.query.as_deref(),
-                args.limit.unwrap_or(DEFAULT_MEMBER_PAGE),
+                args.limit
+                    .unwrap_or(DEFAULT_MEMBER_PAGE)
+                    .clamp(1, MAX_MEMBER_LIMIT),
                 args.after.as_deref(),
             )
             .await
@@ -1526,8 +1541,10 @@ impl BridgeMcpServer {
                        were never woken for. This is how you catch up on a muted chat: somebody \
                        mentions you halfway through a discussion, and this is the discussion. It \
                        reads what this bridge recorded, so it does not go back before the bridge \
-                       was installed or past the configured retention, and it holds nothing from a \
-                       chat you have blocked. Pass the oldest `cursor` you were given back as \
+                       was installed or past the configured retention. A block stops a chat being \
+                       recorded from that point on; whatever was recorded before it is still \
+                       here. It holds what people said, not what you replied: your own messages \
+                       are not recorded, so this is one side of the conversation. Pass the oldest `cursor` you were given back as \
                        `before` to page further back.",
         annotations(title = "Read history", read_only_hint = true, open_world_hint = false)
     )]
@@ -1563,8 +1580,9 @@ impl BridgeMcpServer {
                        one. Use it to find something you were told a while ago, or to check what a \
                        chat was discussing before it mentioned you. Matching is on whole words; \
                        `a OR b`, `a NOT b`, and \"quoted phrases\" work. Same limits as \
-                       read_history: only what this bridge recorded, and nothing from a blocked \
-                       chat.",
+                       read_history: only what this bridge recorded, since it was installed and \
+                       within the configured retention. A block stops a chat being recorded from \
+                       that point on; what was recorded before it is still searchable.",
         annotations(
             title = "Search history",
             read_only_hint = true,
@@ -1705,7 +1723,16 @@ fn parse_duration(
     let parsed = chrono::Duration::from_std(parsed).map_err(|_| {
         format!("`duration` {raw:?} is too long to represent; omit it for no expiry.")
     })?;
-    Ok(Some(chrono::Utc::now() + parsed))
+    // `checked_add_signed` rather than `+`: the plain operator panics once the result leaves
+    // chrono's representable range, and `from_std` above admits durations far past it. The value
+    // reaching here is whatever the model wrote, which is whatever the last person to message the
+    // bot talked it into, so an unhandled panic here is a stalled turn anybody can ask for.
+    chrono::Utc::now()
+        .checked_add_signed(parsed)
+        .map(Some)
+        .ok_or_else(|| {
+            format!("`duration` {raw:?} lands too far in the future; omit it for no expiry.")
+        })
 }
 
 /// Render a successful send.
@@ -3332,23 +3359,77 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_is_read_only_so_the_agent_can_reply_at_read() {
+    fn a_duration_past_the_end_of_time_is_refused_rather_than_fatal() {
+        // `humantime` accepts durations chrono can hold but `DateTime + TimeDelta` cannot add, and
+        // the plain operator panics rather than erroring. The value is whatever the model wrote,
+        // which is whatever the last person to message the bot talked it into, so an unhandled
+        // panic here is a stalled turn anybody can ask for. Reachable from `mute`, `unmute`,
+        // `block`, `unblock` and `moderate_member`.
+        let refused = parse_duration(Some("9999999999days"));
+        assert!(
+            refused.is_err(),
+            "a duration past the representable range was accepted: {refused:?}"
+        );
+        // An ordinary one still resolves.
+        assert!(parse_duration(Some("30m")).expect("valid").is_some());
+        assert!(parse_duration(None).expect("valid").is_none());
+    }
+
+    #[test]
+    fn only_the_irreversible_tools_ask_for_write() {
         // meka derives a tool's required permission from `readOnlyHint` when no config overrides
-        // it. If a send tool ever flips to `false` it lands at meka's `write` level, and a bridge
-        // run at `read` silently becomes a bot that understands every message and answers none.
+        // it, so this list is the permission model. The line is what a tool can do to *other
+        // people*, not whether it changes anything at all: almost every tool here modifies
+        // something, and gating replying behind `write` would make `read` mean "understands every
+        // message and answers none", which fails silently from both ends.
+        //
+        // What sits on the far side is irreversible and aimed outward: banning somebody and purging
+        // their history, deleting other people's messages, changing privileges, renaming the room.
+        // A `read` session can talk; it cannot ban. Tools that only change this bridge's own
+        // bookkeeping stay read-only however much they modify -- `block` discards inbound messages
+        // while it is set, but it is this bridge's own record and the agent can lift it itself.
+        const NEEDS_WRITE: &[&str] = &[
+            "delete_message",
+            "moderate_member",
+            "set_member_rights",
+            "set_member_roles",
+            "set_chat",
+        ];
         let router = BridgeMcpServer::tool_router();
+        let mut seen = Vec::new();
         for tool in router.list_all() {
             let annotations = tool
                 .annotations
                 .as_ref()
                 .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            let needs_write = NEEDS_WRITE.contains(&tool.name.as_ref());
+            if needs_write {
+                seen.push(tool.name.to_string());
+            }
             assert_eq!(
                 annotations.read_only_hint,
-                Some(true),
-                "{} must stay read-only or the agent loses the ability to use it at `read`",
+                Some(!needs_write),
+                "{} is on the wrong side of the permission line",
                 tool.name
             );
+            // The second half of the claim: anything that is not read-only says why.
+            if needs_write {
+                assert_eq!(
+                    annotations.destructive_hint,
+                    Some(true),
+                    "{} asks for write without saying it is destructive",
+                    tool.name
+                );
+            }
         }
+        seen.sort_unstable();
+        let mut expected: Vec<String> =
+            NEEDS_WRITE.iter().map(|name| (*name).to_string()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "a tool that needs write is missing from the surface entirely"
+        );
     }
 
     #[test]

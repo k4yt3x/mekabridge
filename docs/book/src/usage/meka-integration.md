@@ -2,6 +2,10 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
+**meka 0.42.0 or later is required.** Two things below it do not exist: rejoining a dropped turn
+stream with `Last-Event-ID`, which is how the bridge learns how an interrupted turn ended rather
+than guessing, and the `workspace` / `unrestricted` permission levels that replaced `write`.
+
 ## What meka needs from you
 
 ### A token for the bridge
@@ -68,47 +72,80 @@ reading every tool here qualifies, moderation included. That is not a useful lin
 the one drawn here is what a tool can do to *other people*: see below for the five that cannot be
 read-only under it. `openWorldHint: true` carries the caveat that most of them act outside the
 machine. `download_attachment` writes, into `[storage].attachment_dir` and nowhere else, bounded by
-`attachment_max_bytes` and swept on a timer; annotating it otherwise would put it at `write`, where
-a bridge at `read` could receive a document and never be able to open it.
+`attachment_max_bytes` and swept on a timer; annotating it otherwise would put it out of reach of
+every level below `unrestricted`, where a bridge at `read` could receive a document and never be
+able to open it.
 
-The alternative would gate replying behind `write`, and that reads badly once you look at what the
-levels mean in practice. In every other meka front-end, answering the user is not permission-gated at
-all: the REPL just prints the reply. Here it travels as a tool call, which is a property of the
-transport rather than a difference in kind. Gating it would make `read` mean "the agent may run
-commands, fetch URLs and read every file, but may not say hello", which is not a posture anyone would
-pick deliberately, and its failure is silent from both ends.
+The alternative would gate replying behind a level above `read`, and that reads badly once you look
+at what the levels mean in practice. In every other meka front-end, answering the user is not
+permission-gated at all: the REPL just prints the reply. Here it travels as a tool call, which is a
+property of the transport rather than a difference in kind. Gating it would make `read` mean "the
+agent may run commands, fetch URLs and read every file, but may not say hello", which is not a
+posture anyone would pick deliberately, and its failure is silent from both ends.
 
 It also would not contain anything. meka grants `fetch_url` at `read`, so an agent at that level can
 already push arbitrary bytes to any host on the internet. These tools reach only conversations on your
 allowlist, so they are strictly more constrained than a tool meka already treats as read-only.
 
-**Five tools are the exception and need `write`:** `moderate_member`, `delete_message`,
+**Five tools are the exception and need `unrestricted`:** `moderate_member`, `delete_message`,
 `set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody
 else's account or on the room itself: a ban with `revoke_messages` erases everything a person ever
 posted, `delete_message` removes other people's messages where the bot moderates, the two rights
 tools change privileges, and `set_chat` rewrites the group's name and description. A `read` session
-can talk; it cannot ban. Raise `[session].permission` to `"write"` if you want the agent moderating,
-or grant them individually with `tool_permissions`.
+can talk; it cannot ban.
 
 The line is what a tool can do to other people, not whether it changes anything at all. `mute` and
 `block` modify plenty, but only this bridge's own record of what it forwards, and the agent can lift
 either itself, so they stay read-only.
 
-If you want sends gated anyway, invert it on meka's side:
+### Why `unrestricted` and not `workspace`
+
+`workspace` looks like it should be enough and is not, which is worth spelling out because the
+failure is silent from both ends: the agent is told inside a tool result, and you see a bot that
+chats normally and declines to ban.
+
+meka resolves `readOnlyHint: false` to `unrestricted` rather than to some middle rung. Its
+`Permission::allows` then treats `workspace`, `ask` and `unrestricted` as equal, so the call looks
+authorised. But a second gate refuses it: an MCP tool runs inside its server's own process, which
+meka does not sandbox and cannot confine to a workspace root, so allowing it at `workspace` would
+make that level's central promise false while looking exactly like it worked. meka refuses rather
+than promise half a boundary, the same way its shell refuses when it cannot be sandboxed.
+
+So the moderating deployment runs at `unrestricted`, which also means the agent can run shell
+commands with no boundary. If that is more than you want, keep the session at `read` or `workspace`
+and grant the five explicitly on meka's side, which is step 1 of the resolution chain and beats the
+annotation:
 
 ```toml
 [mcp.servers.tool_permissions]
-send_message = "write"
+moderate_member = "read"
+delete_message = "read"
+set_member_rights = "read"
+set_member_roles = "read"
+set_chat = "read"
+```
+
+`mekabridge doctor` says so when the moderation tools are registered and the session sits below
+`unrestricted`, so this does not have to be discovered from a chat that will not ban.
+
+If you want sends gated instead, invert it the same way:
+
+```toml
+[mcp.servers.tool_permissions]
+send_message = "unrestricted"
 ```
 
 There is one other way to end up there by accident. meka only honours `readOnlyHint` while the
 server entry's `trust_read_only_hint` is on, which is its default; set it to `false` and *every*
-tool here falls back to `write`. A session left at `read` then denies each one in turn, so the agent
-reads everything and answers nothing, with the refusal visible only inside the tool result. If you
-want that hardening, raise `[session].permission` to `write` alongside it.
+tool here falls through to `unrestricted`. A session left at `read` then denies each one in turn, so
+the agent reads everything and answers nothing, with the refusal visible only inside the tool
+result. If you want that hardening, raise `[session].permission` to `unrestricted` alongside it, or
+name the tools you do trust in `tool_permissions`, which is checked before the hint is consulted.
 
 Do not run the session at `ask`. meka checks the session level before dispatch, so at `ask` every
-call is prompted including read-only ones, and this bridge answers no prompts.
+call is prompted including read-only ones, and this bridge answers no prompts. `ask` is also outside
+meka's default `[permissions].enabled` set, so a session asking for it is usually refused at
+creation before any of that is reached.
 
 ## Start order
 

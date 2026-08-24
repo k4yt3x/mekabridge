@@ -149,14 +149,18 @@ copy says which:
 - The turn failed *after* the agent had already sent or run something. Not retried, and the chat is
   told it may not have finished rather than that its message never arrived.
 
-`owner_conversation` has the error verbatim. `mekabridge queue list` shows the rows as `failed`, and
+`owner_conversation` has meka's error verbatim, which since meka 0.42 is not the same as the
+provider's: a provider refusal arrives as "the provider rejected or failed this turn; its response is
+in the server log", because the upstream's own body has held account identifiers and request
+fragments and meka will not republish it. The reason it failed is in meka's log, not in the notice.
+`mekabridge queue list` shows the rows as `failed`, and
 `mekabridge unseen` counts what the agent still has not been shown, unless
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
 
 **The agent reads messages but never replies.** Check `mekabridge doctor`. The usual cause is
-`[session].permission` being `ask` or `none`, at which meka denies the send. (`read` is fine: the
-send tools are annotated read-only.) The
+`[session].permission` being `ask` or `none`, at which meka denies the send. (`read` is fine, and so
+is everything above it: the send tools are annotated read-only.) The
 give-away in the log is `turn finished ... sends=0 tool_calls=0` with a non-zero `text_chars`, which
 means the agent wrote a reply that had nowhere to go. Since meka 0.37 the bridge reconciles a
 running session's level with the config on the next turn, so fixing the config and restarting is
@@ -178,7 +182,9 @@ If it persists on 0.2.1 or later, then look at the network. One cause worth ruli
 resolves `api.telegram.org` to IPv6 with no working IPv6 route; compare `curl -4` and `curl -6`
 against `https://api.telegram.org/`, since plain `curl` hides it by falling back.
 
-**Gated tools are denied and the agent cannot reply.** The session is at `permission = "ask"`. Because the bridge declares it cannot answer prompts, gated calls are denied at once rather than stalling, but `send_message` needs `write`, so nothing gets sent. Set `write`, then `mekabridge session reset --yes` if the existing session was created at the wrong level.
+**Gated tools are denied and the agent cannot reply.** The session is at `permission = "ask"`. meka compares the *session* level against `ask` before dispatch, so every call is prompted including read-only ones, and because the bridge declares it cannot answer prompts each is denied at once rather than stalling. That includes `send_message`, so nothing gets sent. Set `read`, then `mekabridge session reset --yes` if the existing session was created at the wrong level.
+
+**The agent chats but will not ban, purge or rename.** The session is below `unrestricted`, where meka puts every tool annotated destructive. `workspace` is not enough and looks like it should be; [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) explains why and gives the narrower alternative. `mekabridge doctor` reports exactly this pairing. The refusal is otherwise visible only inside the tool result, so nothing in the log names it.
 
 **The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the provider profile has `vision = false`; `mekabridge doctor` reports the setting.
 

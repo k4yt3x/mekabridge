@@ -32,10 +32,10 @@
 //! people to stop reading it. Silence during a long tool run is at least true.
 //!
 //! Two consequences worth knowing. On a provider backend that does not stream a call as it is
-//! written, `openai-api` today, meka resolves each call's name and arguments together and the two
-//! events arrive back to back, so the window is empty and the indicator is at most a flicker. And a
-//! turn that dies mid-call emits no closing event, which is why the token is also cancelled when
-//! the turn ends.
+//! written, `openai-chat-completions` today, meka resolves each call's name and arguments together
+//! and the two events arrive back to back, so the window is empty and the indicator is at most a
+//! flicker. And a turn that dies mid-call emits no closing event, which is why the token is also
+//! cancelled when the turn ends.
 //!
 //! Cancelling has to abandon any request still in flight, not merely stop making new ones. Both
 //! platforms queue rate-limited calls rather than refusing them, so an indicator that is allowed to
@@ -360,7 +360,8 @@ impl TurnRunner {
                     tracing::error!(
                         tool = %tool_name,
                         "meka asked for permission, but this bridge has no approval channel; the \
-                         turn will stall and deny. Set [session].permission to \"write\"."
+                         turn will stall and deny. meka only prompts at [session].permission = \
+                         \"ask\", so that is what to change; use \"read\" or \"unrestricted\"."
                     );
                 }
                 _ => {}

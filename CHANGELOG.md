@@ -18,13 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both notices are held to one per chat per 15 minutes; the owner's counts what it swallowed.
 - `[bridge].notify_failures` turns the chat's notice off, leaving the owner's and the logs.
 - A compaction is logged at warn: it is where the agent's memory of other chats becomes a summary.
+- `doctor` fails when meka will not create a session at the configured level, before a message does.
+- `doctor` states when the moderation tools are registered and the session cannot dispatch them.
 
 ### Changed
 
+- **Breaking:** meka 0.42.0 or later is required; the rejoin and the permission levels need it.
+- **Breaking:** `[session].permission` follows meka 0.42: `write` is gone, split in two.
+- **Breaking:** a config still setting `permission = "write"` is refused by name at startup.
+- **Breaking:** moderation, delete and rename tools need `unrestricted`; talking still needs `read`.
 - **Breaking:** a Telegram message now starts a turn as it arrives. The Bot API reports no typing.
 - **Breaking:** the typing indicator shows only while the model is writing a message.
 - **Breaking:** `typing_max` defaults to `2m` rather than the turn budget, which could never fire.
-- **Breaking:** moderation, delete and rename tools need meka's `write`; talking still needs `read`.
 - `settle` applies only where the platform reports typing, and is now `3s`; `settle_max` is `30s`.
 - Discord holds a chat while the person whose message is waiting is still composing more.
 - Every chat is held 1s regardless, so the parts of a split post arrive as one turn. Not tunable.
@@ -74,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A chat mid-burst delayed delivery for every other chat; readiness is now per conversation.
 - A lapsed policy's notice was filed where nothing would read it, so the agent was never told.
 - The docs said `[mcp].strict` defaults to on. It does not, so the samples now set `required`.
+- The docs said `workspace` would do for moderating. meka refuses an MCP tool it cannot confine.
+- The docs named a provider error as reaching the owner in full; meka 0.42 logs it rather than send.
 - `read_history` and `search_history` overstated what a block hides and what the history holds.
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
 - A list written with blank lines between its items was packed as tight as one without.

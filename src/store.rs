@@ -1522,9 +1522,9 @@ impl Store {
     /// actually reached meka. Marking at read time meant a submission meka refused threw the
     /// envelope away *and* the count, and the retry then told the agent nothing had been said in a
     /// chat where thirty messages were waiting.
-    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is.
     ///
-    /// The timestamp is the ceiling that was asked about; the id is the high-water mark of the rows
+    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is. The
+    /// timestamp is the ceiling that was asked about; the id is the high-water mark of the rows
     /// that answered. Keyed on the timestamp alone, a row written between the count and this call
     /// with a time at or below the ceiling is marked without ever being shown, and that is not a
     /// narrow window: Telegram stamps to whole seconds so a burst shares one, and an edit carries

@@ -24,7 +24,7 @@ base_url = "http://127.0.0.1:8080"
 token = "${MEKA_BRIDGE_TOKEN}"
 
 [session]
-permission = "write"
+permission = "read"
 
 [mcp]
 bind = "127.0.0.1:9100"
@@ -100,6 +100,7 @@ INFO mekabridge::bridge::inbound: the agent sent no messages this turn conversat
 | `doctor` reports meka unreachable | `meka serve` is not running, or `base_url` is wrong |
 | meka refuses every turn | meka started before mekabridge; wait a few minutes for it to reconnect, or restart it |
 | Bot ignores you entirely | Your user id is not in `allowed_users` |
-| Turns stall for a minute then do nothing | The session is at `permission = "ask"`; use `write` |
+| Turns stall for a minute then do nothing | The session is at `permission = "ask"`; use `read` |
+| The agent chats but will not ban or rename | Moderation needs `unrestricted`; see [meka Integration](../usage/meka-integration.md#why-unrestricted-and-not-workspace) |
 
 More in [Operations](../usage/operations.md).

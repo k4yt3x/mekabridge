@@ -368,13 +368,17 @@ pub enum TelegramParseMode {
 }
 
 /// meka permission level a session runs at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// The five rungs meka 0.42 defines, in its order rather than a sensible-looking one: `ask`
+/// outranks `workspace`, because an approved call at `ask` writes anywhere while `workspace` cannot
+/// leave its roots however often it is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     None,
     Read,
+    Workspace,
     Ask,
-    Write,
+    Unrestricted,
 }
 
 impl Permission {
@@ -383,8 +387,40 @@ impl Permission {
         match self {
             Self::None => "none",
             Self::Read => "read",
+            Self::Workspace => "workspace",
             Self::Ask => "ask",
-            Self::Write => "write",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
+
+/// Hand-written so `write` can be refused by name rather than as one more unknown variant.
+///
+/// meka 0.42 split `write` into `workspace` and `unrestricted`, and its own parser answers the old
+/// spelling with the same explanation. Left to the derive, an operator upgrading meka would meet
+/// `unknown variant 'write', expected one of ...`, which lists the replacement without saying that
+/// it *is* the replacement, and does not say which of the two rungs restores what they had.
+impl<'de> Deserialize<'de> for Permission {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "none" => Ok(Self::None),
+            "read" => Ok(Self::Read),
+            "workspace" => Ok(Self::Workspace),
+            "ask" => Ok(Self::Ask),
+            "unrestricted" => Ok(Self::Unrestricted),
+            "write" => Err(serde::de::Error::custom(
+                "permission `write` was retired in meka 0.42 and split in two: `workspace` for \
+                 writes confined to the session's roots, `unrestricted` for none. Only \
+                 `unrestricted` reaches this bridge's moderation tools; see the meka Integration \
+                 page",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown permission `{other}`: expected `none`, `read`, `workspace`, `ask` or \
+                 `unrestricted`"
+            ))),
         }
     }
 }
@@ -1182,9 +1218,9 @@ const fn default_max_retries() -> u32 {
 
 /// Default to the lowest level that still works.
 ///
-/// `read` lets the agent reply, because the bridge's send tools are annotated read-only; `write`
-/// additionally lets it modify files. Anyone on the allowlist can drive this agent, so the default
-/// is the one that answers messages without also handing out write access to the session's `cwd`.
+/// `read` lets the agent reply, because the bridge's send tools are annotated read-only. Anyone on
+/// the allowlist can drive this agent, so the default is the one that answers messages without also
+/// handing out write access to the session's `cwd`.
 const fn default_permission() -> Permission {
     Permission::Read
 }
@@ -1494,6 +1530,51 @@ token = \"meka-token\"
         let raw = format!("{MINIMAL}\n[bridge]\ntyping_max = \"45s\"\n");
         let config = parse(&raw).expect("valid");
         assert_eq!(config.bridge.typing_max, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn the_permission_ladder_matches_mekas() {
+        // Pinned against meka's own five, because the wire form goes straight into
+        // `POST /v1/sessions` and a level meka cannot parse is a 422 on the first message rather
+        // than a startup error anybody sees.
+        for (raw, expected) in [
+            ("none", Permission::None),
+            ("read", Permission::Read),
+            ("workspace", Permission::Workspace),
+            ("ask", Permission::Ask),
+            ("unrestricted", Permission::Unrestricted),
+        ] {
+            let text = format!("{MINIMAL}\n[session]\npermission = \"{raw}\"\n");
+            let config = parse(&text).unwrap_or_else(|error| panic!("{raw} must parse: {error}"));
+            assert_eq!(config.session.permission, expected);
+            assert_eq!(config.session.permission.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn a_config_still_setting_write_is_refused_by_name() {
+        // The upgrade case. meka 0.42 retired the level, so leaving it in place would be a session
+        // creation that 422s on the first message; the error has to name the replacement rather
+        // than read as one more unknown word.
+        let raw = format!("{MINIMAL}\n[session]\npermission = \"write\"\n");
+        let error = parse(&raw).expect_err("a retired level must be refused");
+        let message = error.to_string();
+        // Asserting on `write` and `unrestricted` alone proves nothing: the fallback arm below
+        // names the offending word and lists every valid level, so it satisfies both and the test
+        // passes with this arm deleted. `retired` appears only in the message written for it.
+        assert!(message.contains("retired"), "got: {message}");
+        assert!(message.contains("workspace"), "got: {message}");
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused_with_the_ladder() {
+        // The other half, so the arm above cannot be widened into a catch-all that swallows a typo
+        // and blames it on the 0.42 upgrade.
+        let raw = format!("{MINIMAL}\n[session]\npermission = \"writeable\"\n");
+        let error = parse(&raw).expect_err("a level that never existed must be refused");
+        let message = error.to_string();
+        assert!(message.contains("writeable"), "got: {message}");
+        assert!(!message.contains("retired"), "got: {message}");
     }
 
     #[test]

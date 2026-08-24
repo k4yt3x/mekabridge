@@ -3376,11 +3376,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_irreversible_tools_ask_for_write() {
+    fn only_the_irreversible_tools_sit_above_read() {
         // meka derives a tool's required permission from `readOnlyHint` when no config overrides
         // it, so this list is the permission model. The line is what a tool can do to *other
         // people*, not whether it changes anything at all: almost every tool here modifies
-        // something, and gating replying behind `write` would make `read` mean "understands every
+        // something, and gating replying above `read` would make it mean "understands every
         // message and answers none", which fails silently from both ends.
         //
         // What sits on the far side is irreversible and aimed outward: banning somebody and purging
@@ -3388,7 +3388,11 @@ mod tests {
         // A `read` session can talk; it cannot ban. Tools that only change this bridge's own
         // bookkeeping stay read-only however much they modify -- `block` discards inbound messages
         // while it is set, but it is this bridge's own record and the agent can lift it itself.
-        const NEEDS_WRITE: &[&str] = &[
+        //
+        // Where the far side actually lands is meka's call, not this list's, and as of 0.42 it is
+        // `unrestricted`: an MCP tool runs in its server's own process, so meka will not admit one
+        // at `workspace`, whose whole promise is a confinement it cannot apply here.
+        const ABOVE_READ: &[&str] = &[
             "delete_message",
             "moderate_member",
             "set_member_rights",
@@ -3402,33 +3406,32 @@ mod tests {
                 .annotations
                 .as_ref()
                 .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
-            let needs_write = NEEDS_WRITE.contains(&tool.name.as_ref());
-            if needs_write {
+            let above_read = ABOVE_READ.contains(&tool.name.as_ref());
+            if above_read {
                 seen.push(tool.name.to_string());
             }
             assert_eq!(
                 annotations.read_only_hint,
-                Some(!needs_write),
+                Some(!above_read),
                 "{} is on the wrong side of the permission line",
                 tool.name
             );
             // The second half of the claim: anything that is not read-only says why.
-            if needs_write {
+            if above_read {
                 assert_eq!(
                     annotations.destructive_hint,
                     Some(true),
-                    "{} asks for write without saying it is destructive",
+                    "{} sits above read without saying it is destructive",
                     tool.name
                 );
             }
         }
         seen.sort_unstable();
-        let mut expected: Vec<String> =
-            NEEDS_WRITE.iter().map(|name| (*name).to_string()).collect();
+        let mut expected: Vec<String> = ABOVE_READ.iter().map(|name| (*name).to_string()).collect();
         expected.sort_unstable();
         assert_eq!(
             seen, expected,
-            "a tool that needs write is missing from the surface entirely"
+            "a tool that needs more than read is missing from the surface entirely"
         );
     }
 

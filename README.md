@@ -76,7 +76,7 @@ meka retries a failed MCP connect in the background, so the wrong order recovers
 | History | `read_history`, `search_history` |
 | Moderation | `moderate_member`, `set_member_rights`, `set_member_roles`, `pin_message`, `set_chat`, `member`, `list_members` |
 
-Every one is annotated read-only, so the whole surface works at meka's `read` permission level. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
+All but five are annotated read-only, so the conversational surface works at meka's `read` permission level. `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat` act irreversibly on somebody else's account or on the room, and need `unrestricted`. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
 
 Routing is explicit because it has to be: meka's MCP client sends no session identity with a tool call, so an MCP server cannot infer which conversation a call belongs to. Every send names its target, which is also what makes messaging somebody else, or messaging first, the same operation as replying.
 

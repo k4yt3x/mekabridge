@@ -287,9 +287,11 @@ Only two things are refused here: an id that is not well formed, and one naming 
 
 ## Permission level
 
-Most tools are annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, and gating replying behind `write` would leave a bridge running at `read` understanding every message and unable to answer any of them.
+Most tools are annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, and gating replying behind a higher level would leave a bridge running at `read` understanding every message and unable to answer any of them.
 
-Five are the exception and need `write`: `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `mute` and `block` modify plenty, but only this bridge's own record of what it forwards.
+Five are the exception and need `unrestricted`: `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `mute` and `block` modify plenty, but only this bridge's own record of what it forwards.
+
+`workspace` is not enough for those five, which surprises people: meka refuses an unsandboxed MCP tool at the one level whose promise is confinement. [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) has the reasoning and the `tool_permissions` escape hatch.
 
 `download_attachment` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
 

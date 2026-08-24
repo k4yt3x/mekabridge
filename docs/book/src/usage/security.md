@@ -81,10 +81,12 @@ For a finer grain, meka can raise the required permission on individual tools:
 
 ```toml
 [mcp.servers.tool_permissions]
-moderate_member = "write"
+moderate_member = "unrestricted"
 ```
 
-Note that this only helps if the session is *not* at `write`, and running at `write` unlocks file modification too. Config is usually the better lever.
+Note that this only helps if the session is *not* already at `unrestricted`, and running there unlocks unconfined file modification and shell access too. Config is usually the better lever.
+
+It works in the other direction as well, and that is the more useful one here: `tool_permissions` is the first step of meka's resolution chain, so naming a tool `"read"` puts it back within reach of a `read` session. That is how a deployment moderates without handing the agent an unrestricted machine.
 
 ## Privacy mode
 
@@ -107,7 +109,9 @@ Delivery is unaffected either way. What changes is that a muted conversation has
 
 ## What the agent can reach on your machine
 
-The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` or `set_chat`: those are annotated as destructive and need `write`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename. Raise `[session].permission` if you want it moderating. Three things to know:
+The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` or `set_chat`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.
+
+Weigh that trade before raising the level. `unrestricted` is the whole machine, not just the moderation tools, so a deployment that wants the agent banning people and nothing more is better served by the `tool_permissions` override above than by moving the session. Three things to know either way:
 
 - **`send_file` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config and its database. Anyone who can talk the agent into a `send_file` call can exfiltrate those.
 - **`download_attachment` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.

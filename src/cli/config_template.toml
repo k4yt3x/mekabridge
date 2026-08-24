@@ -17,10 +17,11 @@ turn_timeout = "30m"
 # Working directory for the agent's session. Defaults to meka's own working directory.
 # cwd = "/home/you/assistant"
 
-# "read" or "write". The send tools are read-only as far as your machine is concerned, so at "read"
-# the agent can reply to messages but cannot modify files. Use "write" if you want it to actually
-# change things. Do not use "ask": meka prompts for every tool call at that level, and this bridge
-# cannot answer a prompt, so nothing would run at all.
+# "read", "workspace" or "unrestricted". The send tools are read-only as far as your machine is
+# concerned, so at "read" the agent can reply to messages but cannot modify files; "workspace" adds
+# writes confined to the session's roots. Only "unrestricted" reaches the moderation tools, because
+# meka cannot sandbox an MCP server and will not pretend otherwise. Do not use "ask": meka prompts
+# for every tool call at that level, and this bridge cannot answer a prompt, so nothing would run.
 permission = "read"
 
 [bridge]

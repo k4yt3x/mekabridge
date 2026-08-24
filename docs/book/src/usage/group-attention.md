@@ -85,7 +85,8 @@ schedule_create(
 
 `on-change` fires when the command's output differs from the previous run, so a turn is spent only
 once the chat has actually moved. Gates run a shell command unattended and meka requires
-`permission = "write"` to create one; an ungated `at:` job works at `read`.
+`permission = "unrestricted"` to create one, as of 0.42: `workspace` used to authorise a gate and no
+longer does. An ungated `at:` job works at `read`.
 
 The `unseen` MCP tool answers the same question, for the agent to read directly. It returns the
 backlog rather than the marker, because that is what is useful to read and the wrong thing to gate

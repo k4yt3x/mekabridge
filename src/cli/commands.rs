@@ -11,7 +11,7 @@ use chrono::Utc;
 
 use crate::{
     channel::{ChannelRegistry, Platform},
-    config::{Config, McpTransport},
+    config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::MekaClient,
     store::{Policy, Store},
@@ -28,17 +28,10 @@ pub enum Check {
     Fail(String),
 }
 
-/// Decide what meka's readiness answer means.
-///
-/// Pure, and separate from [`doctor`], so it can be tested at all. `doctor` talks to the store, to
-/// meka, and to every configured channel, so its exit status says only that *something* is wrong:
-/// a test asserting `is_err()` against a readiness body passes just as well when the readiness
-/// checks are deleted, because a channel with a placeholder token fails alongside them.
 /// How many failures and warnings a set of checks contributes.
 ///
 /// Shared with [`doctor`] rather than reimplemented there, so a test can assert on the arithmetic
-/// that decides the exit code. `doctor` itself is untestable end to end: it talks to the store, to
-/// meka, and to every configured channel, so its exit status says only that *something* is wrong.
+/// that decides the exit code.
 pub fn verdict(checks: &[Check]) -> (usize, usize) {
     let failures = checks
         .iter()
@@ -51,6 +44,12 @@ pub fn verdict(checks: &[Check]) -> (usize, usize) {
     (failures, warnings)
 }
 
+/// Decide what meka's readiness answer means.
+///
+/// Pure, and separate from [`doctor`], so it can be tested at all. `doctor` talks to the store, to
+/// meka, and to every configured channel, so its exit status says only that *something* is wrong: a
+/// test asserting `is_err()` against a readiness body passes just as well when the readiness checks
+/// are deleted, because a channel with a placeholder token fails alongside them.
 pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
     let mut checks = Vec::new();
     // meka answers 503 with this same body, naming which subsystem is the blocker, so a readiness
@@ -170,6 +169,10 @@ pub async fn doctor(config: &Config) -> Result<()> {
 
     println!("meka at {}", config.meka.base_url);
     let meka = MekaClient::new(&config.meka)?;
+    // Carried out of the match so the verdict can be printed under `session`, next to the other
+    // two permission checks. Empty means either meka said nothing (a build predating the field) or
+    // it could not be reached, and both read the same way: no opinion, so no verdict.
+    let mut enabled_permissions: Vec<String> = Vec::new();
     match meka.info().await {
         Ok(info) => {
             println!(
@@ -189,6 +192,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 );
                 warnings += 1;
             }
+            enabled_permissions = info.enabled_permissions;
         }
         Err(error) => {
             println!("  fail   {error}");
@@ -257,6 +261,22 @@ pub async fn doctor(config: &Config) -> Result<()> {
             config.session.permission.as_str()
         );
         failures += 1;
+    }
+    if let Some(problem) =
+        level_meka_will_not_create(config.session.permission.as_str(), &enabled_permissions)
+    {
+        println!("  fail   {problem}");
+        failures += 1;
+    }
+    let admin_tools = config
+        .channels
+        .iter()
+        .any(|channel| match &channel.platform {
+            PlatformConfig::Telegram(telegram) => telegram.admin_tools,
+            PlatformConfig::Discord(discord) => discord.admin_tools,
+        });
+    if let Some(reach) = moderation_reach(config.session.permission.as_str(), admin_tools) {
+        println!("  ok     {reach}");
     }
 
     println!("channels");
@@ -395,27 +415,89 @@ pub async fn doctor(config: &Config) -> Result<()> {
 
 /// Why a permission level will not work for this bridge, or `None` if it will.
 ///
-/// `read` and `write` both work: the send tools are annotated read-only, so replying sits at meka's
-/// `read` level. Only the five tools that act irreversibly on somebody else's account need `write`,
-/// and a bridge that never moderates does not need it at all.
+/// `read`, `workspace` and `unrestricted` all work: the send tools are annotated read-only, so
+/// replying sits at meka's `read` level and every rung above it allows what `read` allows.
 ///
 /// `ask` does not, and the reason is not obvious. meka compares the *session* level against `Ask`
 /// before dispatching any tool, so at `ask` every call is prompted, read-only ones included. This
 /// bridge declares `supports_permission_prompts: false`, so meka denies each one immediately and
-/// the agent cannot even reply.
+/// the agent cannot even reply. `ask` is also outside meka's default enabled set, so a session
+/// asking for it is usually refused at creation before any of that is reached.
+///
+/// What no level short of `unrestricted` reaches is the five moderation tools, and that is not
+/// stated here because it is not a *failure*: a bridge that never moderates is correct at `read`.
+/// [`moderation_reach`] reports it separately, as a statement of fact.
+///
+/// `write` is unreachable from `[session].permission`, which refuses it while parsing, but not from
+/// the level meka reports for an existing session: a session created against meka 0.41 carries it,
+/// and that is the reading this arm is for.
 fn permission_problem(level: &str) -> Option<&'static str> {
     match level {
-        "read" | "write" => None,
+        "read" | "workspace" | "unrestricted" => None,
         "ask" => Some(
             "meka prompts for every tool call at `ask`, including read-only ones, and this bridge \
              cannot answer a prompt, so each is denied at once. That includes send_message, so the \
-             agent can never reply. Use \"read\" or \"write\".",
+             agent can never reply. Use \"read\", \"workspace\" or \"unrestricted\".",
+        ),
+        "write" => Some(
+            "meka 0.42 retired `write` and split it into `workspace` and `unrestricted`, so a \
+             session cannot be created at this level at all. Use \"read\" to answer messages, or \
+             \"unrestricted\" to also moderate.",
         ),
         _ => Some(
             "no tools are executable at this level, so the agent cannot reply. Use \"read\" to let \
-             it answer messages, or \"write\" to also let it modify files.",
+             it answer messages.",
         ),
     }
+}
+
+/// Why meka will refuse to create a session at `level`, or `None` if it will accept one.
+///
+/// Separate from [`permission_problem`], which asks whether a level suits *this bridge*. This one
+/// asks whether the level exists on the other side at all, and it is the earlier failure: meka
+/// checks its `[permissions].enabled` set before anything else, so a level outside it is a 422 on
+/// the first message rather than an agent that behaves oddly. `ask` is the one to catch, being
+/// outside meka's default set.
+///
+/// An empty `enabled` means no opinion, from a meka that did not report the field or could not be
+/// reached, and yields no verdict rather than a guess.
+fn level_meka_will_not_create(level: &str, enabled: &[String]) -> Option<String> {
+    if enabled.is_empty() || enabled.iter().any(|allowed| allowed == level) {
+        return None;
+    }
+    Some(format!(
+        "meka will not create a session at {level:?}; it enables {}. Add it to meka's \
+         [permissions].enabled, or set [session].permission to one of those.",
+        enabled.join(", ")
+    ))
+}
+
+/// That the five moderation tools are registered and cannot be dispatched at `level`, if so.
+///
+/// Stated rather than warned about, because `admin_tools` defaults on and `permission` defaults to
+/// `read`, so this is the shipped posture and always has been: before 0.42 the same pairing put
+/// them out of reach of `write`. A line that fires on every default install teaches operators to
+/// skim warnings, which costs more than this is worth.
+///
+/// Worth stating at all because the level that *does* reach them moved, and the failure is
+/// otherwise silent from both ends: the agent is told inside a tool result nothing surfaces, and
+/// the operator sees a bot that chats normally and declines to ban.
+///
+/// The chain is three steps and only the last is surprising. `readOnlyHint: false` resolves to
+/// `unrestricted` rather than to the old `write`. `Permission::allows` then treats `workspace`,
+/// `ask` and `unrestricted` as equal, which reads like `workspace` is enough. But an MCP tool runs
+/// in its server's own process, which meka does not sandbox, so a second gate refuses anything
+/// requiring `unrestricted` while the session sits at `workspace`, rather than promise a
+/// confinement it cannot apply.
+fn moderation_reach(level: &str, admin_tools: bool) -> Option<String> {
+    if !admin_tools || level == "unrestricted" {
+        return None;
+    }
+    Some(format!(
+        "the moderation tools are registered but do not run at {level:?}: meka resolves them to \
+         `unrestricted` and refuses them below it. Raise [session].permission, or grant them \
+         individually with meka's [mcp.servers.*].tool_permissions"
+    ))
 }
 
 /// Print what the bridge is currently holding.
@@ -944,11 +1026,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_and_write_both_let_the_agent_reply() {
+    fn every_level_that_can_reply_is_accepted() {
         // The send tools are annotated read-only, so `read` is a supported posture: the agent can
-        // answer messages without being able to modify files.
+        // answer messages without being able to modify anything. The two rungs above it allow
+        // everything `read` allows, so they work for replying too.
         assert!(permission_problem("read").is_none());
-        assert!(permission_problem("write").is_none());
+        assert!(permission_problem("workspace").is_none());
+        assert!(permission_problem("unrestricted").is_none());
     }
 
     #[test]
@@ -958,6 +1042,66 @@ mod tests {
         let ask = permission_problem("ask").expect("ask must be rejected");
         assert!(ask.contains("send_message"), "{ask}");
         assert!(permission_problem("none").is_some());
+    }
+
+    #[test]
+    fn the_retired_write_level_is_named_rather_than_lumped_in_with_a_typo() {
+        // The one an operator upgrading meka actually hits. A session cannot be created at it at
+        // all, so the message has to say that and name what replaced it, or the reader concludes
+        // the bridge stopped supporting a level meka still has.
+        let problem = permission_problem("write").expect("write must be rejected");
+        assert!(problem.contains("0.42"), "{problem}");
+        assert!(problem.contains("unrestricted"), "{problem}");
+    }
+
+    #[test]
+    fn moderation_is_only_within_reach_at_unrestricted() {
+        // `workspace` is the trap: meka's `allows` treats it as equal to `unrestricted`, so the
+        // level looks sufficient, and a second gate refuses the call because an MCP tool runs
+        // outside anything meka can confine.
+        assert!(moderation_reach("unrestricted", true).is_none());
+        for level in ["read", "workspace"] {
+            let reach = moderation_reach(level, true)
+                .unwrap_or_else(|| panic!("{level} cannot reach the moderation tools"));
+            assert!(reach.contains("tool_permissions"), "{reach}");
+        }
+    }
+
+    #[test]
+    fn a_level_meka_does_not_enable_is_caught_before_the_first_message() {
+        // meka's own default set. `ask` is opt-in and absent from it, which is the case worth
+        // catching: without this the session is refused at creation, on the first message, long
+        // after `doctor` said everything was fine.
+        let enabled: Vec<String> = ["none", "read", "workspace", "unrestricted"]
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
+        assert!(level_meka_will_not_create("read", &enabled).is_none());
+        assert!(level_meka_will_not_create("unrestricted", &enabled).is_none());
+        let refused = level_meka_will_not_create("ask", &enabled).expect("ask is not enabled");
+        assert!(refused.contains("ask"), "{refused}");
+        // The way out has to name what meka would accept; "not enabled" alone leaves the operator
+        // guessing which of five words to try.
+        assert!(refused.contains("workspace"), "{refused}");
+    }
+
+    #[test]
+    fn a_meka_with_no_opinion_draws_no_verdict() {
+        // Empty covers two cases that must not become a guess: a meka too old to report the field,
+        // and one `doctor` could not reach at all. Failing either would make `doctor` red over a
+        // configuration that is fine.
+        for level in ["read", "ask", "unrestricted", "nonsense"] {
+            assert!(level_meka_will_not_create(level, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn moderation_reach_is_silent_when_the_tools_are_not_registered() {
+        // Nothing is out of reach if it was never offered, and a warning about a capability the
+        // operator deliberately turned off is noise that trains them to ignore the rest.
+        for level in ["read", "workspace", "unrestricted"] {
+            assert!(moderation_reach(level, false).is_none());
+        }
     }
 
     #[test]

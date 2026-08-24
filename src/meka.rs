@@ -338,6 +338,16 @@ pub struct ServerInfo {
     /// committed to the session's history, which the provider then rejects on every later
     /// request in that session.
     pub vision: bool,
+    /// The permission levels this meka will create a session at, from `[permissions].enabled`.
+    ///
+    /// Asking for one outside the set is a 422 at session creation, which happens on the first
+    /// message rather than at startup, so without this the misconfiguration surfaces as a message
+    /// that never gets answered. `ask` is the one to watch: it is not in meka's default set.
+    ///
+    /// Defaulted rather than required, so an older meka that does not send it reads as "no
+    /// opinion" and the check is skipped instead of taking `doctor` down.
+    #[serde(default)]
+    pub enabled_permissions: Vec<String>,
 }
 
 /// Readiness as returned by `GET /v1/health/ready`.

@@ -39,25 +39,36 @@ The one meka session this instance owns.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `cwd` | meka's working directory | Absolute path the agent works in |
-| `permission` | `read` | meka permission level. `read` or `write`; see below |
+| `permission` | `read` | meka permission level. `read`, `workspace` or `unrestricted`; see below |
 | `recreate_on_missing` | `true` | Create a replacement when meka reports the stored session is gone |
 
-Both `read` and `write` work. The bridge's send tools are annotated read-only, because they change
+All three work for replying. The bridge's send tools are annotated read-only, because they change
 nothing on your machine, so replying sits at meka's `read` level:
 
 - `read`: the agent can answer messages, run commands, and browse, but cannot modify files.
-- `write`: it can also edit files.
+- `workspace`: it can also write, confined to the session's roots.
+- `unrestricted`: no boundary, and the only level that reaches the five moderation tools.
+
+> **`write` was retired in meka 0.42** and split into `workspace` and `unrestricted`. A config still
+> setting it is refused at startup by name, because meka would otherwise reject the session on the
+> first message rather than at launch.
 
 > **Do not use `permission = "ask"`.** meka compares the *session* level against `ask` before
 > dispatching, so at that level every tool call is prompted, read-only ones included. mekabridge
 > declares `supports_permission_prompts: false`, so meka denies each prompt immediately and the agent
-> cannot even reply. `doctor` reports `ask` and `none` as failures.
+> cannot even reply. `doctor` reports `ask` and `none` as failures. `ask` is also outside meka's
+> default `[permissions].enabled` set, so it usually fails at session creation first.
 
-If you would rather sends be gated behind `write` after all, invert it from meka's side:
+Why moderation needs the top rung rather than `workspace` is
+[explained under meka Integration](../usage/meka-integration.md#why-unrestricted-and-not-workspace);
+the short version is that meka will not let an unsandboxed MCP tool run at a level whose promise is
+confinement. `doctor` reports when the moderation tools are registered and the session sits below it.
+
+If you would rather sends be gated too, invert it from meka's side:
 
 ```toml
 [mcp.servers.tool_permissions]
-send_message = "write"
+send_message = "unrestricted"
 ```
 
 When `recreate_on_missing` fires, the agent's memory of every past conversation is gone. It is logged at warn level.
@@ -87,7 +98,7 @@ The indicator tracks one thing: the interval in which the model is writing the a
 
 That is narrower than it used to be. The indicator previously went up when a turn started and stayed up for its whole length, which for a turn spent on a dozen tool calls was a claim that a reply was seconds away for minutes at a time. The cost of the change is that a long turn now looks like silence; the benefit is that when the indicator is up it is true.
 
-Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-api` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn was submitted for rather than the message's eventual target; those are the same thing unless one batch spanned several chats.
+Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-chat-completions` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn was submitted for rather than the message's eventual target; those are the same thing unless one batch spanned several chats.
 
 `typing_max` used to follow `[meka].turn_timeout`, which was right while the indicator covered a whole turn and wrong once it covered only the writing of one message. A window is normally closed by the next tool call meka announces, but a stream that goes quiet after `tool_call.composing` produces no such event, and the rejoin can spend minutes trying to get back on. At the turn budget the ceiling could never fire, so a chat showed "typing" for half an hour and then fell silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
 
@@ -229,7 +240,7 @@ turn_timeout = "30m"
 
 [session]
 cwd = "/var/lib/mekabridge/workspace"
-permission = "write"
+permission = "workspace"
 
 [bridge]
 owner_conversation = "telegram:123456789"

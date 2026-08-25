@@ -11,7 +11,10 @@
 
 pub mod render;
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -22,15 +25,16 @@ use teloxide::{
     payloads::{
         BanChatMemberSetters as _, EditMessageTextSetters as _, PinChatMessageSetters as _,
         PromoteChatMemberSetters as _, RestrictChatMemberSetters as _, SendChatActionSetters as _,
-        SendDocumentSetters as _, SendMessageSetters as _, SendPhotoSetters as _,
-        SetChatDescriptionSetters as _, SetMessageReactionSetters as _,
+        SendDocumentSetters as _, SendMediaGroupSetters as _, SendMessageSetters as _,
+        SendPhotoSetters as _, SetChatDescriptionSetters as _, SetMessageReactionSetters as _,
         UnbanChatMemberSetters as _, UnpinChatMessageSetters as _,
     },
     prelude::Requester,
     types::{
-        AllowedUpdate, ChatAction, ChatId, ChatPermissions, FileId, InputFile, LinkPreviewOptions,
-        MediaKind, Message, MessageEntityKind, MessageId, MessageKind, MessageOrigin, ParseMode,
-        ReactionType, Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
+        AllowedUpdate, ChatAction, ChatId, ChatPermissions, FileId, InputFile, InputMedia,
+        InputMediaDocument, InputMediaPhoto, LinkPreviewOptions, MediaKind, Message,
+        MessageEntityKind, MessageId, MessageKind, MessageOrigin, ParseMode, ReactionType,
+        Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
     },
     update_listeners::{AsUpdateStream, Polling},
 };
@@ -47,6 +51,13 @@ use crate::{
     },
     config::{TelegramConfig, TelegramParseMode},
 };
+
+/// Most files Telegram will take in one album.
+///
+/// The Bot API's own ceiling on `sendMediaGroup`. Enforced here rather than left to the API so an
+/// over-long list costs no upload, and so the agent is told the number rather than reading a
+/// generic rejection.
+const MAX_ALBUM_ITEMS: usize = 10;
 
 /// Longest excerpt kept from a replied-to message, enough for the agent to know what is being
 /// referenced without pasting an entire prior message into the turn.
@@ -374,6 +385,97 @@ impl TelegramChannel {
         request.link_preview_options(Self::link_preview(link_preview))
     }
 
+    /// The parse mode a caption is rendered with, or `None` when the channel sends Markdown as-is.
+    const fn caption_parse_mode(&self) -> Option<ParseMode> {
+        match self.parse_mode {
+            TelegramParseMode::Html => Some(ParseMode::Html),
+            TelegramParseMode::None => None,
+        }
+    }
+
+    /// Whether this many files go through `sendMediaGroup` rather than a single-file endpoint.
+    ///
+    /// The boundary is Telegram's, not a preference: `sendMediaGroup` requires **at least two**
+    /// items, so one file through it is an API error and has to keep the endpoint built for one
+    /// file. Named rather than written inline because the rule is easy to invert while reading and
+    /// the cost of inverting it is a rejection the agent cannot act on.
+    const fn groups_into_an_album(paths: &[PathBuf]) -> bool {
+        paths.len() > 1
+    }
+
+    /// The items of an album, with the caption on exactly one of them.
+    ///
+    /// Exactly one, and this is the whole reason it is a function. The Bot API has **no** group
+    /// caption: what renders under an album is emergent client behaviour when a single item carries
+    /// one. Caption every item, which is the obvious reading of "the album's caption", and the
+    /// official clients render *no* group caption at all, so the caption looks silently dropped
+    /// while each file quietly keeps a copy. Index 0 is arbitrary but has to be some single index.
+    ///
+    /// One `as_photo` for the whole group is also load bearing: Telegram refuses an album that
+    /// mixes documents with photos, and choosing per file could describe a group it will not take.
+    fn album_items(
+        paths: &[PathBuf],
+        caption: Option<String>,
+        as_photo: bool,
+        parse_mode: Option<ParseMode>,
+    ) -> Vec<InputMedia> {
+        paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let file = InputFile::file(path);
+                // Only the first item is captioned; see above.
+                let caption = (index == 0).then(|| caption.clone()).flatten();
+                if as_photo {
+                    let mut item = InputMediaPhoto::new(file);
+                    if let Some(caption) = caption {
+                        item = item.caption(caption);
+                        if let Some(parse_mode) = parse_mode {
+                            item = item.parse_mode(parse_mode);
+                        }
+                    }
+                    InputMedia::Photo(item)
+                } else {
+                    let mut item = InputMediaDocument::new(file);
+                    if let Some(caption) = caption {
+                        item = item.caption(caption);
+                        if let Some(parse_mode) = parse_mode {
+                            item = item.parse_mode(parse_mode);
+                        }
+                    }
+                    InputMedia::Document(item)
+                }
+            })
+            .collect()
+    }
+
+    /// Shape the album request, separated from awaiting it so the shaping can be asserted on.
+    ///
+    /// `JsonRequest` derefs to its payload, so a test can read back what would go on the wire
+    /// without a bot token or a network.
+    fn album_request(
+        &self,
+        chat: ChatId,
+        thread: Option<ThreadId>,
+        paths: &[PathBuf],
+        caption: Option<String>,
+        reply_to: Option<MessageId>,
+        options: &FileOptions,
+    ) -> <Throttle<Bot> as Requester>::SendMediaGroup {
+        let items = Self::album_items(paths, caption, options.as_photo, self.caption_parse_mode());
+        let mut request = self.bot.send_media_group(Recipient::Id(chat), items);
+        if let Some(thread) = thread {
+            request = request.message_thread_id(thread);
+        }
+        if options.send.silent {
+            request = request.disable_notification(true);
+        }
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        request
+    }
+
     /// Split agent Markdown into wire-ready message bodies.
     fn render(&self, markdown: &str, limit: usize) -> (Vec<String>, Option<ParseMode>) {
         match self.parse_mode {
@@ -652,19 +754,32 @@ impl Channel for TelegramChannel {
         Ok(sent)
     }
 
-    /// `options.link_preview` is accepted and has no effect here, deliberately. The Bot API's
-    /// `sendPhoto` and `sendDocument` carry no `link_preview_options`, so a link in a caption never
-    /// expands into a card whatever is asked for. Refusing the call instead would make the agent
-    /// handle a platform difference it cannot see from the tool schema, for a request that is
-    /// harmless; the tool description states it so the absent card is not read as a bug.
-    async fn send_file(
+    /// `options.send.link_preview` is accepted and has no effect here, deliberately. Neither
+    /// `sendPhoto`, `sendDocument` nor `sendMediaGroup` carries `link_preview_options`, so a link
+    /// in a caption never expands into a card whatever is asked for. Refusing the call instead
+    /// would make the agent handle a platform difference it cannot see from the tool schema,
+    /// for a request that is harmless; the tool description states it so the absent card is not
+    /// read as a bug.
+    async fn send_files(
         &self,
         conversation: &ConversationId,
-        path: &Path,
+        paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
         let (chat, thread) = self.target(conversation)?;
+        // Refused before anything is opened, so an over-long list costs no upload. `sendMediaGroup`
+        // would answer with its own error, but only after the files had been read and sent.
+        if paths.len() > MAX_ALBUM_ITEMS {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: format!(
+                    "Telegram takes at most {MAX_ALBUM_ITEMS} files in one album, and {} were \
+                     given. Send them in several batches.",
+                    paths.len()
+                ),
+            });
+        }
 
         // Declared before the upload starts, because that is what the action is for: the docs say
         // to choose it by what the user is about to receive. A large file otherwise
@@ -678,11 +793,11 @@ impl Channel for TelegramChannel {
             tracing::debug!(conversation = %conversation, "upload indicator failed: {}", error);
         }
 
-        let file = InputFile::file(path);
         // Captions have their own, much smaller limit than messages, and unlike a message a caption
         // cannot be continued: it belongs to the file. Taking the first part and dropping the rest
         // lost the difference silently and still reported success, so a caption that does not fit
-        // is refused and the agent is told the limit it has to write to.
+        // is refused and the agent is told the limit it has to write to. The same limit governs an
+        // album's caption, which is one item's caption wearing a different hat.
         let caption_body = match caption {
             None => None,
             Some(caption) => {
@@ -701,9 +816,36 @@ impl Channel for TelegramChannel {
                 bodies.pop()
             }
         };
-        let parse_mode =
-            matches!(self.parse_mode, TelegramParseMode::Html).then_some(ParseMode::Html);
+        let parse_mode = self.caption_parse_mode();
+        let reply_to = options
+            .send
+            .reply_to
+            .as_deref()
+            .map(|raw| self.message_id(raw))
+            .transpose()?;
 
+        // Two endpoints; see `groups_into_an_album`.
+        if Self::groups_into_an_album(paths) {
+            let messages = self
+                .album_request(chat, thread, paths, caption_body, reply_to, options)
+                .await
+                .map_err(|error| self.delivery_error(&error))?;
+            return Ok(messages
+                .into_iter()
+                .map(|message| message.id.0.to_string())
+                .collect());
+        }
+
+        // The trait says `paths` is non-empty, and the tool refuses an empty list before reaching
+        // here. Answered rather than unwrapped so a future caller that breaks the contract gets a
+        // sentence instead of a panic in the drain loop.
+        let Some(path) = paths.first() else {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: "no files were given to send".to_string(),
+            });
+        };
+        let file = InputFile::file(path);
         let message = if options.as_photo {
             let mut request = self.bot.send_photo(Recipient::Id(chat), file);
             if let Some(caption) = caption_body {
@@ -714,6 +856,12 @@ impl Channel for TelegramChannel {
             }
             if let Some(thread) = thread {
                 request = request.message_thread_id(thread);
+            }
+            if options.send.silent {
+                request = request.disable_notification(true);
+            }
+            if let Some(reply_to) = reply_to {
+                request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
             request.await
         } else {
@@ -726,6 +874,12 @@ impl Channel for TelegramChannel {
             }
             if let Some(thread) = thread {
                 request = request.message_thread_id(thread);
+            }
+            if options.send.silent {
+                request = request.disable_notification(true);
+            }
+            if let Some(reply_to) = reply_to {
+                request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
             request.await
         }
@@ -1544,6 +1698,127 @@ mod tests {
 
     fn channel(allowed_users: Vec<i64>, allowed_chats: Vec<i64>) -> TelegramChannel {
         configured(allowed_users, allowed_chats, false)
+    }
+
+    /// The caption of an album item, or `None`, without caring which variant it is.
+    fn item_caption(item: &InputMedia) -> Option<&str> {
+        match item {
+            InputMedia::Photo(photo) => photo.caption.as_deref(),
+            InputMedia::Document(document) => document.caption.as_deref(),
+            other => panic!("an album should hold only photos or documents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_file_does_not_go_through_the_album_endpoint() {
+        // `sendMediaGroup` requires at least two items, so routing one file through it is an API
+        // error the agent can do nothing about. The boundary is the platform's, so it is pinned.
+        assert!(!TelegramChannel::groups_into_an_album(&[PathBuf::from(
+            "/tmp/a.png"
+        )]));
+        assert!(TelegramChannel::groups_into_an_album(&[
+            PathBuf::from("/tmp/a.png"),
+            PathBuf::from("/tmp/b.png")
+        ]));
+    }
+
+    #[test]
+    fn exactly_one_album_item_carries_the_caption() {
+        // The invariant Telegram will not enforce and whose breach is invisible from here. The Bot
+        // API has no group caption: what renders under an album is emergent client behaviour when a
+        // single item carries one. Caption every item and the official clients render *no* group
+        // caption at all, so it reads as though the caption were dropped while each file quietly
+        // keeps a copy.
+        let paths = [
+            PathBuf::from("/tmp/a.png"),
+            PathBuf::from("/tmp/b.png"),
+            PathBuf::from("/tmp/c.png"),
+        ];
+        let items = TelegramChannel::album_items(
+            &paths,
+            Some("the caption".to_string()),
+            true,
+            Some(ParseMode::Html),
+        );
+        assert_eq!(items.len(), 3);
+        let captioned: Vec<&str> = items.iter().filter_map(item_caption).collect();
+        assert_eq!(
+            captioned,
+            ["the caption"],
+            "an album must carry its caption on exactly one item"
+        );
+    }
+
+    #[test]
+    fn an_album_without_a_caption_carries_none_at_all() {
+        // The other half, so the fix above cannot become "always caption item zero" with a stand-in
+        // when the agent gave none.
+        let paths = [PathBuf::from("/tmp/a.pdf"), PathBuf::from("/tmp/b.pdf")];
+        let items = TelegramChannel::album_items(&paths, None, false, None);
+        assert!(items.iter().all(|item| item_caption(item).is_none()));
+    }
+
+    #[test]
+    fn as_photo_decides_the_whole_album() {
+        // Telegram refuses an album mixing documents with photos, so one flag governs every item.
+        let paths = [PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        assert!(
+            TelegramChannel::album_items(&paths, None, true, None)
+                .iter()
+                .all(|item| matches!(item, InputMedia::Photo(_)))
+        );
+        assert!(
+            TelegramChannel::album_items(&paths, None, false, None)
+                .iter()
+                .all(|item| matches!(item, InputMedia::Document(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn more_files_than_telegram_takes_are_refused_before_any_upload() {
+        let channel = channel(vec![1], vec![]);
+        let conversation = ConversationId::parse("telegram:1").expect("valid");
+        let paths: Vec<PathBuf> = (0..=MAX_ALBUM_ITEMS)
+            .map(|index| PathBuf::from(format!("/tmp/{index}.png")))
+            .collect();
+        let error = channel
+            .send_files(&conversation, &paths, None, &FileOptions::default())
+            .await
+            .expect_err("an over-long album must be refused");
+        let message = error.to_string();
+        // The number has to be in the message: "too many" leaves the agent guessing how many to
+        // drop. None of these paths exists, so reaching the platform at all would fail differently.
+        assert!(message.contains("10"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_album_states_its_reply_and_silence_on_the_wire() {
+        // `sendMediaGroup` carries both, and neither reached a file send at all before this.
+        use teloxide::requests::HasPayload as _;
+        let channel = channel(vec![1], vec![]);
+        let paths = [PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")];
+        let options = FileOptions {
+            as_photo: true,
+            send: SendOptions {
+                reply_to: Some("4471".to_string()),
+                silent: true,
+                link_preview: false,
+            },
+        };
+        let request = channel.album_request(
+            ChatId(1),
+            None,
+            &paths,
+            None,
+            Some(MessageId(4471)),
+            &options,
+        );
+        let payload = request.payload_ref();
+        assert_eq!(payload.disable_notification, Some(true));
+        assert!(
+            payload.reply_parameters.is_some(),
+            "the reply target never reached the request"
+        );
     }
 
     #[tokio::test]

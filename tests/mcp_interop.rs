@@ -82,7 +82,7 @@ impl OutboundSink for RecordingSink {
     async fn send_file(
         &self,
         _conversation: &str,
-        _path: &std::path::Path,
+        _paths: &[std::path::PathBuf],
         _caption: Option<&str>,
         _options: mekabridge::mcp::FileOptions,
     ) -> Result<Vec<String>, SinkError> {
@@ -640,6 +640,30 @@ async fn input_schemas_survive_negotiation() {
             "{tool_name} makes {field} mandatory: {schema}"
         );
     }
+
+    // `paths` has to arrive as a required *array*. Nothing in a handler test can see this: the
+    // shape is decided by the derive on the way out, and a schema advertising a bare string
+    // would have the agent send one path as a scalar and be refused by serde on every call.
+    let send_file = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "send_file")
+        .expect("send_file is advertised");
+    let schema = serde_json::to_value(&*send_file.input_schema).expect("schema serializes");
+    assert_eq!(
+        schema["properties"]["paths"]["type"], "array",
+        "send_file must take a list of paths: {schema}"
+    );
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(required.contains(&"paths"), "schema: {schema}");
 
     client.cancel().await.expect("clean shutdown");
 }

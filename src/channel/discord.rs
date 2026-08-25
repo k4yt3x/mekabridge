@@ -24,7 +24,7 @@ pub mod render;
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -78,6 +78,12 @@ use crate::{
 
 /// Longest excerpt kept from a replied-to message.
 const REPLY_EXCERPT_CHARS: usize = 160;
+
+/// Most attachments Discord will take on one message.
+///
+/// Enforced here because twilight does not validate the count, so without it Discord answers a
+/// generic rejection only after every file has been read into memory and uploaded.
+const MAX_ATTACHMENTS: usize = 10;
 
 /// Most members Discord will return from one listing or search call.
 const MAX_MEMBER_PAGE: usize = 1000;
@@ -1442,14 +1448,35 @@ impl Channel for DiscordChannel {
         Ok(sent)
     }
 
-    async fn send_file(
+    async fn send_files(
         &self,
         conversation: &ConversationId,
-        path: &Path,
+        paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
         let channel_id = self.target(conversation).await?;
+        // Answered rather than sent as a caption-only message, which is what an empty list would
+        // otherwise produce here: nothing indexes `paths`, so there is no panic to stop it. The
+        // bridge enforces the same contract, and this is the local half of it.
+        if paths.is_empty() {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: "no files were given to send".to_string(),
+            });
+        }
+        // Refused here because twilight does not validate the count: without this Discord answers a
+        // generic rejection, after every file has been read into memory and uploaded.
+        if paths.len() > MAX_ATTACHMENTS {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: format!(
+                    "Discord takes at most {MAX_ATTACHMENTS} attachments on one message, and {} \
+                     were given. Send them in several batches.",
+                    paths.len()
+                ),
+            });
+        }
         // Discord renders an image inline from the attachment itself, so there is no separate photo
         // send to choose. The flag only decides which indicator is shown while it uploads.
         let activity = if options.as_photo {
@@ -1461,28 +1488,51 @@ impl Channel for DiscordChannel {
             tracing::debug!(conversation = %conversation, "upload indicator failed: {}", error);
         }
 
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|error| ChannelError::Delivery {
-                channel: self.id.as_str().to_string(),
-                message: format!("could not read {}: {error}", path.display()),
-            })?;
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        let attachments = [OutboundAttachment::from_bytes(name, bytes, 0)];
+        // Every file is read whole and held until the request is built, unlike Telegram's, which
+        // streams from the path. Ten files is ten buffers resident at once, which is what
+        // `MAX_ATTACHMENTS` bounds in practice as much as Discord's own rule does.
+        let mut attachments = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|error| ChannelError::Delivery {
+                    channel: self.id.as_str().to_string(),
+                    message: format!("could not read {}: {error}", path.display()),
+                })?;
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            // The third argument is the attachment's id, which Discord uses to match a part of the
+            // multipart body to its descriptor. Enumerated rather than fixed: reusing one id for
+            // every file leaves the request describing a single attachment several times over.
+            attachments.push(OutboundAttachment::from_bytes(name, bytes, index as u64));
+        }
         let mentions = self.allowed_mentions();
+        let reply_to = options
+            .send
+            .reply_to
+            .as_deref()
+            .map(|raw| self.parse_message(raw))
+            .transpose()?;
 
         let mut request = self
             .http
             .create_message(channel_id)
             .attachments(&attachments)
             .allowed_mentions(Some(&mentions));
+        if let Some(reply_to) = reply_to {
+            request = request.reply(reply_to);
+        }
         // A caption is a message body, so a link in one answers to the same switch a link in a
         // message does. Skipped rather than set to empty when a preview *is* wanted, matching
         // `send_text`: on a create, leaving flags unset is already "no suppression".
-        if let Some(flags) = Self::outbound_flags(options.link_preview) {
+        let mut flags =
+            Self::outbound_flags(options.send.link_preview).unwrap_or_else(MessageFlags::empty);
+        if options.send.silent {
+            flags |= MessageFlags::SUPPRESS_NOTIFICATIONS;
+        }
+        if !flags.is_empty() {
             request = request.flags(flags);
         }
         // Refused rather than truncated, for the same reason as Telegram's: the caption belongs to
@@ -2162,6 +2212,23 @@ impl Channel for DiscordChannel {
 mod tests {
     use super::*;
     use crate::config::secret::Secret;
+
+    #[tokio::test]
+    async fn more_attachments_than_discord_takes_are_refused_before_any_read() {
+        // twilight does not validate the count, so without this check Discord answers a generic
+        // rejection only after every file has been read into memory and uploaded.
+        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        let conversation = ConversationId::parse("discord:1").expect("valid");
+        let paths: Vec<PathBuf> = (0..=MAX_ATTACHMENTS)
+            .map(|index| PathBuf::from(format!("/tmp/{index}.png")))
+            .collect();
+        let error = channel
+            .send_files(&conversation, &paths, None, &FileOptions::default())
+            .await
+            .expect_err("an over-long attachment list must be refused");
+        let message = error.to_string();
+        assert!(message.contains("10"), "{message}");
+    }
 
     #[test]
     fn an_edit_states_the_preview_choice_in_both_directions() {

@@ -587,7 +587,7 @@ impl OutboundSink for BridgeSink {
     async fn send_file(
         &self,
         conversation: &str,
-        path: &std::path::Path,
+        paths: &[std::path::PathBuf],
         caption: Option<&str>,
         options: FileOptions,
     ) -> std::result::Result<Vec<String>, SinkError> {
@@ -597,6 +597,14 @@ impl OutboundSink for BridgeSink {
             .resolve(&conversation)
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         let capabilities = channel.capabilities();
+        // The trait promises channels a non-empty list, so it is enforced once here rather than in
+        // each connector. Without it a channel that does not index its input, as Discord's does
+        // not, quietly sends a caption-only message and reports a file delivered.
+        if paths.is_empty() {
+            return Err(SinkError::Delivery(
+                "no files were given to send".to_string(),
+            ));
+        }
         if options.as_photo && !capabilities.photos {
             return Err(SinkError::Delivery(format!(
                 "channel {} cannot send photos",
@@ -610,11 +618,11 @@ impl OutboundSink for BridgeSink {
             )));
         }
         let sent = channel
-            .send_file(&conversation, path, caption, &options)
+            .send_files(&conversation, paths, caption, &options)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
         self.note_sent(&conversation, channel.platform()).await;
-        tracing::info!(conversation = %conversation, "the agent sent a file");
+        tracing::info!(conversation = %conversation, files = paths.len(), "the agent sent a file");
         Ok(sent)
     }
 

@@ -594,10 +594,10 @@ mod tests {
             Ok(vec!["m1".to_string()])
         }
 
-        async fn send_file(
+        async fn send_files(
             &self,
             _conversation: &ConversationId,
-            _path: &std::path::Path,
+            _paths: &[std::path::PathBuf],
             _caption: Option<&str>,
             _options: &crate::channel::FileOptions,
         ) -> Result<Vec<String>, ChannelError> {

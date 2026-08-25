@@ -12,7 +12,7 @@
 pub mod discord;
 pub mod telegram;
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -789,21 +789,27 @@ pub struct SendOptions {
     pub link_preview: bool,
 }
 
-/// Per-file knobs, separate from [`SendOptions`] because sending a file is not sending a message
-/// and the two share only the body.
+/// Per-file knobs.
 ///
-/// A struct rather than two `bool` parameters. `send_file(.., true, false)` reads as nothing at
-/// all, and the compiler cannot tell a transposed pair from a correct one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Composes [`SendOptions`] rather than repeating it. A caption is a message body, so everything
+/// that applies to one applies here: a file can answer somebody, arrive without a sound, and carry
+/// a preview card. Duplicating the fields meant `link_preview` existed twice with two doc comments
+/// to keep in step, and `reply_to` and `silent` existed nowhere at all despite both platforms
+/// accepting them on a file.
+///
+/// A struct rather than loose parameters. `send_files(.., true, false)` reads as nothing at all,
+/// and the compiler cannot tell a transposed pair from a correct one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileOptions {
-    /// Send as a viewable photo rather than as a document. Lossy on Telegram, which re-encodes.
-    pub as_photo: bool,
-    /// Let a link in the caption expand into a preview card.
+    /// Send as viewable photos rather than as documents. Lossy on Telegram, which re-encodes.
     ///
-    /// Discord-only in effect. Telegram's `sendPhoto` and `sendDocument` take no
-    /// `link_preview_options`, so a caption's links never expand there whatever this says; the
-    /// tool description says so rather than letting the agent conclude the switch is broken.
-    pub link_preview: bool,
+    /// One flag for the whole call, not one per file, and that is load bearing on Telegram: an
+    /// album may not mix documents with photos, so a per-file choice could describe a group the
+    /// platform will not accept.
+    pub as_photo: bool,
+    /// Everything a plain message send takes. `link_preview` reaches only Discord here; Telegram's
+    /// file endpoints carry no `link_preview_options`, so a caption's links never expand there.
+    pub send: SendOptions,
 }
 
 /// What a channel can do, so callers can degrade instead of failing.
@@ -901,11 +907,19 @@ pub trait Channel: Send + Sync + 'static {
         options: &SendOptions,
     ) -> Result<Vec<String>, ChannelError>;
 
-    /// Deliver a local file.
-    async fn send_file(
+    /// Deliver local files, grouped into one post where the platform can do that.
+    ///
+    /// Returns one id per message that resulted, which is usually one: both platforms here group
+    /// several files into a single post. A platform that cannot group is free to send one message
+    /// per file and return several ids, so the caller never has to ask whether albums are
+    /// supported.
+    ///
+    /// `paths` is non-empty. Each platform enforces its own ceiling on how many it will take, and
+    /// refuses before opening anything rather than partway through an upload.
+    async fn send_files(
         &self,
         conversation: &ConversationId,
-        path: &Path,
+        paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError>;

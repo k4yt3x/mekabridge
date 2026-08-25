@@ -34,17 +34,23 @@ Text too long for one platform message is split, and each part previews its own 
 
 ## `send_file`
 
-Send a local file.
+Send local files.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
 | `conversation` | string | Target |
-| `path` | string | Absolute path readable by the bridge process |
-| `caption` | string, optional | Text shown alongside |
-| `as_photo` | bool, optional | Show inline rather than as a download |
+| `paths` | string[] | Absolute paths readable by the bridge process. Up to ten |
+| `caption` | string, optional | Text shown alongside, once for the whole group |
+| `as_photo` | bool, optional | Show inline rather than as a download. Applies to all of them |
+| `reply_to` | string, optional | Message id to reply to |
+| `silent` | bool, optional | Deliver without a notification sound |
 | `link_preview` | bool, optional | Expand a link in the caption. Discord only |
 
-Relative paths and missing files are rejected before the platform is contacted, so the agent gets "not a readable file" instead of an opaque upload error.
+Several paths arrive as **one grouped post**: an album on Telegram, a single message carrying every attachment on Discord. Ten is the ceiling on both, and more than that is refused naming the number rather than sent as a partial group.
+
+Relative paths and missing files are rejected before the platform is contacted, so the agent gets "not a readable file" instead of an opaque upload error. Every path is checked before any is sent, so one bad path in a group of five delivers nothing rather than most of an album, and the message names the path that was wrong.
+
+`as_photo` governs the whole call rather than each file, because Telegram will not group documents together with photos, and a per-file choice could describe a group it would refuse.
 
 `link_preview` does nothing on Telegram, and is accepted rather than refused there. `sendPhoto` and `sendDocument` carry no `link_preview_options` at all, so a caption's links never expand into a card; refusing the call would make the agent handle a platform difference it cannot see from the schema, for a request that is harmless.
 

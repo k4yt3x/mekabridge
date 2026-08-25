@@ -185,6 +185,10 @@ Announced in the envelope with a handle, fetched only when the agent asks, as ev
 
 Stickers arrive as a note rather than a file. An animated one says so, since it is not viewable.
 
+Outbound, `send_file` takes up to ten paths and puts them on **one message**, which is Discord's equivalent of a Telegram album; the caption becomes that message's body. Discord does not distinguish photos from documents on the way out, so `as_photo` only picks the indicator shown while the upload runs, and an image is rendered inline either way.
+
+Each file is read whole into memory to be uploaded, unlike Telegram's, which streams from the path, so ten large files are ten buffers held at once.
+
 ## Without the message content intent
 
 Setting `message_content = false` is supported and coherent, but narrower than it sounds. Discord blanks `content`, `embeds`, and `attachments` on every server message **except** those that mention the bot, replies to it, and direct messages.

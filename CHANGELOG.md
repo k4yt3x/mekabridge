@@ -10,10 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `link_preview` on `send_message`, `edit_message` and `send_file`; the agent decides per message.
+- `send_file` takes up to ten paths and delivers them as one album, or one Discord message.
+- `send_file` takes `reply_to` and `silent`, which both platforms accepted all along.
 
 ### Removed
 
 - **Breaking:** `[[channels.*]].link_preview`; a config still setting it is refused by name.
+- **Breaking:** `send_file` takes `paths` rather than `path`, even for a single file.
 
 ## [0.7.0] - 2026-08-24
 

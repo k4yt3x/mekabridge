@@ -91,7 +91,7 @@ pub trait OutboundSink: Send + Sync + 'static {
     async fn send_file(
         &self,
         conversation: &str,
-        path: &std::path::Path,
+        paths: &[std::path::PathBuf],
         caption: Option<&str>,
         options: FileOptions,
     ) -> Result<Vec<String>, SinkError>;
@@ -391,8 +391,11 @@ pub struct SendMessageArgs {
 pub struct SendFileArgs {
     /// Conversation to send to.
     pub conversation: String,
-    /// Absolute path to a file readable by the bridge process.
-    pub path: String,
+    /// Absolute paths to files readable by the bridge process.
+    ///
+    /// Several are delivered as one grouped post where the platform can do that: an album on
+    /// Telegram, one message carrying every attachment on Discord. Ten is the ceiling on both.
+    pub paths: Vec<String>,
     /// Text shown alongside the file.
     #[serde(default)]
     pub caption: Option<String>,
@@ -404,6 +407,12 @@ pub struct SendFileArgs {
     /// preview to a file's caption, so it is ignored there rather than refused.
     #[serde(default)]
     pub link_preview: bool,
+    /// Id of a message to reply to, quoting it so it is clear what is being answered.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Deliver without a notification sound.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -849,10 +858,13 @@ impl BridgeMcpServer {
 
     /// Send a file or image.
     #[tool(
-        description = "Send a file from the local filesystem to a conversation. Use this to deliver \
+        description = "Send files from the local filesystem to a conversation. Use this to deliver \
                        something you produced, such as a report, an archive, or a rendered chart. \
                        Set `as_photo` for images you want shown inline rather than offered as a \
-                       download.",
+                       download. Several paths arrive as one grouped post, an album on Telegram and \
+                       a single message on Discord, with the caption shown once underneath; ten is \
+                       the most either platform takes. `as_photo` applies to all of them, because \
+                       Telegram will not group documents together with photos.",
         annotations(title = "Send file", read_only_hint = true, open_world_hint = true)
     )]
     async fn send_file(
@@ -869,30 +881,46 @@ impl BridgeMcpServer {
         args: SendFileArgs,
         session: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        let path = PathBuf::from(&args.path);
-        if !path.is_absolute() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "`path` must be absolute, got {:?}.",
-                args.path
-            ))]));
+        if args.paths.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "`paths` is empty; nothing was sent. Name at least one file.",
+            )]));
         }
-        // Checked here rather than left to the platform so the agent gets "no such file" instead of
-        // an opaque upload failure from the Telegram API.
-        if !path.is_file() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "{} is not a readable file.",
-                path.display()
-            ))]));
+        // Each path is named in its own error rather than reporting "a path was wrong", because
+        // with several of them the agent otherwise has to guess which one it got wrong.
+        let mut paths = Vec::with_capacity(args.paths.len());
+        for raw in &args.paths {
+            let path = PathBuf::from(raw);
+            if !path.is_absolute() {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "every path must be absolute, got {raw:?}."
+                ))]));
+            }
+            // Checked here rather than left to the platform so the agent gets "no such file"
+            // instead of an opaque upload failure from the Telegram API. Every path is checked
+            // before any is sent, so a bad one in a group of five sends nothing at all rather than
+            // leaving the chat with a partial album.
+            if !path.is_file() {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{} is not a readable file.",
+                    path.display()
+                ))]));
+            }
+            paths.push(path);
         }
         match self
             .sink
             .send_file(
                 &args.conversation,
-                &path,
+                &paths,
                 args.caption.as_deref(),
                 FileOptions {
                     as_photo: args.as_photo,
-                    link_preview: args.link_preview,
+                    send: SendOptions {
+                        reply_to: args.reply_to.clone(),
+                        silent: args.silent,
+                        link_preview: args.link_preview,
+                    },
                 },
             )
             .await
@@ -1881,7 +1909,7 @@ mod tests {
         async fn send_file(
             &self,
             _conversation: &str,
-            _path: &std::path::Path,
+            _paths: &[std::path::PathBuf],
             _caption: Option<&str>,
             options: FileOptions,
         ) -> Result<Vec<String>, SinkError> {
@@ -2426,10 +2454,12 @@ mod tests {
             .send_file_inner(
                 SendFileArgs {
                     conversation: "telegram:1".to_string(),
-                    path: "report.pdf".to_string(),
+                    paths: vec!["report.pdf".to_string()],
                     caption: None,
                     as_photo: false,
                     link_preview: false,
+                    reply_to: None,
+                    silent: false,
                 },
                 None,
             )
@@ -2446,10 +2476,12 @@ mod tests {
             .send_file_inner(
                 SendFileArgs {
                     conversation: "telegram:1".to_string(),
-                    path: "/nonexistent/mekabridge/report.pdf".to_string(),
+                    paths: vec!["/nonexistent/mekabridge/report.pdf".to_string()],
                     caption: None,
                     as_photo: false,
                     link_preview: false,
+                    reply_to: None,
+                    silent: false,
                 },
                 None,
             )
@@ -2598,6 +2630,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_path_list_is_refused_rather_than_sent_as_nothing() {
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .send_file_inner(
+                SendFileArgs {
+                    conversation: "telegram:1".to_string(),
+                    paths: Vec::new(),
+                    caption: None,
+                    as_photo: false,
+                    link_preview: false,
+                    reply_to: None,
+                    silent: false,
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(sink.files.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bad_path_in_a_group_names_itself_and_sends_nothing() {
+        // Every path is checked before any is sent, so one typo among five leaves the chat with
+        // nothing rather than a partial album, and the message says which path was wrong.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let good = directory.path().join("chart.png");
+        std::fs::write(&good, b"png").expect("write");
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .send_file_inner(
+                SendFileArgs {
+                    conversation: "telegram:1".to_string(),
+                    paths: vec![
+                        good.to_string_lossy().into_owned(),
+                        "/nonexistent/mekabridge/missing.png".to_string(),
+                    ],
+                    caption: None,
+                    as_photo: false,
+                    link_preview: false,
+                    reply_to: None,
+                    silent: false,
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text_of(&result).contains("missing.png"),
+            "{:?}",
+            text_of(&result)
+        );
+        assert!(
+            sink.files.lock().expect("lock").is_empty(),
+            "a group with one bad path must send nothing at all"
+        );
+    }
+
+    #[tokio::test]
     async fn a_file_carries_both_of_its_switches() {
         // Two bools travelling together, which is why they are a struct: a transposition here would
         // send a document where a photo was asked for and be invisible to the compiler.
@@ -2612,10 +2710,12 @@ mod tests {
             .send_file_inner(
                 SendFileArgs {
                     conversation: "telegram:1".to_string(),
-                    path: path.to_string_lossy().into_owned(),
+                    paths: vec![path.to_string_lossy().into_owned()],
                     caption: Some("see https://example.com".to_string()),
                     as_photo: true,
                     link_preview: true,
+                    reply_to: None,
+                    silent: false,
                 },
                 None,
             )
@@ -2624,7 +2724,10 @@ mod tests {
         let files = sink.files.lock().expect("lock");
         assert_eq!(files.as_slice(), [FileOptions {
             as_photo: true,
-            link_preview: true
+            send: SendOptions {
+                link_preview: true,
+                ..SendOptions::default()
+            }
         }]);
     }
 

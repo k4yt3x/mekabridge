@@ -186,7 +186,13 @@ This matters more than it sounds. Telegram's cloud Bot API caps `getFile` at 20 
 
 ### Sending
 
-Outbound, the agent uses `send_file` with an absolute path, optionally `as_photo` for images it wants shown inline.
+Outbound, the agent uses `send_file` with absolute paths, optionally `as_photo` for images it wants shown inline.
+
+Two to ten paths become one album, through `sendMediaGroup`. A single path keeps the ordinary `sendPhoto` / `sendDocument` route, because the album endpoint requires at least two items and one is an API error.
+
+The caption is carried by exactly one item of the album, which is not an implementation shortcut but the only way it works. The Bot API has **no** group caption: what renders underneath an album is emergent behaviour in the official clients when a single item has one. Caption every item and the clients render no group caption at all, so it looks as though the caption were dropped while each file quietly keeps a copy.
+
+`as_photo` governs the whole album, because Telegram refuses one that mixes documents with photos.
 
 ## Link previews
 

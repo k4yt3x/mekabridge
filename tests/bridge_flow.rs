@@ -856,24 +856,32 @@ impl Channel for MockChannel {
         Ok(vec![format!("m{}", sent.len())])
     }
 
-    async fn send_file(
+    async fn send_files(
         &self,
         conversation: &ConversationId,
-        path: &std::path::Path,
+        paths: &[std::path::PathBuf],
         _caption: Option<&str>,
         options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
         self.previews
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(options.link_preview);
+            .push(options.send.link_preview);
         let mut sent = self
             .sent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One entry naming every path, so a test can tell one grouped send from several.
         sent.push((
             conversation.as_str().to_string(),
-            format!("<file {}>", path.display()),
+            format!(
+                "<files {}>",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         ));
         Ok(vec!["f1".to_string()])
     }
@@ -4325,6 +4333,38 @@ async fn an_unknown_attachment_handle_is_a_clear_error() {
 }
 
 #[tokio::test]
+async fn a_file_send_with_no_files_is_refused_by_the_sink() {
+    // The contract every channel is handed. Enforced once here rather than in each connector,
+    // because a channel that does not index its input, as Discord's does not, would otherwise send
+    // a caption-only message and report a file delivered.
+    let store = Store::open_in_memory().await.expect("store");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_with_storage(
+        store,
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::new(Presence::default()),
+    );
+
+    let error = sink
+        .send_file("mock:1", &[], None, FileOptions::default())
+        .await
+        .expect_err("an empty file list must be refused");
+    assert!(error.to_string().contains("no files"), "got: {error}");
+    assert!(
+        channel
+            .sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "nothing should have reached the channel"
+    );
+}
+
+#[tokio::test]
 async fn the_preview_switch_survives_the_whole_outbound_path() {
     // The unit tests stop at the sink. This one runs the real `BridgeSink` down to a `Channel`, so
     // it covers the layer between: the sink resolves the conversation, checks capabilities and
@@ -4350,19 +4390,42 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
     .expect("send succeeds");
 
     let directory = tempfile::tempdir().expect("temp dir");
-    let path = directory.path().join("chart.png");
-    std::fs::write(&path, b"png").expect("write");
+    let first = directory.path().join("chart.png");
+    let second = directory.path().join("table.png");
+    std::fs::write(&first, b"png").expect("write");
+    std::fs::write(&second, b"png").expect("write");
+    // Two files in one call, so this also covers the sink handing the whole group to the channel
+    // rather than the first of it.
     sink.send_file(
         "mock:1",
-        &path,
+        &[first.clone(), second.clone()],
         Some("see https://example.com"),
         FileOptions {
             as_photo: false,
-            link_preview: true,
+            send: SendOptions {
+                link_preview: true,
+                ..SendOptions::default()
+            },
         },
     )
     .await
     .expect("file send succeeds");
+
+    let sent = channel
+        .sent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let files = sent
+        .iter()
+        .find(|(_, body)| body.starts_with("<files"))
+        .map(|(_, body)| body.clone())
+        .expect("the file send reached the channel");
+    assert!(files.contains("chart.png"), "{files}");
+    assert!(
+        files.contains("table.png"),
+        "only the first path reached the channel: {files}"
+    );
+    drop(sent);
 
     assert_eq!(
         channel
@@ -4455,9 +4518,14 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
         Arc::clone(&presence),
     );
 
-    sink.send_file("mock:1", &path, None, FileOptions::default())
-        .await
-        .expect("sends");
+    sink.send_file(
+        "mock:1",
+        std::slice::from_ref(&path),
+        None,
+        FileOptions::default(),
+    )
+    .await
+    .expect("sends");
     assert!(
         presence.has_replied(&ConversationId::parse("mock:1").expect("valid")),
         "a file counts as a reply for indicator purposes"

@@ -599,7 +599,7 @@ mod tests {
             _conversation: &ConversationId,
             _path: &std::path::Path,
             _caption: Option<&str>,
-            _as_photo: bool,
+            _options: &crate::channel::FileOptions,
         ) -> Result<Vec<String>, ChannelError> {
             Ok(vec!["f1".to_string()])
         }

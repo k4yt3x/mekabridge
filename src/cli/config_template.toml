@@ -120,9 +120,6 @@ allowed_users = [123456789]
 # since Telegram refuses any of it unless the bot is an admin with the matching right. Turn it off
 # if the bot is an admin only so that it can read group messages.
 # admin_tools = false
-# Show a preview card for links the agent sends. Off by default: the agent usually cites links
-# rather than making one the subject of a message, and a card on each part of a split reply is noise.
-# link_preview = true
 # Turn Telegram's privacy mode off (/setprivacy in @BotFather, then re-add the bot to each group).
 # With it on, Telegram withholds every group message that does not mention the bot, so a muted
 # conversation has nothing to record and read_history comes back empty exactly when the agent needs
@@ -170,8 +167,6 @@ allowed_users = [123456789]
 # # writing to a room it does not own, and @everyone in a large server is a loud mistake to make.
 # # mention_roles = true
 # # mention_everyone = true
-# # Show a preview card for links the agent sends. Off by default, as on Telegram.
-# # link_preview = true
 
 [log]
 level = "info"

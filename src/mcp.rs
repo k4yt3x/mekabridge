@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::{
     channel::{
-        ChannelCapabilities, ChatSettings, MemberAction, MemberCoverage, MemberInfo, MemberListing,
-        MemberRight, SendOptions,
+        ChannelCapabilities, ChatSettings, FileOptions, MemberAction, MemberCoverage, MemberInfo,
+        MemberListing, MemberRight, SendOptions,
     },
     store::{Policy, UnseenSummary},
 };
@@ -93,7 +93,7 @@ pub trait OutboundSink: Send + Sync + 'static {
         conversation: &str,
         path: &std::path::Path,
         caption: Option<&str>,
-        as_photo: bool,
+        options: FileOptions,
     ) -> Result<Vec<String>, SinkError>;
 
     /// Attach a reaction to a message, or clear it with `None`.
@@ -110,6 +110,7 @@ pub trait OutboundSink: Send + Sync + 'static {
         conversation: &str,
         message_id: &str,
         markdown: &str,
+        link_preview: bool,
     ) -> Result<(), SinkError>;
 
     /// Remove a message.
@@ -376,6 +377,14 @@ pub struct SendMessageArgs {
     /// Deliver without a notification sound.
     #[serde(default)]
     pub silent: bool,
+    /// Expand the first link into a preview card. Off unless asked for; turn it on when the link
+    /// is the point of the message rather than a reference.
+    ///
+    /// Text too long for one platform message is split, and each part previews its own first link,
+    /// so a long answer carrying several links produces several cards. Send the link on its own if
+    /// you want exactly one.
+    #[serde(default)]
+    pub link_preview: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -391,6 +400,10 @@ pub struct SendFileArgs {
     /// the platform may recompress them.
     #[serde(default)]
     pub as_photo: bool,
+    /// Expand a link in the caption into a preview card. Discord only; Telegram's API attaches no
+    /// preview to a file's caption, so it is ignored there rather than refused.
+    #[serde(default)]
+    pub link_preview: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -413,6 +426,10 @@ pub struct EditMessageArgs {
     pub message_id: String,
     /// Replacement body, written as Markdown. It replaces the message entirely.
     pub text: String,
+    /// Expand the first link into a preview card. Applies to the revision, so leaving it off
+    /// removes a card the original had.
+    #[serde(default)]
+    pub link_preview: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -813,6 +830,7 @@ impl BridgeMcpServer {
         let options = SendOptions {
             reply_to: args.reply_to,
             silent: args.silent,
+            link_preview: args.link_preview,
         };
         match self
             .sink
@@ -872,7 +890,10 @@ impl BridgeMcpServer {
                 &args.conversation,
                 &path,
                 args.caption.as_deref(),
-                args.as_photo,
+                FileOptions {
+                    as_photo: args.as_photo,
+                    link_preview: args.link_preview,
+                },
             )
             .await
         {
@@ -971,7 +992,12 @@ impl BridgeMcpServer {
         }
         match self
             .sink
-            .edit_message(&args.conversation, &args.message_id, &args.text)
+            .edit_message(
+                &args.conversation,
+                &args.message_id,
+                &args.text,
+                args.link_preview,
+            )
             .await
         {
             Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -1800,7 +1826,8 @@ mod tests {
         no_presence: bool,
         sent: Mutex<Vec<(String, String, SendOptions)>>,
         reactions: Mutex<Vec<(String, String, Option<String>)>>,
-        edits: Mutex<Vec<(String, String, String)>>,
+        edits: Mutex<Vec<(String, String, String, bool)>>,
+        files: Mutex<Vec<FileOptions>>,
         deletes: Mutex<Vec<(String, String)>>,
         policies: Mutex<Vec<RecordedPolicy>>,
         history: Vec<HistoryEntry>,
@@ -1856,8 +1883,9 @@ mod tests {
             _conversation: &str,
             _path: &std::path::Path,
             _caption: Option<&str>,
-            _as_photo: bool,
+            options: FileOptions,
         ) -> Result<Vec<String>, SinkError> {
+            self.files.lock().expect("lock").push(options);
             Ok(vec!["2001".to_string()])
         }
 
@@ -1887,6 +1915,7 @@ mod tests {
             conversation: &str,
             message_id: &str,
             markdown: &str,
+            link_preview: bool,
         ) -> Result<(), SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
@@ -1899,6 +1928,7 @@ mod tests {
                 conversation.to_string(),
                 message_id.to_string(),
                 markdown.to_string(),
+                link_preview,
             ));
             Ok(())
         }
@@ -2227,6 +2257,7 @@ mod tests {
                     text: "hello".to_string(),
                     reply_to: None,
                     silent: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2240,7 +2271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_passes_reply_and_silent_through() {
+    async fn send_message_passes_every_per_send_knob_through() {
         let (server, sink) = server_with(FakeSink {
             conversations: vec![summary("telegram:1")],
             ..FakeSink::default()
@@ -2252,6 +2283,7 @@ mod tests {
                     text: "hi".to_string(),
                     reply_to: Some("42".to_string()),
                     silent: true,
+                    link_preview: true,
                 },
                 None,
             )
@@ -2261,7 +2293,33 @@ mod tests {
         assert_eq!(sent[0].2, SendOptions {
             reply_to: Some("42".to_string()),
             silent: true,
+            link_preview: true,
         });
+    }
+
+    #[tokio::test]
+    async fn a_send_that_asks_for_nothing_gets_no_preview() {
+        // The default an omitted argument lands on, and the one that matters: a card on every part
+        // of a split answer buries the answer, so silence has to mean off rather than platform
+        // default.
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        let args: SendMessageArgs = serde_json::from_value(serde_json::json!({
+            "conversation": "telegram:1",
+            "text": "see https://example.com",
+        }))
+        .expect("the schema defaults every optional field");
+        server
+            .send_message_inner(args, None)
+            .await
+            .expect("tool runs");
+        let sent = sink.sent.lock().expect("lock");
+        assert!(
+            !sent[0].2.link_preview,
+            "an unasked-for preview was requested"
+        );
     }
 
     #[tokio::test]
@@ -2279,6 +2337,7 @@ mod tests {
                     text: "hello".to_string(),
                     reply_to: None,
                     silent: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2300,6 +2359,7 @@ mod tests {
                     text: "hello".to_string(),
                     reply_to: None,
                     silent: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2325,6 +2385,7 @@ mod tests {
                     text: "   ".to_string(),
                     reply_to: None,
                     silent: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2348,6 +2409,7 @@ mod tests {
                     text: "hello".to_string(),
                     reply_to: None,
                     silent: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2367,6 +2429,7 @@ mod tests {
                     path: "report.pdf".to_string(),
                     caption: None,
                     as_photo: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2386,6 +2449,7 @@ mod tests {
                     path: "/nonexistent/mekabridge/report.pdf".to_string(),
                     caption: None,
                     as_photo: false,
+                    link_preview: false,
                 },
                 None,
             )
@@ -2499,6 +2563,7 @@ mod tests {
                 conversation: "telegram:1".to_string(),
                 message_id: "4471".to_string(),
                 text: "actually, **tomorrow**".to_string(),
+                link_preview: false,
             }))
             .await
             .expect("tool runs");
@@ -2506,8 +2571,61 @@ mod tests {
         assert_eq!(sink.edits.lock().expect("lock").as_slice(), [(
             "telegram:1".to_string(),
             "4471".to_string(),
-            "actually, **tomorrow**".to_string()
+            "actually, **tomorrow**".to_string(),
+            false
         )]);
+    }
+
+    #[tokio::test]
+    async fn an_edit_carries_its_own_preview_decision() {
+        // The revision is the message now, so the switch describes it rather than the original.
+        // Without this reaching the sink, an edit could never remove a card the first send drew.
+        let (server, sink) = server_with(FakeSink::default());
+        server
+            .edit_message(Parameters(EditMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_id: "4471".to_string(),
+                text: "see https://example.com".to_string(),
+                link_preview: true,
+            }))
+            .await
+            .expect("tool runs");
+        let edits = sink.edits.lock().expect("lock");
+        assert!(
+            edits[0].3,
+            "the edit's preview request never reached the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_carries_both_of_its_switches() {
+        // Two bools travelling together, which is why they are a struct: a transposition here would
+        // send a document where a photo was asked for and be invisible to the compiler.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("chart.png");
+        std::fs::write(&path, b"png").expect("write");
+        let (server, sink) = server_with(FakeSink {
+            conversations: vec![summary("telegram:1")],
+            ..FakeSink::default()
+        });
+        server
+            .send_file_inner(
+                SendFileArgs {
+                    conversation: "telegram:1".to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    caption: Some("see https://example.com".to_string()),
+                    as_photo: true,
+                    link_preview: true,
+                },
+                None,
+            )
+            .await
+            .expect("tool runs");
+        let files = sink.files.lock().expect("lock");
+        assert_eq!(files.as_slice(), [FileOptions {
+            as_photo: true,
+            link_preview: true
+        }]);
     }
 
     #[tokio::test]
@@ -2520,6 +2638,7 @@ mod tests {
                 conversation: "telegram:1".to_string(),
                 message_id: "4471".to_string(),
                 text: "   ".to_string(),
+                link_preview: false,
             }))
             .await
             .expect("tool runs");
@@ -2558,6 +2677,7 @@ mod tests {
                 conversation: "telegram:1".to_string(),
                 message_id: "4471".to_string(),
                 text: "too late".to_string(),
+                link_preview: false,
             }))
             .await
             .expect("tool runs");

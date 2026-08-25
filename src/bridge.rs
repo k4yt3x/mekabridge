@@ -30,7 +30,9 @@ use crate::{
         inbound::DrainContext,
         turn::{Presence, TurnRunner},
     },
-    channel::{Channel, ChannelRegistry, ChatKind, ConversationId, InboundEvent, SendOptions},
+    channel::{
+        Channel, ChannelRegistry, ChatKind, ConversationId, FileOptions, InboundEvent, SendOptions,
+    },
     config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
     mcp::{
@@ -587,7 +589,7 @@ impl OutboundSink for BridgeSink {
         conversation: &str,
         path: &std::path::Path,
         caption: Option<&str>,
-        as_photo: bool,
+        options: FileOptions,
     ) -> std::result::Result<Vec<String>, SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
@@ -595,20 +597,20 @@ impl OutboundSink for BridgeSink {
             .resolve(&conversation)
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         let capabilities = channel.capabilities();
-        if as_photo && !capabilities.photos {
+        if options.as_photo && !capabilities.photos {
             return Err(SinkError::Delivery(format!(
                 "channel {} cannot send photos",
                 conversation.channel()
             )));
         }
-        if !as_photo && !capabilities.files {
+        if !options.as_photo && !capabilities.files {
             return Err(SinkError::Delivery(format!(
                 "channel {} cannot send files",
                 conversation.channel()
             )));
         }
         let sent = channel
-            .send_file(&conversation, path, caption, as_photo)
+            .send_file(&conversation, path, caption, &options)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
         self.note_sent(&conversation, channel.platform()).await;
@@ -654,6 +656,7 @@ impl OutboundSink for BridgeSink {
         conversation: &str,
         message_id: &str,
         markdown: &str,
+        link_preview: bool,
     ) -> std::result::Result<(), SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
@@ -667,7 +670,7 @@ impl OutboundSink for BridgeSink {
             )));
         }
         channel
-            .edit_text(&conversation, message_id, markdown)
+            .edit_text(&conversation, message_id, markdown, link_preview)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
         // Deliberately not `note_sent`: revising a message is not new activity in the conversation,

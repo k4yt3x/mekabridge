@@ -68,9 +68,9 @@ use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        FetchedFile, ForwardOrigin, FoundMessage, InboundEvent, InboundMessage, MemberAction,
-        MemberCoverage, MemberInfo, MemberListing, MemberStatus, Platform, Presence, ReplyContext,
-        SendOptions, Sender,
+        FetchedFile, FileOptions, ForwardOrigin, FoundMessage, InboundEvent, InboundMessage,
+        MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberStatus, Platform, Presence,
+        ReplyContext, SendOptions, Sender,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -144,7 +144,6 @@ pub struct DiscordChannel {
     presence: bool,
     mention_everyone: bool,
     mention_roles: bool,
-    link_preview: bool,
     names: Arc<NameCache>,
     /// Who is online, accumulated from the gateway. Empty and unused unless `presence` is set.
     presences: Arc<PresenceCache>,
@@ -204,7 +203,6 @@ impl DiscordChannel {
             presence: config.presence,
             mention_everyone: config.mention_everyone,
             mention_roles: config.mention_roles,
-            link_preview: config.link_preview,
             names: NameCache::new(),
             presences: Arc::new(PresenceCache::default()),
             identity: tokio::sync::OnceCell::new(),
@@ -440,8 +438,21 @@ impl DiscordChannel {
         }
     }
 
-    const fn outbound_flags(&self) -> Option<MessageFlags> {
-        if self.link_preview {
+    /// Flags for an edit, which unlike a send must state the choice in both directions.
+    ///
+    /// Leaving flags off an edit keeps whatever the original send chose, so an edit asking for a
+    /// preview on a message sent without one would silently do nothing. `SUPPRESS_EMBEDS` is the
+    /// only flag `update_message` accepts, so writing the whole set cannot clobber anything else.
+    const fn edit_flags(link_preview: bool) -> MessageFlags {
+        if link_preview {
+            MessageFlags::empty()
+        } else {
+            MessageFlags::SUPPRESS_EMBEDS
+        }
+    }
+
+    const fn outbound_flags(link_preview: bool) -> Option<MessageFlags> {
+        if link_preview {
             None
         } else {
             Some(MessageFlags::SUPPRESS_EMBEDS)
@@ -1390,7 +1401,8 @@ impl Channel for DiscordChannel {
             .transpose()?;
         let mentions = self.allowed_mentions();
 
-        let mut flags = self.outbound_flags().unwrap_or_else(MessageFlags::empty);
+        let mut flags =
+            Self::outbound_flags(options.link_preview).unwrap_or_else(MessageFlags::empty);
         if options.silent {
             flags |= MessageFlags::SUPPRESS_NOTIFICATIONS;
         }
@@ -1435,12 +1447,12 @@ impl Channel for DiscordChannel {
         conversation: &ConversationId,
         path: &Path,
         caption: Option<&str>,
-        as_photo: bool,
+        options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
         let channel_id = self.target(conversation).await?;
         // Discord renders an image inline from the attachment itself, so there is no separate photo
         // send to choose. The flag only decides which indicator is shown while it uploads.
-        let activity = if as_photo {
+        let activity = if options.as_photo {
             Activity::SendingPhoto
         } else {
             Activity::SendingFile
@@ -1467,9 +1479,10 @@ impl Channel for DiscordChannel {
             .create_message(channel_id)
             .attachments(&attachments)
             .allowed_mentions(Some(&mentions));
-        // A caption is a message body, so a link in one should not sprout a preview card the
-        // operator turned off. Same suppression `send_text` applies.
-        if let Some(flags) = self.outbound_flags() {
+        // A caption is a message body, so a link in one answers to the same switch a link in a
+        // message does. Skipped rather than set to empty when a preview *is* wanted, matching
+        // `send_text`: on a create, leaving flags unset is already "no suppression".
+        if let Some(flags) = Self::outbound_flags(options.link_preview) {
             request = request.flags(flags);
         }
         // Refused rather than truncated, for the same reason as Telegram's: the caption belongs to
@@ -1638,6 +1651,7 @@ impl Channel for DiscordChannel {
         conversation: &ConversationId,
         message_id: &str,
         markdown: &str,
+        link_preview: bool,
     ) -> Result<(), ChannelError> {
         let channel_id = self.target(conversation).await?;
         let message_id = self.parse_message(message_id)?;
@@ -1658,10 +1672,16 @@ impl Channel for DiscordChannel {
             });
         };
         let mentions = self.allowed_mentions();
+        // Set unconditionally, unlike the send path, because an edit has to be able to *lift*
+        // suppression as well as apply it: leaving flags alone keeps whatever the original send
+        // chose, so an edit asking for a preview on a message sent without one would silently do
+        // nothing. `SUPPRESS_EMBEDS` is the only flag `update_message` accepts, so writing the
+        // whole set cannot clobber anything else.
         self.http
             .update_message(channel_id, message_id)
             .content(Some(body))
             .allowed_mentions(Some(&mentions))
+            .flags(Self::edit_flags(link_preview))
             .await
             .map_err(|error| self.delivery_error("editing the message", &error))?;
         Ok(())
@@ -2143,6 +2163,35 @@ mod tests {
     use super::*;
     use crate::config::secret::Secret;
 
+    #[test]
+    fn an_edit_states_the_preview_choice_in_both_directions() {
+        // Discord keeps a message's flags across an edit, so an edit that leaves them alone cannot
+        // lift a suppression the original send applied. Reverting `edit_flags` to "set only when
+        // suppressing" would compile and pass everything else while silently ignoring an agent
+        // that asked for a card on a message it had sent without one.
+        assert_eq!(
+            DiscordChannel::edit_flags(false),
+            MessageFlags::SUPPRESS_EMBEDS,
+            "an edit without a preview must say so rather than leave the flag alone"
+        );
+        assert_eq!(
+            DiscordChannel::edit_flags(true),
+            MessageFlags::empty(),
+            "an edit asking for a preview must clear the suppression, not skip the field"
+        );
+    }
+
+    #[test]
+    fn a_send_only_states_suppression_when_it_wants_it() {
+        // The opposite convention, and deliberate: a create has no prior flags to lift, so the
+        // absent case is already "no suppression" and writing an empty set would be noise.
+        assert_eq!(
+            DiscordChannel::outbound_flags(false),
+            Some(MessageFlags::SUPPRESS_EMBEDS)
+        );
+        assert_eq!(DiscordChannel::outbound_flags(true), None);
+    }
+
     fn channel_with(
         allowed_users: Vec<u64>,
         allowed_guilds: Vec<u64>,
@@ -2162,7 +2211,6 @@ mod tests {
             presence: false,
             mention_everyone: false,
             mention_roles: false,
-            link_preview: false,
         };
         DiscordChannel::new(ChannelId::new("discord"), &config).expect("constructs")
     }

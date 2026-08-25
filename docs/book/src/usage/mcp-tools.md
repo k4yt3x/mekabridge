@@ -22,10 +22,15 @@ Send a message to a person or group.
 | `text` | string | Body, written as Markdown |
 | `reply_to` | string, optional | Message id to reply to, from a header's `message:` line |
 | `silent` | bool, optional | Deliver without a notification sound |
+| `link_preview` | bool, optional | Expand the first link into a preview card. Off unless asked for |
 
 Returns the platform message ids produced. Long text is split, so there may be several.
 
 `reply_to` quotes the message being answered, which is worth doing in a busy group or when picking up something said a while ago. Only the first part of a split reply carries the quote; repeating it on every part is noise.
+
+`link_preview` is the agent's call per message rather than an operator setting, because the right answer is a property of the message: a link cited in passing wants no card, and a link that *is* the answer wants one. It defaults off.
+
+Text too long for one platform message is split, and each part previews its own first link, so a long answer carrying several links produces several cards. Suppressing all but one would mean guessing which part holds the link the agent meant, and guessing wrong drops a card that was explicitly asked for. Send the link on its own to get exactly one.
 
 ## `send_file`
 
@@ -37,8 +42,11 @@ Send a local file.
 | `path` | string | Absolute path readable by the bridge process |
 | `caption` | string, optional | Text shown alongside |
 | `as_photo` | bool, optional | Show inline rather than as a download |
+| `link_preview` | bool, optional | Expand a link in the caption. Discord only |
 
 Relative paths and missing files are rejected before the platform is contacted, so the agent gets "not a readable file" instead of an opaque upload error.
+
+`link_preview` does nothing on Telegram, and is accepted rather than refused there. `sendPhoto` and `sendDocument` carry no `link_preview_options` at all, so a caption's links never expand into a card; refusing the call would make the agent handle a platform difference it cannot see from the schema, for a request that is harmless.
 
 ## `react`
 
@@ -65,8 +73,11 @@ Replace the text of a message the agent sent.
 | `conversation` | string | Conversation the message is in |
 | `message_id` | string | Id returned by `send_message` |
 | `text` | string | Replacement body, as Markdown |
+| `link_preview` | bool, optional | Expand the first link in the revision. Off unless asked for |
 
 The new text replaces the old entirely. Correcting a reply in place is what a person does; the alternative is a second message saying "sorry, I meant".
+
+`link_preview` describes the revision, not the original, so an edit that leaves it off removes a card the original had. That is the useful reading: the edit is the message now.
 
 An edit is one message, so replacement text long enough to need splitting is refused rather than truncated. Telegram also declines to edit messages older than 48 hours, and passes that back verbatim.
 

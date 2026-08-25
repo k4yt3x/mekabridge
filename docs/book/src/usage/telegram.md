@@ -190,12 +190,13 @@ Outbound, the agent uses `send_file` with an absolute path, optionally `as_photo
 
 ## Link previews
 
-Telegram renders a preview card for the first link in a message. mekabridge disables this by default: the agent cites links as references far more often than it makes one the subject of a message, and a card on each part of a split reply is noise. Turn them back on per channel:
+Telegram renders a preview card for the first link in a message. The agent decides per message, with `link_preview` on `send_message` and `edit_message`; it defaults off, because the agent cites links as references far more often than it makes one the subject of a message, and a card on each part of a split reply is noise.
 
-```toml
-[[channels.telegram]]
-link_preview = true
-```
+There is no config key. It used to be one, which meant one answer for every message a channel would ever send, and the choice is really per message: a link dropped in passing wants no card, a link that *is* the answer wants one.
+
+The choice is sent explicitly in both directions rather than left to Telegram's default, which matters on an edit: an absent field would leave "the default" and "what the message already had" indistinguishable, so an edit asking for a card on a message sent without one might silently do nothing.
+
+`send_file` takes the same argument and Telegram ignores it. `sendPhoto` and `sendDocument` carry no `link_preview_options`, so a link in a caption never expands into a card whatever is asked for. Discord honours it there.
 
 ## Rate limits
 

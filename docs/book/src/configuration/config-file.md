@@ -195,7 +195,6 @@ One table per bot. Each platform gets its own array, so adding a platform never 
 | `allow_all` | `false` | Accept everyone, for a public or customer-service bot |
 | `admin_tools` | `true` | Offer the agent the group moderation tools |
 | `parse_mode` | `html` | `html` renders Markdown into Telegram's HTML subset; `none` sends the Markdown verbatim |
-| `link_preview` | `false` | Show a preview card for the first link in a message. Off because the agent usually cites links rather than making one the subject of a message |
 | `poll_timeout` | `30s` | `getUpdates` long-poll timeout. The HTTP client is sized from this, so raising it is safe |
 
 At least one of `allowed_users`, `allowed_chats`, or `allow_all` must be set. Startup fails otherwise, because a bot with an empty allowlist would accept messages from anyone who finds it, and that should be a decision rather than an oversight.
@@ -222,7 +221,6 @@ One table per bot, in its own array. Ids here are **strings**, because Discord s
 | `presence` | `false` | Track who is online, which needs the privileged Presence Intent. Off by default: it cannot be reached over HTTP, so an ungranted intent closes the gateway at startup |
 | `mention_everyone` | `false` | Let a message the agent writes ping `@everyone` or `@here` |
 | `mention_roles` | `false` | Let a message the agent writes ping a role |
-| `link_preview` | `false` | Show a preview card for links the agent sends |
 
 At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direct messages, which is not optional: anybody sharing a server with the bot can open one. It grants nothing inside a server, so a config naming only people is reachable by DM alone; startup warns when that is the case.
 

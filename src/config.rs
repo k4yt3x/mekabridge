@@ -303,8 +303,6 @@ pub struct TelegramConfig {
     /// should not silently acquire an agent that can ban people.
     pub admin_tools: bool,
     pub parse_mode: TelegramParseMode,
-    /// Whether a link in an outgoing message gets a preview card.
-    pub link_preview: bool,
     /// `getUpdates` long-poll timeout.
     pub poll_timeout: Duration,
 }
@@ -353,8 +351,6 @@ pub struct DiscordConfig {
     pub mention_everyone: bool,
     /// Allow an outgoing message to ping a role.
     pub mention_roles: bool,
-    /// Whether a link in an outgoing message gets a preview card.
-    pub link_preview: bool,
 }
 
 /// How Telegram messages are formatted on the wire.
@@ -649,8 +645,6 @@ struct FileTelegram {
     admin_tools: bool,
     #[serde(default = "default_telegram_parse_mode")]
     parse_mode: TelegramParseMode,
-    #[serde(default = "default_link_preview")]
-    link_preview: bool,
     #[serde(default = "default_poll_timeout", with = "humantime_serde")]
     poll_timeout: Duration,
 }
@@ -683,8 +677,6 @@ struct FileDiscord {
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: bool,
-    #[serde(default = "default_link_preview")]
-    link_preview: bool,
 }
 
 /// Parse a list of Discord snowflakes, naming the field and the offending value on failure.
@@ -918,7 +910,6 @@ impl FileConfig {
                     allow_all: telegram.allow_all,
                     admin_tools: telegram.admin_tools,
                     parse_mode: telegram.parse_mode,
-                    link_preview: telegram.link_preview,
                     poll_timeout: telegram.poll_timeout,
                 }),
             });
@@ -1017,7 +1008,6 @@ impl FileConfig {
                     presence: discord.presence,
                     mention_everyone: discord.mention_everyone,
                     mention_roles: discord.mention_roles,
-                    link_preview: discord.link_preview,
                 }),
             });
         }
@@ -1314,12 +1304,6 @@ const fn default_log_format() -> LogFormat {
     LogFormat::Text
 }
 
-/// Off by default. The agent cites links as references far more often than it makes one the subject
-/// of a message, and a card on each part of a split answer is noise.
-const fn default_link_preview() -> bool {
-    false
-}
-
 const fn default_telegram_parse_mode() -> TelegramParseMode {
     TelegramParseMode::Html
 }
@@ -1598,10 +1582,6 @@ token = \"meka-token\"
             panic!("the config under test declares one Telegram channel");
         };
         assert_eq!(telegram.parse_mode, TelegramParseMode::Html);
-        assert!(
-            !telegram.link_preview,
-            "link previews default off; the template and the docs both say so"
-        );
     }
 
     #[test]
@@ -1729,13 +1709,13 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn link_previews_can_be_turned_back_on() {
+    fn a_config_still_setting_link_preview_is_refused() {
+        // The key moved to the tool call, so an operator who set it would otherwise keep a config
+        // that parses and controls nothing, and read their own file as the explanation for
+        // previews they did not ask for.
         let raw = format!("{MINIMAL}link_preview = true\n");
-        let config = parse(&raw).expect("valid");
-        let PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {
-            panic!("the config under test declares one Telegram channel");
-        };
-        assert!(telegram.link_preview);
+        let error = parse(&raw).expect_err("a key that no longer exists must be refused");
+        assert!(error.to_string().contains("link_preview"), "got: {error}");
     }
 
     #[test]

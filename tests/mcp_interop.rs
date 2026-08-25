@@ -84,7 +84,7 @@ impl OutboundSink for RecordingSink {
         _conversation: &str,
         _path: &std::path::Path,
         _caption: Option<&str>,
-        _as_photo: bool,
+        _options: mekabridge::mcp::FileOptions,
     ) -> Result<Vec<String>, SinkError> {
         Ok(vec!["2001".to_string()])
     }
@@ -159,6 +159,7 @@ impl OutboundSink for RecordingSink {
         conversation: &str,
         message_id: &str,
         markdown: &str,
+        _link_preview: bool,
     ) -> Result<(), SinkError> {
         let mut edits = self
             .edits
@@ -601,6 +602,44 @@ async fn input_schemas_survive_negotiation() {
         .unwrap_or_default();
     assert!(required.contains(&"conversation"), "schema: {schema}");
     assert!(required.contains(&"text"), "schema: {schema}");
+
+    // The switch has to reach the wire, and has to reach it *optional*. A field schemars never
+    // emitted would leave the agent unable to ask for a preview at all, and one emitted as required
+    // would force every existing caller to start passing it. Neither shows up in a unit test of the
+    // handler, because both are decided by the derive on the way out.
+    for (tool_name, field) in [
+        ("send_message", "link_preview"),
+        ("edit_message", "link_preview"),
+        ("send_file", "link_preview"),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} is advertised"));
+        let schema = serde_json::to_value(&*tool.input_schema).expect("schema serializes");
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name} has an object schema"));
+        assert!(
+            properties.contains_key(field),
+            "{tool_name} does not advertise {field}: {schema}"
+        );
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&field),
+            "{tool_name} makes {field} mandatory: {schema}"
+        );
+    }
 
     client.cancel().await.expect("clean shutdown");
 }

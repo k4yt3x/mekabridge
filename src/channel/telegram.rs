@@ -41,9 +41,9 @@ use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        FetchedFile, ForwardOrigin, InboundEvent, InboundMessage, MemberAction, MemberCoverage,
-        MemberInfo, MemberListing, MemberRight, MemberStatus, Platform, ReplyContext, SendOptions,
-        Sender,
+        FetchedFile, FileOptions, ForwardOrigin, InboundEvent, InboundMessage, MemberAction,
+        MemberCoverage, MemberInfo, MemberListing, MemberRight, MemberStatus, Platform,
+        ReplyContext, SendOptions, Sender,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -89,7 +89,6 @@ pub struct TelegramChannel {
     allow_all: bool,
     admin_tools: bool,
     parse_mode: TelegramParseMode,
-    link_preview: bool,
     poll_timeout: std::time::Duration,
     /// Filled by [`Channel::run`] before the first update is read.
     identity: tokio::sync::OnceCell<BotIdentity>,
@@ -116,7 +115,6 @@ impl TelegramChannel {
             allow_all: config.allow_all,
             admin_tools: config.admin_tools,
             parse_mode: config.parse_mode,
-            link_preview: config.link_preview,
             poll_timeout: config.poll_timeout,
             identity: tokio::sync::OnceCell::new(),
         })
@@ -333,15 +331,47 @@ impl TelegramChannel {
             })
     }
 
-    /// Suppress the preview card Telegram would otherwise attach to a link.
-    const fn no_link_preview(&self) -> LinkPreviewOptions {
+    /// Whether Telegram should attach a preview card to a link in this message.
+    ///
+    /// Sent in both directions rather than omitted when a preview is wanted, which matters on
+    /// `editMessageText`: an absent field leaves Telegram to decide, and "the default" and "what
+    /// the message already had" are indistinguishable from here. An edit asking for a card on a
+    /// message sent without one would then silently do nothing, which is the failure Discord's
+    /// edit path sets flags unconditionally to avoid.
+    ///
+    /// Costs nothing on the send path. `is_disabled` is `skip_serializing_if`, so the enabled form
+    /// goes out as an empty object, which is what Telegram means by default options anyway.
+    const fn link_preview(enabled: bool) -> LinkPreviewOptions {
         LinkPreviewOptions {
-            is_disabled: true,
+            is_disabled: !enabled,
             url: None,
             prefer_small_media: false,
             prefer_large_media: false,
             show_above_text: false,
         }
+    }
+
+    /// Shape the edit request, separated from awaiting it so the shaping can be asserted on.
+    ///
+    /// `JsonRequest` derefs to its payload, so a test can read back what would go on the wire
+    /// without a bot token or a network. Worth extracting for one field because that field is the
+    /// one whose absence is invisible: a preview the agent asked for and did not get looks
+    /// identical to one it never asked for.
+    fn edit_request(
+        &self,
+        chat: ChatId,
+        message_id: MessageId,
+        body: String,
+        parse_mode: Option<ParseMode>,
+        link_preview: bool,
+    ) -> teloxide::requests::JsonRequest<teloxide::payloads::EditMessageText> {
+        let mut request = self
+            .bot
+            .edit_message_text(Recipient::Id(chat), message_id, body);
+        if let Some(parse_mode) = parse_mode {
+            request = request.parse_mode(parse_mode);
+        }
+        request.link_preview_options(Self::link_preview(link_preview))
     }
 
     /// Split agent Markdown into wire-ready message bodies.
@@ -597,9 +627,11 @@ impl Channel for TelegramChannel {
             if options.silent {
                 request = request.disable_notification(true);
             }
-            if !self.link_preview {
-                request = request.link_preview_options(self.no_link_preview());
-            }
+            // Per part, deliberately, unlike the reply quote below. A part is a whole message to
+            // Telegram, so suppressing all but one would need to know which one holds the link the
+            // agent meant; guessing wrong drops a card that was explicitly asked for, which is the
+            // worse failure. The tool description says each part previews its own first link.
+            request = request.link_preview_options(Self::link_preview(options.link_preview));
             // Only the first part quotes the message being replied to; repeating the quote on every
             // part of a long answer is noise.
             if index == 0
@@ -620,19 +652,24 @@ impl Channel for TelegramChannel {
         Ok(sent)
     }
 
+    /// `options.link_preview` is accepted and has no effect here, deliberately. The Bot API's
+    /// `sendPhoto` and `sendDocument` carry no `link_preview_options`, so a link in a caption never
+    /// expands into a card whatever is asked for. Refusing the call instead would make the agent
+    /// handle a platform difference it cannot see from the tool schema, for a request that is
+    /// harmless; the tool description states it so the absent card is not read as a bug.
     async fn send_file(
         &self,
         conversation: &ConversationId,
         path: &Path,
         caption: Option<&str>,
-        as_photo: bool,
+        options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
         let (chat, thread) = self.target(conversation)?;
 
         // Declared before the upload starts, because that is what the action is for: the docs say
         // to choose it by what the user is about to receive. A large file otherwise
         // transfers in complete silence.
-        let activity = if as_photo {
+        let activity = if options.as_photo {
             Activity::SendingPhoto
         } else {
             Activity::SendingFile
@@ -667,7 +704,7 @@ impl Channel for TelegramChannel {
         let parse_mode =
             matches!(self.parse_mode, TelegramParseMode::Html).then_some(ParseMode::Html);
 
-        let message = if as_photo {
+        let message = if options.as_photo {
             let mut request = self.bot.send_photo(Recipient::Id(chat), file);
             if let Some(caption) = caption_body {
                 request = request.caption(caption);
@@ -767,6 +804,7 @@ impl Channel for TelegramChannel {
         conversation: &ConversationId,
         message_id: &str,
         markdown: &str,
+        link_preview: bool,
     ) -> Result<(), ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
         let message_id = self.message_id(message_id)?;
@@ -794,16 +832,7 @@ impl Channel for TelegramChannel {
             });
         };
 
-        let mut request = self
-            .bot
-            .edit_message_text(Recipient::Id(chat), message_id, body.clone());
-        if let Some(parse_mode) = parse_mode {
-            request = request.parse_mode(parse_mode);
-        }
-        if !self.link_preview {
-            request = request.link_preview_options(self.no_link_preview());
-        }
-        request
+        self.edit_request(chat, message_id, body.clone(), parse_mode, link_preview)
             .await
             .map(|_| ())
             .map_err(|error| self.delivery_error(&error))
@@ -1518,6 +1547,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edit_states_the_preview_choice_on_the_wire() {
+        // The call site, not just the helper. Reverting this line to "send options only when
+        // suppressing" compiles, passes every other test, and reintroduces exactly the failure the
+        // unconditional form exists to prevent: an edit that asks for a card and silently gets
+        // whatever the message already had.
+        let channel = channel(vec![1], vec![]);
+        for wanted in [true, false] {
+            let request = channel.edit_request(
+                ChatId(1),
+                MessageId(42),
+                "see https://example.com".to_string(),
+                Some(ParseMode::Html),
+                wanted,
+            );
+            let options = request
+                .link_preview_options
+                .clone()
+                .unwrap_or_else(|| panic!("link_preview={wanted} left the field off the wire"));
+            assert_eq!(
+                options.is_disabled, !wanted,
+                "an edit asking for link_preview={wanted} did not say so"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preview_choice_is_stated_in_both_directions() {
+        // The enabled form has to be an explicit "default options" object rather than an absent
+        // field. `is_disabled` is `skip_serializing_if`, so it serialises to `{}`, which is what
+        // Telegram means by default and is distinguishable from sending nothing at all. Sending
+        // nothing on an edit leaves Telegram to choose between its default and whatever the
+        // message already had, and a preview the agent asked for could go missing either way.
+        let wanted = TelegramChannel::link_preview(true);
+        assert!(!wanted.is_disabled);
+        assert_eq!(
+            serde_json::to_string(&wanted).expect("serialises"),
+            "{}",
+            "the enabled form must be the empty object Telegram reads as default options"
+        );
+
+        let refused = TelegramChannel::link_preview(false);
+        assert!(refused.is_disabled);
+        assert!(
+            serde_json::to_string(&refused)
+                .expect("serialises")
+                .contains("is_disabled"),
+            "the disabled form has to actually say so on the wire"
+        );
+    }
+
+    #[tokio::test]
     async fn searching_members_by_name_is_refused_with_the_reason() {
         // The Bot API has no member search and no member listing, so the only honest answer is to
         // say which question Telegram will actually take. Refused before any network call, so this
@@ -1592,7 +1672,6 @@ mod tests {
             allow_all,
             admin_tools: true,
             parse_mode: TelegramParseMode::Html,
-            link_preview: false,
             poll_timeout: std::time::Duration::from_secs(1),
         };
         TelegramChannel::new(ChannelId::new("telegram"), &config).expect("constructs")
@@ -1992,7 +2071,7 @@ mod tests {
         let channel = channel(vec![1], vec![]);
         let conversation = ConversationId::parse("telegram:1").expect("valid");
         let error = channel
-            .edit_text(&conversation, "42", "   ")
+            .edit_text(&conversation, "42", "   ", false)
             .await
             .expect_err("an empty revision must be refused");
         assert!(error.to_string().contains("renders to nothing"), "{error}");

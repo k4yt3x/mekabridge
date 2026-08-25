@@ -780,6 +780,30 @@ pub struct SendOptions {
     pub reply_to: Option<String>,
     /// Deliver without a notification sound.
     pub silent: bool,
+    /// Let the platform expand the first link into a preview card.
+    ///
+    /// Defaults off, which is the useful default rather than the neutral one: the agent cites
+    /// links as references far more often than it makes one the subject of a message, and a card
+    /// on every part of a split answer buries the answer. The agent asks for one when the link
+    /// *is* the message.
+    pub link_preview: bool,
+}
+
+/// Per-file knobs, separate from [`SendOptions`] because sending a file is not sending a message
+/// and the two share only the body.
+///
+/// A struct rather than two `bool` parameters. `send_file(.., true, false)` reads as nothing at
+/// all, and the compiler cannot tell a transposed pair from a correct one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileOptions {
+    /// Send as a viewable photo rather than as a document. Lossy on Telegram, which re-encodes.
+    pub as_photo: bool,
+    /// Let a link in the caption expand into a preview card.
+    ///
+    /// Discord-only in effect. Telegram's `sendPhoto` and `sendDocument` take no
+    /// `link_preview_options`, so a caption's links never expand there whatever this says; the
+    /// tool description says so rather than letting the agent conclude the switch is broken.
+    pub link_preview: bool,
 }
 
 /// What a channel can do, so callers can degrade instead of failing.
@@ -883,7 +907,7 @@ pub trait Channel: Send + Sync + 'static {
         conversation: &ConversationId,
         path: &Path,
         caption: Option<&str>,
-        as_photo: bool,
+        options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError>;
 
     /// Retrieve one file the platform holds, identified by an [`Attachment::file_ref`].
@@ -914,8 +938,9 @@ pub trait Channel: Send + Sync + 'static {
         conversation: &ConversationId,
         message_id: &str,
         markdown: &str,
+        link_preview: bool,
     ) -> Result<(), ChannelError> {
-        let _ = (conversation, message_id, markdown);
+        let _ = (conversation, message_id, markdown, link_preview);
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "editing messages",

@@ -26,8 +26,8 @@ use mekabridge::{
     },
     channel::{
         Activity, Admission, Channel, ChannelCapabilities, ChannelError, ChannelId,
-        ChannelIdentity, ChannelRegistry, ChatKind, ConversationId, FetchedFile, InboundEvent,
-        InboundMessage, Platform, SendOptions, Sender,
+        ChannelIdentity, ChannelRegistry, ChatKind, ConversationId, FetchedFile, FileOptions,
+        InboundEvent, InboundMessage, Platform, SendOptions, Sender,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
@@ -752,6 +752,9 @@ struct MockChannel {
     /// rather than passed in, so the harness constructors do not grow an eighth argument for it.
     typing_status: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<(String, String)>>,
+    /// Whether each outbound asked for a link preview, in send order. Recorded separately from
+    /// `sent` so the existing assertions on message bodies stay readable.
+    previews: Mutex<Vec<bool>>,
     reactions: Mutex<Vec<(String, String, Option<String>)>>,
     activities: Mutex<Vec<Activity>>,
     /// Files this channel will hand back from `fetch`, keyed by reference.
@@ -778,6 +781,7 @@ impl MockChannel {
             id: ChannelId::new(id),
             typing_status: std::sync::atomic::AtomicBool::new(false),
             sent: Mutex::new(Vec::new()),
+            previews: Mutex::new(Vec::new()),
             reactions: Mutex::new(Vec::new()),
             activities: Mutex::new(Vec::new()),
             files: Mutex::new(std::collections::HashMap::new()),
@@ -838,8 +842,12 @@ impl Channel for MockChannel {
         &self,
         conversation: &ConversationId,
         markdown: &str,
-        _options: &SendOptions,
+        options: &SendOptions,
     ) -> Result<Vec<String>, ChannelError> {
+        self.previews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(options.link_preview);
         let mut sent = self
             .sent
             .lock()
@@ -853,8 +861,12 @@ impl Channel for MockChannel {
         conversation: &ConversationId,
         path: &std::path::Path,
         _caption: Option<&str>,
-        _as_photo: bool,
+        options: &FileOptions,
     ) -> Result<Vec<String>, ChannelError> {
+        self.previews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(options.link_preview);
         let mut sent = self
             .sent
             .lock()
@@ -4313,6 +4325,57 @@ async fn an_unknown_attachment_handle_is_a_clear_error() {
 }
 
 #[tokio::test]
+async fn the_preview_switch_survives_the_whole_outbound_path() {
+    // The unit tests stop at the sink. This one runs the real `BridgeSink` down to a `Channel`, so
+    // it covers the layer between: the sink resolves the conversation, checks capabilities and
+    // rebuilds the options on the way through, and a field dropped there would look correct from
+    // both ends.
+    let store = Store::open_in_memory().await.expect("store");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_with_storage(
+        store,
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::new(Presence::default()),
+    );
+
+    sink.send_text("mock:1", "see https://example.com", SendOptions {
+        link_preview: true,
+        ..SendOptions::default()
+    })
+    .await
+    .expect("send succeeds");
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, b"png").expect("write");
+    sink.send_file(
+        "mock:1",
+        &path,
+        Some("see https://example.com"),
+        FileOptions {
+            as_photo: false,
+            link_preview: true,
+        },
+    )
+    .await
+    .expect("file send succeeds");
+
+    assert_eq!(
+        channel
+            .previews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_slice(),
+        [true, true],
+        "a preview the agent asked for was lost between the sink and the channel"
+    );
+}
+
+#[tokio::test]
 async fn sending_a_message_stops_the_typing_indicator() {
     // The sink is the only thing that knows a reply actually went out, so this is the wiring that
     // keeps the refresh loop from re-arming an indicator Telegram has already cleared.
@@ -4392,7 +4455,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
         Arc::clone(&presence),
     );
 
-    sink.send_file("mock:1", &path, None, false)
+    sink.send_file("mock:1", &path, None, FileOptions::default())
         .await
         .expect("sends");
     assert!(

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `link_preview` on `send_message`, `edit_message` and `send_file`; the agent decides per message.
+
+### Removed
+
+- **Breaking:** `[[channels.*]].link_preview`; a config still setting it is refused by name.
+
 ## [0.7.0] - 2026-08-24
 
 ### Added

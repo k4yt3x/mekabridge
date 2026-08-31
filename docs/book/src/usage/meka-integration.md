@@ -2,9 +2,14 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
-**meka 0.42.0 or later is required.** Two things below it do not exist: rejoining a dropped turn
-stream with `Last-Event-ID`, which is how the bridge learns how an interrupted turn ended rather
-than guessing, and the `workspace` / `unrestricted` permission levels that replaced `write`.
+**meka 0.42.0 or later is required, and 0.44.0 or later is recommended.** Two things below 0.42 do
+not exist: rejoining a dropped turn stream with `Last-Event-ID`, which is how the bridge learns how
+an interrupted turn ended rather than guessing, and the `workspace` / `unrestricted` permission
+levels that replaced `write`.
+
+Two things differ across 0.43 and 0.44 and are called out where they arise: where the bridge's MCP
+token is stored, and, since 0.44 reports a rate limit under the same error type as a permanent
+refusal, the bridge retries that whole class rather than reading it as final.
 
 ## What meka needs from you
 
@@ -30,11 +35,13 @@ required = true
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
-If `[mcp].token` is set on the bridge, add the matching `auth_token` here:
+If `[mcp].token` is set on the bridge, meka needs the matching token. **On meka 0.44 and later it does not go in `config.toml`**, which will not parse a `[[mcp.servers]]` entry containing `auth_token` at all: meka refuses to start rather than connecting unauthenticated. Store it instead, which is also how it is rotated later:
 
-```toml
-auth_token = "${MEKABRIDGE_MCP_TOKEN}"
+```sh
+meka mcp login mekabridge --auth-token-stdin
 ```
+
+On meka 0.43 and earlier the same token goes in the server entry as `auth_token = "${MEKABRIDGE_MCP_TOKEN}"`, and the `meka mcp login` form does not exist.
 
 The `name` becomes the namespace prefix, so the agent sees `mcp__mekabridge__send_message`.
 

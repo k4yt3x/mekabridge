@@ -77,10 +77,14 @@ pub struct ProblemDetail {
     /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
     ///
     /// meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
-    /// cap. What it does *not* send it on is the case that matters most: `RetryableProvider`
-    /// carries the provider's own `Retry-After` and then drops it at the boundary that turns
-    /// an error into a Problem Detail, so a rate limit arrives here with the one number that
-    /// is not a guess already discarded.
+    /// cap, and since 0.44 on a `RetryableProvider` too, which is the case that matters most: a
+    /// rate limit now arrives carrying the one number that is not a guess. It used to be dropped
+    /// at the boundary that turns an error into a Problem Detail.
+    ///
+    /// Its presence is also the only thing separating a retryable upstream failure from a
+    /// permanent one, since both are `provider` with the same status and the same detail. Only
+    /// almost, though: a provider that returned no `Retry-After` header leaves nothing here, which
+    /// is why [`MekaError::is_retryable`] does not lean on it.
     pub retry_after: Option<f64>,
 }
 
@@ -100,6 +104,7 @@ impl ProblemDetail {
             "sse-lag" => ProblemKind::SseLag,
             "stream-detached" => ProblemKind::StreamDetached,
             "provider" => ProblemKind::Provider,
+            "context-overflow" => ProblemKind::ContextOverflow,
             "invalid-body" => ProblemKind::InvalidBody,
             "payload-too-large" => ProblemKind::PayloadTooLarge,
             "idempotency" => ProblemKind::Idempotency,
@@ -141,6 +146,11 @@ pub enum ProblemKind {
     /// terminal `turn.failed`, never as an HTTP response.
     StreamDetached,
     Provider,
+    /// The conversation no longer fits the model's window and meka could not compact it far
+    /// enough. A 502 like [`Self::Provider`], and deliberately a separate type: the same
+    /// conversation will not fit on the next attempt either, so this is the one upstream failure
+    /// where retrying is certain to waste the budget.
+    ContextOverflow,
     InvalidBody,
     PayloadTooLarge,
     Idempotency,
@@ -187,11 +197,25 @@ pub enum MekaError {
 impl MekaError {
     /// Whether retrying the same request could plausibly succeed.
     ///
-    /// `provider` is deliberately absent. meka maps both its `Provider` and `InvalidRequest`
-    /// variants onto that type URI and both are its explicitly non-retryable bucket: by the time a
-    /// request is malformed enough for the upstream to reject it, meka's own agent loop has already
-    /// tried to repair it. What a rate limit or an overload becomes is `internal`, because meka's
-    /// `RetryableProvider` has no arm of its own in the mapping and falls through.
+    /// `provider` is included, and that is not obvious, because meka puts four unrelated failures
+    /// behind that one type URI: a malformed request, a mid-stream error, an upstream refusal, and
+    /// `RetryableProvider`, which is what a rate limit or an overload becomes. Its own
+    /// documentation says a client "should not need to" tell them apart. This one does need to, so
+    /// it errs toward retrying: the only signal that separates them is a `retry_after` the upstream
+    /// may not have sent, and reading the whole bucket as permanent is what makes an overloaded
+    /// provider look like an undeliverable message. The cost of being wrong the other way is that a
+    /// genuinely malformed turn takes the whole retry budget, about a minute, to be reported
+    /// instead of being reported at once. That is the cheaper mistake: a late notice about a
+    /// message nobody could have answered, against a message dropped that would have gone through.
+    ///
+    /// Up to meka 0.43 this arm was not needed: `RetryableProvider` had no arm in meka's own
+    /// mapping and fell through to `internal`, which is retryable here. 0.44 gave it one and reused
+    /// the `provider` URI rather than minting a new one, so nothing new arrived for
+    /// [`ProblemKind::Other`] to catch and every rate limit became a message given up on at the
+    /// first attempt.
+    ///
+    /// [`ProblemKind::ContextOverflow`] is the exception and the reason meka split it out: it is a
+    /// 502 like the rest, and it will refuse the same conversation forever.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(error) => {
@@ -200,6 +224,7 @@ impl MekaError {
             Self::Problem(problem) => match problem.kind() {
                 ProblemKind::ConcurrencyLimit
                 | ProblemKind::Internal
+                | ProblemKind::Provider
                 | ProblemKind::SessionLocked
                 // meka emits this when its broadcast to *this* client fell behind, then cancels
                 // the turn and says "Retry the turn" in the detail: nothing about it says the work
@@ -255,6 +280,16 @@ impl MekaError {
     /// create a replacement.
     pub fn is_session_missing(&self) -> bool {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::SessionNotFound)
+    }
+
+    /// Whether the conversation has outgrown the model's window.
+    ///
+    /// Worth telling apart from every other turn failure because it is not about the message that
+    /// happened to hit it. This bridge runs one permanent session, so a window the conversation no
+    /// longer fits refuses the next message too, and the one after that, until somebody shortens
+    /// it. Every other failure here is per-message.
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::ContextOverflow)
     }
 
     /// Whether meka says there is no turn stream to join on a session that does exist.
@@ -324,10 +359,6 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerInfo {
     pub version: String,
-    /// `null` when no model is configured. meka serializes the field either way, so this has to be
-    /// an `Option`: a bare `String` fails to deserialize the null and takes `doctor` and the
-    /// vision check down with it.
-    pub model: Option<String>,
     /// Whether the active provider profile can look at images at all.
     ///
     /// The bridge attaches nothing to a turn, so this gates `view_attachment` instead. Worth being
@@ -348,6 +379,28 @@ pub struct ServerInfo {
     /// opinion" and the check is skipped instead of taking `doctor` down.
     #[serde(default)]
     pub enabled_permissions: Vec<String>,
+}
+
+/// One configured provider profile, as returned by `GET /v1/providers`.
+///
+/// Where the model came from until meka 0.44, which dropped `model` and `provider` from
+/// `GET /v1/info`. The two words meant different things on the two endpoints -- `provider` on
+/// `/v1/info` was a backend, `provider` on `POST /v1/sessions` is a profile -- and this endpoint
+/// names them apart. Present since 0.43 in this exact shape, so reading it costs no version check.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderProfile {
+    /// The profile name, which is what `POST /v1/sessions` would take.
+    pub name: String,
+    /// The wire protocol it speaks, such as `anthropic-messages`.
+    #[serde(rename = "type")]
+    pub backend: String,
+    /// Omitted by meka when the profile configures none.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether a session naming no profile gets this one. The bridge never names one, so this
+    /// marks the profile its session actually runs on.
+    #[serde(default)]
+    pub active: bool,
 }
 
 /// Readiness as returned by `GET /v1/health/ready`.
@@ -493,6 +546,18 @@ impl MekaClient {
     pub async fn info(&self) -> Result<ServerInfo> {
         let url = self.endpoint("/v1/info")?;
         self.get_with_retries(url).await
+    }
+
+    /// `GET /v1/providers`: the configured profiles, one of them marked as the default.
+    pub async fn providers(&self) -> Result<Vec<ProviderProfile>> {
+        #[derive(Deserialize)]
+        struct ProvidersResponse {
+            providers: Vec<ProviderProfile>,
+        }
+
+        let url = self.endpoint("/v1/providers")?;
+        let response: ProvidersResponse = self.get_with_retries(url).await?;
+        Ok(response.providers)
     }
 
     /// `GET /v1/health/ready`.
@@ -1052,9 +1117,47 @@ mod tests {
         assert!(
             MekaError::Problem(problem("https://meka.so/errors/concurrency-limit")).is_retryable()
         );
-        // Where a provider rate limit or overload lands once meka's own retries are spent: its
-        // `RetryableProvider` has no arm in the Problem Detail mapping and falls through to this.
         assert!(MekaError::Problem(problem("https://meka.so/errors/internal")).is_retryable());
+    }
+
+    /// Where a provider rate limit or an overload lands once meka's own retries are spent.
+    ///
+    /// Up to meka 0.43 it was `internal`, which the test above covers. 0.44 gave
+    /// `RetryableProvider` an arm of its own and pointed it at the existing `provider` URI, so this
+    /// bucket stopped being purely permanent and reading it that way turned every rate limit into a
+    /// message given up on at the first attempt.
+    #[test]
+    fn a_provider_failure_is_worth_another_attempt() {
+        assert!(MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
+    }
+
+    /// The one upstream refusal that must not be retried, and the reason meka split it out of
+    /// `provider`: the conversation that did not fit will not fit on the next attempt either, so
+    /// the whole retry budget is spent proving it.
+    #[test]
+    fn a_context_overflow_is_never_worth_another_attempt() {
+        let error = MekaError::Problem(problem("https://meka.so/errors/context-overflow"));
+        assert_eq!(
+            problem("https://meka.so/errors/context-overflow").kind(),
+            ProblemKind::ContextOverflow,
+            "an unrecognised type would fall to `Other`, whose 5xx rule retries it"
+        );
+        assert!(!error.is_retryable());
+        assert!(error.is_context_overflow());
+        assert!(
+            !MekaError::Problem(problem("https://meka.so/errors/provider")).is_context_overflow(),
+            "the two share a status and must not share a remedy"
+        );
+    }
+
+    /// The status a context overflow actually arrives with. `problem()` builds a 409, so without
+    /// this the test above would pass even if the type fell through to `Other`, whose rule is the
+    /// status alone.
+    #[test]
+    fn a_context_overflow_is_not_retried_at_the_status_it_really_carries() {
+        let mut detail = problem("https://meka.so/errors/context-overflow");
+        detail.status = 502;
+        assert!(!MekaError::Problem(detail).is_retryable());
     }
 
     #[test]
@@ -1214,10 +1317,10 @@ mod tests {
         // Retrying an auth or validation failure just burns time; both need operator action.
         assert!(!MekaError::Problem(problem("https://meka.so/errors/auth")).is_retryable());
         assert!(!MekaError::Problem(problem("https://meka.so/errors/invalid-body")).is_retryable());
-        // meka's non-retryable upstream bucket, despite the name reading like a transient fault:
-        // both `Provider` and `InvalidRequest` map onto this URI and the agent loop has already
-        // tried to repair what it could.
-        assert!(!MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
+        // `provider` used to be asserted here, on the grounds that meka's `Provider` and
+        // `InvalidRequest` both mapped onto it and the agent loop had already tried to repair
+        // them. meka 0.44 pointed `RetryableProvider` at the same URI, so the bucket now holds
+        // transient failures too and is retried; see `a_provider_failure_is_worth_another_attempt`.
         assert!(
             !MekaError::Problem(problem("https://meka.so/errors/session-not-found")).is_retryable()
         );
@@ -1232,15 +1335,53 @@ mod tests {
         );
     }
 
+    /// `/v1/info` has to be read across the versions this bridge supports, and it changed in both
+    /// directions at once: meka 0.44 dropped `model` and `provider` and added `default_permission`.
+    /// A field arriving that this build has never heard of is the easy half; the half that bit is
+    /// that a field going missing is silent, because a missing `Option` deserializes to `None`
+    /// rather than failing. `doctor` reported "(none configured)" for every deployment on 0.44
+    /// while nothing looked wrong.
     #[test]
-    fn server_info_tolerates_a_null_model() {
-        // meka serializes `model` unconditionally and it is an `Option` on its side, so a server
-        // with no model configured sends an explicit null.
-        let info: ServerInfo =
-            serde_json::from_str(r#"{"version":"0.36.0","model":null,"vision":true}"#)
-                .expect("a null model must deserialize");
-        assert_eq!(info.model, None);
+    fn server_info_reads_every_meka_this_bridge_supports() {
+        let recent = r#"{"version":"0.44.0","default_permission":"read",
+                         "enabled_permissions":["read","workspace"],"vision":true}"#;
+        let info: ServerInfo = serde_json::from_str(recent).expect("0.44 must deserialize");
+        assert_eq!(info.version, "0.44.0");
         assert!(info.vision);
+        assert_eq!(info.enabled_permissions, ["read", "workspace"]);
+
+        let older = r#"{"version":"0.43.0","model":null,"provider":"anthropic-messages",
+                        "vision":false,"enabled_permissions":[]}"#;
+        let info: ServerInfo = serde_json::from_str(older).expect("0.43 must deserialize");
+        assert!(
+            !info.vision,
+            "the fields it dropped must not shadow the ones it kept"
+        );
+    }
+
+    /// Where the model went. The bridge names no profile, so the one marked `active` is the one its
+    /// session runs on.
+    #[test]
+    fn the_active_provider_profile_is_the_one_the_bridge_gets() {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            providers: Vec<ProviderProfile>,
+        }
+
+        let body = r#"{"providers":[
+            {"name":"cheap","type":"openai-responses","active":false},
+            {"name":"work","type":"anthropic-messages","model":"claude-opus-5","active":true}]}"#;
+        let parsed: Response = serde_json::from_str(body).expect("providers must deserialize");
+        let active = parsed
+            .providers
+            .iter()
+            .find(|profile| profile.active)
+            .expect("one profile is the default");
+        assert_eq!(active.name, "work");
+        assert_eq!(active.backend, "anthropic-messages");
+        assert_eq!(active.model.as_deref(), Some("claude-opus-5"));
+        // meka omits `model` for a profile that configures none, rather than sending null.
+        assert_eq!(parsed.providers[0].model, None);
     }
 
     #[test]

@@ -88,6 +88,7 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the batch is retried at once |
 | `requeued messages after a failed turn` | The batch goes back for another attempt. `retry_in` says how long it waits first, and is absent only for the empty-response case, which is offered again at once |
 | `the turn failed after the agent had already acted` | Not retried, and the batch is marked delivered. meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
+| `the agent's session no longer fits the model's context window` | Not retried, and the next message will fail the same way. The one turn failure that is about the session rather than the message |
 | `giving up on messages after N attempt(s)` | The batch is `failed`. The chat is told something went wrong, the owner is told what, and the message goes back to being unseen |
 | `inbound queue is full` | Messages are being shed; the agent is told how many in the next envelope |
 | `recovered messages that were in flight` | The previous run died mid-turn |
@@ -161,6 +162,8 @@ fragments and meka will not republish it. The reason it failed is in meka's log,
 `mekabridge unseen` counts what the agent still has not been shown, unless
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
+
+**Every message suddenly fails, in every chat at once.** Look for `the agent's session no longer fits the model's context window`. One permanent session carries every conversation, so a window it has outgrown refuses the next message too, and no number of retries changes that. Shorten the conversation on meka's side, with `POST /v1/sessions/{id}/compact` or `/rewind` in its REPL. `mekabridge session reset --yes` also clears it, at the price of the agent's memory of every conversation.
 
 **A chat was told the bridge had a problem, but the owner's copy never came.** Most likely `[bridge].owner_conversation` names a chat the bridge cannot post to, which `mekabridge doctor` reports under `channels`. The cause to check first is a Discord user id where a channel id belongs: the two are both snowflakes, so startup validation accepts it and Discord answers `Unknown Channel` on every send. `discord:@<user id>` is the form that reaches a person. Failing that, the owner's notice is rate limited like the chat's, to one every fifteen minutes.
 

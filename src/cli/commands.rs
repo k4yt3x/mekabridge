@@ -242,11 +242,39 @@ pub async fn doctor(config: &Config) -> Result<()> {
     let mut enabled_permissions: Vec<String> = Vec::new();
     match meka.info().await {
         Ok(info) => {
-            println!(
-                "  ok     reachable, version {}, model {}",
-                info.version,
-                info.model.as_deref().unwrap_or("(none configured)")
-            );
+            println!("  ok     reachable, version {}", info.version);
+            // A separate call since meka 0.44, which took `model` off `/v1/info` because the word
+            // there named a backend while the same word on `POST /v1/sessions` names a profile.
+            // Every meka this bridge supports has this endpoint, back to 0.42, so a failure here
+            // is a real one rather than a version it is too old for.
+            match meka.providers().await {
+                Ok(profiles) => match profiles.iter().find(|profile| profile.active) {
+                    Some(profile) => println!(
+                        "  ok     sessions run on profile {} ({}), model {}",
+                        profile.name,
+                        profile.backend,
+                        profile.model.as_deref().unwrap_or("(none configured)")
+                    ),
+                    None => {
+                        // The bridge creates its session without naming a profile, so meka has to
+                        // have one to fall back on. Nothing marked active means either no profile
+                        // is configured or several are with no default chosen between them, and
+                        // meka defers that failure to the first session rather than refusing to
+                        // start, so this surfaces at the first message otherwise. The remedy is
+                        // meka's own wording: `default_provider` is what a command writes, and
+                        // sending an operator to hand-edit the file instead is worse advice.
+                        println!(
+                            "  fail   meka has no default provider profile, so creating the \
+                             bridge's session will fail; run `meka provider use <name>`"
+                        );
+                        failures += 1;
+                    }
+                },
+                Err(error) => {
+                    println!("  warn   could not read the provider profiles: {error}");
+                    warnings += 1;
+                }
+            }
             if info.vision {
                 println!(
                     "  ok     vision is on, so view_attachment hands the agent the picture itself"

@@ -51,13 +51,18 @@ const ONE_PIXEL_PNG: &[u8] = &[
 /// next, which is the whole of what these tests are about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FailureKind {
-    /// Where a rate limit or an overload actually lands: meka's `RetryableProvider` has no arm of
-    /// its own in the mapping onto a Problem Detail and falls through to `internal`. Nothing ran,
-    /// so the batch may be handed over again.
+    /// meka's own fault rather than the upstream's. Nothing ran, so the batch may be handed over
+    /// again. Where a rate limit landed too until meka 0.44; see [`Self::RateLimited`].
     #[default]
     Transient,
-    /// meka's bucket for an upstream failure its own agent loop has already tried and failed to
-    /// repair. More attempts would only delay the notice saying an operator is needed.
+    /// Where a rate limit or an overload actually lands on meka 0.44: `RetryableProvider` gained an
+    /// arm of its own and was pointed at the existing `provider` type, so this bucket holds both
+    /// transient and permanent upstream failures and cannot be read as either alone. Retried,
+    /// because reading it as permanent gives up on the failure the retry budget exists for.
+    RateLimited,
+    /// The one upstream refusal that is genuinely permanent, and the reason meka gave it a type
+    /// away from `provider`: the conversation that did not fit will not fit on the next attempt
+    /// either. More attempts only delay the notice saying an operator is needed.
     Unrepairable,
     /// What meka sends when it stops a turn whose stream nobody is watching any more: a
     /// `turn.cancelled` with `reason: "client"`, not an error. The work stopped partway.
@@ -446,8 +451,12 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
              \"status\":500,\"detail\":\"SSE consumer fell behind; 12 event(s) were dropped. \
              Retry the turn.\"}"
         } else if kind == FailureKind::Unrepairable {
-            "{\"type\":\"https://meka.so/errors/provider\",\"title\":\"Provider failed\",\
-             \"status\":502,\"detail\":\"upstream refused\"}"
+            "{\"type\":\"https://meka.so/errors/context-overflow\",\
+             \"title\":\"Conversation exceeds the model's context window\",\
+             \"status\":502,\"detail\":\"could not be compacted further; shorten it\"}"
+        } else if kind == FailureKind::RateLimited {
+            "{\"type\":\"https://meka.so/errors/provider\",\"title\":\"Provider call failed\",\
+             \"status\":502,\"detail\":\"the provider rejected or failed this turn\"}"
         } else {
             "{\"type\":\"https://meka.so/errors/internal\",\"title\":\"Internal server error\",\
              \"status\":500,\
@@ -1864,9 +1873,9 @@ async fn a_cancellation_after_the_agent_acted_is_not_replayed() {
 
 #[tokio::test]
 async fn an_unrepairable_failure_is_not_retried_at_all() {
-    // meka maps both its `Provider` and `InvalidRequest` errors onto this type, and both are ones
-    // its own agent loop has already tried and failed to repair. Spending the budget on them only
-    // delays the notice that says an operator is needed.
+    // A conversation that no longer fits the model's window will not fit on the next attempt
+    // either, which is why meka gave it a type away from `provider`. Spending the budget on it
+    // only delays the notice that says an operator is needed.
     let harness = Harness::start_failing(3, FailureKind::Unrepairable, Setup::default()).await;
     harness
         .sender
@@ -2169,6 +2178,30 @@ async fn a_chat_is_not_apologised_to_twice_for_the_same_outage() {
         1,
         "the same chat was apologised to twice inside the suppression window"
     );
+}
+
+#[tokio::test]
+async fn a_rate_limited_turn_is_tried_again() {
+    // meka 0.44 pointed `RetryableProvider` at the `provider` type, which the bridge had been
+    // reading as permanent. A rate limit therefore spent no part of the retry budget: the message
+    // was given up on within seconds of the first refusal, which is the failure the budget exists
+    // for. Nothing in the payload distinguishes it from a permanent refusal, so the whole bucket
+    // is retried.
+    let harness = Harness::start_failing(3, FailureKind::RateLimited, Setup::default()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    // `wait_for` panics on its deadline, so reaching a second attempt is the assertion. Asserting
+    // the count afterwards would only restate what getting here already proved.
+    harness
+        .wait_for(
+            "a provider failure to spend the retry budget rather than skip it",
+            |harness| harness.attempts() >= 2,
+        )
+        .await;
 }
 
 #[tokio::test]

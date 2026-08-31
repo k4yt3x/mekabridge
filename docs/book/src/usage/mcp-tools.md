@@ -165,7 +165,7 @@ A long reply becomes several real messages, and the platform can refuse one afte
 
 The history covers both directions. What the agent sends is recorded alongside what it was told, one row per message that actually reached the chat, marked `own` and stamped with the `session` that sent it.
 
-That last part is the point of it. Several meka sessions share one bot account, and a scheduled or isolated one can speak without the main session knowing. Before this the only record of what a session had said was that session's own transcript, so a message sent by a scheduled job was unfindable by the session asked about it afterwards. Now "have I already told them?" is a search.
+That last part is the point of it. A session's own transcript used to be the only record of what it had said, and a transcript is not a store you can query: a sub-agent speaks on the same bot account without the session that spawned it knowing, and compaction eventually drops what a session said from its own memory of the conversation. Now "have I already told them?" is a search rather than a guess.
 
 Three fields say what has happened to a message since:
 

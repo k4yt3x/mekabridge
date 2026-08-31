@@ -119,8 +119,9 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// because long text is split.
     ///
     /// `session` names the meka session that asked, and is recorded with the message. The bridge
-    /// owns one permanent session, but scheduled and isolated ones speak on the same account, so
-    /// without it the history can say the bot said something and not which of them did.
+    /// owns one permanent session, but it is not the only one that can reach these tools: a
+    /// sub-agent spawned from it holds the same MCP server and speaks on the same account. Without
+    /// this the history can say the bot said something and not which session did.
     async fn send_text(
         &self,
         conversation: &str,
@@ -695,10 +696,10 @@ pub struct GetConversationArgs {
 /// `_meta` key meka uses to name the session a tool call came from.
 ///
 /// Recorded on every outbound message rather than only logged. The bridge binds one session of its
-/// own, but scheduled and isolated ones speak on the same account, so "the bot said this" and "this
-/// session said this" are different facts and only the second answers who to ask about it. Having
-/// it in both processes' logs also makes tracing a message across them possible, which is what it
-/// was originally here for.
+/// own, but a sub-agent spawned from it reaches the same tools on the same account, so "the bot
+/// said this" and "this session said this" are different facts and only the second answers who to
+/// ask about it. Having it in both processes' logs also makes tracing a message across them
+/// possible, which is what it was originally here for.
 const SESSION_META_KEY: &str = "meka/sessionId";
 
 /// Largest `limit` [`BridgeMcpServer::list_conversations`] will honour, so a runaway argument

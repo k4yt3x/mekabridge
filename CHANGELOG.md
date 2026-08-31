@@ -10,20 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The agent's own messages are recorded in history, so it can check what it has already said.
-- Own messages name the meka session that sent them, which is how scheduled jobs are told apart.
+- Own messages record which meka session sent them, since more than one can speak on the same bot.
 - One history row per real message, so an id read back from history addresses the message it names.
 - A reply that was only partly delivered records the parts that did land, rather than nothing.
 - Files the agent sends get attachment handles, so another session can open what it sent.
 - `attachment:` lines carry pixel size and running time, to judge a file without fetching it.
 - `send_message` numbers the parts of a split reply, as `part 2/3: 502`.
 - `mekabridge history` marks the agent's own messages, and deleted and superseded ones.
-- `mekabridge doctor` asks the platform whether operator notices can reach the chat set for them.
+- `mekabridge doctor` checks that operator notices can reach the chat configured to receive them.
+- `mekabridge doctor` names the provider profile and model the agent's session actually runs on.
+- A session that outgrew the model's context window is reported as that, with how to shorten it.
 
 ### Changed
 
 - **Breaking:** a deleted message is kept and marked `deleted` rather than dropped from the record.
 - An edited message keeps its earlier wording, marked `superseded`, alongside the revision.
 - The bridge's own delivery-failure notice is recorded like anything else it puts in a chat.
+- A failed provider call is retried before the chat is told, because a rate limit looks the same.
 - Server instructions are shorter, and cover only what no tool description already says.
 
 ### Fixed
@@ -33,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A newline in the bot's own account name broke the header block of every envelope.
 - The daemon was killed outright by a write to a closed socket, going silent with nothing logged.
 - The systemd unit in the docs did not restart the bridge after the signals systemd calls clean.
+- A message hitting a provider rate limit was given up on at once instead of using its retries.
+- A conversation too long for the model was retried three times, each attempt certain to fail.
+- `mekabridge doctor` said no model was configured on meka 0.44, however the profile was set.
+- The setup docs put the bridge's MCP token where meka 0.44 refuses to start if it finds it.
 
 ## [0.8.0] - 2026-08-25
 

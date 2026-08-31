@@ -1357,7 +1357,22 @@ async fn deliver(
             .await;
         }
         Some(error) => {
-            tracing::error!("turn failed: {}", error);
+            // Only the wording differs, deliberately: a context overflow is already non-retryable
+            // below, so an arm of its own would duplicate everything under it to change one line.
+            // Worth saying differently because it is the one failure here that is not about the
+            // message that hit it. One permanent session carries every conversation, so a window
+            // it has outgrown refuses the next message too.
+            if error.is_context_overflow() {
+                tracing::error!(
+                    "the agent's session no longer fits the model's context window, so every \
+                     message will fail until it is shortened: compact or rewind it on meka's \
+                     side, or `mekabridge session reset --yes` to start a new one and lose what \
+                     it remembers ({})",
+                    error
+                );
+            } else {
+                tracing::error!("turn failed: {}", error);
+            }
             // A failure needing an operator will not stop happening on its own, so spending the
             // whole budget on it only delays the notice that says so.
             let retry = if error.is_retryable() {

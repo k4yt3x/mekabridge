@@ -7,9 +7,10 @@ not exist: rejoining a dropped turn stream with `Last-Event-ID`, which is how th
 an interrupted turn ended rather than guessing, and the `workspace` / `unrestricted` permission
 levels that replaced `write`.
 
-Two things differ across 0.43 and 0.44 and are called out where they arise: where the bridge's MCP
-token is stored, and, since 0.44 reports a rate limit under the same error type as a permanent
-refusal, the bridge retries that whole class rather than reading it as final.
+Two things differ by version and are called out where they arise. Where the bridge's MCP token is
+stored changed in 0.44. And a rate limit shared an error type with a permanent refusal in 0.44,
+where later meka gives it one of its own: the bridge retries both either way, so the difference is
+only how long a genuinely dead credential takes to be reported.
 
 ## What meka needs from you
 

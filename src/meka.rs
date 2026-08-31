@@ -59,6 +59,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// which meka defaults to thirty seconds.
 const REJOIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// How much of the upstream's own response is repeated when an error is rendered.
+///
+/// meka bounds what it sends at 4 KiB, which is sized for its log rather than for a chat: the
+/// owner's notice carries this in the middle and appends the attempt count and the affected
+/// conversations after it, so an unbounded one pushes those past a platform's length limit and into
+/// a second message. The actionable part is the error type, which sits at the start, and meka's own
+/// log keeps the whole thing either way.
+const PROVIDER_RESPONSE_PREVIEW_CHARS: usize = 400;
+
 /// Problem Detail (RFC 9457) as returned by every meka error response.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -68,7 +77,6 @@ pub struct ProblemDetail {
     pub title: String,
     pub status: u16,
     pub detail: String,
-    pub instance: Option<String>,
     /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
     ///
     /// meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
@@ -76,11 +84,19 @@ pub struct ProblemDetail {
     /// rate limit now arrives carrying the one number that is not a guess. It used to be dropped
     /// at the boundary that turns an error into a Problem Detail.
     ///
-    /// Its presence is also the only thing separating a retryable upstream failure from a
-    /// permanent one, since both are `provider` with the same status and the same detail. Only
-    /// almost, though: a provider that returned no `Retry-After` header leaves nothing here, which
-    /// is why [`MekaError::is_retryable`] does not lean on it.
+    /// Never the discriminator between a transient upstream failure and a permanent one, which is
+    /// what [`ProblemKind::ProviderUnavailable`] is for. Most transient failures carry none: a
+    /// dropped connection never received a response to hold a header, and a mid-stream overload
+    /// has no headers at all.
     pub retry_after: Option<f64>,
+
+    /// The upstream's own error text, relayed as an RFC 9457 extension member.
+    ///
+    /// meka's `detail` on a 502 names its server log rather than the failure, so without this the
+    /// owner's notice says only that the provider refused and an operator has to go and read
+    /// meka's log to learn whether a credential died or a quota ran out. Absent when the operator
+    /// set `[serve] relay_provider_errors = false`, and from any meka before it had the key.
+    pub provider_response: Option<String>,
 }
 
 impl ProblemDetail {
@@ -99,6 +115,7 @@ impl ProblemDetail {
             "sse-lag" => ProblemKind::SseLag,
             "stream-detached" => ProblemKind::StreamDetached,
             "provider" => ProblemKind::Provider,
+            "provider-unavailable" => ProblemKind::ProviderUnavailable,
             "context-overflow" => ProblemKind::ContextOverflow,
             "invalid-body" => ProblemKind::InvalidBody,
             "payload-too-large" => ProblemKind::PayloadTooLarge,
@@ -112,14 +129,30 @@ impl ProblemDetail {
 impl std::fmt::Display for ProblemDetail {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.detail.is_empty() {
-            write!(formatter, "{} ({})", self.title, self.status)
+            write!(formatter, "{} ({})", self.title, self.status)?;
         } else {
             write!(
                 formatter,
                 "{} ({}): {}",
                 self.title, self.status, self.detail
-            )
+            )?;
         }
+        // Appended rather than replacing `detail`, which stays meka's own sentence. This reaches
+        // the owner's notice, which is the reader meka relayed it for; the affected chat is told
+        // one line carrying none of it.
+        if let Some(response) = &self.provider_response {
+            let preview: String = response
+                .chars()
+                .take(PROVIDER_RESPONSE_PREVIEW_CHARS)
+                .collect();
+            let elided = if preview.len() < response.len() {
+                "..."
+            } else {
+                ""
+            };
+            write!(formatter, ". The provider said: {preview}{elided}")?;
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +174,13 @@ pub enum ProblemKind {
     /// terminal `turn.failed`, never as an HTTP response.
     StreamDetached,
     Provider,
+    /// The transient half of the same 502: a failure meka's own classifier recognised, covering an
+    /// overload, a 5xx, a dropped connection and a stalled stream.
+    ///
+    /// Split out of [`Self::Provider`] because a relayed `Retry-After` was the only thing
+    /// separating the two and most of these carry none, so the 529 a bridge sees most often
+    /// arrived byte-identical to a dead credential.
+    ProviderUnavailable,
     /// The conversation no longer fits the model's window and meka could not compact it far
     /// enough. A 502 like [`Self::Provider`], and deliberately a separate type: the same
     /// conversation will not fit on the next attempt either, so this is the one upstream failure
@@ -189,14 +229,18 @@ pub enum MekaError {
 impl MekaError {
     /// Whether retrying the same request could plausibly succeed.
     ///
-    /// `provider` is retryable despite reading like a refusal, because meka puts four unrelated
-    /// failures behind that one URI, a rate limit among them, and says a client "should not need
-    /// to" tell them apart. This one does, and errs toward retrying: the only discriminator is a
-    /// `retry_after` the upstream may not have sent, and the cost of being wrong this way is a late
-    /// notice, against a dropped message that would have gone through.
+    /// [`ProblemKind::ProviderUnavailable`] is the transient upstream failure and the one this
+    /// exists for. [`ProblemKind::Provider`] is retryable too, despite reading like a refusal: meka
+    /// describes it as a catch-all meaning "no reason to expect a retry to help" rather than "a
+    /// retry cannot help", and asks clients not to be built so that they never retry it. The queue
+    /// bounds the attempts, which is the part meka does warn against leaving open.
     ///
-    /// [`ProblemKind::ContextOverflow`] is the exception, and why meka split it out of that bucket:
-    /// it will refuse the same conversation forever.
+    /// On meka 0.44 those two shared the `provider` URI, so a bridge reading that bucket as
+    /// permanent gave up on every rate limit at the first attempt. Retrying both keeps that from
+    /// coming back on an older meka while the split does the work on a newer one.
+    ///
+    /// [`ProblemKind::ContextOverflow`] is the exception, and why meka split it out as well: it
+    /// will refuse the same conversation forever.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(error) => {
@@ -206,6 +250,7 @@ impl MekaError {
                 ProblemKind::ConcurrencyLimit
                 | ProblemKind::Internal
                 | ProblemKind::Provider
+                | ProblemKind::ProviderUnavailable
                 | ProblemKind::SessionLocked
                 // meka emits this when its broadcast to *this* client fell behind, then cancels
                 // the turn and says "Retry the turn" in the detail: nothing about it says the work
@@ -1044,8 +1089,8 @@ mod tests {
             title: "t".to_string(),
             status: 409,
             detail: "d".to_string(),
-            instance: None,
             retry_after: None,
+            provider_response: None,
         }
     }
 
@@ -1094,6 +1139,17 @@ mod tests {
     #[test]
     fn a_provider_failure_is_worth_another_attempt() {
         assert!(MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
+    }
+
+    /// The type meka minted so a transient upstream failure stops arriving byte-identical to a dead
+    /// credential. Unrecognised it would fall to [`ProblemKind::Other`], which retries a 502 by its
+    /// status alone and would answer correctly today for the wrong reason, then stop the moment
+    /// meka gave one of these a 4xx.
+    #[test]
+    fn an_upstream_meka_calls_transient_is_worth_another_attempt() {
+        let detail = problem("https://meka.so/errors/provider-unavailable");
+        assert_eq!(detail.kind(), ProblemKind::ProviderUnavailable);
+        assert!(MekaError::Problem(detail).is_retryable());
     }
 
     /// The one upstream refusal that must not be retried, and the reason meka split it out of
@@ -1353,5 +1409,61 @@ mod tests {
     fn problem_detail_displays_title_status_and_detail() {
         let rendered = problem("https://meka.so/errors/auth").to_string();
         assert_eq!(rendered, "t (409): d");
+    }
+
+    /// meka's own `detail` for a 502 points at its server log, so the owner's notice is only worth
+    /// reading if the relayed upstream text rides along with it.
+    #[test]
+    fn the_upstream_response_reaches_whoever_reads_the_failure() {
+        let mut detail = problem("https://meka.so/errors/provider");
+        detail.provider_response = Some("401 invalid_api_key".to_string());
+        assert_eq!(
+            detail.to_string(),
+            "t (409): d. The provider said: 401 invalid_api_key"
+        );
+        // Absent where the operator turned relaying off, or on a meka predating the key.
+        assert_eq!(
+            problem("https://meka.so/errors/provider").to_string(),
+            "t (409): d"
+        );
+    }
+
+    /// meka bounds this at 4 KiB for its log. The owner's notice puts it mid-message and appends
+    /// the attempt count and affected conversations after it, so an unbounded one pushes those past
+    /// Telegram's 4096 characters and into a second message the operator may never read.
+    #[test]
+    fn a_vast_upstream_response_does_not_displace_the_rest_of_the_notice() {
+        let mut detail = problem("https://meka.so/errors/provider");
+        // A multi-byte character throughout, so a byte-wise cut would land mid-character and panic.
+        detail.provider_response = Some("é".repeat(4 * 1024));
+        let rendered = detail.to_string();
+        assert!(rendered.ends_with("..."), "the cut is not marked");
+        assert!(
+            rendered.chars().count() < 600,
+            "{} characters would crowd out the lines after it",
+            rendered.chars().count()
+        );
+        // The start survives, which is where the provider puts the error type.
+        assert!(rendered.contains("The provider said: éé"));
+    }
+
+    /// The whole body meka sends, rather than a hand-built struct, so a rename on either side is
+    /// caught here instead of by an operator reading a notice that stopped naming the cause.
+    #[test]
+    fn a_real_502_body_parses_into_both_new_fields() {
+        let body = r#"{"type":"https://meka.so/errors/provider-unavailable",
+                       "title":"Provider temporarily unavailable","status":502,
+                       "detail":"its response is in the server log",
+                       "provider_response":"529 overloaded_error","retry_after":30}"#;
+        let detail: ProblemDetail = serde_json::from_str(body).expect("a 502 body must parse");
+        assert_eq!(detail.kind(), ProblemKind::ProviderUnavailable);
+        assert_eq!(
+            detail.provider_response.as_deref(),
+            Some("529 overloaded_error")
+        );
+        assert_eq!(
+            MekaError::Problem(detail).retry_after(),
+            Some(Duration::from_secs(30))
+        );
     }
 }

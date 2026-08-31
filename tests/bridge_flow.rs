@@ -52,13 +52,12 @@ const ONE_PIXEL_PNG: &[u8] = &[
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FailureKind {
     /// meka's own fault rather than the upstream's. Nothing ran, so the batch may be handed over
-    /// again. Where a rate limit landed too until meka 0.44; see [`Self::RateLimited`].
+    /// again. Where a rate limit landed too, on a meka older than 0.44.
     #[default]
     Transient,
-    /// Where a rate limit or an overload actually lands on meka 0.44: `RetryableProvider` gained an
-    /// arm of its own and was pointed at the existing `provider` type, so this bucket holds both
-    /// transient and permanent upstream failures and cannot be read as either alone. Retried,
-    /// because reading it as permanent gives up on the failure the retry budget exists for.
+    /// Where a rate limit or an overload lands now: meka's own classifier labelled it transient and
+    /// gave it a type saying so, which is the signal the retry budget exists to act on. Carries the
+    /// upstream's text, as a 502 does whenever `[serve] relay_provider_errors` is left on.
     RateLimited,
     /// The one upstream refusal that is genuinely permanent, and the reason meka gave it a type
     /// away from `provider`: the conversation that did not fit will not fit on the next attempt
@@ -455,8 +454,10 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
              \"title\":\"Conversation exceeds the model's context window\",\
              \"status\":502,\"detail\":\"could not be compacted further; shorten it\"}"
         } else if kind == FailureKind::RateLimited {
-            "{\"type\":\"https://meka.so/errors/provider\",\"title\":\"Provider call failed\",\
-             \"status\":502,\"detail\":\"the provider rejected or failed this turn\"}"
+            "{\"type\":\"https://meka.so/errors/provider-unavailable\",\
+             \"title\":\"Provider temporarily unavailable\",\"status\":502,\
+             \"detail\":\"the provider did not complete this turn\",\
+             \"provider_response\":\"529 overloaded_error\"}"
         } else {
             "{\"type\":\"https://meka.so/errors/internal\",\"title\":\"Internal server error\",\
              \"status\":500,\
@@ -2182,11 +2183,8 @@ async fn a_chat_is_not_apologised_to_twice_for_the_same_outage() {
 
 #[tokio::test]
 async fn a_rate_limited_turn_is_tried_again() {
-    // meka 0.44 pointed `RetryableProvider` at the `provider` type, which the bridge had been
-    // reading as permanent. A rate limit therefore spent no part of the retry budget: the message
-    // was given up on within seconds of the first refusal, which is the failure the budget exists
-    // for. Nothing in the payload distinguishes it from a permanent refusal, so the whole bucket
-    // is retried.
+    // The failure the retry budget exists for, and the one a bridge reading this bucket as
+    // permanent gives up on within seconds of the first refusal.
     let harness = Harness::start_failing(3, FailureKind::RateLimited, Setup::default()).await;
     harness
         .sender
@@ -2198,7 +2196,7 @@ async fn a_rate_limited_turn_is_tried_again() {
     // the count afterwards would only restate what getting here already proved.
     harness
         .wait_for(
-            "a provider failure to spend the retry budget rather than skip it",
+            "a transient upstream failure to spend the retry budget rather than skip it",
             |harness| harness.attempts() >= 2,
         )
         .await;

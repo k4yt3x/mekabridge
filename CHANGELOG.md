@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-31
+
+### Added
+
+- The owner's failure notice quotes the provider's own error, naming a dead key or a spent quota.
+
 ## [0.9.0] - 2026-08-31
 
 ### Added
@@ -313,7 +319,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...HEAD
+[0.10.0]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/k4yt3x/mekabridge/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/k4yt3x/mekabridge/compare/0.6.0...0.7.0

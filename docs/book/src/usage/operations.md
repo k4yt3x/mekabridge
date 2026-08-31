@@ -154,11 +154,12 @@ copy says which:
 - The turn failed *after* the agent had already sent or run something. Not retried, and the chat is
   told it may not have finished rather than that its message never arrived.
 
-`owner_conversation` has meka's error verbatim, which since meka 0.42 is not the same as the
-provider's: a provider refusal arrives as "the provider rejected or failed this turn; its response is
-in the server log", because the upstream's own body has held account identifiers and request
-fragments and meka will not republish it. The reason it failed is in meka's log, not in the notice.
-`mekabridge queue list` shows the rows as `failed`, and
+`owner_conversation` has meka's error verbatim, and after a provider failure the upstream's own
+response alongside it, as `The provider said: ...`. That is what names a revoked credential or a
+spent quota rather than leaving the notice pointing at meka's log. Two things withhold it: a meka
+older than the `[serve] relay_provider_errors` key, and an operator who set that key to `false`,
+which is worth doing where read-only meka tokens go to people not entitled to the provider account,
+since the same text names it. `mekabridge queue list` shows the rows as `failed`, and
 `mekabridge unseen` counts what the agent still has not been shown, unless
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.

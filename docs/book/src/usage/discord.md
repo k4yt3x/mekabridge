@@ -93,7 +93,7 @@ chat: group "#deploys in Acme Corp"
 at: 2026-08-12T14:03:11.427+00:00
 woke you: you were named, or this replies to something you said
 in reply to a message from Ali (id 1287733441209827300): "rollback is done"
-attachment: photo, "crash.png", image/png, 412.3 KiB [418]
+attachment: photo, "crash.png", image/png, 1920x1080, 412.3 KiB [418]
 text (verbatim, fenced by a19f4c):
 <<<a19f4c
 @mekabot can you check #incidents, Release Team should see this

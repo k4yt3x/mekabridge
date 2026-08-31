@@ -185,23 +185,29 @@ pub async fn writer(
         // to be given a decision rather than falling into a catch-all that silently drops it.
         let message = match &mut event {
             InboundEvent::Message(message) => message,
-            // A retraction exists so the bridge's own record of a chat does not outlive the chat.
-            // Without it `read_history` would keep handing back a message its author deleted, and
-            // on a platform that reports deletions there is no excuse for that.
-            InboundEvent::Retraction { message_id, .. } => {
+            // A retraction marks the message rather than removing it. The record is what the agent
+            // has to check itself against: anything it was woken for is already in its session for
+            // good, so erasing the row took away the only thing that could later tell it what it
+            // acted on has been taken back. Marked rows stay out of everything it is owed, so a
+            // retracted message is never offered as context it missed.
+            InboundEvent::Retraction {
+                message_id,
+                timestamp,
+                ..
+            } => {
                 match store
-                    .forget_message(conversation.as_str(), message_id)
+                    .mark_deleted(conversation.as_str(), message_id, *timestamp)
                     .await
                 {
                     Ok(true) => tracing::debug!(
                         conversation = %conversation,
                         message_id = %message_id,
-                        "dropped a message its author deleted"
+                        "marked a message its author deleted"
                     ),
                     Ok(false) => {}
                     Err(error) => tracing::error!(
                         conversation = %conversation,
-                        "failed to drop a deleted message: {}",
+                        "failed to mark a deleted message: {}",
                         error
                     ),
                 }
@@ -631,41 +637,46 @@ async fn record_message(
             // A queued message is one the agent is about to be handed, so it is accounted for
             // already and must not also be offered back to it later as context it missed.
             seen: queued,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
             timestamp: message.timestamp,
         })
-        .await
+        .await?;
+    // An edit is recorded as a row of its own, since the queue needs a distinct key to deliver it
+    // as an event rather than discard it as a redelivery. Marking what it replaced is what stops
+    // `read_history` returning the old and the new wording as two messages that both look current.
+    if let Some(edited_at) = message.edited_at {
+        store
+            .supersede_message(
+                message.conversation.as_str(),
+                &message.message_id,
+                &message.external_id,
+                edited_at,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
-/// Register the files an event brought with it and stamp each with the handle the agent fetches by.
+/// [`super::register_files`] over an inbound message's own fields.
 ///
-/// Done here rather than in the channel: the channel has no store handle, and giving it one would
-/// couple every platform to the database for no other reason. Runs before the payload is
-/// serialized, so the handles travel with the queued event and survive a restart.
+/// Runs before the payload is serialized, so the handles travel with the queued event and survive a
+/// restart.
 async fn register_attachments(
     store: &Store,
     message: &mut InboundMessage,
 ) -> Result<(), crate::store::StoreError> {
-    for (index, attachment) in message.attachments.iter_mut().enumerate() {
-        let handle = store
-            .register_attachment(crate::store::AttachmentRecord {
-                // Stable across a redelivery of the same message, so a replay reuses the handle
-                // already issued rather than minting a second one for the same file.
-                id: format!("{}:{}:{index}", message.conversation, message.external_id),
-                conversation_id: message.conversation.as_str().to_string(),
-                channel_id: message.channel.as_str().to_string(),
-                kind: attachment.kind.as_str().to_string(),
-                file_ref: attachment.file_ref.clone(),
-                thumb_ref: attachment.thumb_ref.clone(),
-                file_name: attachment.file_name.clone(),
-                media_type: attachment.media_type.clone(),
-                bytes: attachment.bytes,
-                path: None,
-                created_at: message.timestamp,
-            })
-            .await?;
-        attachment.handle = Some(handle);
-    }
-    Ok(())
+    super::register_files(
+        store,
+        &message.conversation,
+        &message.channel,
+        &message.external_id,
+        message.timestamp,
+        &mut message.attachments,
+    )
+    .await
 }
 
 /// Store the conversation an event came from, so it stays in the address book the agent can list.
@@ -1712,8 +1723,10 @@ async fn announce(
 /// Write one line of the bridge's own into a conversation.
 ///
 /// The only place the bridge does that. It is strictly about the bridge being broken, never about
-/// what anybody said, and it is not recorded in the message history: outbound is not, so the agent
-/// is never shown a message from its own account that it has no memory of sending.
+/// what anybody said, so it goes to the platform directly rather than through the sink: it is not
+/// the agent speaking and must not stamp the conversation as answered. It is still recorded, under
+/// no session, because the chat can see it and a record that omits it would leave the agent reading
+/// replies to something it has no trace of.
 async fn notify(context: &DrainContext, conversation: &ConversationId, text: &str) {
     let channel = match context.channels.resolve(conversation) {
         Ok(channel) => channel,
@@ -1722,12 +1735,32 @@ async fn notify(context: &DrainContext, conversation: &ConversationId, text: &st
             return;
         }
     };
+    let mut sent = Vec::new();
     if let Err(error) = channel
-        .send_text(conversation, text, &crate::channel::SendOptions::default())
+        .send_text(
+            conversation,
+            text,
+            &crate::channel::SendOptions::default(),
+            &mut sent,
+        )
         .await
     {
         tracing::error!(conversation = %conversation, "failed to say so: {}", error);
     }
+    // Recorded like anything else the bridge puts in a chat. The session is `None`, which is what
+    // distinguishes it: the row says the account spoke and names no session behind it, so the agent
+    // reading the conversation back finds the notice where the people it was sent to see it,
+    // instead of finding replies to something it has no record of.
+    super::record_own_messages(
+        &context.store,
+        context.config.storage.history_retention,
+        conversation,
+        channel.id(),
+        None,
+        sent,
+        None,
+    )
+    .await;
 }
 
 /// When each conversation was last told that something failed.
@@ -1926,6 +1959,9 @@ mod tests {
             file_name: None,
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(2048),
+            width: None,
+            height: None,
+            duration_secs: None,
             file_ref: file_ref.to_string(),
             thumb_ref: None,
             handle: None,

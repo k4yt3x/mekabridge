@@ -159,6 +159,30 @@ This is what makes `mute` usable: somebody mentions the agent halfway through a 
 
 Both read what the bridge recorded: nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
 
+A long reply becomes several real messages, and the platform can refuse one after the earlier ones have gone out. The tool reports the failure and names the part, and the parts that landed are recorded, so `read_history` matches what the person can actually see rather than showing nothing at all.
+
+### Both sides, and what became of each message
+
+The history covers both directions. What the agent sends is recorded alongside what it was told, one row per message that actually reached the chat, marked `own` and stamped with the `session` that sent it.
+
+That last part is the point of it. Several meka sessions share one bot account, and a scheduled or isolated one can speak without the main session knowing. Before this the only record of what a session had said was that session's own transcript, so a message sent by a scheduled job was unfindable by the session asked about it afterwards. Now "have I already told them?" is a search.
+
+Three fields say what has happened to a message since:
+
+| Field | Meaning |
+|-------|---------|
+| `own` | The agent sent this rather than received it |
+| `deleted` | The platform says it has since been retracted. The text is kept and still searchable |
+| `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id` |
+
+A message the agent was woken for is in its context permanently, so the record is the only thing able to tell it afterwards that what it acted on has been withdrawn or rewritten. That is why neither is erased. Both are excluded from `unseen` and from the missed-context lookback, though: a retracted message must never be offered as news.
+
+Long text is split into several real messages with several ids, and each gets its own row. `send_message`'s receipt numbers them (`part 2/3: 502`), so a later `edit_message` or `react` addresses the part meant rather than the first one.
+
+A file the agent sent carries an attachment handle like any other, so a session that did not send it can still open it.
+
+Deletions are reported by Discord only. The Telegram Bot API never tells a bot that somebody deleted a message, so deleted Telegram messages are never marked and simply age out under `history_retention`.
+
 On Discord, `search_history` also asks Discord's own guild search when the search names one conversation, and merges what comes back. That reaches messages from before the bot joined, which the bridge cannot have recorded. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord has indexed it; each of those falls back to the local results rather than failing the search. A result that came from Discord rather than the archive has no attachment handles and a `cursor` of `0`, since there is no local row to page from.
 
 Attachment handles come back with each message, so a picture found in history can go straight to `view_attachment` while it is still within `attachment_retention`.
@@ -262,6 +286,8 @@ Look at a picture, without writing anything to disk.
 | `attachment` | string | The handle in square brackets on an `attachment:` line |
 
 Returns the image itself, which meka forwards to the provider as a multimodal block, so the agent sees the picture in that same call.
+
+Prefer triaging from the `attachment:` line first. It carries the media type, pixel size, running time and byte count, which is usually enough to decide whether a file is worth looking at, and what an agent looks at stays in its context for the life of the session.
 
 Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `download_attachment` instead. So does everything when the active profile has no vision.
 

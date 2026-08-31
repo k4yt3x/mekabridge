@@ -551,6 +551,24 @@ mod tests {
         }
     }
 
+    /// Stand in for the record a platform returns when it accepts a send.
+    fn echo(message_id: &str, text: &str) -> crate::channel::SentMessage {
+        crate::channel::SentMessage {
+            message_id: message_id.to_string(),
+            text: text.to_string(),
+            sender: crate::channel::Sender {
+                id: "4242".to_string(),
+                display_name: "Mica".to_string(),
+                username: None,
+                is_bot: true,
+                on_behalf_of_chat: false,
+            },
+            attachments: Vec::new(),
+            notes: Vec::new(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     #[async_trait]
     impl Channel for SpyChannel {
         fn id(&self) -> &ChannelId {
@@ -588,20 +606,24 @@ mod tests {
         async fn send_text(
             &self,
             _conversation: &ConversationId,
-            _markdown: &str,
+            markdown: &str,
             _options: &SendOptions,
-        ) -> Result<Vec<String>, ChannelError> {
-            Ok(vec!["m1".to_string()])
+            sent: &mut Vec<crate::channel::SentMessage>,
+        ) -> Result<(), ChannelError> {
+            sent.push(echo("m1", markdown));
+            Ok(())
         }
 
         async fn send_files(
             &self,
             _conversation: &ConversationId,
             _paths: &[std::path::PathBuf],
-            _caption: Option<&str>,
+            caption: Option<&str>,
             _options: &crate::channel::FileOptions,
-        ) -> Result<Vec<String>, ChannelError> {
-            Ok(vec!["f1".to_string()])
+            sent: &mut Vec<crate::channel::SentMessage>,
+        ) -> Result<(), ChannelError> {
+            sent.push(echo("f1", caption.unwrap_or("")));
+            Ok(())
         }
 
         async fn fetch(

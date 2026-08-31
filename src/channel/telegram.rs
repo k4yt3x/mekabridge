@@ -47,7 +47,7 @@ use crate::{
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
         FetchedFile, FileOptions, ForwardOrigin, InboundEvent, InboundMessage, MemberAction,
         MemberCoverage, MemberInfo, MemberListing, MemberRight, MemberStatus, Platform,
-        ReplyContext, SendOptions, Sender,
+        ReplyContext, SendOptions, Sender, SentMessage,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -704,11 +704,12 @@ impl Channel for TelegramChannel {
         conversation: &ConversationId,
         markdown: &str,
         options: &SendOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         let (chat, thread) = self.target(conversation)?;
         let (bodies, parse_mode) = self.render(markdown, render::MESSAGE_LIMIT);
         if bodies.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let reply_to = options
@@ -717,7 +718,6 @@ impl Channel for TelegramChannel {
             .and_then(|raw| raw.parse::<i32>().ok())
             .map(MessageId);
 
-        let mut sent = Vec::with_capacity(bodies.len());
         for (index, body) in bodies.iter().enumerate() {
             let mut request = self.bot.send_message(Recipient::Id(chat), body.clone());
             if let Some(parse_mode) = parse_mode {
@@ -749,9 +749,11 @@ impl Channel for TelegramChannel {
                     message: format!("part {} of {} failed: {error}", index + 1, bodies.len()),
                 }
             })?;
-            sent.push(message.id.0.to_string());
+            // Pushed as each one lands rather than collected and returned, so a part refused
+            // after an earlier one went out still leaves the caller holding what the chat now has.
+            sent.push(sent_message(&message));
         }
-        Ok(sent)
+        Ok(())
     }
 
     /// `options.send.link_preview` is accepted and has no effect here, deliberately. Neither
@@ -766,7 +768,8 @@ impl Channel for TelegramChannel {
         paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         let (chat, thread) = self.target(conversation)?;
         // Refused before anything is opened, so an over-long list costs no upload. `sendMediaGroup`
         // would answer with its own error, but only after the files had been read and sent.
@@ -830,10 +833,8 @@ impl Channel for TelegramChannel {
                 .album_request(chat, thread, paths, caption_body, reply_to, options)
                 .await
                 .map_err(|error| self.delivery_error(&error))?;
-            return Ok(messages
-                .into_iter()
-                .map(|message| message.id.0.to_string())
-                .collect());
+            sent.extend(messages.iter().map(sent_message));
+            return Ok(());
         }
 
         // The trait says `paths` is non-empty, and the tool refuses an empty list before reaching
@@ -884,7 +885,8 @@ impl Channel for TelegramChannel {
             request.await
         }
         .map_err(|error| self.delivery_error(&error))?;
-        Ok(vec![message.id.0.to_string()])
+        sent.push(sent_message(&message));
+        Ok(())
     }
 
     async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError> {
@@ -959,7 +961,7 @@ impl Channel for TelegramChannel {
         message_id: &str,
         markdown: &str,
         link_preview: bool,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<Option<SentMessage>, ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
         let message_id = self.message_id(message_id)?;
         let (bodies, parse_mode) = self.render(markdown, render::MESSAGE_LIMIT);
@@ -988,7 +990,7 @@ impl Channel for TelegramChannel {
 
         self.edit_request(chat, message_id, body.clone(), parse_mode, link_preview)
             .await
-            .map(|_| ())
+            .map(|message| Some(sent_message(&message)))
             .map_err(|error| self.delivery_error(&error))
     }
 
@@ -1448,6 +1450,91 @@ fn member_rights(kind: &teloxide::types::ChatMemberKind) -> Vec<MemberRight> {
 }
 
 /// Best-effort human name for a Telegram user.
+/// Describe a message Telegram just made, as the record of something the bridge sent.
+///
+/// Read off the response rather than off what was submitted, and the difference matters. What goes
+/// out is HTML, but that is only how a body is handed to Telegram: it parses the markup away and
+/// keeps the text with entities beside it, and that stored text is the form every received message
+/// is recorded in. Taking it back off the response is what keeps the bridge's own rows in the same
+/// shape as everybody else's, and it costs no second rendering pass.
+///
+/// `describe_content` is the same function the inbound path uses, so a file the bot sent is
+/// described exactly as one it received and can be fetched back the same way.
+fn sent_message(message: &Message) -> SentMessage {
+    let (attachments, notes) = describe_content(message);
+    let user = message.from.as_ref();
+    SentMessage {
+        message_id: message.id.0.to_string(),
+        text: message
+            .text()
+            .or_else(|| message.caption())
+            .unwrap_or_default()
+            .to_string(),
+        sender: Sender {
+            id: user.map(|user| user.id.0.to_string()).unwrap_or_default(),
+            display_name: user.map_or_else(
+                || message.chat.title().unwrap_or("unknown sender").to_string(),
+                display_name,
+            ),
+            username: user.and_then(|user| user.username.clone()),
+            is_bot: user.is_some_and(|user| user.is_bot),
+            // A send by the bot itself always carries `from`, so this only becomes true for a
+            // message posted as the chat, which is what a channel post is.
+            on_behalf_of_chat: user.is_none(),
+        },
+        attachments,
+        notes,
+        timestamp: message.date,
+    }
+}
+
+/// Pixel size and running time, as far as one media kind has them.
+///
+/// Grouped rather than passed as three more arguments to `describe_content`'s builder, which is
+/// already at five: they arrive together, they are absent together, and every arm that has neither
+/// says so once with [`Shape::none`] instead of three times with `None`.
+#[derive(Debug, Default, Clone, Copy)]
+struct Shape {
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_secs: Option<u32>,
+}
+
+impl Shape {
+    /// A document or a voice-less file: the platform reports neither size nor length.
+    const fn none() -> Self {
+        Self {
+            width: None,
+            height: None,
+            duration_secs: None,
+        }
+    }
+
+    const fn sized(width: u32, height: u32) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+            duration_secs: None,
+        }
+    }
+
+    const fn clip(width: u32, height: u32, duration_secs: u32) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+            duration_secs: Some(duration_secs),
+        }
+    }
+
+    const fn sound(duration_secs: u32) -> Self {
+        Self {
+            width: None,
+            height: None,
+            duration_secs: Some(duration_secs),
+        }
+    }
+}
+
 fn display_name(user: &teloxide::types::User) -> String {
     match &user.last_name {
         Some(last) if !last.is_empty() => format!("{} {}", user.first_name, last),
@@ -1492,6 +1579,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
                       file: &teloxide::types::FileMeta,
                       file_name,
                       media_type,
+                      shape: Shape,
                       thumb: Option<&teloxide::types::PhotoSize>| {
         (
             vec![Attachment {
@@ -1499,6 +1587,9 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
                 file_name,
                 media_type,
                 bytes: Some(file.size as u64),
+                width: shape.width,
+                height: shape.height,
+                duration_secs: shape.duration_secs,
                 file_ref: file.id.to_string(),
                 thumb_ref: thumb.map(|thumb| thumb.file.id.to_string()),
                 handle: None,
@@ -1537,6 +1628,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
                 &largest.file,
                 None,
                 Some("image/jpeg".to_string()),
+                Shape::sized(largest.width, largest.height),
                 None,
             )
         }
@@ -1545,6 +1637,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.document.file,
             media.document.file_name.clone(),
             media.document.mime_type.as_ref().map(ToString::to_string),
+            Shape::none(),
             media.document.thumbnail.as_ref(),
         ),
         MediaKind::Animation(media) => attachment(
@@ -1552,6 +1645,11 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.animation.file,
             media.animation.file_name.clone(),
             media.animation.mime_type.as_ref().map(ToString::to_string),
+            Shape::clip(
+                media.animation.width,
+                media.animation.height,
+                media.animation.duration.seconds(),
+            ),
             media.animation.thumbnail.as_ref(),
         ),
         MediaKind::Voice(media) => attachment(
@@ -1559,6 +1657,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.voice.file,
             None,
             media.voice.mime_type.as_ref().map(ToString::to_string),
+            Shape::sound(media.voice.duration.seconds()),
             None,
         ),
         MediaKind::Audio(media) => attachment(
@@ -1566,6 +1665,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.audio.file,
             media.audio.file_name.clone(),
             media.audio.mime_type.as_ref().map(ToString::to_string),
+            Shape::sound(media.audio.duration.seconds()),
             media.audio.thumbnail.as_ref(),
         ),
         MediaKind::Video(media) => attachment(
@@ -1573,6 +1673,11 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.video.file,
             media.video.file_name.clone(),
             media.video.mime_type.as_ref().map(ToString::to_string),
+            Shape::clip(
+                media.video.width,
+                media.video.height,
+                media.video.duration.seconds(),
+            ),
             media.video.thumbnail.as_ref(),
         ),
         MediaKind::VideoNote(media) => attachment(
@@ -1580,6 +1685,12 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
             &media.video_note.file,
             None,
             None,
+            // A video note is square, so Telegram reports one side rather than two.
+            Shape::clip(
+                media.video_note.length,
+                media.video_note.length,
+                media.video_note.duration.seconds(),
+            ),
             media.video_note.thumbnail.as_ref(),
         ),
         MediaKind::Sticker(media) => {
@@ -1593,6 +1704,7 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
                 &sticker.file,
                 None,
                 (!animated).then(|| "image/webp".to_string()),
+                Shape::sized(sticker.width.into(), sticker.height.into()),
                 thumb,
             );
             notes.push(match &sticker.emoji {
@@ -1782,7 +1894,13 @@ mod tests {
             .map(|index| PathBuf::from(format!("/tmp/{index}.png")))
             .collect();
         let error = channel
-            .send_files(&conversation, &paths, None, &FileOptions::default())
+            .send_files(
+                &conversation,
+                &paths,
+                None,
+                &FileOptions::default(),
+                &mut Vec::new(),
+            )
             .await
             .expect_err("an over-long album must be refused");
         let message = error.to_string();
@@ -2715,6 +2833,35 @@ mod tests {
             message.attachments[0].thumb_ref.as_deref(),
             Some("AAMCvthumb")
         );
+        // Telegram sends these in the same payload the rest of this is read from, so not carrying
+        // them was leaving the agent to spend a fetch on a decision the envelope could have made.
+        assert_eq!(message.attachments[0].width, Some(1920));
+        assert_eq!(message.attachments[0].height, Some(1080));
+        assert_eq!(message.attachments[0].duration_secs, Some(30));
+    }
+
+    #[tokio::test]
+    async fn a_voice_note_says_how_long_it_is() {
+        // The case with no dimensions at all, and the one where the length is the whole decision:
+        // a nine-second note and a nine-minute one are answered differently.
+        let channel = channel(vec![111], vec![]);
+        let event = channel
+            .to_event(&private_message(serde_json::json!({
+                "voice": {
+                    "file_id": "AWADvoice",
+                    "file_unique_id": "u9",
+                    "file_size": 4200,
+                    "duration": 9,
+                    "mime_type": "audio/ogg",
+                },
+            })))
+            .await
+            .expect("event");
+        let message = inbound(event);
+        assert_eq!(message.attachments[0].kind, AttachmentKind::Voice);
+        assert_eq!(message.attachments[0].duration_secs, Some(9));
+        assert_eq!(message.attachments[0].width, None);
+        assert_eq!(message.attachments[0].height, None);
     }
 
     #[tokio::test]

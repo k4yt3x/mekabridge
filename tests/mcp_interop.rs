@@ -67,6 +67,7 @@ impl OutboundSink for RecordingSink {
         conversation: &str,
         markdown: &str,
         _options: SendOptions,
+        _session: Option<&str>,
     ) -> Result<Vec<String>, SinkError> {
         if conversation != "telegram:1" {
             return Err(SinkError::UnknownConversation(conversation.to_string()));
@@ -85,6 +86,7 @@ impl OutboundSink for RecordingSink {
         _paths: &[std::path::PathBuf],
         _caption: Option<&str>,
         _options: mekabridge::mcp::FileOptions,
+        _session: Option<&str>,
     ) -> Result<Vec<String>, SinkError> {
         Ok(vec!["2001".to_string()])
     }
@@ -160,6 +162,7 @@ impl OutboundSink for RecordingSink {
         message_id: &str,
         markdown: &str,
         _link_preview: bool,
+        _session: Option<&str>,
     ) -> Result<(), SinkError> {
         let mut edits = self
             .edits
@@ -312,6 +315,10 @@ impl OutboundSink for RecordingSink {
             notes: None,
             attachments: Vec::new(),
             addressed: false,
+            own: false,
+            session: None,
+            deleted: false,
+            superseded: false,
             timestamp: "2026-08-11T09:30:00+00:00".to_string(),
             cursor: 41,
         }])
@@ -410,9 +417,13 @@ async fn handshake_succeeds_across_the_version_gap() {
         .instructions
         .as_deref()
         .expect("server instructions orient the agent and must survive negotiation");
+    // Asserted on a header line rather than on a tool name. The instructions deliberately do not
+    // enumerate the tools, whose own descriptions are in front of the agent whenever it reaches for
+    // one; what only they can supply is the envelope's headers, which appear in a user message that
+    // no schema describes.
     assert!(
-        instructions.contains("send_message"),
-        "instructions should name the reply tool, got: {instructions}"
+        instructions.contains("`admitted:`"),
+        "instructions should explain the envelope headers, got: {instructions}"
     );
 
     client.cancel().await.expect("clean shutdown");

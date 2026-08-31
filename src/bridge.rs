@@ -375,6 +375,46 @@ async fn shutdown_signal() {
     }
 }
 
+/// Register files against a message and stamp each with the handle the agent fetches by.
+///
+/// Shared by both directions. A file the agent sent is on the platform exactly as one it received
+/// is, and the send response carries the reference needed to pull it back, so a session that did
+/// not send it can still open it. Without this the bridge's own attachments would be the only ones
+/// in the history that could not be viewed.
+///
+/// The handle id is `<conversation>:<external_id>:<index>`, stable across a redelivery so a replay
+/// reuses the handle already issued rather than minting a second one for the same file. Outbound
+/// messages use their platform message id as the external id, which cannot collide with an inbound
+/// one; see the note in [`record_own_messages`] for why not, which differs per platform.
+async fn register_files(
+    store: &Store,
+    conversation: &ConversationId,
+    channel: &crate::channel::ChannelId,
+    external_id: &str,
+    timestamp: chrono::DateTime<Utc>,
+    attachments: &mut [crate::channel::Attachment],
+) -> std::result::Result<(), crate::store::StoreError> {
+    for (index, attachment) in attachments.iter_mut().enumerate() {
+        let handle = store
+            .register_attachment(crate::store::AttachmentRecord {
+                id: format!("{conversation}:{external_id}:{index}"),
+                conversation_id: conversation.as_str().to_string(),
+                channel_id: channel.as_str().to_string(),
+                kind: attachment.kind.as_str().to_string(),
+                file_ref: attachment.file_ref.clone(),
+                thumb_ref: attachment.thumb_ref.clone(),
+                file_name: attachment.file_name.clone(),
+                media_type: attachment.media_type.clone(),
+                bytes: attachment.bytes,
+                path: None,
+                created_at: timestamp,
+            })
+            .await?;
+        attachment.handle = Some(handle);
+    }
+    Ok(())
+}
+
 /// Implements the MCP server's outbound port over the channel registry.
 ///
 /// Sends are not restricted to conversations the bridge has seen. The agent may write to any id its
@@ -529,11 +569,55 @@ impl BridgeSink {
         }
     }
 
-    async fn note_sent(&self, conversation: &ConversationId, platform: crate::channel::Platform) {
-        let conversation = &self.canonical(conversation).await;
+    /// Everything that happens after a send lands, over the conversation it landed in.
+    ///
+    /// Resolves the canonical id once and hands it to all three, because a dialling address names a
+    /// person rather than a chat and the reply will arrive under the resolved id. Recording the
+    /// history under the address instead would put the bot's own message in a different
+    /// conversation from the answer to it.
+    async fn note_sent(
+        &self,
+        conversation: &ConversationId,
+        channel: &Arc<dyn Channel>,
+        session: Option<&str>,
+        sent: Vec<crate::channel::SentMessage>,
+    ) {
+        let conversation = self.canonical(conversation).await;
         // Stops the typing indicator re-arming here. Telegram already cleared it when this message
         // landed, so setting it again would announce a follow-up that is not coming.
-        self.presence.note_sent(conversation);
+        self.presence.note_sent(&conversation);
+        self.touch_outbound(&conversation, channel.platform()).await;
+        self.record_own(&conversation, channel, session, sent, None)
+            .await;
+    }
+
+    /// This sink's half of [`record_own_messages`], which carries the reasoning.
+    async fn record_own(
+        &self,
+        conversation: &ConversationId,
+        channel: &Arc<dyn Channel>,
+        session: Option<&str>,
+        sent: Vec<crate::channel::SentMessage>,
+        revised_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        record_own_messages(
+            &self.store,
+            self.storage.history_retention,
+            conversation,
+            channel.id(),
+            session,
+            sent,
+            revised_at,
+        )
+        .await;
+    }
+
+    /// Stamp the conversation as one the agent has written in, minting it if it is new.
+    async fn touch_outbound(
+        &self,
+        conversation: &ConversationId,
+        platform: crate::channel::Platform,
+    ) {
         let now = Utc::now();
         if let Err(error) = self
             .store
@@ -558,6 +642,134 @@ impl BridgeSink {
     }
 }
 
+/// Write the bridge's own messages into the same history everybody else's is in.
+///
+/// Until this existed the history held only what other people said, so the agent could not answer
+/// "did I already tell them that?" about its own account, and a message sent by a scheduled session
+/// was unfindable by the session asked about it afterwards. One row per real platform message, not
+/// per tool call: text too long for one message becomes several with several ids, and a row can
+/// only carry one of them, so a single row would hand back an id that edits or reacts to the first
+/// part alone.
+///
+/// A free function rather than a method on [`BridgeSink`], because the drain loop's own failure
+/// notice is outbound too and reaches its channel directly rather than through a sink. As a method
+/// this would have left that notice the one thing the bridge says to a chat that its own record of
+/// the chat does not contain.
+///
+/// Nothing here can fail the send, which has already happened. A store that cannot record it costs
+/// a gap in the history and is logged; failing the tool call would tell the agent its message did
+/// not go out when it did, which is the worse of the two.
+///
+/// `seen` is true on every row. It marks what the agent still has to be shown, and the bridge's own
+/// output is not owed to it: at false these rows would be counted as a backlog and offered back as
+/// context it missed. `session` is `None` for the bridge's own notice, which is what distinguishes
+/// the account having spoken from a session having spoken.
+///
+/// `revised_at` says these are replacements rather than new messages. A revision keeps the message
+/// id it revises, so it needs a deduplication key of its own or the unique constraint would swallow
+/// it, and the wording it replaced is marked superseded once it is safely recorded. Same treatment
+/// as an edit arriving from the platform, for the same reason: without it the history holds two
+/// rows for one message and both look current.
+async fn record_own_messages(
+    store: &Store,
+    history_retention: Duration,
+    conversation: &ConversationId,
+    channel: &crate::channel::ChannelId,
+    session: Option<&str>,
+    mut sent: Vec<crate::channel::SentMessage>,
+    revised_at: Option<chrono::DateTime<Utc>>,
+) {
+    if history_retention.is_zero() {
+        return;
+    }
+    for message in &mut sent {
+        if let Err(error) = register_files(
+            store,
+            conversation,
+            channel,
+            &message.message_id,
+            message.timestamp,
+            &mut message.attachments,
+        )
+        .await
+        {
+            tracing::warn!(
+                conversation = %conversation,
+                "could not register the files of a message the agent sent: {}",
+                error
+            );
+        }
+        // The platform's message id serves as the deduplication key too, and cannot collide with an
+        // inbound one, though for a different reason on each platform: Telegram numbers a chat's
+        // messages in one sequence covering both directions, and Discord's snowflakes are unique
+        // everywhere. Neither ever hands the bridge its own message as an inbound event in any
+        // case.
+        //
+        // A revision carries the id it revises, so it takes the `<id>:e<time>` shape the inbound
+        // path gives an edit, at millisecond resolution rather than that path's seconds. Two edits
+        // sharing a key would leave the second unrecorded, and two full API round trips inside one
+        // millisecond is not reachable; superseding is ordered against the revision's own row, so
+        // even a shared key marks the right rows.
+        let external_id = match revised_at {
+            Some(revised_at) => {
+                format!("{}:e{}", message.message_id, revised_at.timestamp_millis())
+            }
+            None => message.message_id.clone(),
+        };
+        let record = crate::store::MessageRecord {
+            id: 0,
+            conversation_id: conversation.as_str().to_string(),
+            external_id: external_id.clone(),
+            message_id: message.message_id.clone(),
+            sender_id: (!message.sender.id.is_empty()).then(|| message.sender.id.clone()),
+            sender_name: message.sender.display_name.clone(),
+            text: message.text.clone(),
+            notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
+            attachments: message
+                .attachments
+                .iter()
+                .filter_map(|attachment| attachment.handle.clone())
+                .collect(),
+            addressed: false,
+            seen: true,
+            own: true,
+            session_id: session.map(str::to_string),
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: message.timestamp,
+        };
+        if let Err(error) = store.record_message(record).await {
+            tracing::warn!(
+                conversation = %conversation,
+                message_id = %message.message_id,
+                "could not record a message the agent sent: {}",
+                error
+            );
+            // Superseding is skipped when the replacement did not land, so a failure here leaves
+            // the old wording readable rather than marking it stale with nothing to read in its
+            // place.
+            continue;
+        }
+        if let Some(revised_at) = revised_at
+            && let Err(error) = store
+                .supersede_message(
+                    conversation.as_str(),
+                    &message.message_id,
+                    &external_id,
+                    revised_at,
+                )
+                .await
+        {
+            tracing::warn!(
+                conversation = %conversation,
+                message_id = %message.message_id,
+                "could not mark the wording an edit replaced: {}",
+                error
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl OutboundSink for BridgeSink {
     async fn send_text(
@@ -565,23 +777,39 @@ impl OutboundSink for BridgeSink {
         conversation: &str,
         markdown: &str,
         options: SendOptions,
+        session: Option<&str>,
     ) -> std::result::Result<Vec<String>, SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
             .channels
             .resolve(&conversation)
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        let sent = channel
-            .send_text(&conversation, markdown, &options)
-            .await
-            .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        self.note_sent(&conversation, channel.platform()).await;
+        // The result is kept rather than propagated, because `sent` is meaningful either way:
+        // splitting means part two can be refused with part one already in the chat, and recording
+        // only on success would leave the chat holding words the history has no record of. That is
+        // the failure own-message recording exists to prevent, so the record comes first and the
+        // error after it.
+        let mut sent = Vec::new();
+        let outcome = channel
+            .send_text(&conversation, markdown, &options, &mut sent)
+            .await;
+        let ids: Vec<String> = sent
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect();
         tracing::info!(
             conversation = %conversation,
             parts = sent.len(),
+            failed = outcome.is_err(),
             "the agent sent a message"
         );
-        Ok(sent)
+        // Skipped only when nothing landed and the send failed, so a chat that received nothing is
+        // not minted into the address book with a time the agent last spoke there.
+        if outcome.is_ok() || !sent.is_empty() {
+            self.note_sent(&conversation, channel, session, sent).await;
+        }
+        outcome.map_err(|error| SinkError::Delivery(error.to_string()))?;
+        Ok(ids)
     }
 
     async fn send_file(
@@ -590,6 +818,7 @@ impl OutboundSink for BridgeSink {
         paths: &[std::path::PathBuf],
         caption: Option<&str>,
         options: FileOptions,
+        session: Option<&str>,
     ) -> std::result::Result<Vec<String>, SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
@@ -617,13 +846,28 @@ impl OutboundSink for BridgeSink {
                 conversation.channel()
             )));
         }
-        let sent = channel
-            .send_files(&conversation, paths, caption, &options)
-            .await
-            .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        self.note_sent(&conversation, channel.platform()).await;
-        tracing::info!(conversation = %conversation, files = paths.len(), "the agent sent a file");
-        Ok(sent)
+        // Recorded before the error is raised, for the reason `send_text` above gives. Neither
+        // platform here can half send a group, but the contract allows one that loops and this
+        // side of it costs nothing to honour.
+        let mut sent = Vec::new();
+        let outcome = channel
+            .send_files(&conversation, paths, caption, &options, &mut sent)
+            .await;
+        let ids: Vec<String> = sent
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect();
+        tracing::info!(
+            conversation = %conversation,
+            files = paths.len(),
+            failed = outcome.is_err(),
+            "the agent sent a file"
+        );
+        if outcome.is_ok() || !sent.is_empty() {
+            self.note_sent(&conversation, channel, session, sent).await;
+        }
+        outcome.map_err(|error| SinkError::Delivery(error.to_string()))?;
+        Ok(ids)
     }
 
     async fn react(
@@ -665,6 +909,7 @@ impl OutboundSink for BridgeSink {
         message_id: &str,
         markdown: &str,
         link_preview: bool,
+        session: Option<&str>,
     ) -> std::result::Result<(), SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
@@ -677,18 +922,33 @@ impl OutboundSink for BridgeSink {
                 conversation.channel()
             )));
         }
-        channel
+        let revised = channel
             .edit_text(&conversation, message_id, markdown, link_preview)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        // Deliberately not `note_sent`: revising a message is not new activity in the conversation,
-        // and treating it as such would make a chat the agent only corrected itself in look freshly
-        // answered.
         tracing::info!(
             conversation = %conversation,
             message_id = %message_id,
             "the agent edited a message"
         );
+        // Deliberately not `note_sent`: revising a message is not new activity in the conversation,
+        // and treating it as such would make a chat the agent only corrected itself in look freshly
+        // answered. The history still has to learn about it, so the recording half runs on its own.
+        //
+        // The canonical id is resolved here rather than reused, because the row being revised was
+        // recorded under it and an edit addressed to a dialling address would otherwise look for it
+        // somewhere else.
+        if let Some(revised) = revised {
+            let conversation = self.canonical(&conversation).await;
+            self.record_own(
+                &conversation,
+                channel,
+                session,
+                vec![revised],
+                Some(Utc::now()),
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -706,13 +966,29 @@ impl OutboundSink for BridgeSink {
             .delete_message(&conversation, message_id)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        // Warn, not info: a deletion leaves no trace on the platform, so this log line is the only
-        // remaining record that it happened.
+        // Warn, not info: a deletion leaves no trace on the platform, so the chat itself no longer
+        // shows it happened.
         tracing::warn!(
             conversation = %conversation,
             message_id = %message_id,
             "the agent deleted a message"
         );
+        // Marked in the history the same way a deletion reported by the platform is, so a message
+        // the agent removed reads back as removed rather than as one that was never there. Failing
+        // here would report a deletion that did happen as an error, so it is logged instead.
+        let conversation = self.canonical(&conversation).await;
+        if let Err(error) = self
+            .store
+            .mark_deleted(conversation.as_str(), message_id, Utc::now())
+            .await
+        {
+            tracing::warn!(
+                conversation = %conversation,
+                message_id = %message_id,
+                "could not mark a deleted message in the history: {}",
+                error
+            );
+        }
         Ok(())
     }
 
@@ -1176,6 +1452,15 @@ impl OutboundSink for BridgeSink {
                             notes: None,
                             attachments: Vec::new(),
                             addressed: false,
+                            // The connector settles this one from its own account id. The rest are
+                            // unknowable from a platform search, which returns a message id, an
+                            // author and a time and nothing the bridge recorded about it, so they
+                            // are left at their defaults rather than guessed, the same way
+                            // `attachments` and `addressed` above are.
+                            own: message.own,
+                            session: None,
+                            deleted: false,
+                            superseded: false,
                             timestamp: message.timestamp.to_rfc3339(),
                             // Not a row in the bridge's history, so there is nothing to page back
                             // from. Zero is the value `read_history` already treats as no cursor.
@@ -1266,6 +1551,10 @@ fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
         notes: record.notes,
         attachments: record.attachments,
         addressed: record.addressed,
+        own: record.own,
+        session: record.session_id,
+        deleted: record.deleted_at.is_some(),
+        superseded: record.superseded_at.is_some(),
         timestamp: record.timestamp.to_rfc3339(),
         cursor: record.id,
     }

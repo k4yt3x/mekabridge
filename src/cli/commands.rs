@@ -817,14 +817,25 @@ pub async fn history_show(
     for message in messages {
         let marker = if message.addressed { "@" } else { " " };
         let seen = if message.seen { " " } else { "*" };
+        // The bridge's own messages read as an ordinary participant otherwise, distinguishable
+        // only by whoever happens to know the bot's display name.
+        let side = if message.own { ">" } else { " " };
+        // A retracted or rewritten message reading as though it still stands is the same defect the
+        // agent's own history tools were fixed for; an operator scrolling this deserves the same
+        // answer.
+        let state = match (message.deleted_at, message.superseded_at) {
+            (Some(_), _) => "  [deleted]",
+            (None, Some(_)) => "  [superseded by a later edit]",
+            (None, None) => "",
+        };
         println!(
-            "{seen}{marker} {}  {:<20} {}",
+            "{seen}{marker}{side} {}  {:<20} {}{state}",
             short_time(message.timestamp),
             message.sender_name,
             message.text.replace('\n', " ")
         );
     }
-    println!("\n* not yet shown to the agent, @ addressed to it");
+    println!("\n* not yet shown to the agent, @ addressed to it, > sent by the agent");
     Ok(())
 }
 

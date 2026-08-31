@@ -70,7 +70,7 @@ use crate::{
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
         FetchedFile, FileOptions, ForwardOrigin, FoundMessage, InboundEvent, InboundMessage,
         MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberStatus, Platform, Presence,
-        ReplyContext, SendOptions, Sender,
+        ReplyContext, SendOptions, Sender, SentMessage,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -676,6 +676,17 @@ impl DiscordChannel {
                     file_name: Some(attachment.filename.clone()),
                     media_type,
                     bytes: Some(attachment.size),
+                    // Discord types these as 64-bit and rounds duration to the millisecond. Neither
+                    // range survives the narrowing in practice, and a value that would not fit is
+                    // reported as absent rather than wrapped into a plausible wrong number.
+                    width: attachment.width.and_then(|width| u32::try_from(width).ok()),
+                    height: attachment
+                        .height
+                        .and_then(|height| u32::try_from(height).ok()),
+                    duration_secs: attachment
+                        .duration_secs
+                        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                        .map(|seconds| seconds.round() as u32),
                     file_ref: format!("{}/{}/{}", message.channel_id, message.id, attachment.id),
                     // Discord exposes no still frame for a video to a bot, so there is nothing to
                     // fall back to. Saying nothing is better than a handle that fetches the video.
@@ -684,6 +695,36 @@ impl DiscordChannel {
                 }
             })
             .collect()
+    }
+
+    /// Describe a message Discord just made, as the record of something the bridge sent.
+    ///
+    /// Taken from the response rather than from what was submitted, and here the two happen to
+    /// agree: Discord stores and returns its own flavour of Markdown, which is the same form
+    /// [`InboundMessage::text`] holds, so no second rendering is involved. What the response adds
+    /// is what only Discord knows, chiefly the attachment ids that make a file the bot sent
+    /// fetchable afterwards by whoever reads the conversation back.
+    ///
+    /// Reuses [`Self::attachments`], so an outbound file is described exactly as an inbound one.
+    fn sent_message(&self, message: &Message) -> SentMessage {
+        SentMessage {
+            message_id: message.id.to_string(),
+            text: self.demention(&message.content, &message.mentions, message.guild_id),
+            sender: Sender {
+                id: message.author.id.to_string(),
+                display_name: message
+                    .author
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| message.author.name.clone()),
+                username: Some(message.author.name.clone()),
+                is_bot: message.author.bot,
+                on_behalf_of_chat: message.webhook_id.is_some(),
+            },
+            attachments: self.attachments(message),
+            notes: Vec::new(),
+            timestamp: timestamp_to_chrono(message.timestamp).unwrap_or_else(Utc::now),
+        }
     }
 
     /// Rewrite Discord's id markup into names.
@@ -1070,7 +1111,7 @@ impl DiscordChannel {
                             serde_json::Value::Array(inner) => inner.first(),
                             other => Some(other),
                         })
-                        .filter_map(found_message)
+                        .filter_map(|hit| found_message(hit, self.identity.get().copied()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1213,8 +1254,16 @@ fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
 ///
 /// Anything without an author, text, and a time is skipped rather than filled in with placeholders:
 /// a result the agent cannot attribute is worse than one fewer result.
-fn found_message(value: &serde_json::Value) -> Option<FoundMessage> {
+fn found_message(value: &serde_json::Value, me: Option<Id<UserMarker>>) -> Option<FoundMessage> {
     let author = value.get("author")?;
+    // Discord's search returns the author in full, so whether a hit is the bot's own is settled
+    // here rather than guessed from the display name downstream.
+    let own = me.is_some_and(|me| {
+        author
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == me.get().to_string())
+    });
     let sender_name = author
         .get("global_name")
         .and_then(serde_json::Value::as_str)
@@ -1233,6 +1282,7 @@ fn found_message(value: &serde_json::Value) -> Option<FoundMessage> {
         message_id: value.get("id")?.as_str()?.to_string(),
         sender_name,
         text,
+        own,
         timestamp,
     })
 }
@@ -1394,11 +1444,12 @@ impl Channel for DiscordChannel {
         conversation: &ConversationId,
         markdown: &str,
         options: &SendOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         let channel_id = self.target(conversation).await?;
         let bodies = render::to_markdown(markdown, render::MESSAGE_LIMIT);
         if bodies.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let reply_to = options
             .reply_to
@@ -1413,7 +1464,6 @@ impl Channel for DiscordChannel {
             flags |= MessageFlags::SUPPRESS_NOTIFICATIONS;
         }
 
-        let mut sent = Vec::with_capacity(bodies.len());
         for (index, body) in bodies.iter().enumerate() {
             let mut request = self
                 .http
@@ -1443,9 +1493,11 @@ impl Channel for DiscordChannel {
                 .model()
                 .await
                 .map_err(|error| self.decode_error("the sent message", &error))?;
-            sent.push(message.id.to_string());
+            // Pushed as each one lands rather than collected and returned, so a part refused after
+            // an earlier one went out still leaves the caller holding what the chat now has.
+            sent.push(self.sent_message(&message));
         }
-        Ok(sent)
+        Ok(())
     }
 
     async fn send_files(
@@ -1454,7 +1506,8 @@ impl Channel for DiscordChannel {
         paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         let channel_id = self.target(conversation).await?;
         // Answered rather than sent as a caption-only message, which is what an empty list would
         // otherwise produce here: nothing indexes `paths`, so there is no panic to stop it. The
@@ -1565,7 +1618,8 @@ impl Channel for DiscordChannel {
             .model()
             .await
             .map_err(|error| self.decode_error("the sent message", &error))?;
-        Ok(vec![message.id.to_string()])
+        sent.push(self.sent_message(&message));
+        Ok(())
     }
 
     async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError> {
@@ -1702,7 +1756,7 @@ impl Channel for DiscordChannel {
         message_id: &str,
         markdown: &str,
         link_preview: bool,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<Option<SentMessage>, ChannelError> {
         let channel_id = self.target(conversation).await?;
         let message_id = self.parse_message(message_id)?;
         let bodies = render::to_markdown(markdown, render::MESSAGE_LIMIT);
@@ -1727,14 +1781,30 @@ impl Channel for DiscordChannel {
         // chose, so an edit asking for a preview on a message sent without one would silently do
         // nothing. `SUPPRESS_EMBEDS` is the only flag `update_message` accepts, so writing the
         // whole set cannot clobber anything else.
-        self.http
+        let response = self
+            .http
             .update_message(channel_id, message_id)
             .content(Some(body))
             .allowed_mentions(Some(&mentions))
             .flags(Self::edit_flags(link_preview))
             .await
             .map_err(|error| self.delivery_error("editing the message", &error))?;
-        Ok(())
+        // Discord has already applied the edit by here, so a body this cannot parse costs the
+        // history row and nothing else. Returning the decode error instead would report a
+        // successful edit as a failure, and an agent told its correction did not land is liable to
+        // send it again.
+        match response.model().await {
+            Ok(message) => Ok(Some(self.sent_message(&message))),
+            Err(error) => {
+                tracing::warn!(
+                    channel = %self.id,
+                    "the edit was applied but its response could not be read, so the history keeps \
+                     the old wording: {}",
+                    error
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn delete_message(
@@ -2223,7 +2293,13 @@ mod tests {
             .map(|index| PathBuf::from(format!("/tmp/{index}.png")))
             .collect();
         let error = channel
-            .send_files(&conversation, &paths, None, &FileOptions::default())
+            .send_files(
+                &conversation,
+                &paths,
+                None,
+                &FileOptions::default(),
+                &mut Vec::new(),
+            )
             .await
             .expect_err("an over-long attachment list must be refused");
         let message = error.to_string();
@@ -2709,11 +2785,39 @@ mod tests {
                 serde_json::Value::Array(inner) => inner.first(),
                 other => Some(other),
             })
-            .filter_map(found_message)
+            .filter_map(|hit| found_message(hit, None))
             .collect();
         assert_eq!(found.len(), 1, "the real response shape must parse");
         assert_eq!(found[0].sender_name, "mekabot");
         assert_eq!(found[0].text, "operations check: an attached file");
+        assert!(
+            !found[0].own,
+            "with no identity resolved nothing can be claimed as the bot's own"
+        );
+
+        // This path reaches back past anything the bridge recorded, which is exactly where "have I
+        // already said this?" is hardest, so a hit the bot wrote has to say so. The author id is in
+        // the response either way; only the comparison was missing.
+        let author = messages
+            .iter()
+            .filter_map(|group| match group {
+                serde_json::Value::Array(inner) => inner.first(),
+                other => Some(other),
+            })
+            .next()
+            .and_then(|hit| hit.get("author")?.get("id")?.as_str())
+            .and_then(|id| id.parse::<u64>().ok())
+            .and_then(Id::new_checked)
+            .expect("the fixture names its author");
+        let mine: Vec<_> = messages
+            .iter()
+            .filter_map(|group| match group {
+                serde_json::Value::Array(inner) => inner.first(),
+                other => Some(other),
+            })
+            .filter_map(|hit| found_message(hit, Some(author)))
+            .collect();
+        assert!(mine[0].own, "a hit the bot wrote is its own");
     }
 
     #[tokio::test]
@@ -2878,6 +2982,40 @@ mod tests {
             AttachmentKind::Audio
         );
         assert_eq!(attachment_kind(None, false), AttachmentKind::Document);
+    }
+
+    #[tokio::test]
+    async fn an_attachment_carries_the_size_and_length_discord_reported() {
+        let channel = channel_with(vec![1], vec![], vec![], vec![], false);
+        let message = message(serde_json::json!({
+            "attachments": [{
+                "id": "900",
+                "filename": "screenshot.png",
+                "size": 40_000,
+                "url": "https://cdn.example/900",
+                "proxy_url": "https://proxy.example/900",
+                "content_type": "image/png",
+                "width": 1920,
+                "height": 1080,
+            }, {
+                "id": "901",
+                "filename": "note.ogg",
+                "size": 4200,
+                "url": "https://cdn.example/901",
+                "proxy_url": "https://proxy.example/901",
+                "content_type": "audio/ogg",
+                "duration_secs": 8.6,
+                "waveform": "AAA=",
+            }],
+        }));
+        let attachments = channel.attachments(&message);
+        assert_eq!(attachments[0].width, Some(1920));
+        assert_eq!(attachments[0].height, Some(1080));
+        assert_eq!(attachments[0].duration_secs, None);
+        // Discord reports this as a float; the envelope shows whole seconds, so it rounds rather
+        // than truncating and an 8.6-second note does not read as eight.
+        assert_eq!(attachments[1].duration_secs, Some(9));
+        assert_eq!(attachments[1].width, None);
     }
 
     #[tokio::test]

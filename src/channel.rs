@@ -327,6 +327,21 @@ pub struct Attachment {
     pub media_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Pixel size, where the platform reports one.
+    ///
+    /// Announced rather than left to be discovered, because the agent's decision is whether to
+    /// spend a fetch at all and this is most of what that decision needs: 1920x1080 is a
+    /// screenshot and 96x96 is an avatar, and telling them apart from "photo, 40 KiB" alone is
+    /// guesswork. Both platforms hand these over in the payload the connector already parses,
+    /// so knowing costs nothing while looking costs the rest of the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Running time in whole seconds, for audio and video. The same argument as the dimensions: a
+    /// nine-second voice note and a nine-minute one are different decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
     /// Platform-native reference used to fetch the file later. Telegram file ids stay valid
     /// indefinitely for the same bot, which is what makes deferring the download safe.
     pub file_ref: String,
@@ -341,6 +356,32 @@ pub struct Attachment {
     pub handle: Option<String>,
 }
 
+/// One message the bridge sent, as the platform recorded it.
+///
+/// Built from the response to the send rather than from what was submitted, and that distinction is
+/// the point. A connector renders Markdown into whatever its platform parses, and text too long for
+/// one message becomes several, so what went out is neither what the agent wrote nor one message.
+/// The response says what the platform actually stored: its id, its text in the same form an
+/// [`InboundMessage`] carries, and the files it kept. Recording that is what lets a later session
+/// read the conversation back and find the bot's own messages sitting among everybody else's,
+/// addressable by ids that work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    /// Platform-native id, which is what a later edit, reaction or reply targets.
+    pub message_id: String,
+    /// The body as the platform holds it, which for a file is its caption and is often empty.
+    pub text: String,
+    /// Who the platform says sent it, taken from the response so no connector needs to look its
+    /// own account up per send.
+    pub sender: Sender,
+    pub attachments: Vec<Attachment>,
+    /// Descriptor lines for anything the message carries that has no text, matching
+    /// [`InboundMessage::notes`].
+    pub notes: Vec<String>,
+    /// The platform's own send time, not the bridge's, so recorded order matches the chat's.
+    pub timestamp: DateTime<Utc>,
+}
+
 /// One message the platform found, from its own record rather than the bridge's.
 ///
 /// Deliberately thin. Anything the bridge recorded it can say more about, and anything it did not
@@ -351,6 +392,14 @@ pub struct FoundMessage {
     pub message_id: String,
     pub sender_name: String,
     pub text: String,
+    /// Whether the bot itself wrote this.
+    ///
+    /// The one thing about a hit the connector can settle without the bridge's record, because it
+    /// knows its own account. Worth settling: this path is the one that reaches back past what the
+    /// bridge ever recorded, so it is exactly where "have I already said this?" is hardest and
+    /// where a name alone will not answer it, since a chat can hold another bot called the same
+    /// thing.
+    pub own: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -471,10 +520,12 @@ pub enum InboundEvent {
     Message(Box<InboundMessage>),
     /// A message the platform says is gone.
     ///
-    /// Never queued and never shown to the agent: it exists so the bridge's own record of a chat
-    /// does not outlive the chat itself, replaying something its author deleted. Only platforms
-    /// that report deletions produce these, which is why it is an event rather than something the
-    /// store could work out for itself.
+    /// Never queued: it marks the recorded message deleted rather than putting anything in front of
+    /// the agent. The record is kept and flagged instead of dropped, because a message the agent
+    /// was woken for is in its session for good, so erasing the row would leave nothing able to
+    /// tell it later that what it acted on had been taken back. Only platforms that report
+    /// deletions produce these, which is why it is an event rather than something the store
+    /// could work out for itself.
     Retraction {
         conversation: ConversationId,
         message_id: String,
@@ -898,21 +949,40 @@ pub trait Channel: Send + Sync + 'static {
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError>;
 
-    /// Deliver Markdown text, splitting it if the platform has a length limit. Returns one id per
-    /// message actually sent.
+    /// Deliver Markdown text, splitting it if the platform has a length limit.
+    ///
+    /// Pushes one [`SentMessage`] onto `sent` per message the platform accepted, in order, each
+    /// built from the platform's own response rather than from what was submitted, so the caller
+    /// records what the platform stored.
+    ///
+    /// **`sent` holds whatever landed, including when this returns an error.** Splitting means a
+    /// send can half succeed: three parts go out as three requests and the second can be refused
+    /// with the first already in the chat. Reporting only the error would leave the chat holding
+    /// words the bridge has no record of, which is the one thing the history is there to prevent,
+    /// so this is an out-parameter rather than a return value. A connector must push each part as
+    /// the platform accepts it, not collect them and push at the end.
     async fn send_text(
         &self,
         conversation: &ConversationId,
         markdown: &str,
         options: &SendOptions,
-    ) -> Result<Vec<String>, ChannelError>;
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError>;
 
     /// Deliver local files, grouped into one post where the platform can do that.
     ///
-    /// Returns one id per message that resulted, which is usually one: both platforms here group
-    /// several files into a single post. A platform that cannot group is free to send one message
-    /// per file and return several ids, so the caller never has to ask whether albums are
-    /// supported.
+    /// Pushes one [`SentMessage`] onto `sent` per message that resulted, which is not always one
+    /// per file: Discord carries every attachment on a single message, while a Telegram album is
+    /// several messages sharing a group. A platform that cannot group at all is free to send one
+    /// message per file, so the caller never has to ask whether albums are supported.
+    ///
+    /// Each carries the attachments as the platform stored them, so the file the agent sent can be
+    /// fetched back later by whoever reads the conversation, and the caption sits on whichever
+    /// message actually bears it.
+    ///
+    /// `sent` holds whatever landed even on an error, for the reason [`Self::send_text`] gives.
+    /// Neither platform here can half send a group, since each does it in one request, but a
+    /// connector that loops has to report what it got through.
     ///
     /// `paths` is non-empty. Each platform enforces its own ceiling on how many it will take, and
     /// refuses before opening anything rather than partway through an upload.
@@ -922,7 +992,8 @@ pub trait Channel: Send + Sync + 'static {
         paths: &[PathBuf],
         caption: Option<&str>,
         options: &FileOptions,
-    ) -> Result<Vec<String>, ChannelError>;
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError>;
 
     /// Retrieve one file the platform holds, identified by an [`Attachment::file_ref`].
     ///
@@ -944,6 +1015,10 @@ pub trait Channel: Send + Sync + 'static {
 
     /// Replace the text of a message the bot sent.
     ///
+    /// Returns the revision as the platform stored it, or `None` where the platform acknowledges
+    /// the edit without echoing the result. The caller records what comes back and marks the older
+    /// wording superseded either way, so `None` costs the new text in history and nothing more.
+    ///
     /// Defaulted to [`ChannelError::Unsupported`] here, as are the moderation methods below. A new
     /// platform should compile without having to reimplement a model it may not share, and
     /// [`ChannelCapabilities`] is how callers find out before trying.
@@ -953,7 +1028,7 @@ pub trait Channel: Send + Sync + 'static {
         message_id: &str,
         markdown: &str,
         link_preview: bool,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<Option<SentMessage>, ChannelError> {
         let _ = (conversation, message_id, markdown, link_preview);
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
@@ -1319,6 +1394,9 @@ mod tests {
                 file_name: Some("photo.jpg".to_string()),
                 media_type: Some("image/jpeg".to_string()),
                 bytes: Some(2048),
+                width: None,
+                height: None,
+                duration_secs: None,
                 file_ref: "AgACAgEAAx".to_string(),
                 thumb_ref: None,
                 handle: Some("417".to_string()),

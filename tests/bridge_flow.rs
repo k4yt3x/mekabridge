@@ -25,9 +25,10 @@ use mekabridge::{
         turn::{Presence, TurnRunner},
     },
     channel::{
-        Activity, Admission, Channel, ChannelCapabilities, ChannelError, ChannelId,
-        ChannelIdentity, ChannelRegistry, ChatKind, ConversationId, FetchedFile, FileOptions,
-        InboundEvent, InboundMessage, Platform, SendOptions, Sender,
+        Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
+        ChannelError, ChannelId, ChannelIdentity, ChannelRegistry, ChatKind, ConversationId,
+        FetchedFile, FileOptions, FoundMessage, InboundEvent, InboundMessage, Platform,
+        SendOptions, Sender, SentMessage,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
@@ -804,6 +805,35 @@ impl MockChannel {
     }
 }
 
+/// Where [`MockChannel::send_text`] pretends the platform's length limit fell.
+const SPLIT_MARKER: &str = "<split>";
+
+/// A part [`MockChannel::send_text`] refuses, standing in for a platform rejecting one message of a
+/// split reply after the earlier ones have already landed.
+const REFUSED_PART: &str = "<refused>";
+
+/// Stand in for the record a platform returns when it accepts a send.
+///
+/// The real connectors build this from the response, which is what makes the bridge's own history
+/// rows look like everybody else's. The mock has to supply one too, or nothing downstream of the
+/// channel is exercised.
+fn echo(message_id: &str, text: &str, attachments: Vec<Attachment>) -> SentMessage {
+    SentMessage {
+        message_id: message_id.to_string(),
+        text: text.to_string(),
+        sender: Sender {
+            id: "4242".to_string(),
+            display_name: "Mica".to_string(),
+            username: Some("micaagentbot".to_string()),
+            is_bot: true,
+            on_behalf_of_chat: false,
+        },
+        attachments,
+        notes: Vec::new(),
+        timestamp: Utc::now(),
+    }
+}
+
 #[async_trait]
 impl Channel for MockChannel {
     fn id(&self) -> &ChannelId {
@@ -843,36 +873,54 @@ impl Channel for MockChannel {
         conversation: &ConversationId,
         markdown: &str,
         options: &SendOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         self.previews
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(options.link_preview);
-        let mut sent = self
+        let mut log = self
             .sent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sent.push((conversation.as_str().to_string(), markdown.to_string()));
-        Ok(vec![format!("m{}", sent.len())])
+        log.push((conversation.as_str().to_string(), markdown.to_string()));
+        // A real connector splits text past its platform's limit into several messages with several
+        // ids. Reproducing that here on an explicit marker, rather than on a length, keeps every
+        // other test sending exactly one message while still giving the split one something to
+        // assert against.
+        let base = log.len();
+        for (index, part) in markdown.split(SPLIT_MARKER).enumerate() {
+            // A part the platform refuses, with the earlier ones already in the chat. The whole
+            // point of the out-parameter is that the caller keeps those.
+            if part == REFUSED_PART {
+                return Err(ChannelError::Delivery {
+                    channel: self.id.as_str().to_string(),
+                    message: format!("part {} of the message was refused", index + 1),
+                });
+            }
+            sent.push(echo(&format!("m{}", base + index), part, Vec::new()));
+        }
+        Ok(())
     }
 
     async fn send_files(
         &self,
         conversation: &ConversationId,
         paths: &[std::path::PathBuf],
-        _caption: Option<&str>,
+        caption: Option<&str>,
         options: &FileOptions,
-    ) -> Result<Vec<String>, ChannelError> {
+        sent: &mut Vec<SentMessage>,
+    ) -> Result<(), ChannelError> {
         self.previews
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(options.send.link_preview);
-        let mut sent = self
+        let mut log = self
             .sent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // One entry naming every path, so a test can tell one grouped send from several.
-        sent.push((
+        log.push((
             conversation.as_str().to_string(),
             format!(
                 "<files {}>",
@@ -883,7 +931,36 @@ impl Channel for MockChannel {
                     .join(", ")
             ),
         ));
-        Ok(vec!["f1".to_string()])
+        // One message per file, the shape a Telegram album comes back in, so a test can tell that
+        // the bridge records a row per real message rather than one per call. The caption rides on
+        // the first, which is where the platform puts it.
+        sent.extend(paths.iter().enumerate().map(|(index, path)| {
+            echo(
+                &format!("f{}", index + 1),
+                if index == 0 {
+                    caption.unwrap_or("")
+                } else {
+                    ""
+                },
+                vec![Attachment {
+                    kind: AttachmentKind::Document,
+                    file_name: path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string()),
+                    media_type: None,
+                    bytes: None,
+                    // Keyed by path so `fetch` can be primed with the same string, which is
+                    // what lets a test read back a file the agent sent.
+                    width: None,
+                    height: None,
+                    duration_secs: None,
+                    file_ref: path.display().to_string(),
+                    thumb_ref: None,
+                    handle: None,
+                }],
+            )
+        }));
+        Ok(())
     }
 
     async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError> {
@@ -928,6 +1005,43 @@ impl Channel for MockChannel {
             message_id.to_string(),
             emoji.map(str::to_string),
         ));
+        Ok(())
+    }
+
+    async fn search_messages(
+        &self,
+        _conversation: &ConversationId,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<FoundMessage>, ChannelError> {
+        // Stands in for Discord's guild search, which reaches back past anything the bridge
+        // recorded and settles `own` from the connector's own account id.
+        Ok(vec![FoundMessage {
+            message_id: "from-the-platform".to_string(),
+            sender_name: "Mica".to_string(),
+            text: "said long before this bridge existed".to_string(),
+            own: true,
+            timestamp: Utc::now(),
+        }])
+    }
+
+    async fn edit_text(
+        &self,
+        _conversation: &ConversationId,
+        message_id: &str,
+        markdown: &str,
+        _link_preview: bool,
+    ) -> Result<Option<SentMessage>, ChannelError> {
+        // A revision keeps the id of the message it revises, which is what makes the two rows in
+        // the history belong to one message.
+        Ok(Some(echo(message_id, markdown, Vec::new())))
+    }
+
+    async fn delete_message(
+        &self,
+        _conversation: &ConversationId,
+        _message_id: &str,
+    ) -> Result<(), ChannelError> {
         Ok(())
     }
 
@@ -2558,7 +2672,7 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
     let sink = sink_for(store.clone(), channels);
 
     let ids = sink
-        .send_text("mock:1", "**hello**", SendOptions::default())
+        .send_text("mock:1", "**hello**", SendOptions::default(), None)
         .await
         .expect("sends");
     assert_eq!(ids, vec!["m1".to_string()]);
@@ -2955,9 +3069,11 @@ async fn a_busy_session_defers_a_batch_instead_of_giving_up_on_it() {
 }
 
 #[tokio::test]
-async fn a_retracted_message_leaves_the_bridges_history_too() {
-    // A platform that reports deletions is the only one that can do this, and the point is that the
-    // agent can never be handed back something its author took down.
+async fn a_retracted_message_is_marked_rather_than_erased() {
+    // Only a platform that reports deletions can do this. The row stays: a message the agent was
+    // woken for is already in its session for good, so deleting the record would take away the one
+    // thing able to tell it later that what it acted on had been withdrawn. What must not happen is
+    // the retraction passing unrecorded, leaving the old text looking current.
     let harness = Harness::start(1, 0).await;
     harness
         .sender
@@ -2975,7 +3091,29 @@ async fn a_retracted_message_leaves_the_bridges_history_too() {
         })
         .await
         .expect("queued");
-    await_history(&harness, 0, "the recorded copy to go").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let history = harness
+            .store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read");
+        assert_eq!(history.len(), 1, "the row must not be removed");
+        let record = history.first().expect("one row");
+        if record.deleted_at.is_some() {
+            assert_eq!(
+                record.text, "said too much",
+                "the text is kept, so the agent can see what it was"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the retraction to be recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Poll until the recorded history for `mock:1` is exactly `expected` messages long.
@@ -3425,7 +3563,7 @@ async fn the_sink_delivers_to_a_conversation_it_has_never_seen() {
     ]));
     let sink = sink_for(store.clone(), channels);
 
-    sink.send_text("mock:999", "hello", SendOptions::default())
+    sink.send_text("mock:999", "hello", SendOptions::default(), None)
         .await
         .expect("an unseen id is deliverable");
     assert_eq!(channel.sent(), vec![(
@@ -3461,7 +3599,7 @@ async fn an_inbound_message_fills_in_what_a_send_could_not_know() {
     ]));
     let sink = sink_for(store.clone(), channels);
 
-    sink.send_text("mock:7", "first contact", SendOptions::default())
+    sink.send_text("mock:7", "first contact", SendOptions::default(), None)
         .await
         .expect("sends");
     store
@@ -3481,7 +3619,7 @@ async fn an_inbound_message_fills_in_what_a_send_could_not_know() {
         .expect("inbound");
 
     // A second send must not drag the now-known title and kind back to their placeholders.
-    sink.send_text("mock:7", "second", SendOptions::default())
+    sink.send_text("mock:7", "second", SendOptions::default(), None)
         .await
         .expect("sends");
     let record = store
@@ -3508,13 +3646,13 @@ async fn the_sink_still_refuses_ids_it_cannot_route() {
     // Unrestricted means "any chat", not "any string". These two fail here because no channel could
     // act on them at all, which is different from a chat the platform will reject.
     let malformed = sink
-        .send_text("not-an-id", "hello", SendOptions::default())
+        .send_text("not-an-id", "hello", SendOptions::default(), None)
         .await
         .expect_err("a malformed id must be refused");
     assert!(malformed.to_string().contains("not-an-id"), "{malformed}");
 
     let unconfigured = sink
-        .send_text("discord:1", "hello", SendOptions::default())
+        .send_text("discord:1", "hello", SendOptions::default(), None)
         .await
         .expect_err("an unconfigured channel must be refused");
     assert!(
@@ -4211,6 +4349,9 @@ async fn attachments_are_announced_with_a_handle_and_nothing_is_downloaded() {
             file_name: Some("photo.jpg".to_string()),
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(4096),
+            width: None,
+            height: None,
+            duration_secs: None,
             file_ref: "AgACphoto".to_string(),
             thumb_ref: None,
             handle: None,
@@ -4350,7 +4491,7 @@ async fn a_file_send_with_no_files_is_refused_by_the_sink() {
     );
 
     let error = sink
-        .send_file("mock:1", &[], None, FileOptions::default())
+        .send_file("mock:1", &[], None, FileOptions::default(), None)
         .await
         .expect_err("an empty file list must be refused");
     assert!(error.to_string().contains("no files"), "got: {error}");
@@ -4382,10 +4523,15 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
         Arc::new(Presence::default()),
     );
 
-    sink.send_text("mock:1", "see https://example.com", SendOptions {
-        link_preview: true,
-        ..SendOptions::default()
-    })
+    sink.send_text(
+        "mock:1",
+        "see https://example.com",
+        SendOptions {
+            link_preview: true,
+            ..SendOptions::default()
+        },
+        None,
+    )
     .await
     .expect("send succeeds");
 
@@ -4407,6 +4553,7 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
                 ..SendOptions::default()
             },
         },
+        None,
     )
     .await
     .expect("file send succeeds");
@@ -4474,7 +4621,7 @@ async fn sending_a_message_stops_the_typing_indicator() {
     let conversation = ConversationId::parse("mock:1").expect("valid");
     assert!(!presence.has_replied(&conversation));
 
-    sink.send_text("mock:1", "hello", SendOptions::default())
+    sink.send_text("mock:1", "hello", SendOptions::default(), None)
         .await
         .expect("sends");
     assert!(
@@ -4523,6 +4670,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
         std::slice::from_ref(&path),
         None,
         FileOptions::default(),
+        None,
     )
     .await
     .expect("sends");
@@ -4566,4 +4714,441 @@ async fn a_message_arriving_mid_turn_is_flagged_in_the_next_envelope() {
         "the amendment must be marked as having landed mid-turn, got:\n{}",
         turns[1]
     );
+}
+
+/// A sink whose history retention can be turned off, for the one test that needs it.
+fn sink_with_retention(
+    store: Store,
+    channels: Arc<ChannelRegistry>,
+    history_retention: Duration,
+) -> BridgeSink {
+    let storage = StorageConfig {
+        path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+        attachment_dir: std::env::temp_dir().join("mekabridge-test-attachments"),
+        attachment_max_bytes: 20 * 1024 * 1024,
+        attachment_retention: Duration::from_secs(86_400),
+        history_retention,
+    };
+    let meka = MekaClient::new(
+        &config_for(
+            ([127, 0, 0, 1], 1).into(),
+            std::path::Path::new("/tmp/mekabridge-unused.db"),
+            0,
+            false,
+            "20s",
+        )
+        .meka,
+    )
+    .expect("client builds");
+    BridgeSink::new(
+        store,
+        channels,
+        storage,
+        DefaultPolicy {
+            direct: Policy::Active,
+            group: Policy::Mute,
+            channel: Policy::Mute,
+        },
+        meka,
+        Arc::new(Presence::default()),
+    )
+}
+
+/// A sink over a fresh mock channel, returned alongside the channel and the store.
+async fn own_message_harness() -> (BridgeSink, Arc<MockChannel>, Store) {
+    let store = Store::open_in_memory().await.expect("store");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_with_storage(
+        store.clone(),
+        channels,
+        std::env::temp_dir().join("mekabridge-test-attachments"),
+        Arc::new(Presence::default()),
+    );
+    (sink, channel, store)
+}
+
+#[tokio::test]
+async fn what_the_agent_sends_is_recorded_one_row_per_platform_message() {
+    // The failure this exists for: a scheduled session sent somebody a message, and the session
+    // asked about it afterwards could find no trace of it, because the bridge recorded only what
+    // other people said.
+    //
+    // One row per real message rather than one per call, because text past the platform's limit
+    // becomes several messages with several ids, and `message_id` can only hold one of them. A
+    // single row would hand back an id that edits or reacts to the first part alone.
+    let (sink, _channel, store) = own_message_harness().await;
+
+    let ids = sink
+        .send_text(
+            "mock:1",
+            "first<split>second<split>third",
+            SendOptions::default(),
+            Some("scheduled-news"),
+        )
+        .await
+        .expect("send succeeds");
+    assert_eq!(ids, vec!["m1", "m2", "m3"], "the caller is told every id");
+
+    let history = store.history("mock:1", 10, None).await.expect("read");
+    assert_eq!(
+        history.len(),
+        3,
+        "one row per message that reached the chat"
+    );
+    let rows: Vec<(&str, &str)> = history
+        .iter()
+        .map(|row| (row.message_id.as_str(), row.text.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("m1", "first"), ("m2", "second"), ("m3", "third")],
+        "each row carries the id and the text of its own message"
+    );
+    assert!(
+        history.iter().all(|row| row.own),
+        "these are the bridge's own messages"
+    );
+    assert!(
+        history
+            .iter()
+            .all(|row| row.session_id.as_deref() == Some("scheduled-news")),
+        "and each says which session sent it"
+    );
+}
+
+#[tokio::test]
+async fn the_agents_own_messages_are_never_a_backlog() {
+    // `seen` is what the bridge owes the agent. Recording its own output unseen would have it
+    // reporting a backlog made of things it said itself, and handing them back as missed context.
+    let (sink, _channel, store) = own_message_harness().await;
+
+    sink.send_text("mock:1", "on it", SendOptions::default(), None)
+        .await
+        .expect("send succeeds");
+
+    let summary = store.unseen_summary(Some("mock:1")).await.expect("summary");
+    assert_eq!(summary.count, 0, "nothing is owed after speaking");
+    let (count, context, _) = store
+        .take_unseen("mock:1", Utc::now() + chrono::Duration::hours(1), 10)
+        .await
+        .expect("take");
+    assert_eq!(count, 0);
+    assert!(context.is_empty(), "and nothing is offered back as missed");
+}
+
+#[tokio::test]
+async fn a_file_the_agent_sent_can_be_opened_again() {
+    // The case that matters is not the sending session, which still has the local path, but every
+    // other one: a file sent by a scheduled job is otherwise a history row nobody can open.
+    let (sink, channel, store) = own_message_harness().await;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, ONE_PIXEL_PNG).expect("write");
+    // What the platform will hand back when the handle is redeemed.
+    channel.put_file(&path.display().to_string(), ONE_PIXEL_PNG.to_vec());
+
+    sink.send_file(
+        "mock:1",
+        std::slice::from_ref(&path),
+        Some("here it is"),
+        FileOptions::default(),
+        None,
+    )
+    .await
+    .expect("send succeeds");
+
+    let history = store.history("mock:1", 10, None).await.expect("read");
+    let row = history.first().expect("one row");
+    let handle = row
+        .attachments
+        .first()
+        .expect("the file the agent sent has a handle");
+    // Downloaded rather than viewed, because viewing branches on whether the model has vision and
+    // this is about the handle reaching the platform and coming back with the bytes.
+    let downloaded = sink
+        .download_attachment(handle)
+        .await
+        .expect("the handle resolves to the file");
+    assert_eq!(
+        std::fs::read(&downloaded.path).expect("the file landed"),
+        ONE_PIXEL_PNG,
+        "the bytes came back from the platform"
+    );
+}
+
+#[tokio::test]
+async fn the_agent_editing_its_own_message_supersedes_the_old_wording() {
+    let (sink, _channel, store) = own_message_harness().await;
+    sink.send_text("mock:1", "meet at four", SendOptions::default(), None)
+        .await
+        .expect("send succeeds");
+
+    sink.edit_message("mock:1", "m1", "meet at five", false, None)
+        .await
+        .expect("edit succeeds");
+
+    let history = store.history("mock:1", 10, None).await.expect("read");
+    assert_eq!(history.len(), 2, "both wordings are kept");
+    let live: Vec<&str> = history
+        .iter()
+        .filter(|row| row.superseded_at.is_none())
+        .map(|row| row.text.as_str())
+        .collect();
+    assert_eq!(live, vec!["meet at five"], "only the revision is current");
+    assert!(
+        history.iter().all(|row| row.message_id == "m1"),
+        "both rows belong to the one message"
+    );
+}
+
+#[tokio::test]
+async fn the_agent_deleting_its_own_message_marks_the_row() {
+    // Symmetry with a deletion reported by the platform. Without it, the agent retracting something
+    // leaves a history that still reads as though it stands.
+    let (sink, _channel, store) = own_message_harness().await;
+    sink.send_text("mock:1", "spoke too soon", SendOptions::default(), None)
+        .await
+        .expect("send succeeds");
+
+    sink.delete_message("mock:1", "m1")
+        .await
+        .expect("delete succeeds");
+
+    let history = store.history("mock:1", 10, None).await.expect("read");
+    let row = history.first().expect("the row survives");
+    assert!(row.deleted_at.is_some(), "and says it was deleted");
+    assert_eq!(row.text, "spoke too soon", "with the text still readable");
+}
+
+#[tokio::test]
+async fn history_switched_off_records_nothing_the_agent_sent() {
+    // `history_retention = 0` means the bridge keeps no record of a conversation. Recording its own
+    // half anyway would make that setting a half-measure nobody asked for.
+    let store = Store::open_in_memory().await.expect("store");
+    let channel = Arc::new(MockChannel::new("mock"));
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+    let sink = sink_with_retention(store.clone(), channels, Duration::ZERO);
+
+    sink.send_text("mock:1", "on it", SendOptions::default(), None)
+        .await
+        .expect("send succeeds");
+
+    assert!(
+        store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .is_empty(),
+        "nothing is recorded when history is off"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_from_the_platform_supersedes_the_wording_it_replaced() {
+    // An edit arrives as a second row, under an id of its own, because the queue needs a distinct
+    // key to deliver it as an event rather than discard it as a redelivery. Nothing used to connect
+    // the two, so `read_history` returned the pre-edit and post-edit wordings as two messages that
+    // both looked current, and an agent reading back could act on the retracted one.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .sender
+        .send(message("meet at four", "12"))
+        .await
+        .expect("queued");
+    await_history(&harness, 1, "the original to be recorded").await;
+
+    let InboundEvent::Message(mut revision) = message("meet at five", "12:e1") else {
+        panic!("the builder makes a message");
+    };
+    revision.message_id = "12".to_string();
+    revision.edited_at = Some(Utc::now());
+    harness
+        .sender
+        .send(InboundEvent::Message(revision))
+        .await
+        .expect("queued");
+    await_history(&harness, 2, "the revision to be recorded").await;
+
+    let history = harness
+        .store
+        .history("mock:1", 10, None)
+        .await
+        .expect("read");
+    let live: Vec<&str> = history
+        .iter()
+        .filter(|row| row.superseded_at.is_none())
+        .map(|row| row.text.as_str())
+        .collect();
+    assert_eq!(
+        live,
+        vec!["meet at five"],
+        "only the revision is the current wording"
+    );
+}
+
+#[tokio::test]
+async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
+    // This path is the one that reaches back past anything the bridge recorded, so it is exactly
+    // where "have I already said this?" is hardest and where the mark matters most. The connector
+    // settles it from its own account id, and the bridge has to carry that through rather than
+    // filling in a default: the field is omitted when false, so the agent cannot tell a hit that
+    // was not the bot's from one nobody bothered to check.
+    let (sink, _channel, store) = own_message_harness().await;
+    store
+        .record_message(mekabridge::store::MessageRecord {
+            id: 0,
+            conversation_id: "mock:1".to_string(),
+            external_id: "local".to_string(),
+            message_id: "local".to_string(),
+            sender_id: Some("1".to_string()),
+            sender_name: "Alice".to_string(),
+            text: "a locally recorded match".to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            seen: true,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: Utc::now(),
+        })
+        .await
+        .expect("record");
+
+    let entries = sink
+        .search_history("match", Some("mock:1"), 20)
+        .await
+        .expect("search runs");
+    let from_platform = entries
+        .iter()
+        .find(|entry| entry.message_id == "from-the-platform")
+        .expect("the platform's own record is merged in");
+    assert!(
+        from_platform.own,
+        "a hit the connector attributed to the bot has to stay attributed to it"
+    );
+    assert!(
+        entries.iter().any(|entry| entry.message_id == "local"),
+        "the bridge's own record is still there alongside it"
+    );
+}
+
+#[tokio::test]
+async fn a_half_sent_reply_records_the_parts_that_landed() {
+    // Splitting means a send can half succeed: three parts go out as three requests and the second
+    // can be refused with the first already in the chat. Reporting only the error left the chat
+    // holding words the history had no record of, so "have I already said this?" answered no about
+    // something the person could see on their screen. The agent still learns the send failed; what
+    // changes is that the record matches the chat either way.
+    let (sink, _channel, store) = own_message_harness().await;
+
+    let error = sink
+        .send_text(
+            "mock:1",
+            "this part landed<split><refused><split>never reached",
+            SendOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the refused part has to fail the call");
+    assert!(error.to_string().contains("refused"), "got: {error}");
+
+    let history = store.history("mock:1", 10, None).await.expect("read");
+    let texts: Vec<&str> = history.iter().map(|row| row.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["this part landed"],
+        "what the chat received is recorded, and what it did not is absent"
+    );
+    assert!(history.iter().all(|row| row.own));
+}
+
+#[tokio::test]
+async fn a_reply_that_never_started_leaves_no_trace() {
+    // The other half of the same rule. Nothing reached the chat, so nothing is recorded and the
+    // conversation is not minted into the address book with a time the agent last spoke in it.
+    let (sink, _channel, store) = own_message_harness().await;
+
+    sink.send_text("mock:1", "<refused>", SendOptions::default(), None)
+        .await
+        .expect_err("the first part failing fails the call");
+
+    assert!(
+        store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .is_empty(),
+        "a chat that received nothing has nothing recorded"
+    );
+    assert!(
+        store.conversation("mock:1").await.expect("read").is_none(),
+        "and is not stamped as one the agent has written in"
+    );
+}
+
+#[tokio::test]
+async fn the_bridges_own_apology_is_recorded_like_anything_else_it_says() {
+    // The one message the bridge writes itself, and the one send that reaches a platform without
+    // going through the sink. Leaving it unrecorded made it the single thing the bridge puts in a
+    // chat that its own record of the chat does not contain, so somebody replying to the apology
+    // would have the agent reading a reply to nothing.
+    //
+    // It is marked `own` with no session behind it, which is the distinction that makes it
+    // representable: the account spoke, and no session did.
+    let harness = Harness::start_failing(0, FailureKind::Transient, Setup {
+        notify_failures: true,
+        ..Setup::default()
+    })
+    .await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the chat to be told", |harness| {
+            harness
+                .channel
+                .sent()
+                .iter()
+                .any(|(conversation, _)| conversation == "mock:1")
+        })
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recorded = harness
+            .store
+            .history("mock:1", 10, None)
+            .await
+            .expect("read")
+            .into_iter()
+            .find(|row| row.own);
+        if let Some(row) = recorded {
+            assert!(
+                row.text.contains("went wrong"),
+                "the row has to hold what the chat was actually told, got {:?}",
+                row.text
+            );
+            assert_eq!(
+                row.session_id, None,
+                "no session wrote this; the bridge did"
+            );
+            assert!(row.seen, "and it is not a backlog owed to the agent");
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the notice to reach the history"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_005.sql"),
     include_str!("store/schema_006.sql"),
     include_str!("store/schema_007.sql"),
+    include_str!("store/schema_008.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -184,10 +185,12 @@ pub struct UnseenSummary {
     pub count: u64,
     /// When the most recent of those was sent, or `None` when there are none.
     pub newest: Option<DateTime<Utc>>,
-    /// When the most recent message was recorded at all, shown or not.
+    /// When somebody else last said something that still stands, shown or not.
     ///
     /// Separate from [`Self::newest`] because the two answer different questions and only this one
-    /// can be watched. See [`Self::marker`].
+    /// can be watched. See [`Self::marker`] for what each clause of that sentence is holding up:
+    /// "somebody else" excludes the bridge's own messages, and "still stands" excludes retracted
+    /// ones.
     pub latest: Option<DateTime<Utc>>,
 }
 
@@ -277,6 +280,20 @@ pub struct MessageRecord {
     pub attachments: Vec<String>,
     pub addressed: bool,
     pub seen: bool,
+    /// Whether the bridge sent this rather than received it.
+    ///
+    /// Recorded as its own column rather than inferred from [`Self::sender_id`], so reading a row
+    /// back never requires knowing which account the bot holds on that platform.
+    pub own: bool,
+    /// The meka session that sent an outbound message, and `None` on everything received.
+    pub session_id: Option<String>,
+    /// When the platform reported this message deleted.
+    ///
+    /// The row and its text are kept so the agent can find out that something it may already have
+    /// acted on was retracted. Only platforms that report deletions ever set it.
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// When a revision of this same message was recorded, making this row the older wording.
+    pub superseded_at: Option<DateTime<Utc>>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1357,8 +1374,9 @@ impl Store {
                 connection.execute(
                     "INSERT INTO messages
                          (conversation_id, external_id, message_id, sender_id, sender_name, text,
-                          notes, attachments, addressed, seen, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                          notes, attachments, addressed, seen, own, session_id, deleted_at,
+                          superseded_at, timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                      ON CONFLICT(conversation_id, external_id) DO NOTHING",
                     rusqlite::params![
                         record.conversation_id,
@@ -1371,6 +1389,10 @@ impl Store {
                         join_handles(&record.attachments),
                         record.addressed,
                         record.seen,
+                        record.own,
+                        record.session_id,
+                        record.deleted_at.map(to_rfc3339),
+                        record.superseded_at.map(to_rfc3339),
                         to_rfc3339(record.timestamp),
                     ],
                 )?;
@@ -1405,14 +1427,13 @@ impl Store {
         let mut records = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT id, conversation_id, external_id, message_id, sender_id, sender_name,
-                            text, notes, attachments, addressed, seen, timestamp
-                     FROM messages
-                     WHERE conversation_id = ?1 AND (?2 IS NULL OR id < ?2)
-                     ORDER BY id DESC
-                     LIMIT ?3",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS}
+                     FROM messages m
+                     WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2)
+                     ORDER BY m.id DESC
+                     LIMIT ?3"
+                ))?;
                 let rows = statement.query_map(
                     rusqlite::params![conversation_id, before, limit],
                     row_to_message,
@@ -1440,17 +1461,15 @@ impl Store {
         let records = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT m.id, m.conversation_id, m.external_id, m.message_id, m.sender_id,
-                            m.sender_name, m.text, m.notes, m.attachments, m.addressed, m.seen,
-                            m.timestamp
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS}
                      FROM messages_fts f
                      JOIN messages m ON m.id = f.rowid
                      WHERE messages_fts MATCH ?1
                        AND (?2 IS NULL OR m.conversation_id = ?2)
                      ORDER BY f.rank
-                     LIMIT ?3",
-                )?;
+                     LIMIT ?3"
+                ))?;
                 let rows = statement.query_map(
                     rusqlite::params![query, conversation, limit],
                     row_to_message,
@@ -1488,20 +1507,23 @@ impl Store {
                 // timestamp can easily be at or below -- Telegram stamps to whole seconds, and an
                 // edit carries the *original* message's time, which may be weeks old.
                 let (count, watermark): (i64, Option<i64>) = transaction.query_row(
-                    "SELECT COUNT(*), MAX(id) FROM messages
-                     WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2",
+                    &format!(
+                        "SELECT COUNT(*), MAX(m.id) FROM messages m
+                         WHERE m.conversation_id = ?1 AND m.seen = 0 AND m.timestamp <= ?2
+                           AND {MESSAGE_CURRENT}"
+                    ),
                     rusqlite::params![&conversation_id, &through],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let records = {
-                    let mut statement = transaction.prepare(
-                        "SELECT id, conversation_id, external_id, message_id, sender_id,
-                                sender_name, text, notes, attachments, addressed, seen, timestamp
-                         FROM messages
-                         WHERE conversation_id = ?1 AND seen = 0 AND timestamp <= ?2
-                         ORDER BY timestamp DESC, id DESC
-                         LIMIT ?3",
-                    )?;
+                    let mut statement = transaction.prepare(&format!(
+                        "SELECT {MESSAGE_COLUMNS}
+                         FROM messages m
+                         WHERE m.conversation_id = ?1 AND m.seen = 0 AND m.timestamp <= ?2
+                           AND {MESSAGE_CURRENT}
+                         ORDER BY m.timestamp DESC, m.id DESC
+                         LIMIT ?3"
+                    ))?;
                     let rows = statement.query_map(
                         rusqlite::params![&conversation_id, &through, context],
                         row_to_message,
@@ -1599,21 +1621,39 @@ impl Store {
     /// Chrono varies the fractional-second precision per row, which does not break it, because
     /// `+` and `.` both sort below every digit.
     pub async fn unseen_summary(&self, conversation_id: Option<&str>) -> Result<UnseenSummary> {
-        /// Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
-        const COLUMNS: &str = "COUNT(CASE WHEN seen = 0 THEN 1 END),
-                               MAX(CASE WHEN seen = 0 THEN timestamp END),
-                               MAX(timestamp)";
+        // Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
+        //
+        // The unseen pair skips retracted and superseded rows, for the reason `MESSAGE_CURRENT`
+        // gives, and shares its spelling of that rule rather than repeating it: writing the third
+        // out by hand is how it came to disagree with the contract on `UnseenSummary::marker`
+        // without anything saying so.
+        //
+        // That third column is what a watcher polls, so its filter decides when a scheduled job
+        // wakes. It skips the bridge's own messages or the agent replying moves the marker, firing
+        // the watcher on the main session having spoken and spending a turn on a room whose only
+        // new message the agent wrote itself. Nothing outbound was recorded when this was written,
+        // so the exclusion was free; recording it made the filter load bearing.
+        //
+        // It skips retracted rows for the other half of the same contract. A deletion moving the
+        // marker back is documented on `UnseenSummary::marker` as news of a kind, and it used to
+        // happen by itself because the row went away. Keeping the row means saying so here, or a
+        // watcher never learns that what it last fired on has been withdrawn.
+        let columns = format!(
+            "COUNT(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN 1 END),
+             MAX(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN m.timestamp END),
+             MAX(CASE WHEN m.own = 0 AND m.deleted_at IS NULL THEN m.timestamp END)"
+        );
         let conversation_id = conversation_id.map(str::to_string);
         let (count, newest, latest): (i64, Option<String>, Option<String>) = self
             .connection
             .call(move |connection| match conversation_id {
                 Some(conversation_id) => connection.query_row(
-                    &format!("SELECT {COLUMNS} FROM messages WHERE conversation_id = ?1"),
+                    &format!("SELECT {columns} FROM messages m WHERE m.conversation_id = ?1"),
                     [conversation_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ),
                 None => {
-                    connection.query_row(&format!("SELECT {COLUMNS} FROM messages"), [], |row| {
+                    connection.query_row(&format!("SELECT {columns} FROM messages m"), [], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })
                 }
@@ -1638,24 +1678,93 @@ impl Store {
         Ok(deleted)
     }
 
-    /// Drop one recorded message, because the platform says its author deleted it.
+    /// Mark one recorded message deleted, because the platform says it is gone.
+    ///
+    /// The row and its text stay. Erasing it was the earlier behaviour and it was deliberate, but a
+    /// message the agent has already been handed is already in its session for good, and dropping
+    /// the record removed the only thing that could later tell it that what it acted on was
+    /// retracted. Marked rows still read back through `read_history` and `search_history`, and are
+    /// excluded from everything the agent is owed, so a retracted message is never offered back as
+    /// context it missed.
     ///
     /// Keyed on the platform's message id rather than the queue's `external_id`, since a deletion
-    /// names the message and knows nothing about the edit that may have given it a second row.
-    /// Returns whether anything was there to drop.
-    pub async fn forget_message(&self, conversation: &str, message_id: &str) -> Result<bool> {
+    /// names the message and knows nothing about the edit that may have given it a second row. That
+    /// is also why every row for the message is marked rather than one: deleting a message that had
+    /// been edited removes all of it.
+    ///
+    /// Returns whether anything was there to mark.
+    pub async fn mark_deleted(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
         let conversation = conversation.to_string();
         let message_id = message_id.to_string();
-        let deleted = self
+        let at = to_rfc3339(at);
+        let marked = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
-                    (conversation, message_id),
+                    "UPDATE messages SET deleted_at = ?3
+                     WHERE conversation_id = ?1 AND message_id = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![conversation, message_id, at],
                 )
             })
             .await?;
-        Ok(deleted > 0)
+        Ok(marked > 0)
+    }
+
+    /// Mark the wordings a message had before `external_id` revised it.
+    ///
+    /// An edit arrives as a row of its own, under its own `external_id`, because the queue needs a
+    /// distinct key to deliver it as an event rather than swallow it as a redelivery. That left two
+    /// rows for one message with nothing connecting them, so `read_history` returned the old and
+    /// the new wording as two messages that both looked current.
+    ///
+    /// Marks what came *before* the revision rather than everything that is not it, which is the
+    /// only form that survives being called twice or out of order. Identity alone is neither
+    /// idempotent nor commutative: a redelivered older edit would mark the newer wording that had
+    /// already replaced it, and since `superseded_at IS NULL` stops the older one being cleared
+    /// again, the message would end with every wording marked and none current. Ordering on the
+    /// revision's own row makes a repeat a no-op and makes two revisions landing in either order
+    /// agree on the later one.
+    ///
+    /// A revision that is not in the table, because history was off or retention has since taken
+    /// it, leaves the subquery `NULL` and marks nothing. That is the right answer: without the
+    /// replacement there is nothing to point the agent at, so the wording it replaced stays
+    /// readable rather than being marked stale with no successor.
+    ///
+    /// Returns how many rows were marked, which is zero for the first version of a message.
+    pub async fn supersede_message(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        external_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<usize> {
+        let conversation = conversation.to_string();
+        let message_id = message_id.to_string();
+        let external_id = external_id.to_string();
+        let at = to_rfc3339(at);
+        let marked = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    // The subquery names the message as well as the row, so a caller pairing an
+                    // external id with the wrong message id marks nothing instead of superseding a
+                    // different message's history. `(conversation_id, external_id)` is unique, so
+                    // the extra clause only ever removes a mismatch.
+                    "UPDATE messages SET superseded_at = ?4
+                     WHERE conversation_id = ?1 AND message_id = ?2 AND superseded_at IS NULL
+                       AND id < (SELECT id FROM messages
+                                 WHERE conversation_id = ?1 AND message_id = ?2
+                                   AND external_id = ?3)",
+                    rusqlite::params![conversation, message_id, external_id, at],
+                )
+            })
+            .await?;
+        Ok(marked)
     }
 
     /// Unseen counts for every conversation that has any, keyed by conversation id.
@@ -1666,10 +1775,11 @@ impl Store {
         let counts = self
             .connection
             .call(|connection| {
-                let mut statement = connection.prepare(
-                    "SELECT conversation_id, COUNT(*) FROM messages
-                     WHERE seen = 0 GROUP BY conversation_id",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT m.conversation_id, COUNT(*) FROM messages m
+                     WHERE m.seen = 0 AND {MESSAGE_CURRENT}
+                     GROUP BY m.conversation_id"
+                ))?;
                 let rows = statement.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1828,9 +1938,29 @@ fn join_handles(handles: &[String]) -> Option<String> {
     (!handles.is_empty()).then(|| handles.join(","))
 }
 
+/// The columns [`row_to_message`] reads, in the order it reads them.
+///
+/// One constant shared by every query that returns a [`MessageRecord`], and aliased because the
+/// search join puts `messages` next to an FTS table that also has a `text` column. Written out
+/// rather than `m.*` so the order is fixed here: with sixteen positional `row.get` calls, a column
+/// added to one query and not another reads back as the wrong field instead of failing.
+const MESSAGE_COLUMNS: &str = "m.id, m.conversation_id, m.external_id, m.message_id, m.sender_id,
+     m.sender_name, m.text, m.notes, m.attachments, m.addressed, m.seen, m.own, m.session_id,
+     m.deleted_at, m.superseded_at, m.timestamp";
+
+/// What excludes a recorded message from everything the agent is owed.
+///
+/// A retracted message must not be offered as context it missed, and neither must the older wording
+/// of one that has since been edited, because the revision is in the table too and is the version
+/// worth showing. Both still read back through `read_history` and `search_history`, which is where
+/// finding them is the point.
+const MESSAGE_CURRENT: &str = "m.deleted_at IS NULL AND m.superseded_at IS NULL";
+
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     let attachments: Option<String> = row.get(8)?;
-    let timestamp: String = row.get(11)?;
+    let deleted_at: Option<String> = row.get(13)?;
+    let superseded_at: Option<String> = row.get(14)?;
+    let timestamp: String = row.get(15)?;
     Ok(MessageRecord {
         id: row.get(0)?,
         conversation_id: row.get(1)?,
@@ -1846,6 +1976,10 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
             .unwrap_or_default(),
         addressed: row.get(9)?,
         seen: row.get(10)?,
+        own: row.get(11)?,
+        session_id: row.get(12)?,
+        deleted_at: deleted_at.as_deref().map(parse_rfc3339).transpose()?,
+        superseded_at: superseded_at.as_deref().map(parse_rfc3339).transpose()?,
         timestamp: parse_rfc3339(&timestamp)?,
     })
 }
@@ -2156,6 +2290,10 @@ mod tests {
             attachments: Vec::new(),
             addressed: false,
             seen: false,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
             timestamp: now(),
         }
     }
@@ -2339,6 +2477,280 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deletion_marks_the_row_and_leaves_it_readable() {
+        // The reversal of the earlier behaviour, which removed the row. A message the agent was
+        // shown is in its session for good, so the record is the only thing that can later tell it
+        // the message was withdrawn; erasing the row erased the notice along with the text.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .record_message(message("telegram:1", "1", "said too much"))
+            .await
+            .expect("record");
+
+        let marked = store
+            .mark_deleted("telegram:1", "1", now())
+            .await
+            .expect("mark");
+        assert!(marked, "the row was there to mark");
+
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        assert_eq!(history.len(), 1, "the row must survive the deletion");
+        assert!(
+            history.first().is_some_and(|row| row.deleted_at.is_some()),
+            "and must say it was deleted"
+        );
+        let found = store
+            .search_messages("said", None, 10)
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1, "a deleted message is still searchable");
+    }
+
+    #[tokio::test]
+    async fn marking_a_deletion_twice_keeps_the_first_time() {
+        // A platform can report the same deletion more than once, and a redelivery must not move
+        // the time it happened forward.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .record_message(message("telegram:1", "1", "said too much"))
+            .await
+            .expect("record");
+        let first = now();
+        assert!(
+            store
+                .mark_deleted("telegram:1", "1", first)
+                .await
+                .expect("mark")
+        );
+        assert!(
+            !store
+                .mark_deleted("telegram:1", "1", first + chrono::Duration::hours(1))
+                .await
+                .expect("mark"),
+            "the second report changes nothing"
+        );
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        assert_eq!(
+            history.first().and_then(|row| row.deleted_at),
+            Some(first),
+            "the time kept is when it was first reported gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_supersedes_the_wording_it_replaced() {
+        // Both rows stay, because "what did they say before they changed it" is worth answering,
+        // but only one of them is current. Without the mark `read_history` returns the two wordings
+        // as separate messages that both look like the live one.
+        let store = Store::open_in_memory().await.expect("opens");
+        let mut original = message("telegram:1", "7", "meet at four");
+        original.message_id = "7".to_string();
+        store.record_message(original).await.expect("record");
+
+        let mut revision = message("telegram:1", "7:e1", "meet at five");
+        revision.message_id = "7".to_string();
+        store.record_message(revision).await.expect("record");
+
+        let marked = store
+            .supersede_message("telegram:1", "7", "7:e1", now())
+            .await
+            .expect("supersede");
+        assert_eq!(marked, 1, "only the older wording is marked");
+
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        assert_eq!(history.len(), 2, "both wordings are kept");
+        let superseded: Vec<&str> = history
+            .iter()
+            .filter(|row| row.superseded_at.is_some())
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(
+            superseded,
+            vec!["meet at four"],
+            "the revision itself must not be marked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_edited_twice_keeps_exactly_one_current_wording() {
+        // Superseding by "every row that is not this one" is neither idempotent nor order
+        // insensitive, and both failures end the same way: every wording marked, none current. The
+        // agent is told the revision is elsewhere in the list under the same message id, and there
+        // would be no such row; `MESSAGE_CURRENT` would then hide the message from `unseen` and the
+        // missed-context lookback for good.
+        //
+        // Redelivery is the reachable path. The writer records before it enqueues, and the queue's
+        // duplicate branch exists because a lost `getUpdates` confirmation re-offers a batch, so an
+        // older edit arriving a second time is ordinary rather than exotic.
+        let store = Store::open_in_memory().await.expect("opens");
+        let current = async || {
+            store
+                .history("telegram:1", 10, None)
+                .await
+                .expect("read")
+                .into_iter()
+                .filter(|row| row.superseded_at.is_none())
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+        };
+        for (external_id, text) in [("9", "one"), ("9:e1", "two"), ("9:e2", "three")] {
+            let mut record = message("telegram:1", external_id, text);
+            record.message_id = "9".to_string();
+            store.record_message(record).await.expect("record");
+            store
+                .supersede_message("telegram:1", "9", external_id, now())
+                .await
+                .expect("supersede");
+        }
+        assert_eq!(current().await, vec!["three"], "the last edit is current");
+
+        // The same edit again, the way a replayed batch delivers it.
+        let mut replayed = message("telegram:1", "9:e1", "two");
+        replayed.message_id = "9".to_string();
+        store.record_message(replayed).await.expect("record");
+        store
+            .supersede_message("telegram:1", "9", "9:e1", now())
+            .await
+            .expect("supersede");
+        assert_eq!(
+            current().await,
+            vec!["three"],
+            "a redelivered older edit must not supersede the wording that replaced it"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_the_agent_is_owed_skips_deleted_and_superseded_rows() {
+        // Offering a retracted message, or wording that has since been rewritten, as "here is what
+        // you missed" presents something untrue as news. The count and the excerpt have to agree on
+        // that, or the agent is told about messages it is never shown.
+        let store = Store::open_in_memory().await.expect("opens");
+        for (external_id, text) in [("1", "kept"), ("2", "retracted"), ("3", "the old wording")] {
+            store
+                .record_message(message("telegram:1", external_id, text))
+                .await
+                .expect("record");
+        }
+        store
+            .mark_deleted("telegram:1", "2", now())
+            .await
+            .expect("mark");
+        // Recorded rather than merely named: superseding is ordered against the revision's own row,
+        // so a replacement that is not in the table marks nothing, which is the point.
+        let mut revision = message("telegram:1", "3:e1", "the new wording");
+        revision.message_id = "3".to_string();
+        store.record_message(revision).await.expect("record");
+        store
+            .supersede_message("telegram:1", "3", "3:e1", now())
+            .await
+            .expect("supersede");
+
+        let summary = store
+            .unseen_summary(Some("telegram:1"))
+            .await
+            .expect("summary");
+        assert_eq!(
+            summary.count, 2,
+            "the live message and the current wording of the edited one"
+        );
+        let counts = store.unseen_counts().await.expect("counts");
+        assert_eq!(counts.get("telegram:1"), Some(&2));
+
+        let (count, context, _) = store
+            .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 10)
+            .await
+            .expect("take");
+        assert_eq!(count, 2);
+        let texts: Vec<&str> = context.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["kept", "the new wording"],
+            "the count and the excerpt must describe the same set, and neither the retracted \
+             message nor the wording an edit replaced is in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_edited_before_it_was_shown_leaves_nothing_stranded() {
+        // The two halves of this change meet here. Superseding hides the older wording from
+        // everything the agent is owed, and the watermark is the highest id among the rows that
+        // survive that filter, so the arithmetic only works if the row it hides sorts below the row
+        // it keeps. If it did not, the older wording would sit unseen forever: skipped by the
+        // filter on the way out and left behind by `mark_seen` on the way back.
+        let store = Store::open_in_memory().await.expect("opens");
+        let mut original = message("telegram:1", "5", "meet at four");
+        original.message_id = "5".to_string();
+        store.record_message(original).await.expect("record");
+        let mut revision = message("telegram:1", "5:e1", "meet at five");
+        revision.message_id = "5".to_string();
+        store.record_message(revision).await.expect("record");
+        store
+            .supersede_message("telegram:1", "5", "5:e1", now())
+            .await
+            .expect("supersede");
+
+        let through = now() + chrono::Duration::hours(1);
+        let (count, context, watermark) = store
+            .take_unseen("telegram:1", through, 10)
+            .await
+            .expect("take");
+        assert_eq!(count, 1, "one message is owed, not two wordings of it");
+        assert_eq!(
+            context.first().map(|row| row.text.as_str()),
+            Some("meet at five")
+        );
+        store
+            .mark_seen("telegram:1", watermark, through)
+            .await
+            .expect("mark seen");
+
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            0,
+            "nothing is left owed"
+        );
+        assert!(
+            store
+                .history("telegram:1", 10, None)
+                .await
+                .expect("read")
+                .iter()
+                .all(|row| row.seen),
+            "and no wording is left unseen behind the filter that hid it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_message_remembers_which_side_it_came_from() {
+        // The columns that make the history cover both directions. Read back wrong, the agent's own
+        // messages would be indistinguishable from another bot's in the same chat.
+        let store = Store::open_in_memory().await.expect("opens");
+        let mut record = message("telegram:1", "1", "on it");
+        record.own = true;
+        record.session_id = Some("scheduled-news".to_string());
+        record.seen = true;
+        store.record_message(record).await.expect("record");
+
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let row = history.first().expect("one row");
+        assert!(row.own);
+        assert_eq!(row.session_id.as_deref(), Some("scheduled-news"));
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            0,
+            "the bridge's own output is not a backlog owed to the agent"
+        );
+    }
+
+    #[tokio::test]
     async fn asking_what_is_unseen_does_not_spend_it() {
         // The whole reason this exists alongside `take_unseen`. A watcher asks on a timer, and if
         // asking consumed the backlog the turn it went on to trigger would find an empty room.
@@ -2405,6 +2817,62 @@ mod tests {
             marker().await,
             after_one,
             "a message in another chat still has to register on a bridge-wide watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_own_message_does_not_move_the_watcher_marker() {
+        // The marker is what a scheduled job polls to decide whether a chat is worth a turn. Once
+        // the bridge started recording its own output, the agent replying moved it, so a watcher
+        // fired on the main session having spoken and spent a turn reading a room whose only new
+        // message was the agent's own. Nothing was recorded here before, which is why the marker
+        // was safe; keeping it safe now means saying so.
+        let store = Store::open_in_memory().await.expect("opens");
+        let marker = async || store.unseen_summary(None).await.expect("summary").marker();
+
+        let mut theirs = message("telegram:1", "1", "the deploy is stuck");
+        theirs.timestamp = now();
+        store.record_message(theirs).await.expect("record");
+        let after_theirs = marker().await;
+
+        let mut ours = message("telegram:1", "2", "on it");
+        ours.own = true;
+        ours.seen = true;
+        ours.timestamp = now() + chrono::Duration::seconds(30);
+        store.record_message(ours).await.expect("record");
+        assert_eq!(
+            marker().await,
+            after_theirs,
+            "answering a chat is not the chat moving"
+        );
+    }
+
+    #[tokio::test]
+    async fn retracting_the_newest_message_still_moves_the_marker_back() {
+        // Documented on `marker` as news of a kind, and it used to happen for free because a
+        // deletion removed the row. Now the row is kept, so the marker has to skip it deliberately
+        // or a watcher never learns that the message it last fired on has been withdrawn.
+        let store = Store::open_in_memory().await.expect("opens");
+        let marker = async || store.unseen_summary(None).await.expect("summary").marker();
+
+        let mut first = message("telegram:1", "1", "one");
+        first.timestamp = now();
+        store.record_message(first).await.expect("record");
+        let after_first = marker().await;
+
+        let mut second = message("telegram:1", "2", "spoke too soon");
+        second.timestamp = now() + chrono::Duration::seconds(30);
+        store.record_message(second).await.expect("record");
+        assert_ne!(marker().await, after_first);
+
+        store
+            .mark_deleted("telegram:1", "2", now())
+            .await
+            .expect("mark");
+        assert_eq!(
+            marker().await,
+            after_first,
+            "a retraction has to move the marker back, as removing the row used to"
         );
     }
 
@@ -3565,6 +4033,57 @@ mod tests {
             .record_message(message("telegram:1", "1", "after the upgrade"))
             .await
             .expect("the history added by the upgrade is usable");
+    }
+
+    #[tokio::test]
+    async fn history_recorded_before_0_9_0_still_reads_back() {
+        // The upgrade above starts from a schema with no `messages` table, so it never has a row in
+        // it when the lifecycle columns are added. This is that case: a real bridge upgrading has a
+        // populated history, and every one of those rows predates `own`, `deleted_at` and
+        // `superseded_at`. They have to read back as somebody else's message that is neither
+        // deleted nor superseded, which is what they are.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        let connection = tokio_rusqlite::Connection::open(&path)
+            .await
+            .expect("opens");
+        connection
+            .call(|connection| {
+                for (version, statements) in MIGRATIONS.iter().enumerate().take(7) {
+                    connection.execute_batch(statements)?;
+                    connection.pragma_update(None, "user_version", (version + 1) as i64)?;
+                }
+                connection.execute(
+                    "INSERT INTO messages
+                         (conversation_id, external_id, message_id, sender_id, sender_name, text,
+                          notes, attachments, addressed, seen, timestamp)
+                     VALUES ('telegram:1', '4', '4', '111', 'Alice', 'said before the upgrade',
+                             NULL, NULL, 0, 0, ?1)",
+                    [to_rfc3339(now())],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("build a version 7 database");
+        connection.close().await.expect("closes");
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let row = history.first().expect("the old row survives");
+        assert_eq!(row.text, "said before the upgrade");
+        assert!(!row.own, "an unmarked row is not the bridge's own message");
+        assert_eq!(row.deleted_at, None);
+        assert_eq!(row.superseded_at, None);
+        assert_eq!(row.session_id, None);
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            1,
+            "and it is still owed to the agent, since it was never shown"
+        );
     }
 
     #[tokio::test]

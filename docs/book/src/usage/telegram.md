@@ -40,7 +40,7 @@ at: 2026-08-11T14:22:31+00:00
 forwarded from: Alice (@alice, id 111222333)
 album: 13294839284
 in reply to a message from Mica (id 4468): "deploy finished"
-attachment: photo, image/jpeg, 2.1 MiB [417]
+attachment: photo, image/jpeg, 1920x1080, 2.1 MiB [417]
 ```
 
 Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` always appear; the rest show up when they apply.
@@ -65,9 +65,11 @@ Being added to or removed from a group is logged. If the group is not allowliste
 
 ## Editing and reactions
 
-An edited message is delivered again, marked as an edit, rather than being mistaken for a repeat of the original. The agent sees the revised text and knows which message it revises.
+An edited message is delivered again, marked as an edit, rather than being mistaken for a repeat of the original. The agent sees the revised text and knows which message it revises. In the history the wording it replaced is kept and marked `superseded`, so reading a conversation back shows the current text without losing what it used to say.
 
 In the other direction the agent can revise its own messages with `edit_message` and retract them with `delete_message`, which is how a person corrects a typo rather than sending a second message about it. Telegram declines to edit a message older than 48 hours.
+
+**Telegram never reports that somebody deleted a message.** The Bot API has no such update, so unlike on Discord a deleted Telegram message is never marked `deleted` in the history: the bridge's copy stays as it was until `history_retention` prunes it. A message the agent deleted itself is marked, because that one the bridge did.
 
 The agent can react to any message with `react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
 
@@ -163,11 +165,13 @@ If rendering ever misbehaves on a particular message, `parse_mode = "none"` send
 **Nothing is downloaded on arrival.** The envelope announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `view_attachment` to look at a picture or `download_attachment` to get the file on disk.
 
 ```
-attachment: photo, image/jpeg, 2.1 MiB [417]
+attachment: photo, image/jpeg, 1920x1080, 2.1 MiB [417]
 attachment: document, "q3-report.pdf", application/pdf, 8.4 MiB [418]
 ```
 
 Three reasons it works this way. A download inside the polling loop stalls every later message behind it, so one large file used to delay an entire conversation. Disk filled with files nobody asked for. And because the bridge owns one permanent session, an image attached to a turn stays in the agent's context for the life of that session, whether or not it ever mattered; now only the pictures it chose to look at do.
+
+That last one is why the line carries pixel size and running time where the platform reports them. The decision the agent makes here is whether to spend a fetch at all, and it is a decision it cannot take back: 1920x1080 is a screenshot worth reading and 96x96 is an avatar that is not, while both are a few tens of kilobytes. A nine-second voice note and a nine-minute one are answered differently too. Both platforms hand these over in the payload the connector already parses, so knowing costs nothing where looking costs the rest of the session.
 
 Photos, documents, voice notes, audio, video, video notes, animations, and stickers all arrive this way. Content with no file at all becomes a descriptor line instead, so a shared location, a contact card, a poll, or a dice roll is still something the agent can see and respond to:
 

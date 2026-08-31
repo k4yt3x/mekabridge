@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The agent's own messages are recorded in history, so it can check what it has already said.
+- Own messages name the meka session that sent them, which is how scheduled jobs are told apart.
+- One history row per real message, so an id read back from history addresses the message it names.
+- A reply that was only partly delivered records the parts that did land, rather than nothing.
+- Files the agent sends get attachment handles, so another session can open what it sent.
+- `attachment:` lines carry pixel size and running time, to judge a file without fetching it.
+- `send_message` numbers the parts of a split reply, as `part 2/3: 502`.
+- `mekabridge history` marks the agent's own messages, and deleted and superseded ones.
+
+### Changed
+
+- **Breaking:** a deleted message is kept and marked `deleted` rather than dropped from the record.
+- An edited message keeps its earlier wording, marked `superseded`, alongside the revision.
+- The bridge's own delivery-failure notice is recorded like anything else it puts in a chat.
+- Server instructions are shorter, and cover only what no tool description already says.
+
+### Fixed
+
+- `read_history` presented the earlier wording of an edited message as though it still stood.
+- Server instructions claimed the agent's turn text is invisible, which a REPL deployment disproves.
+- A newline in the bot's own account name broke the header block of every envelope.
+
 ## [0.8.0] - 2026-08-25
 
 ### Added

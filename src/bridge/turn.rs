@@ -1,46 +1,17 @@
 //! Running one turn against meka, and the presence signalling that goes with it.
 //!
-//! The bridge relays no deltas: nothing the agent streams reaches a user unless the agent calls
-//! `send_message`. Streaming is still the transport, because a multi-minute turn on a blocking POST
-//! is fragile behind proxies with read timeouts, and because the event stream is the only place
-//! tool activity is visible for logs.
+//! The typing window is closed by the next `tool_call.executing` or `tool_call.composing`, not by
+//! one carrying the id that opened it. meka emits `composing` without marking the attempt as having
+//! produced output, so a call whose arguments never finish is safe to retry, and a retry mints
+//! fresh tool ids while the `composing` already on the wire cannot be taken back. Matching on the
+//! id waits for one that never arrives, leaving the indicator up until the turn ends.
 //!
-//! Typing indicators are the one thing the bridge emits on its own. That is presence rather than
-//! content, the same signal a person's phone shows while they type, so it does not compete with the
-//! agent's decision about whether to reply at all.
+//! A turn that dies mid-call emits no closing event either, which is why the token is cancelled
+//! when the turn ends rather than only by an event.
 //!
-//! It is raised while the model is writing the arguments to a send tool, and at no other time.
-//! meka opens that window with `tool_call.composing`, so the interval is roughly the time spent
-//! generating the message: long for a long reply, brief for a short one, absent while the agent is
-//! reading, searching or thinking.
-//!
-//! The window is closed by the next `tool_call.executing` or `tool_call.composing`, whichever comes
-//! first, and not by one carrying the id that opened it. meka emits `composing` *without* marking
-//! the attempt as having produced output, deliberately, so that a call whose arguments never finish
-//! is still safe to retry. That makes the composing window exactly the window in which meka retries
-//! the whole provider round, and a retry mints fresh tool ids while the `composing` already on the
-//! wire cannot be taken back. Waiting for a matching id there is waiting for one that will never
-//! arrive, and the indicator stays up, refreshing, until the turn ends. Matching gains nothing in
-//! return: meka accumulates one call at a time, so the only thing that can close a window is that
-//! call or the one that displaced it.
-//!
-//! This used to be held for the whole turn, on the reasoning that a chat which shows typing briefly
-//! and then falls silent for minutes reads as a bot that has died rather than one that is thinking.
-//! That cost is real and is now accepted, because the other side of it turned out to be worse: an
-//! indicator that is up for every one of a dozen tool calls is a claim of "a reply is seconds away"
-//! that is wrong nearly all of the time, and a signal that is wrong nearly all of the time teaches
-//! people to stop reading it. Silence during a long tool run is at least true.
-//!
-//! Two consequences worth knowing. On a provider backend that does not stream a call as it is
-//! written, `openai-chat-completions` today, meka resolves each call's name and arguments together
-//! and the two events arrive back to back, so the window is empty and the indicator is at most a
-//! flicker. And a turn that dies mid-call emits no closing event, which is why the token is also
-//! cancelled when the turn ends.
-//!
-//! Cancelling has to abandon any request still in flight, not merely stop making new ones. Both
-//! platforms queue rate-limited calls rather than refusing them, so an indicator that is allowed to
-//! finish sending after its window has closed goes on being drawn for as long as the backlog takes
-//! to drain, which is a chat that claims the agent is working when it has been idle for minutes.
+//! Cancelling has to abandon a request already in flight, not merely stop starting new ones: both
+//! platforms queue rate-limited calls rather than refusing them, so one allowed to finish keeps the
+//! indicator drawn for as long as the backlog takes to drain.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -54,15 +25,13 @@ use crate::{
 
 /// Which conversations the agent has sent to since the current composing window opened.
 ///
-/// Shared with the outbound sink, which is the only thing that knows a message actually went out.
 /// Telegram clears the typing status when a message from the bot arrives, so without this the
-/// refresh loop re-arms it seconds later and the user, having just been answered, waits for a
-/// second message that is never coming.
+/// refresh loop re-arms it seconds later and somebody who has just been answered waits for a second
+/// message that is never coming.
 ///
-/// Scoped to the window rather than the turn, and cleared when each one opens. Per turn it would
-/// silence every send after the first: the indicator is now dropped at `tool_call.executing`, which
-/// is *before* the send tool runs and records itself here, so the record could only ever suppress a
-/// later window rather than the one it was written for.
+/// Scoped to the window rather than the turn: the indicator drops at `tool_call.executing`, which
+/// is *before* the send tool runs and records itself here, so a per-turn record could only suppress
+/// a later window rather than the one it was written for.
 #[derive(Debug, Default)]
 pub struct Presence {
     replied: std::sync::Mutex<std::collections::HashSet<ConversationId>>,
@@ -119,29 +88,23 @@ const TEXT_PREVIEW_CHARS: usize = 240;
 /// What a turn did, for logging, for deciding whether to warn about a silent turn, and for deciding
 /// whether a failed one may be handed over again.
 ///
-/// Reported for a failed turn as much as a finished one, which is the whole reason the outcome is a
-/// `Result` in here rather than the return type. A failure reaching the bridge means meka's own
-/// retries ran out, and those are scoped to a single provider call, so the turn may well have made
-/// several already: a rate limit on the third call of a tool loop arrives with the first two
-/// iterations' tool calls behind it. Whether anything actually happened is the difference between a
-/// batch that is safe to offer again and one whose retry would repeat work the agent cannot
-/// remember doing.
+/// Reported for a failed turn as much as a finished one, which is why the outcome is a `Result` in
+/// here rather than the return type. meka's own retries are scoped to a single provider call, so a
+/// failure reaching the bridge may already have several calls behind it, and whether anything
+/// happened is the difference between a batch safe to offer again and one whose retry would repeat
+/// work the agent cannot remember doing.
 #[derive(Debug)]
 pub struct TurnReport {
     pub outcome: Result<TurnOutcome, MekaError>,
     /// Whether meka took the turn at all.
     ///
-    /// A refused submission and a turn that ran and failed are both an `Err`, and they mean
-    /// opposite things to a caller holding state it spent on the envelope: a turn that ran reached
-    /// the agent, a refused one reached nobody. Read off the events rather than off the error,
-    /// because the error cannot always tell you: meka's `internal` covers both a submission it
-    /// threw out and a provider failure halfway through the work. Any accepted turn opens with
-    /// `turn.started`, and a refusal produces no events at all, so the first event of any kind is
-    /// the answer.
+    /// A refused submission and a turn that ran and failed are both an `Err` but mean opposite
+    /// things: one reached the agent, the other reached nobody. Read off the events rather than
+    /// the error, which cannot tell them apart, since meka's `internal` covers both. Any
+    /// accepted turn opens with `turn.started` and a refusal produces no events at all.
     ///
-    /// A stream that dies before its first event reads as not accepted when it was. That errs
-    /// toward showing the agent a backlog twice rather than losing it, which is the right way
-    /// round.
+    /// A stream that dies before its first event therefore reads as not accepted when it was,
+    /// erring toward showing the agent a backlog twice rather than losing it.
     pub accepted: bool,
     /// Times the agent called a send tool during the turn.
     pub sends: usize,
@@ -201,14 +164,12 @@ impl TurnReport {
 
     /// Whether the turn did nothing at all because the model came back empty.
     ///
-    /// meka substitutes a bracketed stand-in when a turn yields no content, and streams it as the
-    /// assistant text. Paired with zero tool calls that is provably inert: nothing was sent,
-    /// nothing was executed, so the batch can be handed over again without any risk of doing
-    /// something twice. Refusals are excluded because those are a real answer, just not one
-    /// anybody likes.
+    /// meka streams a bracketed stand-in as the assistant text when a turn yields no content, and
+    /// paired with zero tool calls that is provably inert, so the batch can be handed over again.
+    /// Refusals are excluded, being a real answer.
     ///
-    /// Matching meka's wording is a little brittle. It degrades safely: if the phrasing changes the
-    /// turn is simply treated as silent and logged, rather than retried.
+    /// Matching meka's wording is brittle but degrades safely: a rewording leaves the turn treated
+    /// as silent and logged rather than retried.
     pub fn produced_nothing(&self) -> bool {
         // Only a turn that ran to its own end can be called inert. One that was stopped partway
         // produced the stand-in for the round it managed rather than for the turn, and what to do

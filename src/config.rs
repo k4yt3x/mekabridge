@@ -161,16 +161,11 @@ pub struct BridgeConfig {
     pub typing_indicator: bool,
     /// Ceiling on how long the typing indicator is held for one composing window.
     ///
-    /// It used to default to `[meka].turn_timeout`, which was right while the indicator covered a
-    /// whole turn and is wrong now that it covers one message being written. Under the current
-    /// design this is not a safety net that never fires, it is the *only* thing that closes a
-    /// window whose closing event never arrives: a stream that goes quiet after
-    /// `tool_call.composing` produces neither an `executing` nor another `composing`, and the
-    /// rejoin can spend minutes trying to get back on. Left at the turn budget, a chat sat
-    /// showing "typing" for half an hour and then fell silent with no message.
-    ///
-    /// So it is a short fixed default now, sized for the longest a model plausibly spends writing
-    /// one message's arguments rather than for the longest a turn may run.
+    /// Not a safety net that never fires: it is the *only* thing that closes a window whose
+    /// closing event never arrives, since a stream going quiet after `tool_call.composing`
+    /// produces neither an `executing` nor another `composing`. Sized for the longest a model
+    /// plausibly spends writing one message's arguments, not for the longest a turn may run,
+    /// which is what it used to be and left chats showing "typing" for half an hour.
     pub typing_max: Duration,
     /// What happens to a conversation nobody has ruled on, decided by its chat kind.
     pub default_policy: DefaultPolicy,

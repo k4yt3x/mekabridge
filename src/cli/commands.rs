@@ -525,22 +525,16 @@ pub async fn doctor(config: &Config) -> Result<()> {
 
 /// Why a permission level will not work for this bridge, or `None` if it will.
 ///
-/// `read`, `workspace` and `unrestricted` all work: the send tools are annotated read-only, so
-/// replying sits at meka's `read` level and every rung above it allows what `read` allows.
+/// `ask` fails for a reason that is not obvious: meka compares the *session* level against `Ask`
+/// before dispatching any tool, so every call is prompted, read-only ones included, and this bridge
+/// declares `supports_permission_prompts: false`, so meka denies each immediately and the agent
+/// cannot even reply.
 ///
-/// `ask` does not, and the reason is not obvious. meka compares the *session* level against `Ask`
-/// before dispatching any tool, so at `ask` every call is prompted, read-only ones included. This
-/// bridge declares `supports_permission_prompts: false`, so meka denies each one immediately and
-/// the agent cannot even reply. `ask` is also outside meka's default enabled set, so a session
-/// asking for it is usually refused at creation before any of that is reached.
-///
-/// What no level short of `unrestricted` reaches is the five moderation tools, and that is not
-/// stated here because it is not a *failure*: a bridge that never moderates is correct at `read`.
-/// [`moderation_reach`] reports it separately, as a statement of fact.
+/// Falling short of the moderation tools is not a failure here, since a bridge that never moderates
+/// is correct at `read`; [`moderation_reach`] reports that separately.
 ///
 /// `write` is unreachable from `[session].permission`, which refuses it while parsing, but not from
-/// the level meka reports for an existing session: a session created against meka 0.41 carries it,
-/// and that is the reading this arm is for.
+/// the level meka reports for a session created against 0.41, which is what that arm is for.
 fn permission_problem(level: &str) -> Option<&'static str> {
     match level {
         "read" | "workspace" | "unrestricted" => None,
@@ -563,11 +557,9 @@ fn permission_problem(level: &str) -> Option<&'static str> {
 
 /// Why meka will refuse to create a session at `level`, or `None` if it will accept one.
 ///
-/// Separate from [`permission_problem`], which asks whether a level suits *this bridge*. This one
-/// asks whether the level exists on the other side at all, and it is the earlier failure: meka
-/// checks its `[permissions].enabled` set before anything else, so a level outside it is a 422 on
-/// the first message rather than an agent that behaves oddly. `ask` is the one to catch, being
-/// outside meka's default set.
+/// Separate from [`permission_problem`], which asks whether a level suits *this bridge*. This is
+/// the earlier failure: meka checks `[permissions].enabled` before anything else, so a level
+/// outside it is a 422 on the first message rather than an agent behaving oddly.
 ///
 /// An empty `enabled` means no opinion, from a meka that did not report the field or could not be
 /// reached, and yields no verdict rather than a guess.
@@ -584,21 +576,14 @@ fn level_meka_will_not_create(level: &str, enabled: &[String]) -> Option<String>
 
 /// That the five moderation tools are registered and cannot be dispatched at `level`, if so.
 ///
-/// Stated rather than warned about, because `admin_tools` defaults on and `permission` defaults to
-/// `read`, so this is the shipped posture and always has been: before 0.42 the same pairing put
-/// them out of reach of `write`. A line that fires on every default install teaches operators to
-/// skim warnings, which costs more than this is worth.
+/// Stated rather than warned about: `admin_tools` defaults on and `permission` to `read`, so a
+/// warning here would fire on every default install and teach operators to skim them.
 ///
-/// Worth stating at all because the level that *does* reach them moved, and the failure is
-/// otherwise silent from both ends: the agent is told inside a tool result nothing surfaces, and
-/// the operator sees a bot that chats normally and declines to ban.
-///
-/// The chain is three steps and only the last is surprising. `readOnlyHint: false` resolves to
-/// `unrestricted` rather than to the old `write`. `Permission::allows` then treats `workspace`,
-/// `ask` and `unrestricted` as equal, which reads like `workspace` is enough. But an MCP tool runs
-/// in its server's own process, which meka does not sandbox, so a second gate refuses anything
-/// requiring `unrestricted` while the session sits at `workspace`, rather than promise a
-/// confinement it cannot apply.
+/// Only the last step of the chain is surprising. `readOnlyHint: false` resolves to `unrestricted`,
+/// and `Permission::allows` then treats `workspace`, `ask` and `unrestricted` as equal, which reads
+/// like `workspace` is enough. But an MCP tool runs in its server's own process, which meka does
+/// not sandbox, so a second gate refuses anything needing `unrestricted` from a `workspace` session
+/// rather than promise a confinement it cannot apply.
 fn moderation_reach(level: &str, admin_tools: bool) -> Option<String> {
     if !admin_tools || level == "unrestricted" {
         return None;

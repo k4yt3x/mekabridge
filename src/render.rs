@@ -1,17 +1,12 @@
 //! Markdown to a platform-neutral intermediate, with length-safe splitting.
 //!
-//! Every chat platform accepts some small subset of the formatting agent output uses, and none of
-//! them accept all of it. Rather than each connector parsing Markdown itself, the parse happens
-//! once here into [`Block`]s and [`Span`]s that carry their own styling, and each connector
-//! supplies only the emitter that turns a group of blocks into whatever its platform speaks.
+//! Splitting is why this goes through a structured intermediate instead of building a string and
+//! slicing it: slicing rendered markup can cut a tag in half or leave one unclosed, and a platform
+//! rejects the whole message when that happens. Splitting on span boundaries and emitting markup
+//! afterwards makes every chunk well formed by construction.
 //!
-//! Splitting is the reason the conversion goes through a structured intermediate instead of
-//! building a string and slicing it. Slicing rendered markup can cut a tag in half or leave one
-//! unclosed, and a platform rejects the whole message when that happens. Here splitting is done on
-//! span boundaries and markup is emitted afterwards, so every chunk is well formed by construction.
-//!
-//! Lengths are counted in visible characters, because that is what platforms charge against their
-//! limits: markup overhead is not part of the budget.
+//! What counts against a platform's limit differs by platform, so the budget is measured on emitted
+//! output rather than on visible length; see [`into_messages`].
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -105,16 +100,13 @@ impl Block {
 
 /// Parse Markdown and emit one or more messages, each within `limit` characters of output.
 ///
-/// The budget is measured on what `emit` produced, not on the text underneath it. That distinction
-/// is the whole reason this is not a one-line pipeline: Telegram counts characters after its markup
-/// is parsed away, so markup is free, while Discord counts the markup itself, and there escaping
-/// `snake_case` or wrapping a code fence is charged to the same allowance as the words. Budgeting
-/// on visible length alone overshoots on Discord by however much the emitter added, and a message
-/// over the limit is refused outright rather than trimmed.
-///
-/// So `measure` belongs to the emitter, which is the only thing that knows how its platform counts,
-/// and blocks are grouped, emitted, measured, and regrouped against a tighter budget until they
-/// fit. Emitters are pure and cheap, and the retry only touches the groups that need it.
+/// The budget is measured on what `emit` produced, not on the text underneath it, which is the
+/// whole reason this is not a one-line pipeline. Telegram counts characters after its markup is
+/// parsed away, so markup is free, while Discord counts the markup itself and charges escaping
+/// `snake_case` or wrapping a fence to the same allowance as the words. Budgeting on visible length
+/// overshoots on Discord, and a message over the limit is refused outright rather than trimmed, so
+/// `measure` belongs to the emitter and groups are re-emitted against a tighter budget until they
+/// fit.
 ///
 /// Returns an empty vector for input that renders to nothing, so callers do not send blank
 /// messages.
@@ -757,18 +749,14 @@ fn split_spans(spans: Vec<Span>, limit: usize) -> Vec<Vec<Span>> {
                     current_length = 0;
                     continue;
                 }
-                // Nothing to flush, so flushing achieves nothing: the group is already empty and
-                // the budget is already the whole limit, which made the next pass
-                // identical to this one. That spun forever without consuming a
-                // byte, allocating, or reaching an await, so the task could not
-                // even be cancelled and the worker thread was gone for good.
+                // Nothing to flush and the budget already the whole limit, so the next pass would
+                // be identical to this one. That spun without consuming a byte or reaching an
+                // await, so the task could not even be cancelled.
                 //
-                // Dropping the leading whitespace is what makes progress here, and it is the right
-                // rendering anyway, since no message wants to begin with it. `head` is non-empty
-                // and entirely whitespace, so the text does start with some and
-                // this always shortens it. The equality check is a backstop rather
-                // than a live branch: it costs a comparison and it means a future
-                // change to `split_at_visible` cannot bring the hang back.
+                // Dropping the leading whitespace is what makes progress, and is the right
+                // rendering anyway. `head` is non-empty and entirely whitespace so this always
+                // shortens the text; the equality check is a backstop against a future change to
+                // `split_at_visible` bringing the hang back.
                 let trimmed = remaining.text.trim_start();
                 if trimmed.len() == remaining.text.len() {
                     break;

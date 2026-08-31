@@ -1,17 +1,15 @@
 //! Durable state: the session binding, the conversation address book, and the inbound queue.
 //!
-//! The queue is the part that matters most. One meka session runs one turn at a time, so messages
-//! that arrive mid-turn have to wait somewhere, and "somewhere" cannot be process memory: a crash
-//! with a full queue would silently swallow everything a user typed. Every inbound message is
-//! therefore written to SQLite before it is acknowledged, claimed transactionally when a turn
-//! starts, and only marked done once that turn has actually completed.
+//! One meka session runs one turn at a time, so messages arriving mid-turn have to wait somewhere,
+//! and that cannot be process memory: a crash with a full queue would silently swallow everything a
+//! user typed. Every message is written before it is acknowledged and marked done only once the
+//! turn carrying it completed.
 //!
-//! Queue rows move through `pending` to `in_flight` to `done` or `failed`. Any row left `in_flight`
-//! at startup is evidence of a crash mid-turn and is reset to `pending`, which is why the state is
-//! a column rather than an in-memory flag.
+//! A row's state is a column rather than an in-memory flag so that anything left `in_flight` at
+//! startup is evidence of a crash mid-turn and can be returned to `pending`.
 //!
-//! Payloads are opaque JSON strings here. Keeping the queue ignorant of message structure means the
-//! state machine can be tested on its own and does not change when a new platform adds fields.
+//! Payloads stay opaque JSON so the state machine can be tested on its own and does not change when
+//! a platform adds fields.
 
 use std::{
     collections::HashMap,
@@ -48,14 +46,13 @@ const WAL_PRAGMA_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 
 /// How long a resolved policy is reused before the store is consulted again.
 ///
-/// The gate runs on every message from every conversation, so without this a busy group pays a
-/// database round trip per message to decide, almost always, to ignore it. Conversations with no
-/// policy at all are cached too, since that is the common case and the one on the hot path.
+/// The gate runs on every message, so without this a busy group pays a database round trip per
+/// message to decide, almost always, to ignore it. Conversations with no policy are cached too,
+/// being the common case.
 ///
-/// The window is also how long an operator running `mekabridge policy set` against a live daemon
-/// waits for it to take effect, which is why it is seconds rather than minutes: the CLI is the
-/// recovery path for a policy the agent set on itself, and a recovery path nobody can see working
-/// is not one.
+/// Seconds rather than minutes because this is also how long an operator running `mekabridge policy
+/// set` against a live daemon waits to see it take effect, and that CLI is the recovery path for a
+/// policy the agent set on itself.
 const POLICY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Ceiling on cached policy lookups, past which the cache is emptied rather than grown.
@@ -197,14 +194,13 @@ pub struct UnseenSummary {
 impl UnseenSummary {
     /// The value a watcher compares, which moves when and only when something new was said.
     ///
-    /// Deliberately not the backlog. A count of unseen messages falls to zero every time an
-    /// ordinary turn sweeps the conversation, so a watcher comparing successive readings would
-    /// fire on the sweep and spend a turn announcing news that had already been delivered. The
-    /// newest recorded timestamp is indifferent to whether anything has been shown, so it changes
-    /// on a new message and on nothing else.
+    /// Deliberately not the backlog, which falls to zero every time an ordinary turn sweeps the
+    /// conversation, so a watcher comparing successive readings would fire on the sweep. The newest
+    /// recorded timestamp is indifferent to what has been shown, and changes on nothing but a new
+    /// message.
     ///
-    /// Two things can still move it backwards, and both are real news of a kind: the author
-    /// deleting the newest message, and retention pruning the last of them.
+    /// Two things move it backwards, and both are news of a kind: the author deleting the newest
+    /// message, and retention pruning the last of them.
     pub fn marker(&self) -> String {
         self.latest.map_or_else(|| "never".to_string(), to_rfc3339)
     }
@@ -995,16 +991,12 @@ impl Store {
 
     /// Oldest and newest arrival times per conversation with something waiting.
     ///
-    /// Grouped rather than aggregated across the whole queue because the rule that decides when a
-    /// conversation is ready differs by conversation: a platform that reports typing holds one
-    /// until the person stops, and a platform that cannot report it holds one barely at all. A
-    /// single window over every pending row would mean one chat's burst deferring every other
-    /// chat's delivery, which it did until this was split.
+    /// Grouped rather than aggregated across the whole queue because readiness differs by
+    /// conversation: a single window over every pending row meant one chat's burst deferring every
+    /// other chat's delivery, which it did until this was split.
     ///
-    /// `min`/`max` over the stored RFC 3339 text rather than over parsed dates. That is sound here
-    /// because every row is written by [`Store::enqueue`] with a fixed `+00:00` offset and
-    /// zero-padded fields, so byte order and chronological order agree, including between a
-    /// timestamp with fractional seconds and one without.
+    /// `min`/`max` over the stored RFC 3339 text is sound because [`Store::enqueue`] writes a fixed
+    /// `+00:00` offset and zero-padded fields, so byte order and chronological order agree.
     ///
     /// Derived from the queue rather than from in-memory state so the behaviour is the same on the
     /// first message after a restart.
@@ -1404,18 +1396,15 @@ impl Store {
 
     /// Read a conversation back, oldest first, ending at `before` when one is given.
     ///
-    /// Selected newest-first so `limit` takes the most recent, then reversed, because that is what
-    /// "the last twenty messages" means and reading them in the order they were said is what makes
-    /// them legible.
+    /// Selected newest-first so `limit` takes the most recent, then reversed, which is what "the
+    /// last twenty messages" means.
     ///
     /// `before` is a [`MessageRecord::id`], not a time. Paging on the timestamp cannot be made
     /// correct: a burst shares one second, so "older than this timestamp" either drops the siblings
-    /// of the message paged from or returns them again, and the first of those loses messages
-    /// silently, which is the one failure a history tool cannot afford.
+    /// of the message paged from or returns them twice, and the first loses messages silently.
     ///
-    /// Ordered by id rather than by timestamp so the sequence agrees with the cursor. That is also
-    /// arrival order, which is what reading a conversation back means; the two only differ for an
-    /// edit, which carries the timestamp of the message it revises but arrives when it arrives.
+    /// Ordered by id so the sequence agrees with the cursor. That is also arrival order, which the
+    /// timestamp is not for an edit: it carries the time of the message it revises.
     pub async fn history(
         &self,
         conversation_id: &str,
@@ -1541,21 +1530,15 @@ impl Store {
     /// Mark everything a conversation withheld up to `through` as accounted for.
     ///
     /// Split from [`Self::take_unseen`] so the backlog is only spent once a turn carrying it has
-    /// actually reached meka. Marking at read time meant a submission meka refused threw the
-    /// envelope away *and* the count, and the retry then told the agent nothing had been said in a
-    /// chat where thirty messages were waiting.
+    /// reached meka: marking at read time meant a submission meka refused threw away the envelope
+    /// *and* the count.
     ///
-    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is. The
-    /// timestamp is the ceiling that was asked about; the id is the high-water mark of the rows
-    /// that answered. Keyed on the timestamp alone, a row written between the count and this call
-    /// with a time at or below the ceiling is marked without ever being shown, and that is not a
-    /// narrow window: Telegram stamps to whole seconds so a burst shares one, and an edit carries
-    /// the *original* message's time, so an edit of anything older lands inside it. Keyed on the id
-    /// alone, the same edit sweeps in the other direction: recorded out of timestamp order it has a
-    /// low id and a high timestamp, so it was never counted and is marked anyway.
-    ///
-    /// Either way the message ends up absent from `unseen`, from the missed-context lookback, and
-    /// from the CLI predicate, with nothing but `read_history` over the right window to find it.
+    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is. On the
+    /// timestamp alone, a row written between the count and this call at or below the ceiling is
+    /// marked without ever being shown, which is not a narrow window: Telegram stamps to whole
+    /// seconds, and an edit carries the *original* message's time. On the id alone, that same edit
+    /// sweeps the other way, having a low id and a high timestamp, so it was never counted and is
+    /// marked anyway.
     pub async fn mark_seen(
         &self,
         conversation_id: &str,
@@ -1579,15 +1562,13 @@ impl Store {
 
     /// Put one message back among what the agent is owed.
     ///
-    /// The inverse of [`Self::mark_seen`], and the reason it is keyed on one message rather than a
-    /// watermark: a message is marked seen the moment it is queued, on the assumption that the
-    /// agent is about to be handed it, and that assumption fails exactly when its batch runs out of
-    /// attempts. Without this the message is neither delivered nor owed, so it is absent from
-    /// `unseen`, from the missed-context lookback, and from the `mekabridge unseen` predicate.
-    /// Nothing short of `read_history` over the right window would find it again.
+    /// Keyed on one message rather than a watermark because a message is marked seen when it is
+    /// queued, assuming the agent is about to be handed it, and that assumption fails exactly when
+    /// its batch runs out of attempts. Without this the message is neither delivered nor owed, so
+    /// nothing short of `read_history` over the right window finds it again.
     ///
-    /// Returns whether a row was actually changed. `[storage].history_retention` of zero writes no
-    /// history at all, so there is legitimately nothing to un-see.
+    /// A `false` return is legitimate: `[storage].history_retention` of zero writes no history, so
+    /// there is nothing to un-see.
     pub async fn mark_unseen(&self, conversation_id: &str, external_id: &str) -> Result<bool> {
         let conversation_id = conversation_id.to_string();
         let external_id = external_id.to_string();
@@ -1606,38 +1587,28 @@ impl Store {
 
     /// How much is owed to the agent, without spending any of it.
     ///
-    /// The read-only half of [`Store::take_unseen`], which exists because the obvious way to answer
-    /// this question is to ask for the backlog, and asking for the backlog consumes it. A caller
-    /// that only wants to know whether to look would otherwise leave the turn it triggers with
-    /// nothing to read.
+    /// The read-only half of [`Store::take_unseen`], which exists because asking for the backlog
+    /// consumes it, leaving the turn that asked with nothing to read.
     ///
     /// Three answers from one snapshot, because a caller comparing readings taken separately could
-    /// see a message land between them: the backlog, when the newest of it arrived, and when
-    /// anything was last recorded here at all. The third is the only one a watcher can compare;
-    /// see [`UnseenSummary::marker`].
+    /// see a message land between them. Only the third is one a watcher can compare; see
+    /// [`UnseenSummary::marker`].
     ///
-    /// `MAX` over the stored text is the same lexical-ordering trick the rest of this module
-    /// relies on: RFC 3339 with a fixed `+00:00` offset sorts as text exactly as it does as time.
-    /// Chrono varies the fractional-second precision per row, which does not break it, because
-    /// `+` and `.` both sort below every digit.
+    /// `MAX` over the stored text works because RFC 3339 with a fixed `+00:00` offset sorts as text
+    /// exactly as it does as time, and chrono's per-row fractional-second precision does not break
+    /// that: `+` and `.` both sort below every digit.
     pub async fn unseen_summary(&self, conversation_id: Option<&str>) -> Result<UnseenSummary> {
         // Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
         //
-        // The unseen pair skips retracted and superseded rows, for the reason `MESSAGE_CURRENT`
-        // gives, and shares its spelling of that rule rather than repeating it: writing the third
-        // out by hand is how it came to disagree with the contract on `UnseenSummary::marker`
-        // without anything saying so.
+        // The unseen pair shares `MESSAGE_CURRENT` rather than spelling that rule out again;
+        // writing the third by hand is how it came to disagree with the contract on
+        // `UnseenSummary::marker` without anything saying so.
         //
-        // That third column is what a watcher polls, so its filter decides when a scheduled job
-        // wakes. It skips the bridge's own messages or the agent replying moves the marker, firing
-        // the watcher on the main session having spoken and spending a turn on a room whose only
-        // new message the agent wrote itself. Nothing outbound was recorded when this was written,
-        // so the exclusion was free; recording it made the filter load bearing.
-        //
-        // It skips retracted rows for the other half of the same contract. A deletion moving the
-        // marker back is documented on `UnseenSummary::marker` as news of a kind, and it used to
-        // happen by itself because the row went away. Keeping the row means saying so here, or a
-        // watcher never learns that what it last fired on has been withdrawn.
+        // The third column is what a watcher polls, so its filter decides when a scheduled job
+        // wakes. Own messages are excluded or the agent replying moves the marker, firing the
+        // watcher on a room whose only new message the agent wrote itself. Retracted rows are
+        // excluded because a deletion moving the marker back is news, which used to happen by
+        // itself when the row was removed and now has to be said explicitly.
         let columns = format!(
             "COUNT(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN 1 END),
              MAX(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN m.timestamp END),
@@ -1680,19 +1651,13 @@ impl Store {
 
     /// Mark one recorded message deleted, because the platform says it is gone.
     ///
-    /// The row and its text stay. Erasing it was the earlier behaviour and it was deliberate, but a
-    /// message the agent has already been handed is already in its session for good, and dropping
-    /// the record removed the only thing that could later tell it that what it acted on was
-    /// retracted. Marked rows still read back through `read_history` and `search_history`, and are
-    /// excluded from everything the agent is owed, so a retracted message is never offered back as
-    /// context it missed.
+    /// The row and its text stay. A message the agent has been handed is in its session for good,
+    /// and erasing the record removed the only thing that could later tell it what it acted on was
+    /// retracted.
     ///
     /// Keyed on the platform's message id rather than the queue's `external_id`, since a deletion
     /// names the message and knows nothing about the edit that may have given it a second row. That
-    /// is also why every row for the message is marked rather than one: deleting a message that had
-    /// been edited removes all of it.
-    ///
-    /// Returns whether anything was there to mark.
+    /// is also why every row for the message is marked rather than one.
     pub async fn mark_deleted(
         &self,
         conversation: &str,
@@ -1717,25 +1682,15 @@ impl Store {
 
     /// Mark the wordings a message had before `external_id` revised it.
     ///
-    /// An edit arrives as a row of its own, under its own `external_id`, because the queue needs a
-    /// distinct key to deliver it as an event rather than swallow it as a redelivery. That left two
-    /// rows for one message with nothing connecting them, so `read_history` returned the old and
-    /// the new wording as two messages that both looked current.
+    /// Ordered on the revision's own row id rather than "everything that is not this one", which is
+    /// the only form that survives being called twice or out of order: a redelivered older edit
+    /// would mark the newer wording that had replaced it, and since `superseded_at IS NULL` stops
+    /// the older one being cleared again, the message would end with every wording marked and none
+    /// current.
     ///
-    /// Marks what came *before* the revision rather than everything that is not it, which is the
-    /// only form that survives being called twice or out of order. Identity alone is neither
-    /// idempotent nor commutative: a redelivered older edit would mark the newer wording that had
-    /// already replaced it, and since `superseded_at IS NULL` stops the older one being cleared
-    /// again, the message would end with every wording marked and none current. Ordering on the
-    /// revision's own row makes a repeat a no-op and makes two revisions landing in either order
-    /// agree on the later one.
-    ///
-    /// A revision that is not in the table, because history was off or retention has since taken
-    /// it, leaves the subquery `NULL` and marks nothing. That is the right answer: without the
-    /// replacement there is nothing to point the agent at, so the wording it replaced stays
-    /// readable rather than being marked stale with no successor.
-    ///
-    /// Returns how many rows were marked, which is zero for the first version of a message.
+    /// A revision that is not in the table, because history was off or retention has taken it,
+    /// leaves the subquery `NULL` and marks nothing, leaving the wording it replaced readable
+    /// rather than stale with no successor.
     pub async fn supersede_message(
         &self,
         conversation: &str,

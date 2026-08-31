@@ -382,14 +382,12 @@ fn block_on<T, F: Future<Output = Result<T>>>(future: F) -> Result<T> {
 
 /// Let a closed pipe end the process, as every other command-line tool does.
 ///
-/// Rust sets `SIGPIPE` to `SIG_IGN` during startup, which turns a perfectly ordinary `mekabridge
-/// conversations list | head` into a panic on the first write past the pipe `head` closed behind
-/// it. The operator subcommands exist to be piped into `grep` and `head`, so the default
-/// disposition, exit quietly, is the correct one for them.
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns `mekabridge conversations list | head`
+/// into a panic on the first write past the closed pipe.
 ///
-/// Called from `main` rather than from [`Cli::run`], because `--help` and `--version` print before
-/// `run` is reached. The daemon wants the opposite and takes it back for itself, in
-/// [`crate::bridge::run`], so nothing here has to work out which subcommand is the daemon.
+/// Called from `main` rather than [`Cli::run`], because `--help` prints before `run` is reached.
+/// The daemon takes the opposite disposition back for itself in [`crate::bridge::run`], so nothing
+/// here has to work out which subcommand is the daemon.
 #[cfg(unix)]
 pub fn exit_quietly_on_broken_pipe() {
     // SAFETY: a valid signal number with one of the two dispositions libc defines for it. Called

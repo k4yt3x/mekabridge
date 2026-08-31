@@ -1,17 +1,12 @@
 //! Guild, channel, and role names, kept from the gateway's own events.
 //!
-//! A Discord conversation id is a bare channel snowflake, which tells the agent nothing about where
-//! it is, and raw message content refers to people, roles, and channels by id. Both need names, and
-//! fetching them over REST per message would be several round trips for every line of chat.
-//!
-//! The gateway supplies them free. With the `GUILDS` intent, connecting delivers one `GUILD_CREATE`
-//! per server carrying its name, every channel, and every role, and the create/update/delete events
-//! keep that current afterwards. So this is not a cache in the sense of something that can be stale
-//! and needs invalidating: it is the gateway's own state, mirrored.
+//! Not a cache in the sense of something that goes stale and needs invalidating: the `GUILDS`
+//! intent delivers one `GUILD_CREATE` per server carrying its name, channels and roles, and the
+//! create/update/delete events keep that current, so this is the gateway's own state mirrored.
+//! Fetching the same names over REST would be several round trips per line of chat.
 //!
 //! Deliberately holds nothing about people. Member names come from the message that mentions them,
-//! which is always present, and keeping a member list would need a second privileged intent for
-//! data the bridge already has.
+//! and keeping a list would need a second privileged intent for data the bridge already has.
 
 use std::{
     collections::HashMap,

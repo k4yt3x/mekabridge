@@ -1,22 +1,16 @@
 //! Discord connector.
 //!
-//! Events come off twilight's `Shard`, which is a `Stream` of gateway messages, consumed directly
-//! rather than through a framework. That mirrors the Telegram connector's reason for skipping
-//! teloxide's `Dispatcher`: there is exactly one destination for every event, so a routing layer
-//! would only sit between the socket and the queue.
+//! Events come off twilight's `Shard` directly rather than through a framework, as on Telegram:
+//! there is exactly one destination for every event, so a routing layer would only sit between the
+//! socket and the queue.
 //!
-//! Two things about Discord shape almost everything here.
+//! Two things about Discord shape the rest. Everything holding messages is a channel with its own
+//! snowflake, threads and direct messages included, so `discord:<channel_id>` addresses all of them
+//! and the thread segment of [`ConversationId`] goes unused. The exception is somebody who has
+//! never written, whose user id is not a channel id, hence the `discord:@<user_id>` dialling form.
 //!
-//! Everything that holds messages is a channel with its own snowflake. A server text channel, a
-//! thread, a forum post, and a direct message are all channels, so one conversation id form,
-//! `discord:<channel_id>`, addresses all of them and the thread segment of [`ConversationId`] goes
-//! unused. The exception is dialling somebody who has never written, since a Discord user id is not
-//! a channel id: `discord:@<user_id>` is accepted for that and resolves to the real channel on
-//! first send.
-//!
-//! Permissions are per channel, not per server. The bot can be free to post in one channel of a
-//! server and silent in the next, so "can I do this" is never a question about the server, and
-//! [`Channel::member`] computes the answer for the specific channel asked about.
+//! And permissions are per channel, not per server, so "can I do this" is never a question about
+//! the server and [`Channel::member`] answers for the specific channel asked about.
 
 pub mod cache;
 pub mod presence;

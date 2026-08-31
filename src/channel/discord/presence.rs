@@ -1,22 +1,19 @@
 //! Who is online, accumulated from the gateway.
 //!
-//! Presence is the one thing Discord will not answer over HTTP: there is no endpoint to ask whether
-//! somebody is around, only a stream of updates to keep up with. So this is a running tally rather
-//! than a lookup, and everything awkward about it follows from that.
+//! Discord will not answer presence over HTTP, only stream updates, so this is a running tally
+//! rather than a lookup and everything awkward about it follows from that.
 //!
-//! **Only status is kept.** Discord sends what somebody is playing, listening to, and their custom
-//! status alongside it. None of that is stored, logged, or exposed. The bridge ingests presence for
-//! every member of every server it is in, involuntarily on their part, and the narrowest thing that
-//! answers "can I give this person work" is the status alone.
+//! Discord also sends what somebody is playing and their custom status. Dropping all of it is
+//! deliberate: the bridge ingests presence for every member of every server it is in, involuntarily
+//! on their part, and status alone answers the only question asked of it.
 //!
-//! **Absence is not offline.** A member the cache has never heard of reads as
-//! [`PresenceStatus::Unknown`], never as offline. In the seconds after startup that is every
-//! member, and reporting a server full of offline people would be a confident lie at exactly the
-//! moment the bridge knows least.
+//! A member the cache has not heard of is [`PresenceStatus::Unknown`], never offline. That is every
+//! member for the seconds after startup, when a server full of offline people would be a confident
+//! lie at the moment the bridge knows least.
 //!
-//! **A reconnect replaces a guild's entry rather than merging into it.** Updates missed while the
-//! gateway was away are unrecoverable, so anything still in the map afterwards is a claim nobody
-//! checked. Merging would leave whoever went offline during the gap looking permanently available.
+//! A reconnect replaces a guild's entry rather than merging into it, because updates missed while
+//! the gateway was away are unrecoverable and merging would leave whoever went offline during the
+//! gap looking permanently available.
 
 use std::collections::HashMap;
 

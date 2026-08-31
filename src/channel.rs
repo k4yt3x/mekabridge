@@ -449,14 +449,12 @@ pub struct InboundMessage {
     pub admission: Admission,
     /// Whether the sender's own account is on the channel's user allowlist, wherever they wrote.
     ///
-    /// Deliberately separate from [`Self::admission`], which names the grant that admitted *this
-    /// message*. Since the user list reaches direct messages only, an operator writing in a group
-    /// is admitted by the group, and reporting solely that would say nothing about the person was
-    /// checked when in fact they were named by hand. The two facts answer different questions and
-    /// collapsing them loses the one the agent most wants.
+    /// Separate from [`Self::admission`], which names the grant that admitted *this message*. The
+    /// user list reaches direct messages only, so an operator writing in a group is admitted by
+    /// the group, and reporting only that would say nothing was checked about a person named
+    /// by hand.
     ///
-    /// Defaulted on decode so a message queued by an older build still reads back rather than
-    /// being dropped as unreadable.
+    /// Defaulted on decode so a message queued by an older build still reads back.
     #[serde(default)]
     pub sender_allowlisted: bool,
     /// Whether this message was aimed at the agent rather than merely said in front of it.
@@ -842,14 +840,10 @@ pub struct SendOptions {
 
 /// Per-file knobs.
 ///
-/// Composes [`SendOptions`] rather than repeating it. A caption is a message body, so everything
-/// that applies to one applies here: a file can answer somebody, arrive without a sound, and carry
-/// a preview card. Duplicating the fields meant `link_preview` existed twice with two doc comments
-/// to keep in step, and `reply_to` and `silent` existed nowhere at all despite both platforms
-/// accepting them on a file.
-///
-/// A struct rather than loose parameters. `send_files(.., true, false)` reads as nothing at all,
-/// and the compiler cannot tell a transposed pair from a correct one.
+/// Composes [`SendOptions`] rather than repeating it, since a caption is a message body and
+/// everything that applies to one applies here. A struct rather than loose parameters because
+/// `send_files(.., true, false)` reads as nothing and the compiler cannot tell a transposed pair
+/// from a correct one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileOptions {
     /// Send as viewable photos rather than as documents. Lossy on Telegram, which re-encodes.
@@ -964,15 +958,12 @@ pub trait Channel: Send + Sync + 'static {
     /// Deliver Markdown text, splitting it if the platform has a length limit.
     ///
     /// Pushes one [`SentMessage`] onto `sent` per message the platform accepted, in order, each
-    /// built from the platform's own response rather than from what was submitted, so the caller
-    /// records what the platform stored.
+    /// built from the platform's own response rather than from what was submitted.
     ///
-    /// **`sent` holds whatever landed, including when this returns an error.** Splitting means a
-    /// send can half succeed: three parts go out as three requests and the second can be refused
-    /// with the first already in the chat. Reporting only the error would leave the chat holding
-    /// words the bridge has no record of, which is the one thing the history is there to prevent,
-    /// so this is an out-parameter rather than a return value. A connector must push each part as
-    /// the platform accepts it, not collect them and push at the end.
+    /// **`sent` holds whatever landed, including when this returns an error**, which is why it is
+    /// an out-parameter: splitting means three parts go out as three requests and the second can be
+    /// refused with the first already in the chat. A connector must therefore push each part as the
+    /// platform accepts it, not collect them and push at the end.
     async fn send_text(
         &self,
         conversation: &ConversationId,
@@ -983,21 +974,15 @@ pub trait Channel: Send + Sync + 'static {
 
     /// Deliver local files, grouped into one post where the platform can do that.
     ///
-    /// Pushes one [`SentMessage`] onto `sent` per message that resulted, which is not always one
-    /// per file: Discord carries every attachment on a single message, while a Telegram album is
-    /// several messages sharing a group. A platform that cannot group at all is free to send one
-    /// message per file, so the caller never has to ask whether albums are supported.
-    ///
-    /// Each carries the attachments as the platform stored them, so the file the agent sent can be
-    /// fetched back later by whoever reads the conversation, and the caption sits on whichever
-    /// message actually bears it.
+    /// Pushes one [`SentMessage`] onto `sent` per message that resulted, which is not one per file:
+    /// Discord carries every attachment on a single message, a Telegram album is several sharing a
+    /// group, and a platform that cannot group may send one each. The caller therefore never has to
+    /// ask whether albums are supported. Each carries the attachments as the platform stored them,
+    /// so the file can be fetched back later.
     ///
     /// `sent` holds whatever landed even on an error, for the reason [`Self::send_text`] gives.
-    /// Neither platform here can half send a group, since each does it in one request, but a
-    /// connector that loops has to report what it got through.
-    ///
-    /// `paths` is non-empty. Each platform enforces its own ceiling on how many it will take, and
-    /// refuses before opening anything rather than partway through an upload.
+    /// `paths` is non-empty, and each platform enforces its own ceiling before opening anything
+    /// rather than partway through an upload.
     async fn send_files(
         &self,
         conversation: &ConversationId,
@@ -1165,14 +1150,10 @@ pub trait Channel: Send + Sync + 'static {
 
     /// Ask the platform what a conversation id names, or fail if it names nothing reachable.
     ///
-    /// Exists so an id an operator typed into `config.toml` can be checked before the notice it
-    /// was meant to carry fails in the middle of an incident. Nothing on the message path uses it:
-    /// [`Self::canonical_conversation`] is the cheap resolve, and this is the expensive question of
-    /// whether the thing on the other end is real.
-    ///
-    /// A platform whose ids cannot be told apart by inspection needs this most. A Discord user id
-    /// and a Discord channel id are both snowflakes, so the one in the wrong position parses,
-    /// validates, and then answers `10003 Unknown Channel` on the first send.
+    /// Nothing on the message path uses this: [`Self::canonical_conversation`] is the cheap
+    /// resolve, and this is the expensive question of whether the thing on the other end is real.
+    /// It exists because a Discord user id and a channel id are both snowflakes, so the one in the
+    /// wrong position parses, validates, and only then answers `10003 Unknown Channel`.
     async fn describe_conversation(
         &self,
         conversation: &ConversationId,

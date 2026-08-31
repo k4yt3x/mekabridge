@@ -1,15 +1,13 @@
 //! The inbound path: channel events into the durable queue, and the queue into turns.
 //!
-//! Two tasks, deliberately separate. The writer persists every event before acknowledging it, so a
-//! crash cannot swallow a message a user already sent. The drain loop claims batches and runs
-//! turns, and is the only thing here that talks to meka. One drain loop means the bridge never
-//! races itself, but it no longer means the session is idle whenever the bridge wants it: meka runs
-//! background tasks and scheduled wakes of its own, so a submission can be refused by a turn this
-//! bridge knows nothing about. That refusal is a deferral, not a failure, and is treated as one.
+//! Two tasks, deliberately separate: the writer persists every event before acknowledging it, and
+//! the drain loop claims batches and runs turns. One drain loop means the bridge never races
+//! itself, but not that the session is idle whenever it wants: meka runs background tasks and
+//! scheduled wakes of its own, so a submission can be refused by a turn this bridge knows nothing
+//! about. That refusal is a deferral, not a failure.
 //!
-//! Batching is the reason messages that pile up during a turn become one turn rather than several.
-//! That matches what happens to a person who puts their phone down: they come back to the whole
-//! conversation, not to one message at a time, and it saves a provider round trip per message.
+//! Messages piling up during a turn become one turn rather than several, which is what happens to
+//! somebody who puts their phone down and saves a provider round trip per message.
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -347,14 +345,13 @@ enum Disposition {
 
 /// Decide what happens to one message, and annotate it when a lapsed policy is being lifted.
 ///
-/// Resolution order is the explicit decision first and the configured default second. A
-/// conversation nobody has ruled on has no record at all, which is why changing
-/// `[bridge].default_policy` moves every such conversation at once while leaving the ones somebody
-/// ruled on where they were put.
+/// A conversation nobody has ruled on has no record at all, which is why changing
+/// `[bridge].default_policy` moves every such conversation at once while leaving ruled-on ones
+/// where they were put.
 ///
 /// A lapsed record is cleared here rather than swept on a timer, and what it did is handed to the
-/// message that lifted it: a policy whose effect is invisible gives the agent nothing to judge
-/// whether to renew it on.
+/// message that lifted it, since a policy whose effect is invisible gives the agent nothing to
+/// judge a renewal on.
 async fn gate(
     store: &Store,
     config: &Config,
@@ -428,19 +425,15 @@ async fn gate(
 
 /// Tell the agent what a policy it set did before it lapsed.
 ///
-/// The wording differs by policy on purpose. Under a block the messages are gone and saying so is
-/// the whole of it; under a mute they were recorded, so the note points at the tool that reaches
-/// them, or the agent will assume the same thing happened to both. Under an `active` set for a
-/// while nothing was missed at all, and the news is the other direction: the agent has stopped
-/// hearing a room it asked to hear, which without this reads as the room having gone quiet.
+/// The wording differs by policy because the news does. A lapsed block or mute is about messages
+/// missed, but a lapsed `active` is the other direction: the agent has stopped hearing a room it
+/// asked to hear, which without saying so reads as the room having gone quiet.
 ///
 /// `fallback` is what the conversation reverts to, which is not the policy that preceded the one
-/// lapsing. Only the `active` wording needs it, and only because "you are back on mentions only"
-/// would be a lie in a deployment whose groups default to being heard in full.
+/// lapsing: "back on mentions only" would be a lie where groups default to being heard in full.
 ///
-/// Returns whether anything was said, which the caller uses to make sure the message carrying it is
-/// actually delivered. Reported rather than recomputed at the call site so the two cannot disagree
-/// about which cases produce a notice.
+/// Returns whether anything was said, rather than letting the caller recompute it, so the two
+/// cannot disagree about which cases produce a notice.
 fn announce_expiry(
     message: &mut crate::channel::InboundMessage,
     lapsed: &PolicyRecord,
@@ -496,16 +489,13 @@ struct Spent {
 
 /// Collect what each muted conversation in this batch said while the agent was not listening.
 ///
-/// Marks it seen in the same call, so the next mention in that chat reports what has accumulated
-/// since rather than the same backlog again. The consequence is that a turn which fails and is
-/// retried from the queue gets a smaller lookback the second time: the messages themselves are
-/// still in the history, and repeating the count on every attempt would be the worse trade.
+/// Marks it seen in the same call, so a failed turn retried from the queue gets a smaller lookback
+/// the second time. The messages are still in the history, and repeating the count on every attempt
+/// is the worse trade.
 ///
-/// Every conversation in the batch is asked, not only the muted ones. Under `active` the answer is
-/// almost always nothing, because a delivered message is recorded as seen, but "almost" is doing
-/// work: unmuting a conversation leaves behind whatever piled up while it was muted. Asking only
-/// the muted ones would report that backlog to nobody and never clear it, so `unseen` would climb
-/// for the life of the conversation and `list_conversations` would go on quoting it.
+/// Every conversation in the batch is asked, not only the muted ones: unmuting one leaves behind
+/// whatever piled up while it was muted, and asking only the muted ones would report that backlog
+/// to nobody and never clear it.
 async fn missed_context(
     context: &DrainContext,
     events: &[InboundEvent],
@@ -809,16 +799,14 @@ struct Readiness {
 
 /// Decide which conversations have settled, and when to look again at those that have not.
 ///
-/// Three rules, applied per conversation. The floor is unconditional and exists for the wire rather
-/// than for people. The quiet period only applies where the platform can say whether somebody is
-/// still typing, because without that signal it is a guess, and a guess long enough to catch
-/// somebody composing is far too long to impose on somebody who only ever meant to send one
-/// message. The ceiling bounds the whole thing.
+/// The quiet period only applies where the platform reports typing, because without that signal it
+/// is a guess, and a guess long enough to catch somebody composing is far too long to impose on
+/// somebody who only meant to send one message.
 ///
-/// Timestamps here are the platform's own send times, not when the row was written, which is what
-/// makes a backlog replayed after a restart release immediately instead of being debounced as
-/// though it had just arrived. The cost is a dependence on the two clocks roughly agreeing; both
-/// directions of skew degrade safely, into either no debounce or one full quiet period.
+/// Timestamps are the platform's own send times, not when the row was written, so a backlog
+/// replayed after a restart releases immediately instead of being debounced as though it had just
+/// arrived. The cost is a dependence on the two clocks roughly agreeing, and both directions of
+/// skew degrade into either no debounce or one full quiet period.
 async fn readiness(context: &DrainContext) -> Readiness {
     let windows = match context.store.pending_windows().await {
         Ok(windows) => windows,
@@ -1144,11 +1132,10 @@ async fn deliver(
     //
     // Keyed on whether the turn was taken, not on which error came back. The `turn-in-flight` 409
     // used to be the only refusal excepted, and it is far from the only one: a meka restarting
-    // refuses the socket, its concurrency limit answers 429, a rotated token answers 401, a proxy
-    // answers 502. Each of those spent a backlog nobody was shown, so the retry moments later told
-    // the agent "nothing has been said there since you last looked" about a chat with thirty
-    // messages waiting -- and they were then gone from `unseen`, from every future lookback, and
-    // from the CLI predicate, with nothing to point at them.
+    // refuses the socket, its concurrency limit answers 429, a rotated token answers 401. Each of
+    // those spent a backlog nobody was shown, leaving the retry to tell the agent nothing had been
+    // said in a chat with thirty messages waiting, and those messages gone from every path that
+    // would have found them again.
     if !report.accepted {
         // The counter is restored for the same reason and on the same condition: the envelope it
         // was rendered into never reached anybody.
@@ -1280,21 +1267,14 @@ async fn deliver(
             }
             complete(context, &sequences).await;
         }
-        // The agent sent something, or ran something, and then the turn died. Handing the batch
-        // over again would repeat that work, and the agent would have no memory of the first run to
-        // tell it from the second, so the batch is accounted for instead: the same contract a turn
-        // that finished gets.
+        // Must stay ahead of the lost-stream arm below: every dropped stream satisfies
+        // `turn_outcome_unknown`, so behind it this guard is unreachable and a turn that had
+        // already answered somebody gets handed back to be answered again. The counters are
+        // truncated by a drop, so whatever they do show is a floor on what the agent did.
         //
-        // Ahead of the lost-stream arm below, and that order is the whole of it. Every dropped
-        // stream satisfies `turn_outcome_unknown`, so behind it this guard was unreachable and a
-        // turn that had already answered somebody was handed back to be answered again. It is also
-        // the case where replaying is least excusable: the counters are truncated by the drop, so
-        // whatever they *do* show is a floor on what the agent actually did.
-        //
-        // `content_started` is what makes this reachable rather than theoretical. meka scopes that
-        // flag to a single provider call, so a rate limit on the third call of a tool loop is
-        // retried inside meka and, when those retries run out, arrives here with the first two
-        // iterations' tool calls already made.
+        // Reachable rather than theoretical because meka scopes `content_started` to a single
+        // provider call, so a rate limit partway through a tool loop arrives here with the earlier
+        // iterations' calls already made.
         Some(error) if report.had_side_effects() => {
             tracing::error!(
                 sends = report.sends,
@@ -1412,17 +1392,14 @@ async fn complete(context: &DrainContext, sequences: &[i64]) {
 
 /// Submit a turn, retrying on a timer while meka is busy with a turn of its own.
 ///
-/// A `turn-in-flight` rejection means some turn is running: one of this bridge's own after a
-/// dropped stream, or one meka started for itself. The batch is refused before it runs, so retrying
-/// delivers it exactly once. It stays claimed throughout, so nothing else picks it up and the
-/// envelope is not rebuilt per attempt.
+/// A `turn-in-flight` rejection refuses the batch before it runs, so retrying delivers it exactly
+/// once, and it stays claimed throughout so the envelope is not rebuilt per attempt.
 ///
-/// The 409 is the only trustworthy sign that the session is busy. meka's `turn_in_flight` is not,
-/// and asking it is worse than not asking: the counter it reports and the mutex that produces the
-/// refusal are taken at different moments. meka's scheduled work locks the session's runtime first
-/// and marks itself busy after (its `schedule::run_prompt_in_session`), so in the window between
-/// the two the session calls itself idle and refuses anyway, and waiting for it to go idle returns
-/// at once with the retry a spin as tight as the two processes can trade requests.
+/// The 409 is the only trustworthy sign that the session is busy; meka's `turn_in_flight` is not,
+/// and asking it is worse than not asking. Its scheduled work locks the session's runtime before
+/// marking itself busy, so in the window between the two the session calls itself idle and refuses
+/// anyway, turning a wait-for-idle retry into a spin as tight as the two processes can trade
+/// requests.
 async fn submit(
     context: &DrainContext,
     session_id: Uuid,
@@ -1517,11 +1494,9 @@ enum Retry {
 /// upstream out of quota, where the right wait is unknowable and the cost of guessing short is an
 /// attempt spent for nothing.
 ///
-/// A `Retry-After` raises the wait but never lowers it. It is the only number here that is not a
-/// guess, so it is honoured when it asks for longer; letting it ask for *shorter* would undo the
-/// whole point on the one error that actually carries it today. meka sends it on its
-/// concurrency-limit 429 with a flat one second, which taken literally would put all four attempts
-/// inside four seconds.
+/// A `Retry-After` raises the wait but never lowers it. Letting it ask for *shorter* would undo the
+/// point: meka's concurrency-limit 429 carries a flat one second, which taken literally puts all
+/// four attempts inside four seconds.
 fn retry_delay(base: Duration, attempts: u32, retry_after: Option<Duration>) -> Duration {
     // Capped exponent as well as capped result: `Duration * u32` panics on overflow, and this is
     // reached with whatever attempt count a database row happens to hold.

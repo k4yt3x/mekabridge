@@ -45,21 +45,14 @@ use crate::{
 
 /// Buffer between the channel pollers and the durable writer.
 ///
-/// Backpressure here is deliberate, and this number is a durability bound rather than a throughput
-/// knob. teloxide advances its `getUpdates` offset the moment a batch arrives, before yielding a
-/// single update, and issues the confirming request once its own buffer has drained into this
-/// channel. Blocking the poller when this is full is therefore what stops that confirmation going
-/// out: whatever is sitting here unwritten when it does is acknowledged to Telegram and will never
-/// be sent again. So the depth of this channel *is* the number of messages a hard kill can lose.
+/// A durability bound, not a throughput knob. teloxide advances its `getUpdates` offset the moment
+/// a batch arrives and confirms it once its own buffer has drained into this channel, so blocking
+/// the poller when this is full is what holds that confirmation back. Whatever sits here unwritten
+/// when it goes out is acknowledged to Telegram and never sent again, which makes this depth the
+/// number of messages a hard kill can lose.
 ///
-/// Small for that reason. It was 64, chosen as a throughput buffer before anyone worked out what it
-/// bounded. The remaining window is closed only by driving `getUpdates` from the highest id
-/// actually written, which means owning the poll loop rather than using teloxide's listener.
-///
-/// Not zero, and not one: Discord's typing notices ride the same channel on a `try_send` and are
-/// dropped when it is full, so a depth that a normal burst of messages fills would stop the settle
-/// window working. Eight is past that and still small enough that what a crash costs is a rounding
-/// error beside everything else it costs.
+/// Not one, though: Discord's typing notices ride the same channel on a `try_send` and are dropped
+/// when it is full, so a depth an ordinary burst fills would stop the settle window working.
 const EVENT_BUFFER: usize = 8;
 
 /// How long shutdown waits for an in-flight turn before giving up on it.
@@ -348,19 +341,14 @@ async fn janitor(store: Store, config: Arc<Config>, shutdown: CancellationToken)
 
 /// Turn a closed pipe back into an ordinary `EPIPE`, which is what a network daemon needs.
 ///
-/// A signal disposition belongs to the process, not to a subcommand, so the daemon inherits
-/// whatever [`crate::cli::exit_quietly_on_broken_pipe`] left behind unless it says otherwise.
-/// Exiting quietly is fatal here: `SIGPIPE` reaches any write whose peer has already closed, which
-/// for a process holding a Discord gateway socket and a Telegram long poll open for days is a
-/// matter of time, and the kernel kills the process before the write returns. No reconnect runs,
-/// nothing is logged, and systemd counts the corpse as a clean exit, so `Restart=on-failure` does
-/// not fire either. That is the shape of the four-hour silent outage on 2026-08-30.
+/// A disposition belongs to the process, so the daemon inherits whatever
+/// [`crate::cli::exit_quietly_on_broken_pipe`] left behind unless it says otherwise. Exiting
+/// quietly is fatal here: the kernel kills the process before the write returns, so no reconnect
+/// runs and nothing is logged, and systemd counts the corpse as a clean exit so
+/// `Restart=on-failure` does not fire either.
 ///
-/// Ignored, the same write returns `EPIPE` as an `io::Error` and the connectors reconnect from it
-/// like any other dropped connection.
-///
-/// Lives here, called by [`run`], rather than in whichever caller decided to start a daemon. That
-/// way a second way in cannot be written without it.
+/// Lives here, called by [`run`], rather than in whichever caller decided to start a daemon, so a
+/// second way in cannot be written without it.
 #[cfg(unix)]
 fn fail_writes_on_broken_pipe() {
     // SAFETY: a valid signal number with one of the two dispositions libc defines for it. Other
@@ -678,32 +666,20 @@ impl BridgeSink {
 
 /// Write the bridge's own messages into the same history everybody else's is in.
 ///
-/// Until this existed the history held only what other people said, so the agent could not answer
-/// "did I already tell them that?" about its own account, and a message sent by a scheduled session
-/// was unfindable by the session asked about it afterwards. One row per real platform message, not
-/// per tool call: text too long for one message becomes several with several ids, and a row can
-/// only carry one of them, so a single row would hand back an id that edits or reacts to the first
-/// part alone.
+/// One row per real platform message, not per tool call: text too long for one message becomes
+/// several with several ids, and a single row could carry only one of them, so an id read back from
+/// history would edit or react to the first part alone.
 ///
 /// A free function rather than a method on [`BridgeSink`], because the drain loop's own failure
-/// notice is outbound too and reaches its channel directly rather than through a sink. As a method
-/// this would have left that notice the one thing the bridge says to a chat that its own record of
-/// the chat does not contain.
+/// notice is outbound too and reaches its channel directly rather than through a sink.
 ///
-/// Nothing here can fail the send, which has already happened. A store that cannot record it costs
-/// a gap in the history and is logged; failing the tool call would tell the agent its message did
-/// not go out when it did, which is the worse of the two.
+/// Errors are logged rather than propagated: the send has already happened, and failing the tool
+/// call would tell the agent its message did not go out when it did.
 ///
-/// `seen` is true on every row. It marks what the agent still has to be shown, and the bridge's own
-/// output is not owed to it: at false these rows would be counted as a backlog and offered back as
-/// context it missed. `session` is `None` for the bridge's own notice, which is what distinguishes
-/// the account having spoken from a session having spoken.
-///
-/// `revised_at` says these are replacements rather than new messages. A revision keeps the message
-/// id it revises, so it needs a deduplication key of its own or the unique constraint would swallow
-/// it, and the wording it replaced is marked superseded once it is safely recorded. Same treatment
-/// as an edit arriving from the platform, for the same reason: without it the history holds two
-/// rows for one message and both look current.
+/// `seen` is true on every row, or the bridge's own output would count as a backlog and be offered
+/// back to the agent as context it missed. `revised_at` gives a revision a deduplication key of its
+/// own, since it keeps the message id it revises and the unique constraint would otherwise swallow
+/// it.
 async fn record_own_messages(
     store: &Store,
     history_retention: Duration,
@@ -739,11 +715,10 @@ async fn record_own_messages(
         // everywhere. Neither ever hands the bridge its own message as an inbound event in any
         // case.
         //
-        // A revision carries the id it revises, so it takes the `<id>:e<time>` shape the inbound
-        // path gives an edit, at millisecond resolution rather than that path's seconds. Two edits
-        // sharing a key would leave the second unrecorded, and two full API round trips inside one
-        // millisecond is not reachable; superseding is ordered against the revision's own row, so
-        // even a shared key marks the right rows.
+        // A revision carries the id it revises, so it takes the inbound path's `<id>:e<time>` shape
+        // at millisecond rather than second resolution. Two edits sharing a key would leave the
+        // second unrecorded, which two API round trips inside one millisecond cannot reach, and
+        // superseding orders against the revision's own row so even a shared key marks correctly.
         let external_id = match revised_at {
             Some(revised_at) => {
                 format!("{}:e{}", message.message_id, revised_at.timestamp_millis())
@@ -1197,11 +1172,9 @@ impl OutboundSink for BridgeSink {
         // *does* say it only fires on the base64 form, which is the looser of meka's two
         // limits and so never first.
         //
-        // Only when the file itself is what will be fetched. `record.bytes` is the size of the main
-        // file, and a preview fetches the thumbnail instead -- tens of kilobytes for a still frame.
-        // Checking one against the other rejected every video over the ceiling on the strength of a
-        // number describing something else, so "what is in this clip?" answered "too large to show"
-        // while the frame that would have answered it sat one fetch away.
+        // Only when the file itself is what will be fetched. `record.bytes` sizes the main file
+        // while a preview fetches the thumbnail, so checking one against the other rejected every
+        // oversized video on the strength of a number describing something else.
         if !preview && record.bytes.is_some_and(|bytes| bytes > MAX_VIEW_BYTES) {
             return Ok(ViewedAttachment::Description(format!(
                 "This {} is {}, too large to show inline. Use download_attachment to get the file \

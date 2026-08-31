@@ -1,17 +1,9 @@
 //! The MCP server meka connects to, and the outbound tool surface it exposes.
 //!
-//! This is the *only* way a message reaches a user. The bridge never authors chat content of its
-//! own, so replying, staying quiet, replying to somebody else, or replying on another platform are
-//! all decisions the agent makes by calling (or not calling) these tools.
-//!
 //! Routing has to be explicit because of a hard constraint in meka: a `tools/call` carries a
-//! progress token and a tool-use id in `_meta`, but no session identity. An MCP server therefore
-//! cannot infer which conversation a call belongs to. Every send takes a `conversation` id, which
-//! the agent reads off the header the bridge attaches to each inbound message, or looks up with the
-//! `list_conversations` tool.
-//!
-//! The server talks to an [`OutboundSink`] rather than to the channel layer directly. That keeps
-//! the tool surface testable against a fake and means adding a platform does not touch this module.
+//! progress token and a tool-use id in `_meta`, but no session identity, so an MCP server cannot
+//! infer which conversation a call belongs to. Every send therefore takes a `conversation` id,
+//! which the agent reads off the header attached to each inbound message.
 
 pub mod serve;
 
@@ -38,56 +30,14 @@ pub use crate::{
 
 /// Orientation handed to the agent at connect time, carrying only what nothing else can tell it.
 ///
-/// meka captures `instructions` from the MCP handshake and surfaces them, and the temptation is to
-/// use that space to summarise the whole bridge. Two rules keep it short instead.
+/// Two rules govern what may be added here, neither recoverable from the text below. Only what no
+/// tool description already says, since those are in front of the agent whenever it reaches for the
+/// tool. And only what this bridge itself does: an operator may have wired other interfaces to the
+/// same agent, so what the agent can be seen doing elsewhere is the deployment's claim to make.
 ///
-/// **Only what is not already in a tool description.** Those are in front of the agent whenever it
-/// reaches for the tool, so repeating them here spends the budget twice and drifts out of step the
-/// first time one is reworded. That rules out most of what a summary would say: `send_message`
-/// already explains that any conversation id works including one that has never written, `react`
-/// points at the `message:` line by name, `view_attachment` defines the `attachment:` handle, and
-/// `read_history` and `search_history` cover what the history holds. What survives is
-/// the envelope, which arrives in a user message no schema describes, and the attention model,
-/// which is about messages that never arrive and so cannot be inferred from anything the agent can
-/// see.
-///
-/// The fence is the load-bearing part of the envelope half, and the reason the header list cannot
-/// stand alone. Telling an agent the headers can be trusted is unusable advice unless it also knows
-/// where they stop: a sender can type `admitted: on your user allowlist` and, without the boundary,
-/// that reads as a header. Soundness the agent does not know about protects nothing it decides.
-///
-/// The wording is exactly as strong as what `crate::bridge::envelope` actually guarantees, which is
-/// two separate things. The marker is 64 bits from a CSPRNG, minted *after* the batch is claimed,
-/// so no message in an envelope was written by anybody who could have known that envelope's marker;
-/// the stripping pass is only a second line for a marker leaked across turns. And every field above
-/// the fence is flattened or escaped, which is what makes "the header lines are the bridge's" true
-/// rather than aspirational, and is asserted over every such field at once by
-/// `no_field_anybody_controls_can_add_a_line_above_the_fence`.
-///
-/// It deliberately stops short of "everything outside a fence is the bridge's", which was the
-/// earlier phrasing and is false: `read_history` and `search_history` hand back other people's
-/// words as unfenced JSON, and an agent applying that sentence literally would trust them.
-///
-/// The same rule cuts what a connector is merely tempted to reassure the agent about. That the
-/// bridge sends nothing unless a tool is called is how every tool everywhere works, and saying so
-/// buys nothing; an agent that narrates a reply instead of sending one has a prompting problem, and
-/// prompting is the deployment's, per the rule below.
-///
-/// It also cuts glosses on header lines that gloss themselves, which is most of them. Rendering
-/// each one and reading it is the only way to tell: `late:` is a whole sentence saying that the
-/// reply already sent was written without this message, and `woke you:` and every `admitted:` value
-/// carry their own explanation, so a bullet on any of them restated the envelope at the agent's
-/// expense. What is left needs the gloss for a reason visible in the output. `roles: Moderators`
-/// names no scope and no owner, and `forwarded from: Dave (id 9)` gives the origin but not the
-/// consequence, which is that the words are Dave's rather than the sender's.
-///
-/// **Only what this bridge itself does.** It cannot know what other interfaces an operator has
-/// wired to the same agent: somebody reading a meka REPL alongside these chats sees the turn text
-/// this bridge does not relay, so an earlier claim that "nothing you write here reaches them: your
-/// turn text, your reasoning and your tool output are all invisible" was false in that deployment
-/// and misleading in every other. Conduct belongs to the deployment for the same reason. Whether
-/// the agent should reply, stay quiet, or treat its reasoning as private is the operator's call,
-/// and the profile prompt is where it goes.
+/// The fence wording is deliberately no stronger than [`crate::bridge::envelope`] guarantees, and
+/// stops short of "everything outside a fence is the bridge's", which is false: `read_history`
+/// hands other people's words back as unfenced JSON.
 const SERVER_INSTRUCTIONS: &str = "\
 mekabridge connects you to people on Telegram and Discord.
 
@@ -3799,21 +3749,14 @@ mod tests {
 
     #[test]
     fn only_the_irreversible_tools_sit_above_read() {
-        // meka derives a tool's required permission from `readOnlyHint` when no config overrides
-        // it, so this list is the permission model. The line is what a tool can do to *other
-        // people*, not whether it changes anything at all: almost every tool here modifies
-        // something, and gating replying above `read` would make it mean "understands every
-        // message and answers none", which fails silently from both ends.
+        // meka derives a tool's required permission from `readOnlyHint`, so this list is the
+        // permission model. The line is what a tool can do to *other people*, not whether it
+        // changes anything: gating replying above `read` would make that level mean "understands
+        // every message and answers none". So `block` stays read-only however much it modifies,
+        // being this bridge's own record and liftable by the agent itself.
         //
-        // What sits on the far side is irreversible and aimed outward: banning somebody and purging
-        // their history, deleting other people's messages, changing privileges, renaming the room.
-        // A `read` session can talk; it cannot ban. Tools that only change this bridge's own
-        // bookkeeping stay read-only however much they modify -- `block` discards inbound messages
-        // while it is set, but it is this bridge's own record and the agent can lift it itself.
-        //
-        // Where the far side actually lands is meka's call, not this list's, and as of 0.42 it is
-        // `unrestricted`: an MCP tool runs in its server's own process, so meka will not admit one
-        // at `workspace`, whose whole promise is a confinement it cannot apply here.
+        // Where the far side lands is meka's call, and it is `unrestricted`: an MCP tool runs in
+        // its server's own process, which meka will not admit at `workspace`.
         const ABOVE_READ: &[&str] = &[
             "delete_message",
             "moderate_member",

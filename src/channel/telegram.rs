@@ -65,16 +65,13 @@ const REPLY_EXCERPT_CHARS: usize = 160;
 
 /// How much longer the HTTP client waits than the long poll it is carrying.
 ///
-/// `getUpdates` deliberately holds the connection open until either an update arrives or
-/// `poll_timeout` elapses, so the client's own request timeout has to outlast it. teloxide's
-/// default client stops at 17 seconds and does not adjust for the poll timeout: the code that would
-/// add one to the other is commented out behind a FIXME in `teloxide-core`, and its own docs say
-/// the caller is responsible for keeping the client timeout the larger of the two. Left alone, any
-/// poll_timeout above 17s aborts client-side on every quiet poll, which surfaces as a network error
-/// and a reconnect several times a minute on an idle bot.
+/// `getUpdates` holds the connection open until an update arrives or `poll_timeout` elapses, so the
+/// client's own timeout has to outlast it. teloxide's default client stops at 17 seconds and does
+/// not adjust for the poll timeout, the code that would being commented out behind a FIXME in
+/// `teloxide-core`, so any `poll_timeout` above that aborts client-side on every quiet poll and
+/// surfaces as a reconnect several times a minute on an idle bot.
 ///
-/// The margin covers what happens after Telegram's timer fires: writing the empty response back
-/// over a possibly slow link. It is not a retry budget.
+/// The margin covers writing the empty response back over a slow link, not a retry.
 const POLL_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Who the bot is, as far as deciding whether a message was aimed at it.
@@ -133,15 +130,13 @@ impl TelegramChannel {
 
     /// Whether this message was aimed at the bot rather than merely said in front of it.
     ///
-    /// Every signal here is one Telegram produced. Three of the four compare user ids, because
-    /// Telegram supplies a `User` for them: the sender of the message being replied to, the account
-    /// in a `text_mention` entity, and the bot a message was sent via. Only a plain `mention`
-    /// entity and a targeted command come down to a username, and only because a username is
-    /// the sole identifier Telegram uses for a bot inside message text.
+    /// Every signal here is one Telegram produced. Most compare user ids; only a plain `mention`
+    /// entity and a targeted command come down to a username, because that is the sole identifier
+    /// Telegram uses for a bot inside message text.
     ///
-    /// Deliberately narrow. This is what wakes a conversation the agent is only half listening to,
-    /// so counting anything more generous, such as the bot's name appearing as ordinary words,
-    /// would turn a mention-only chat back into every message.
+    /// Deliberately narrow: this is what wakes a conversation the agent is only half listening to,
+    /// so counting the bot's name appearing as ordinary words would turn a mention-only chat back
+    /// into every message.
     fn addressed(&self, message: &Message) -> bool {
         // In a one-to-one chat there is nobody else it could be for. Checked before the identity so
         // a direct message still reads as addressed even if `getMe` never succeeded.
@@ -350,8 +345,8 @@ impl TelegramChannel {
     /// message sent without one would then silently do nothing, which is the failure Discord's
     /// edit path sets flags unconditionally to avoid.
     ///
-    /// Costs nothing on the send path. `is_disabled` is `skip_serializing_if`, so the enabled form
-    /// goes out as an empty object, which is what Telegram means by default options anyway.
+    /// Costs nothing on the send path: `is_disabled` is `skip_serializing_if`, so the enabled form
+    /// goes out as the empty object Telegram already reads as its defaults.
     const fn link_preview(enabled: bool) -> LinkPreviewOptions {
         LinkPreviewOptions {
             is_disabled: !enabled,
@@ -1484,14 +1479,10 @@ fn member_rights(kind: &teloxide::types::ChatMemberKind) -> Vec<MemberRight> {
 /// Best-effort human name for a Telegram user.
 /// Describe a message Telegram just made, as the record of something the bridge sent.
 ///
-/// Read off the response rather than off what was submitted, and the difference matters. What goes
-/// out is HTML, but that is only how a body is handed to Telegram: it parses the markup away and
-/// keeps the text with entities beside it, and that stored text is the form every received message
-/// is recorded in. Taking it back off the response is what keeps the bridge's own rows in the same
-/// shape as everybody else's, and it costs no second rendering pass.
-///
-/// `describe_content` is the same function the inbound path uses, so a file the bot sent is
-/// described exactly as one it received and can be fetched back the same way.
+/// Read off the response rather than off what was submitted. HTML is only how a body is handed to
+/// Telegram, which parses the markup away and stores the text with entities beside it, and that
+/// stored form is what every received message is recorded in. Taking it back off the response keeps
+/// the bridge's own rows in the same shape as everybody else's without a second rendering pass.
 fn sent_message(message: &Message) -> SentMessage {
     let (attachments, notes) = describe_content(message);
     let user = message.from.as_ref();

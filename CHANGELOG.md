@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-31
+
 ### Added
 
 - The agent's own messages are recorded in history, so it can check what it has already said.
@@ -311,7 +313,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...HEAD
+[0.9.0]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/k4yt3x/mekabridge/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/k4yt3x/mekabridge/compare/0.6.0...0.7.0
 [0.6.0]: https://github.com/k4yt3x/mekabridge/compare/0.5.0...0.6.0

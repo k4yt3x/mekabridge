@@ -45,9 +45,9 @@ use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        FetchedFile, FileOptions, ForwardOrigin, InboundEvent, InboundMessage, MemberAction,
-        MemberCoverage, MemberInfo, MemberListing, MemberRight, MemberStatus, Platform,
-        ReplyContext, SendOptions, Sender, SentMessage,
+        ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, InboundEvent, InboundMessage,
+        MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberRight, MemberStatus,
+        Platform, ReplyContext, SendOptions, Sender, SentMessage,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -1264,6 +1264,38 @@ impl Channel for TelegramChannel {
                 }
                 _ => None,
             },
+        })
+    }
+
+    async fn describe_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<ConversationInfo, ChannelError> {
+        let (chat, _thread) = self.target(conversation)?;
+        let info = self
+            .bot
+            .get_chat(Recipient::Id(chat))
+            .await
+            .map_err(|error| self.delivery_error(&error))?;
+        let kind = if info.is_private() {
+            ChatKind::Direct
+        } else if info.is_channel() {
+            ChatKind::Channel
+        } else {
+            ChatKind::Group
+        };
+        Ok(ConversationInfo {
+            // Telegram's ids are final, so the id asked about is the answer. A thread segment
+            // rides along unchecked: the Bot API answers for a chat and has nothing that says
+            // whether one of its topics still exists.
+            id: conversation.clone(),
+            kind,
+            // A private chat has no title, and is named by whoever is on the other end.
+            title: info
+                .title()
+                .map(str::to_string)
+                .or_else(|| info.first_name().map(str::to_string))
+                .or_else(|| info.username().map(|username| format!("@{username}"))),
         })
     }
 

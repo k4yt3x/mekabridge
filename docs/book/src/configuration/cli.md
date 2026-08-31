@@ -19,7 +19,7 @@ With no subcommand, mekabridge runs the daemon.
 | Command | Purpose |
 |---------|---------|
 | `run` | Run the daemon (the default) |
-| `doctor` | Check config, database, meka, session permission, channels, and the MCP port |
+| `doctor` | Check config, database, meka, session permission, channels, where operator notices go, and the MCP port |
 | `status` | Session, queue depth, conversation count, configured channels |
 | `queue list [--limit N]` | Messages waiting to be delivered |
 | `queue clear --yes` | Delete every queue row, including undelivered ones |

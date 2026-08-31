@@ -28,6 +28,11 @@ permission = "read"
 # Where operator notices go when a message cannot be delivered to the agent at all: which chats lost
 # something, how many attempts were made, and the error itself. Optional, but without it the only
 # detailed record is the logs.
+#
+# This wants a chat id, not a person's account id. The two look identical on Discord, where a user
+# id in this position is accepted here and then rejected by Discord on every send. To be reached by
+# direct message, write "discord:@<user id>" and the bridge opens the direct message itself.
+# `mekabridge doctor` asks the platform whether whichever form is set resolves.
 # owner_conversation = "telegram:123456789"
 
 # Whether the affected chat is told, in one line that says nothing but that something went wrong.

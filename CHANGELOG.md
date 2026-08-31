@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `attachment:` lines carry pixel size and running time, to judge a file without fetching it.
 - `send_message` numbers the parts of a split reply, as `part 2/3: 502`.
 - `mekabridge history` marks the agent's own messages, and deleted and superseded ones.
+- `mekabridge doctor` asks the platform whether operator notices can reach the chat set for them.
 
 ### Changed
 
@@ -30,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `read_history` presented the earlier wording of an edited message as though it still stood.
 - Server instructions claimed the agent's turn text is invisible, which a REPL deployment disproves.
 - A newline in the bot's own account name broke the header block of every envelope.
+- The daemon was killed outright by a write to a closed socket, going silent with nothing logged.
+- The systemd unit in the docs did not restart the bridge after the signals systemd calls clean.
 
 ## [0.8.0] - 2026-08-25
 

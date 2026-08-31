@@ -896,6 +896,18 @@ pub struct ChannelCapabilities {
     pub member_roles: bool,
 }
 
+/// What a platform says about one conversation. Used by `mekabridge doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationInfo {
+    /// The id the conversation is really known by, which differs from the one asked about when a
+    /// Discord dialling address resolves to its direct-message channel.
+    pub id: ConversationId,
+    pub kind: ChatKind,
+    /// A group's title, or the name of the person on the other end of a direct message. Absent
+    /// where the platform offers none.
+    pub title: Option<String>,
+}
+
 /// Who a channel is logged in as. Used by `mekabridge doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelIdentity {
@@ -1149,6 +1161,27 @@ pub trait Channel: Send + Sync + 'static {
         conversation: &ConversationId,
     ) -> Result<ConversationId, ChannelError> {
         Ok(conversation.clone())
+    }
+
+    /// Ask the platform what a conversation id names, or fail if it names nothing reachable.
+    ///
+    /// Exists so an id an operator typed into `config.toml` can be checked before the notice it
+    /// was meant to carry fails in the middle of an incident. Nothing on the message path uses it:
+    /// [`Self::canonical_conversation`] is the cheap resolve, and this is the expensive question of
+    /// whether the thing on the other end is real.
+    ///
+    /// A platform whose ids cannot be told apart by inspection needs this most. A Discord user id
+    /// and a Discord channel id are both snowflakes, so the one in the wrong position parses,
+    /// validates, and then answers `10003 Unknown Channel` on the first send.
+    async fn describe_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<ConversationInfo, ChannelError> {
+        let _ = conversation;
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "looking a conversation up",
+        })
     }
 
     /// Search the platform's own record of a conversation.

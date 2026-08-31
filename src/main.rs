@@ -6,24 +6,11 @@ use std::process::ExitCode;
 use clap::Parser;
 use mekabridge::cli::Cli;
 
-/// Restore the default `SIGPIPE` disposition.
-///
-/// Rust sets `SIGPIPE` to `SIG_IGN` during startup, which turns a perfectly ordinary
-/// `mekabridge conversations list | head` into a panic on the first write past the closed pipe. The
-/// operator subcommands exist to be piped into `grep` and `head`, so the default disposition (exit
-/// quietly) is the correct one here.
-#[cfg(unix)]
-fn restore_sigpipe() {
-    // SAFETY: called before any other thread is spawned, with a valid signal number and the
-    // libc-provided default handler. `signal` returns the previous handler, which is not needed.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
 fn main() -> ExitCode {
+    // Set here rather than inside `run`, because `--help` and `--version` print before `run` is
+    // reached. `mekabridge::bridge::run` takes it back for the daemon, which needs the opposite.
     #[cfg(unix)]
-    restore_sigpipe();
+    mekabridge::cli::exit_quietly_on_broken_pipe();
 
     let cli = Cli::parse();
     match cli.run() {

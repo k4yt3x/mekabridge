@@ -68,9 +68,9 @@ use crate::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        FetchedFile, FileOptions, ForwardOrigin, FoundMessage, InboundEvent, InboundMessage,
-        MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberStatus, Platform, Presence,
-        ReplyContext, SendOptions, Sender, SentMessage,
+        ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, FoundMessage, InboundEvent,
+        InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberStatus,
+        Platform, Presence, ReplyContext, SendOptions, Sender, SentMessage,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -2212,6 +2212,37 @@ impl Channel for DiscordChannel {
         // the time this is called.
         let channel_id = self.target(conversation).await?;
         Ok(ConversationId::new(&self.id, &channel_id.to_string(), None))
+    }
+
+    async fn describe_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<ConversationInfo, ChannelError> {
+        // The whole point of the round trip. A user id sitting where a channel id belongs resolves
+        // and parses like any other snowflake, and only Discord can say it names nobody's channel.
+        let channel_id = self.target(conversation).await?;
+        let channel = self
+            .http
+            .channel(channel_id)
+            .await
+            .map_err(|error| self.delivery_error("reading the channel", &error))?
+            .model()
+            .await
+            .map_err(|error| self.decode_error("the channel", &error))?;
+        self.names.insert_channel(&channel);
+        let title = self.names.describe(channel_id).or_else(|| {
+            // A direct-message channel has no name of its own, so it is named by who is in it.
+            channel.recipients.as_ref()?.first().map(|user| {
+                user.global_name
+                    .clone()
+                    .unwrap_or_else(|| user.name.clone())
+            })
+        });
+        Ok(ConversationInfo {
+            id: ConversationId::new(&self.id, &channel_id.to_string(), None),
+            kind: chat_kind(Some(channel.kind)),
+            title,
+        })
     }
 
     async fn search_messages(

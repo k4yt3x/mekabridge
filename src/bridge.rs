@@ -96,6 +96,14 @@ const MAX_VIEW_BYTES: u64 = 3_750_000;
 
 /// Run the bridge until a shutdown signal arrives.
 pub async fn run(config: Config) -> Result<()> {
+    // First, and here rather than in the caller, because this is a property of the daemon and not
+    // of how it was started: every route to a running bridge goes through this function, so none
+    // of them can forget. Startup before this point keeps the command-line disposition, which is
+    // right for it. Nothing is connected yet, and a process still printing its own diagnostics to
+    // a pipe somebody closed should stop like any other command would.
+    #[cfg(unix)]
+    fail_writes_on_broken_pipe();
+
     let config = Arc::new(config);
 
     let store = Store::open(&config.storage.path).await?;
@@ -335,6 +343,32 @@ async fn janitor(store: Store, config: Arc<Config>, shutdown: CancellationToken)
                 }
             }
         }
+    }
+}
+
+/// Turn a closed pipe back into an ordinary `EPIPE`, which is what a network daemon needs.
+///
+/// A signal disposition belongs to the process, not to a subcommand, so the daemon inherits
+/// whatever [`crate::cli::exit_quietly_on_broken_pipe`] left behind unless it says otherwise.
+/// Exiting quietly is fatal here: `SIGPIPE` reaches any write whose peer has already closed, which
+/// for a process holding a Discord gateway socket and a Telegram long poll open for days is a
+/// matter of time, and the kernel kills the process before the write returns. No reconnect runs,
+/// nothing is logged, and systemd counts the corpse as a clean exit, so `Restart=on-failure` does
+/// not fire either. That is the shape of the four-hour silent outage on 2026-08-30.
+///
+/// Ignored, the same write returns `EPIPE` as an `io::Error` and the connectors reconnect from it
+/// like any other dropped connection.
+///
+/// Lives here, called by [`run`], rather than in whichever caller decided to start a daemon. That
+/// way a second way in cannot be written without it.
+#[cfg(unix)]
+fn fail_writes_on_broken_pipe() {
+    // SAFETY: a valid signal number with one of the two dispositions libc defines for it. Other
+    // threads exist by now, which is fine: `signal` is a thread-safe wrapper over `sigaction` and
+    // the disposition it sets is a property of the process. The returned previous handler is not
+    // needed.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 
@@ -1660,6 +1694,73 @@ impl BridgeSink {
 #[cfg(test)]
 mod tests {
     use super::{EVENT_BUFFER, MAX_VIEW_BASE64_BYTES, MAX_VIEW_BYTES, sanitize_file_stem};
+
+    /// Read the disposition without disturbing it, so no window exists where a concurrent test
+    /// writing to a closed pipe would take the whole process down.
+    #[cfg(unix)]
+    fn sigpipe_disposition() -> libc::sighandler_t {
+        // SAFETY: a null `act` asks `sigaction` to report the current action and change nothing.
+        // The zeroed `sigaction` is only an out-parameter.
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut current);
+            current.sa_sigaction
+        }
+    }
+
+    /// The only test that touches `SIGPIPE`, deliberately: the disposition is process-wide, so a
+    /// second one would leave the suite briefly killable by a broken pipe in whichever test was
+    /// running alongside it.
+    ///
+    /// Drives [`run`] rather than calling [`fail_writes_on_broken_pipe`] directly, because the call
+    /// inside `run` is the part that was missing on 2026-08-30 and the part a refactor can drop.
+    /// `run` sets the disposition before its first fallible step, so a store that cannot be opened
+    /// is enough to reach it and return, with nothing bound and no network touched.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn starting_the_daemon_survives_a_closed_peer() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[meka]\ntoken = \"meka-token\"\n\n[storage]\npath = {:?}\n\n\
+                 [[channels.telegram]]\nid = \"telegram\"\ntoken = \"bot-token\"\n\
+                 allowed_users = [123]\n",
+                // A directory, so SQLite refuses to open it as a database.
+                directory.path()
+            ),
+        )
+        .expect("write config");
+        let config = crate::config::Config::load(Some(&config_path)).expect("config parses");
+
+        // Stated rather than assumed. If SQLite ever opened a directory, `run` would carry on past
+        // it to bind a port and start polling Telegram for real, and this would fail as a hang
+        // rather than as an assertion.
+        assert!(
+            crate::store::Store::open(directory.path()).await.is_err(),
+            "the test depends on `run` stopping at the store"
+        );
+
+        crate::cli::exit_quietly_on_broken_pipe();
+        assert_eq!(
+            sigpipe_disposition(),
+            libc::SIG_DFL,
+            "piping `mekabridge history` into `head` should end quietly, not panic"
+        );
+
+        assert!(
+            super::run(config).await.is_err(),
+            "the store was supposed to be unopenable"
+        );
+        assert_eq!(
+            sigpipe_disposition(),
+            libc::SIG_IGN,
+            "a daemon holding a gateway socket open for days must survive a closed peer"
+        );
+        // Left ignored, which is where Rust's own startup puts it and what the rest of the suite
+        // was running under before this test.
+    }
 
     #[test]
     fn two_attachments_on_one_message_get_different_paths() {

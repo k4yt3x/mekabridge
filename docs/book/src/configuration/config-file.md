@@ -77,7 +77,7 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `owner_conversation` | none | Conversation that receives the detailed version of an operator notice, e.g. `telegram:123456789` |
+| `owner_conversation` | none | Conversation that receives the detailed version of an operator notice, e.g. `telegram:123456789`. To be reached by direct message on Discord, `discord:@<user id>` |
 | `notify_failures` | `true` | Tell the affected chat, in one line and no detail, when its message could not be delivered |
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
@@ -109,6 +109,8 @@ A message that runs out of attempts produces two notices, deliberately different
 Both are rate limited to one message per conversation per fifteen minutes, and the owner's notice says how many failures went unreported in between, so a provider out of quota for an hour reads as an hour rather than as a blip.
 
 Those two are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the first. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
+
+`owner_conversation` names a chat, not a person, and startup can only check the shape of the id, never whether anything answers to it. Discord makes that gap sharp, because a user id and a channel id are both snowflakes: the wrong one is accepted here and then answered with `Unknown Channel` on every send, and nothing says so. Write `discord:@<user id>` to be reached by direct message and the bridge opens the channel itself. `mekabridge doctor` asks the platform whether the configured id resolves, which is the only way to settle it short of sending.
 
 The message is also put back among what the agent has not seen, so `unseen` counts it and it comes back as missed context the next time that conversation wakes.
 

@@ -16,7 +16,7 @@ Wants=network-online.target
 Type=simple
 User=mekabridge
 ExecStart=/usr/local/bin/mekabridge
-Restart=on-failure
+Restart=always
 RestartSec=5s
 Environment=MEKABRIDGE_CONFIG=/etc/mekabridge/config.toml
 
@@ -44,12 +44,14 @@ Requires=mekabridge.service
 Type=simple
 User=meka
 ExecStart=/usr/local/bin/meka serve
-Restart=on-failure
+Restart=always
 RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`Restart=always` rather than `on-failure`, because `on-failure` does not cover every way a process can stop. systemd counts an exit on SIGHUP, SIGINT, SIGTERM or SIGPIPE as a success, so a daemon killed by one of those is left dead with `Result=success` and nothing in the journal to say the chat went quiet. `always` still honours `systemctl stop`, which is the only stop an operator asked for.
 
 `Requires=` plus `After=` means meka starts after the bridge and is stopped if the bridge is. meka does recover on its own from a bridge that was missing at boot, retrying in the background with backoff, so this is about avoiding the window rather than avoiding a permanent break: while the server is disconnected, `required = true` makes meka refuse turns rather than run them with no way to reply.
 
@@ -74,6 +76,8 @@ Delivered rows are kept for seven days rather than deleted immediately, because 
 **There is one window a hard kill can still lose.** Telegram's client library confirms a batch's offset as soon as the batch arrives, before the bridge has stored any of it, so a small number of messages can be acknowledged to Telegram and not yet written. The buffer between the pollers and the writer bounds that number at eight, and blocking the poller when it is full is what stops the confirmation going out any earlier. In practice this only bites on `SIGKILL`, an OOM kill, or power loss: `SIGTERM` drains, and an idle bridge has nothing in flight. Those messages are lost outright rather than recorded as unseen, which makes it the one loss path here that leaves no trace. Closing it fully means the bridge driving `getUpdates` itself, from the highest id it has actually stored.
 
 Discord has no equivalent window, because its gateway replays from a sequence number on resume. It has the opposite gap: nothing backfills messages sent while the connection was down.
+
+That asymmetry is what the restart policy is for. Telegram holds undelivered updates for a day, so a bridge that was down catches up on the next start, but everything sent on Discord meanwhile is gone and was never recorded, which leaves the unseen count looking normal throughout an outage.
 
 ## Logs worth knowing
 
@@ -157,6 +161,8 @@ fragments and meka will not republish it. The reason it failed is in meka's log,
 `mekabridge unseen` counts what the agent still has not been shown, unless
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
+
+**A chat was told the bridge had a problem, but the owner's copy never came.** Most likely `[bridge].owner_conversation` names a chat the bridge cannot post to, which `mekabridge doctor` reports under `channels`. The cause to check first is a Discord user id where a channel id belongs: the two are both snowflakes, so startup validation accepts it and Discord answers `Unknown Channel` on every send. `discord:@<user id>` is the form that reaches a person. Failing that, the owner's notice is rate limited like the chat's, to one every fifteen minutes.
 
 **The agent reads messages but never replies.** Check `mekabridge doctor`. The usual cause is
 `[session].permission` being `ask` or `none`, at which meka denies the send. (`read` is fine, and so

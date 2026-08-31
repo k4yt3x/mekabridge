@@ -5,12 +5,12 @@
 //! bridge is up or down. That avoids inventing a control socket, and it means a wedged daemon can
 //! still be inspected.
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use chrono::Utc;
 
 use crate::{
-    channel::{ChannelRegistry, Platform},
+    channel::{ChannelError, ChannelRegistry, ConversationId, Platform},
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::MekaClient,
@@ -85,6 +85,73 @@ pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
         ));
     }
     checks
+}
+
+/// Ask the platform whether the conversation operator notices go to is one it can reach.
+///
+/// Startup validation can only judge the shape of the id, and on Discord the shape says nothing:
+/// a user id and a channel id are both snowflakes, so the wrong one sits in the config looking
+/// correct until a notice fails to send, which by definition is during an incident. This is the
+/// only check here that costs a round trip to settle a question the config cannot answer alone.
+///
+/// Warns rather than fails. Nothing about the bridge stops working, but the one channel it has for
+/// telling an operator that a message never reached the agent is dead, and quietly.
+async fn assess_owner_conversation(
+    registry: &ChannelRegistry,
+    owner: &str,
+    authenticated: &HashSet<&str>,
+) -> Vec<Check> {
+    // Both of these are reported already, by config validation, with the form the id should take.
+    let Some(conversation) = ConversationId::parse(owner) else {
+        return Vec::new();
+    };
+    let Some(channel) = registry.get(conversation.channel()) else {
+        return Vec::new();
+    };
+    // A channel that is not logged in refuses every question the same way, so asking would return
+    // its own failure a second time, dressed up as a problem with this id. That failure is printed
+    // just above and is what has to be fixed first.
+    if !authenticated.contains(conversation.channel()) {
+        return Vec::new();
+    }
+
+    match channel.describe_conversation(&conversation).await {
+        Ok(info) => {
+            let title = info
+                .title
+                .map(|title| format!(" ({title})"))
+                .unwrap_or_default();
+            // Worth printing even when it did not change: seeing the resolved id is how an operator
+            // matches this against what `mekabridge conversations list` shows.
+            let resolved = if info.id.as_str() == owner {
+                String::new()
+            } else {
+                format!(", which is {}", info.id.as_str())
+            };
+            vec![Check::Ok(format!(
+                "[bridge].owner_conversation reaches a {} chat{title}{resolved}",
+                info.kind.as_str()
+            ))]
+        }
+        Err(ChannelError::Unsupported { .. }) => vec![Check::Ok(format!(
+            "{} cannot look a conversation id up, so [bridge].owner_conversation is taken on trust",
+            channel.id()
+        ))],
+        Err(error) => {
+            let mut line = format!(
+                "[bridge].owner_conversation {owner:?} cannot be reached, so an operator notice \
+                 goes nowhere: {error}"
+            );
+            if channel.platform() == Platform::Discord && !conversation.chat().starts_with('@') {
+                line.push_str(
+                    ". A Discord user id and a channel id look alike, and only a channel id can be \
+                     posted to. To reach a person, dial them as `discord:@<user id>` and the \
+                     bridge opens the direct message itself",
+                );
+            }
+            vec![Check::Warn(line)]
+        }
+    }
 }
 
 /// Report on every moving part, in the order a failure would bite.
@@ -282,6 +349,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
     println!("channels");
     match ChannelRegistry::build(&config.channels) {
         Ok(registry) => {
+            let mut authenticated: HashSet<&str> = HashSet::new();
             for channel in registry.iter() {
                 match channel.probe().await {
                     Ok(identity) => {
@@ -291,6 +359,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                                 format!("@{username}")
                             });
                         println!("  ok     {} authenticated as {label}", channel.id());
+                        authenticated.insert(channel.id().as_str());
                         if !identity.reads_all_group_messages {
                             // Both platforms have a switch that withholds everything not aimed at
                             // the bot, which is what the `mute` policy does except that nothing is
@@ -363,6 +432,19 @@ pub async fn doctor(config: &Config) -> Result<()> {
                         failures += 1;
                     }
                 }
+            }
+            if let Some(owner) = &config.bridge.owner_conversation {
+                let checks = assess_owner_conversation(&registry, owner, &authenticated).await;
+                for check in &checks {
+                    match check {
+                        Check::Ok(line) => println!("  ok     {line}"),
+                        Check::Warn(line) => println!("  warn   {line}"),
+                        Check::Fail(line) => println!("  fail   {line}"),
+                    }
+                }
+                let (failed, warned) = verdict(&checks);
+                failures += failed;
+                warnings += warned;
             }
         }
         Err(error) => {
@@ -952,10 +1034,318 @@ fn describe_age(at: chrono::DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Aliased rather than imported as `Result`, which would shadow the module's own alias for
+    // every other test here and turn an ordinary `Result<()>` into a confusing arity error.
+    use std::{result::Result as StdResult, sync::Arc};
+
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
     use crate::{
-        cli::commands::{Check, assess_readiness},
+        channel::{
+            Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind,
+            ConversationId, ConversationInfo, FetchedFile, FileOptions, InboundEvent, Platform,
+            SendOptions, SentMessage,
+        },
+        cli::commands::{Check, assess_owner_conversation, assess_readiness},
         meka::ReadyStatus,
     };
+
+    /// What the platform under test says when asked about a conversation.
+    ///
+    /// [`ChannelError`] is not `Clone`, so the refusal is described here and built on the spot
+    /// rather than held.
+    enum Answer {
+        Reaches(ConversationInfo),
+        /// The id names nothing the bot can post to, which is what a Discord user id does.
+        Refuses,
+        /// The platform offers no way to look a conversation up.
+        CannotSay,
+    }
+
+    struct OwnerProbe {
+        id: ChannelId,
+        platform: Platform,
+        answer: Answer,
+    }
+
+    #[async_trait]
+    impl Channel for OwnerProbe {
+        fn id(&self) -> &ChannelId {
+            &self.id
+        }
+
+        fn platform(&self) -> Platform {
+            self.platform
+        }
+
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                member_rights: false,
+                member_roles: false,
+                typing_indicator: false,
+                typing_status: false,
+                files: true,
+                photos: true,
+                reactions: false,
+                edit: false,
+                admin: false,
+                presence: false,
+            }
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _sink: tokio::sync::mpsc::Sender<InboundEvent>,
+            shutdown: CancellationToken,
+        ) -> StdResult<(), ChannelError> {
+            shutdown.cancelled().await;
+            Ok(())
+        }
+
+        async fn send_text(
+            &self,
+            _conversation: &ConversationId,
+            _markdown: &str,
+            _options: &SendOptions,
+            _sent: &mut Vec<SentMessage>,
+        ) -> StdResult<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn send_files(
+            &self,
+            _conversation: &ConversationId,
+            _paths: &[std::path::PathBuf],
+            _caption: Option<&str>,
+            _options: &FileOptions,
+            _sent: &mut Vec<SentMessage>,
+        ) -> StdResult<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn fetch(
+            &self,
+            _file_ref: &str,
+            _max_bytes: u64,
+        ) -> StdResult<FetchedFile, ChannelError> {
+            Ok(FetchedFile {
+                bytes: Vec::new(),
+                media_type: None,
+                extension: None,
+            })
+        }
+
+        async fn react(
+            &self,
+            _conversation: &ConversationId,
+            _message_id: &str,
+            _emoji: Option<&str>,
+        ) -> StdResult<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn describe_conversation(
+            &self,
+            _conversation: &ConversationId,
+        ) -> StdResult<ConversationInfo, ChannelError> {
+            match &self.answer {
+                Answer::Reaches(info) => Ok(info.clone()),
+                Answer::Refuses => Err(ChannelError::Delivery {
+                    channel: self.id.as_str().to_string(),
+                    message: "reading the channel: Unknown Channel".to_string(),
+                }),
+                Answer::CannotSay => Err(ChannelError::Unsupported {
+                    channel: self.id.as_str().to_string(),
+                    feature: "looking a conversation up",
+                }),
+            }
+        }
+
+        async fn set_activity(
+            &self,
+            _conversation: &ConversationId,
+            _activity: crate::channel::Activity,
+        ) -> StdResult<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn probe(&self) -> StdResult<ChannelIdentity, ChannelError> {
+            Ok(ChannelIdentity {
+                id: "1".to_string(),
+                display_name: "Probe".to_string(),
+                username: None,
+                reads_all_group_messages: true,
+            })
+        }
+    }
+
+    async fn owner_checks(platform: Platform, answer: Answer, owner: &str) -> Vec<Check> {
+        owner_checks_with(platform, answer, owner, true).await
+    }
+
+    async fn owner_checks_with(
+        platform: Platform,
+        answer: Answer,
+        owner: &str,
+        authenticated: bool,
+    ) -> Vec<Check> {
+        let name = match platform {
+            Platform::Telegram => "telegram",
+            Platform::Discord => "discord",
+        };
+        let channel = Arc::new(OwnerProbe {
+            id: ChannelId::new(name),
+            platform,
+            answer,
+        });
+        let registry =
+            crate::channel::ChannelRegistry::from_channels([channel as Arc<dyn Channel>]);
+        let logged_in = if authenticated {
+            HashSet::from([name])
+        } else {
+            HashSet::new()
+        };
+        assess_owner_conversation(&registry, owner, &logged_in).await
+    }
+
+    #[tokio::test]
+    async fn an_owner_conversation_that_goes_nowhere_is_found_before_it_is_needed() {
+        // The 2026-08-30 config: a Discord user id where a channel id belongs. It parses, it names
+        // a configured channel, and every operator notice sent to it was silently lost.
+        let checks = owner_checks(
+            Platform::Discord,
+            Answer::Refuses,
+            "discord:1354919639859335428",
+        )
+        .await;
+        assert_eq!(verdict(&checks), (0, 1), "unreachable, but the bridge runs");
+        let Some(Check::Warn(line)) = checks.first() else {
+            panic!("expected one warning, got {checks:?}");
+        };
+        assert!(
+            line.contains("discord:@<user id>"),
+            "the warning has to name the form that works: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dialling_address_is_not_told_to_become_a_dialling_address() {
+        // Already in the `@` form, so the failure is something else and the hint would misdirect.
+        // Keyed on the same phrase the test above requires, so rewording the hint breaks that one
+        // loudly rather than leaving this one asserting nothing.
+        let checks = owner_checks(
+            Platform::Discord,
+            Answer::Refuses,
+            "discord:@1354919639859335428",
+        )
+        .await;
+        let Some(Check::Warn(line)) = checks.first() else {
+            panic!("expected one warning, got {checks:?}");
+        };
+        assert!(
+            !line.contains("discord:@<user id>"),
+            "misdirecting hint: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_telegram_failure_is_not_given_discord_advice() {
+        // Telegram chat ids and user ids are not interchangeable, so the whole confusion the hint
+        // explains does not exist there.
+        let checks = owner_checks(Platform::Telegram, Answer::Refuses, "telegram:123").await;
+        let Some(Check::Warn(line)) = checks.first() else {
+            panic!("expected one warning, got {checks:?}");
+        };
+        assert!(
+            !line.contains("discord:@<user id>"),
+            "advice for the wrong platform: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_resolved_to_itself_is_not_reported_as_having_moved() {
+        let checks = owner_checks(
+            Platform::Telegram,
+            Answer::Reaches(ConversationInfo {
+                id: ConversationId::parse("telegram:-1001234567890").expect("valid"),
+                kind: ChatKind::Group,
+                title: Some("Acme".to_string()),
+            }),
+            "telegram:-1001234567890",
+        )
+        .await;
+        let Some(Check::Ok(line)) = checks.first() else {
+            panic!("expected one pass, got {checks:?}");
+        };
+        assert!(!line.contains("which is"), "nothing moved: {line}");
+    }
+
+    #[tokio::test]
+    async fn a_resolved_owner_conversation_reports_the_id_it_resolved_to() {
+        // The dialling address is not the id anything else will show, so printing only the
+        // configured one would leave an operator unable to match this against
+        // `mekabridge conversations list`.
+        let checks = owner_checks(
+            Platform::Discord,
+            Answer::Reaches(ConversationInfo {
+                id: ConversationId::parse("discord:1537199580129525881").expect("valid"),
+                kind: ChatKind::Direct,
+                title: Some("Kay".to_string()),
+            }),
+            "discord:@1354919639859335428",
+        )
+        .await;
+        assert_eq!(verdict(&checks), (0, 0));
+        let Some(Check::Ok(line)) = checks.first() else {
+            panic!("expected one pass, got {checks:?}");
+        };
+        assert!(line.contains("direct"), "{line}");
+        assert!(line.contains("Kay"), "{line}");
+        assert!(line.contains("discord:1537199580129525881"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_platform_that_cannot_look_up_says_so_rather_than_claiming_a_pass() {
+        let checks = owner_checks(Platform::Telegram, Answer::CannotSay, "telegram:123").await;
+        assert_eq!(verdict(&checks), (0, 0), "no lookup is not a fault");
+        let Some(Check::Ok(line)) = checks.first() else {
+            panic!("expected one pass, got {checks:?}");
+        };
+        assert!(line.contains("taken on trust"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_is_not_logged_in_is_not_blamed_on_the_owner_conversation() {
+        // A rejected token refuses this lookup exactly as a wrong id does, so asking would report
+        // the token problem a second time and attach advice about ids to it.
+        assert!(
+            owner_checks_with(
+                Platform::Discord,
+                Answer::Refuses,
+                "discord:1354919639859335428",
+                false,
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_conversation_config_validation_already_rejected_is_not_reported_twice() {
+        // Startup fails on a channel that is not configured and warns on an id that will not
+        // parse. Repeating either here would only make `doctor` noisier about the same mistake.
+        assert!(
+            owner_checks(Platform::Telegram, Answer::Refuses, "slack:123")
+                .await
+                .is_empty()
+        );
+        assert!(
+            owner_checks(Platform::Telegram, Answer::Refuses, "telegram")
+                .await
+                .is_empty()
+        );
+    }
 
     fn readiness(status: &str, session_db: bool, provider: bool, mcp: bool) -> ReadyStatus {
         ReadyStatus {

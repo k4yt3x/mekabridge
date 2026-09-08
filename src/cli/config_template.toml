@@ -20,8 +20,8 @@ turn_timeout = "30m"
 # "read", "workspace" or "unrestricted". The send tools are read-only as far as your machine is
 # concerned, so at "read" the agent can reply to messages but cannot modify files; "workspace" adds
 # writes confined to the session's roots. Only "unrestricted" reaches the moderation tools, because
-# meka cannot sandbox an MCP server and will not pretend otherwise. Do not use "ask": meka prompts
-# for every tool call at that level, and this bridge cannot answer a prompt, so nothing would run.
+# meka cannot sandbox an MCP server and will not pretend otherwise. meka 0.46 retired "ask"; leave
+# its replacement, [permissions].approvals, off, since this bridge has nobody to put an approval to.
 permission = "read"
 
 [bridge]

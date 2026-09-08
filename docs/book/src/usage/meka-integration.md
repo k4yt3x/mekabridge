@@ -2,15 +2,19 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
-**meka 0.42.0 or later is required, and 0.44.0 or later is recommended.** Two things below 0.42 do
-not exist: rejoining a dropped turn stream with `Last-Event-ID`, which is how the bridge learns how
-an interrupted turn ended rather than guessing, and the `workspace` / `unrestricted` permission
-levels that replaced `write`.
+**meka 0.46.0 or later is required.** It renamed three things the bridge depends on and kept no
+alias for any of them: `GET /v1/providers`, which the bridge reads the running model from, is now
+`GET /v1/profiles`; the terminal SSE event for a stopped turn is `turn.canceled`, one `l`; and the
+`ask` permission level is gone, replaced by an `approvals` switch beside the level.
 
-Two things differ by version and are called out where they arise. Where the bridge's MCP token is
-stored changed in 0.44. And a rate limit shared an error type with a permanent refusal in 0.44,
-where later meka gives it one of its own: the bridge retries both either way, so the difference is
-only how long a genuinely dead credential takes to be reported.
+Against an older meka the bridge still runs, and what it loses is diagnostic rather than silent:
+`doctor` warns that it could not read the profiles, and so reports neither the model nor a missing
+default profile. Turns themselves are unaffected, because the bridge reads the cancel event and the
+readiness flag under both spellings.
+
+0.46 also changes the shape of meka's own `config.toml`, which it refuses to start against until
+converted. meka ships `migrate-0.45-to-0.46.py` as a release asset for that, and its upgrade guide
+is the authority on it. None of the snippets below are affected by the conversion.
 
 ## What meka needs from you
 
@@ -36,13 +40,11 @@ required = true
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
-If `[mcp].token` is set on the bridge, meka needs the matching token. **On meka 0.44 and later it does not go in `config.toml`**, which will not parse a `[[mcp.servers]]` entry containing `auth_token` at all: meka refuses to start rather than connecting unauthenticated. Store it instead, which is also how it is rotated later:
+If `[mcp].token` is set on the bridge, meka needs the matching token. **It does not go in `config.toml`**, which will not parse a `[[mcp.servers]]` entry containing `auth_token` at all: meka refuses to start rather than connecting unauthenticated. Store it instead, which is also how it is rotated later:
 
 ```sh
 meka mcp login mekabridge --auth-token-stdin
 ```
-
-On meka 0.43 and earlier the same token goes in the server entry as `auth_token = "${MEKABRIDGE_MCP_TOKEN}"`, and the `meka mcp login` form does not exist.
 
 The `name` becomes the namespace prefix, so the agent sees `mcp__mekabridge__send_message`.
 
@@ -113,7 +115,7 @@ failure is silent from both ends: the agent is told inside a tool result, and yo
 chats normally and declines to ban.
 
 meka resolves `readOnlyHint: false` to `unrestricted` rather than to some middle rung. Its
-`Permission::allows` then treats `workspace`, `ask` and `unrestricted` as equal, so the call looks
+`Permission::allows` then treats `workspace` and `unrestricted` as equal, so the call looks
 authorised. But a second gate refuses it: an MCP tool runs inside its server's own process, which
 meka does not sandbox and cannot confine to a workspace root, so allowing it at `workspace` would
 make that level's central promise false while looking exactly like it worked. meka refuses rather
@@ -150,10 +152,9 @@ the agent reads everything and answers nothing, with the refusal visible only in
 result. If you want that hardening, raise `[session].permission` to `unrestricted` alongside it, or
 name the tools you do trust in `tool_permissions`, which is checked before the hint is consulted.
 
-Do not run the session at `ask`. meka checks the session level before dispatch, so at `ask` every
-call is prompted including read-only ones, and this bridge answers no prompts. `ask` is also outside
-meka's default `[permissions].enabled` set, so a session asking for it is usually refused at
-creation before any of that is reached.
+Leave meka's `[permissions].approvals` off. With it on, a call above the session's level is put to
+the operator instead of being refused, and this bridge tells meka it has nobody to ask, so each is
+denied at once instead. That is the same outcome as leaving the switch off, reached less directly.
 
 ## Start order
 
@@ -170,10 +171,10 @@ records it, and meka's readiness probe still reports healthy, because that probe
 *required* server's failure worth reporting. With it, meka refuses the turn instead, the bridge sees
 the refusal and backs off, and the messages wait in the queue until the connection is up.
 
-`[mcp].strict` sets the default for `required` across every server, and it defaults to **`false`**,
-so leaving both unset is the silent case above rather than the safe one. Per-server is the better
-knob: whether a missing server should stop a turn is a property of that server, not of the
-installation.
+`[mcp].default_required` sets the default for `required` across every server, and it defaults to
+**`false`**, so leaving both unset is the silent case above rather than the safe one. Per-server is
+the better knob: whether a missing server should stop a turn is a property of that server, not of
+the installation. It was called `[mcp].strict` before meka 0.46.
 
 Restarting the bridge alone is fine, but meka's reconnect is lazy rather than immediate: nothing
 watches a server that is still marked `Connected`, and the reconnect is triggered by the next tool
@@ -225,11 +226,11 @@ mekabridge creates its session with `supports_permission_prompts: false`, tellin
 client has no interface to show an approval prompt on.
 
 With that set, a gated tool call is denied immediately with an explanatory notice instead of parking
-the turn on the SSE channel for a minute waiting for an answer that can never arrive.
+the turn on the SSE channel for the thirty minutes meka keeps an approval request answerable.
 
-It is a safety net, not a way to run at `ask`. meka checks the session level before dispatch, so at
-`ask` every call is prompted, `send_message` included, and each is denied at once. The agent cannot
-reply at all. `doctor` reports `ask` as a failure for that reason.
+It is a safety net, not a way to run with approvals on. What it prevents is a stalled turn, not a
+refused call: the remedy for a tool the agent needs is still the session's level, or
+`tool_permissions` on meka's side.
 
 ## Vision and images
 

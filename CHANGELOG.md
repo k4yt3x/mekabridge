@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-08
+
+### Changed
+
+- **Breaking:** meka 0.46.0 or later is required, which renamed three contracts the bridge reads.
+- **Breaking:** `[session].permission` refuses `ask` by name, which meka 0.46 retired.
+- `doctor` reads profiles from `GET /v1/profiles` and names the account each one bills.
+- `doctor` names `meka profile use`, `default_profile` and `[profiles.<name>]`, as 0.46 spells them.
+
+### Fixed
+
+- A turn meka cancels is read as cancelled, not as an outcome nobody could establish.
+- `doctor` no longer reports every healthy meka 0.46 as having no profile configured.
+- `doctor` and `session show` read a session whose level meka records as unset, rather than failing.
+
 ## [0.10.0] - 2026-08-31
 
 ### Added
@@ -319,7 +334,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...HEAD
+[0.11.0]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/k4yt3x/mekabridge/compare/0.7.0...0.8.0

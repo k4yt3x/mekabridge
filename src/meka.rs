@@ -110,7 +110,10 @@ impl ProblemDetail {
             "not-found" => ProblemKind::NotFound,
             "session-locked" => ProblemKind::SessionLocked,
             "turn-in-flight" => ProblemKind::TurnInFlight,
-            "turn-cancelled" => ProblemKind::TurnCancelled,
+            // Respelled in 0.46. Both are matched for the reason the SSE terminal is: an
+            // unrecognised type falls to `Other`, where the status alone decides, and that decides
+            // wrongly without saying so.
+            "turn-canceled" | "turn-cancelled" => ProblemKind::TurnCancelled,
             "concurrency-limit" => ProblemKind::ConcurrencyLimit,
             "sse-lag" => ProblemKind::SseLag,
             "stream-detached" => ProblemKind::StreamDetached,
@@ -366,7 +369,12 @@ type Result<T> = std::result::Result<T, MekaError>;
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionInfo {
     pub id: Uuid,
-    pub permission: String,
+    /// Omitted since meka 0.46 for a row that records no level, rather than sent as `""`.
+    ///
+    /// Never this bridge's own session, which is created naming a level, so a session that answers
+    /// without one was made by another hand and there is nothing to check it against.
+    #[serde(default)]
+    pub permission: Option<String>,
     pub title: String,
     /// Omitted by meka when the session has no working directory of its own.
     #[serde(default)]
@@ -396,7 +404,7 @@ pub struct ServerInfo {
     ///
     /// Asking for one outside the set is a 422 at session creation, which happens on the first
     /// message rather than at startup, so without this the misconfiguration surfaces as a message
-    /// that never gets answered. `ask` is the one to watch: it is not in meka's default set.
+    /// that never gets answered.
     ///
     /// Defaulted rather than required, so an older meka that does not send it reads as "no
     /// opinion" and the check is skipped instead of taking `doctor` down.
@@ -404,19 +412,25 @@ pub struct ServerInfo {
     pub enabled_permissions: Vec<String>,
 }
 
-/// One configured provider profile, as returned by `GET /v1/providers`.
+/// One configured profile, as returned by `GET /v1/profiles`.
 ///
-/// Where the model came from until meka 0.44, which dropped `model` and `provider` from
-/// `GET /v1/info`. The two words meant different things on the two endpoints -- `provider` on
-/// `/v1/info` was a backend, `provider` on `POST /v1/sessions` is a profile -- and this endpoint
-/// names them apart. Present since 0.43 in this exact shape, so reading it costs no version check.
+/// Where the model came from once meka 0.44 dropped `model` and `provider` from `GET /v1/info`.
+/// The two words meant different things on the two endpoints -- `provider` on `/v1/info` was a
+/// backend, `provider` on `POST /v1/sessions` was a profile -- and this endpoint names them apart.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ProviderProfile {
+pub struct Profile {
     /// The profile name, which is what `POST /v1/sessions` would take.
     pub name: String,
-    /// The wire protocol it speaks, such as `anthropic-messages`.
-    #[serde(rename = "type")]
-    pub backend: String,
+    /// The account it bills, which is where the credential and the backend live since meka 0.46
+    /// split one `[providers.<name>]` table into two.
+    #[serde(default)]
+    pub account: String,
+    /// The wire protocol the account speaks, such as `anthropic-messages`.
+    ///
+    /// Omitted when the profile names an account `config.toml` does not have, which is a
+    /// misconfiguration no meka will start a session on.
+    #[serde(default)]
+    pub backend: Option<String>,
     /// Omitted by meka when the profile configures none.
     #[serde(default)]
     pub model: Option<String>,
@@ -433,8 +447,14 @@ pub struct ReadyStatus {
     pub status: String,
     #[serde(default)]
     pub session_db: bool,
-    #[serde(default)]
-    pub provider_configured: bool,
+    /// Whether `config.toml` names at least one profile. Not whether its credential works, which
+    /// meka only finds out when a session first needs it.
+    ///
+    /// `provider_configured` until 0.46 renamed it. Aliased rather than simply renamed because
+    /// every field here defaults: a rename alone reads a 0.45 body as `false` and `doctor` calls a
+    /// healthy deployment unservable, which is the failure this flag exists to report.
+    #[serde(default, alias = "provider_configured")]
+    pub profile_configured: bool,
     #[serde(default)]
     pub mcp_servers_healthy: bool,
 }
@@ -571,16 +591,20 @@ impl MekaClient {
         self.get_with_retries(url).await
     }
 
-    /// `GET /v1/providers`: the configured profiles, one of them marked as the default.
-    pub async fn providers(&self) -> Result<Vec<ProviderProfile>> {
+    /// `GET /v1/profiles`: the configured profiles, one of them marked as the default.
+    ///
+    /// `GET /v1/providers` until meka 0.46 renamed the endpoint and the key together. Not read
+    /// under both names: the old path answers 404 on a new meka and the new one answers 404 on an
+    /// old one, and `doctor` prints that either way rather than quietly reporting the wrong thing.
+    pub async fn profiles(&self) -> Result<Vec<Profile>> {
         #[derive(Deserialize)]
-        struct ProvidersResponse {
-            providers: Vec<ProviderProfile>,
+        struct ProfilesResponse {
+            profiles: Vec<Profile>,
         }
 
-        let url = self.endpoint("/v1/providers")?;
-        let response: ProvidersResponse = self.get_with_retries(url).await?;
-        Ok(response.providers)
+        let url = self.endpoint("/v1/profiles")?;
+        let response: ProfilesResponse = self.get_with_retries(url).await?;
+        Ok(response.profiles)
     }
 
     /// `GET /v1/health/ready`.
@@ -1380,29 +1404,73 @@ mod tests {
         );
     }
 
+    /// The rename that reads as a healthy deployment being unservable. Every field on
+    /// [`ReadyStatus`] defaults, so a name meka no longer sends is `false` rather than an error,
+    /// and `doctor` fails the run over it.
+    #[test]
+    fn readiness_reads_the_configured_profile_flag_under_either_name() {
+        let new = r#"{"status":"ok","session_db":true,"profile_configured":true,
+                      "mcp_servers_healthy":true}"#;
+        let ready: ReadyStatus = serde_json::from_str(new).expect("0.46 must deserialize");
+        assert!(ready.profile_configured);
+
+        let old = r#"{"status":"ok","session_db":true,"provider_configured":true,
+                      "mcp_servers_healthy":true}"#;
+        let ready: ReadyStatus = serde_json::from_str(old).expect("0.45 must deserialize");
+        assert!(
+            ready.profile_configured,
+            "the old spelling must not read as no profile configured"
+        );
+    }
+
+    /// meka 0.46 omits the level for a row that records none, where it used to send `""`. A
+    /// required field here would turn `doctor` reporting on somebody else's session into a decode
+    /// error.
+    #[test]
+    fn a_session_that_records_no_level_still_reads() {
+        let body = r#"{"id":"6f1a4b9c-0000-4000-8000-000000000000","title":"",
+                       "approvals":false,"profile":"work","turn_in_flight":false}"#;
+        let info: SessionInfo = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(info.permission, None);
+        assert!(!info.turn_in_flight);
+    }
+
     /// Where the model went. The bridge names no profile, so the one marked `active` is the one its
     /// session runs on.
     #[test]
-    fn the_active_provider_profile_is_the_one_the_bridge_gets() {
+    fn the_active_profile_is_the_one_the_bridge_gets() {
         #[derive(serde::Deserialize)]
         struct Response {
-            providers: Vec<ProviderProfile>,
+            profiles: Vec<Profile>,
         }
 
-        let body = r#"{"providers":[
-            {"name":"cheap","type":"openai-responses","active":false},
-            {"name":"work","type":"anthropic-messages","model":"claude-opus-5","active":true}]}"#;
-        let parsed: Response = serde_json::from_str(body).expect("providers must deserialize");
+        let body = r#"{"profiles":[
+            {"name":"cheap","account":"personal","backend":"openai-responses","active":false},
+            {"name":"work","account":"work","backend":"anthropic-messages",
+             "model":"claude-opus-5","active":true}]}"#;
+        let parsed: Response = serde_json::from_str(body).expect("profiles must deserialize");
         let active = parsed
-            .providers
+            .profiles
             .iter()
             .find(|profile| profile.active)
             .expect("one profile is the default");
         assert_eq!(active.name, "work");
-        assert_eq!(active.backend, "anthropic-messages");
+        assert_eq!(active.account, "work");
+        assert_eq!(active.backend.as_deref(), Some("anthropic-messages"));
         assert_eq!(active.model.as_deref(), Some("claude-opus-5"));
         // meka omits `model` for a profile that configures none, rather than sending null.
-        assert_eq!(parsed.providers[0].model, None);
+        assert_eq!(parsed.profiles[0].model, None);
+    }
+
+    /// A profile naming an account `config.toml` does not have. meka lists it with no `backend`
+    /// rather than dropping it, and reports the dangling account beside the table, so a required
+    /// field here would turn the row that explains the misconfiguration into a decode error.
+    #[test]
+    fn a_profile_on_a_missing_account_still_reads() {
+        let body = r#"{"name":"work","account":"gone","active":true}"#;
+        let profile: Profile = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(profile.backend, None);
+        assert_eq!(profile.account, "gone");
     }
 
     #[test]

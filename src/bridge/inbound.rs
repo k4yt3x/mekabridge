@@ -1851,9 +1851,9 @@ async fn channel_identities(context: &DrainContext) -> ChannelIdentities {
 /// Bring a session's permission level in line with `[session].permission`.
 ///
 /// A session's level is fixed when it is created, so without this an operator who edits the config
-/// sees no effect and no explanation. `ask` is the case that makes it matter: meka prompts for
-/// every tool call at that level and this bridge answers no prompts, so a session created at `ask`
-/// cannot reply to anyone until its level changes.
+/// sees no effect and no explanation. A session carried across meka 0.46 is the case that makes it
+/// matter: one created at `ask` was migrated to `none` with approvals on, which denies every call
+/// including `send_message`, so it cannot reply to anyone until its level changes.
 ///
 /// Runs once per process, on the first turn rather than at startup, because the bridge comes up
 /// before meka does.
@@ -1863,14 +1863,16 @@ async fn reconcile_permission(context: &DrainContext, session_id: Uuid) {
     }
     let desired = context.config.session.permission;
     match context.meka.session(session_id).await {
-        Ok(info) if info.permission == desired.as_str() => {
+        Ok(info) if info.permission.as_deref() == Some(desired.as_str()) => {
             let _ = context.permission_checked.set(());
         }
+        // A row meka reports no level for lands here too, and is set rather than left: it is a
+        // session this bridge did not create, so nothing has established it can reply.
         Ok(info) => {
             tracing::warn!(
                 "session {} is at permission {:?} but the config says {:?}; updating it",
                 session_id,
-                info.permission,
+                info.permission.as_deref().unwrap_or("unrecorded"),
                 desired.as_str()
             );
             match context

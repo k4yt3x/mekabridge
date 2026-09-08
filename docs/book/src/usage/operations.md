@@ -169,8 +169,8 @@ into and it is gone.
 **A chat was told the bridge had a problem, but the owner's copy never came.** Most likely `[bridge].owner_conversation` names a chat the bridge cannot post to, which `mekabridge doctor` reports under `channels`. The cause to check first is a Discord user id where a channel id belongs: the two are both snowflakes, so startup validation accepts it and Discord answers `Unknown Channel` on every send. `discord:@<user id>` is the form that reaches a person. Failing that, the owner's notice is rate limited like the chat's, to one every fifteen minutes.
 
 **The agent reads messages but never replies.** Check `mekabridge doctor`. The usual cause is
-`[session].permission` being `ask` or `none`, at which meka denies the send. (`read` is fine, and so
-is everything above it: the send tools are annotated read-only.) The
+`[session].permission` being `none`, at which meka denies the send. (`read` is fine, and so is
+everything above it: the send tools are annotated read-only.) The
 give-away in the log is `turn finished ... sends=0 tool_calls=0` with a non-zero `text_chars`, which
 means the agent wrote a reply that had nowhere to go. Since meka 0.37 the bridge reconciles a
 running session's level with the config on the next turn, so fixing the config and restarting is
@@ -192,11 +192,11 @@ If it persists on 0.2.1 or later, then look at the network. One cause worth ruli
 resolves `api.telegram.org` to IPv6 with no working IPv6 route; compare `curl -4` and `curl -6`
 against `https://api.telegram.org/`, since plain `curl` hides it by falling back.
 
-**Gated tools are denied and the agent cannot reply.** The session is at `permission = "ask"`. meka compares the *session* level against `ask` before dispatch, so every call is prompted including read-only ones, and because the bridge declares it cannot answer prompts each is denied at once rather than stalling. That includes `send_message`, so nothing gets sent. Set `read`, then `mekabridge session reset --yes` if the existing session was created at the wrong level.
+**Every tool is denied and the agent cannot reply.** The session is at `permission = "none"`, where nothing is executable, `send_message` included, so nothing gets sent. The common way to arrive here is meka's 0.46 upgrade: it retired the `ask` level, and its store migration turns an existing `ask` session into `none` with approvals on, which denies every call because this bridge has nobody to put an approval to. Set `[session].permission` to `read` and restart; as above, the bridge reconciles the level before its next turn, so no session reset is needed. The `approvals` switch the migration left on can stay: with no one to ask, meka denies an above-level call either way.
 
 **The agent chats but will not ban, purge or rename.** The session is below `unrestricted`, where meka puts every tool annotated destructive. `workspace` is not enough and looks like it should be; [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) explains why and gives the narrower alternative. `mekabridge doctor` reports exactly this pairing. The refusal is otherwise visible only inside the tool result, so nothing in the log names it.
 
-**The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the provider profile has `vision = false`; `mekabridge doctor` reports the setting.
+**The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the profile has `vision = false`; `mekabridge doctor` reports the setting.
 
 **The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is blocked. Run with `-v` to see the drop at debug level, and check `mekabridge policy list`.
 

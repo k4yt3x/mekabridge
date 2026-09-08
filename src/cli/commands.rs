@@ -66,11 +66,11 @@ pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
             "meka cannot reach its session database; no turn can run".to_string(),
         ));
     }
-    if !ready.provider_configured {
-        // Likewise terminal: without a provider meka cannot serve a single turn. Reported as a
+    if !ready.profile_configured {
+        // Likewise terminal: without a profile meka cannot serve a single turn. Reported as a
         // warning, `doctor` exited 0 against it, which is the opposite of what a gate wants.
         checks.push(Check::Fail(
-            "meka reports no provider is configured; no turn can run".to_string(),
+            "meka reports no profile is configured; no turn can run".to_string(),
         ));
     }
     if !ready.mcp_servers_healthy {
@@ -245,14 +245,19 @@ pub async fn doctor(config: &Config) -> Result<()> {
             println!("  ok     reachable, version {}", info.version);
             // A separate call since meka 0.44, which took `model` off `/v1/info` because the word
             // there named a backend while the same word on `POST /v1/sessions` names a profile.
-            // Every meka this bridge supports has this endpoint, back to 0.42, so a failure here
-            // is a real one rather than a version it is too old for.
-            match meka.providers().await {
+            match meka.profiles().await {
                 Ok(profiles) => match profiles.iter().find(|profile| profile.active) {
                     Some(profile) => println!(
-                        "  ok     sessions run on profile {} ({}), model {}",
+                        "  ok     sessions run on profile {} (account {}, {}), model {}",
                         profile.name,
-                        profile.backend,
+                        profile.account,
+                        // Absent where the profile names an account `config.toml` does not have,
+                        // which is why it is worth printing rather than eliding: meka starts on
+                        // that config and refuses the session.
+                        profile
+                            .backend
+                            .as_deref()
+                            .unwrap_or("account not configured"),
                         profile.model.as_deref().unwrap_or("(none configured)")
                     ),
                     None => {
@@ -261,17 +266,22 @@ pub async fn doctor(config: &Config) -> Result<()> {
                         // is configured or several are with no default chosen between them, and
                         // meka defers that failure to the first session rather than refusing to
                         // start, so this surfaces at the first message otherwise. The remedy is
-                        // meka's own wording: `default_provider` is what a command writes, and
+                        // meka's own wording: `default_profile` is what a command writes, and
                         // sending an operator to hand-edit the file instead is worse advice.
                         println!(
-                            "  fail   meka has no default provider profile, so creating the \
-                             bridge's session will fail; run `meka provider use <name>`"
+                            "  fail   meka has no default profile, so creating the bridge's \
+                             session will fail; run `meka profile use <name>`"
                         );
                         failures += 1;
                     }
                 },
                 Err(error) => {
-                    println!("  warn   could not read the provider profiles: {error}");
+                    // Named rather than left to the error, which on the version that moved this
+                    // endpoint is a bare 404 with no body to explain itself.
+                    println!(
+                        "  warn   could not read the profiles: {error}. meka 0.46 or later is \
+                         required; before it this was GET /v1/providers"
+                    );
                     warnings += 1;
                 }
             }
@@ -283,7 +293,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 println!(
                     "  warn   the active profile has vision off, so view_attachment returns a \
                      description rather than the image and the agent can only reach a file through \
-                     download_attachment. Set `vision = true` under [providers.<name>]."
+                     download_attachment. Set `vision = true` under [profiles.<name>]."
                 );
                 warnings += 1;
             }
@@ -323,18 +333,21 @@ pub async fn doctor(config: &Config) -> Result<()> {
         None => println!("  ok     no session yet; one is created on the first message"),
         Some(session_id) => match meka.session(session_id).await {
             Ok(info) => {
+                // meka omits the level for a row that records none since 0.46. Not a session this
+                // bridge made, which always names one, so there is no level to hold against the
+                // ladder below and saying so beats inventing one.
+                let level = info.permission.as_deref();
                 println!(
                     "  ok     bound to {session_id} (permission {})",
-                    info.permission
+                    level.unwrap_or("unrecorded")
                 );
                 if info.turn_in_flight {
                     println!("  ok     a turn is running on it right now");
                 }
-                if let Some(problem) = permission_problem(&info.permission) {
-                    println!(
-                        "  fail   the session is at permission {:?}. {problem}",
-                        info.permission
-                    );
+                if let Some(level) = level
+                    && let Some(problem) = permission_problem(level)
+                {
+                    println!("  fail   the session is at permission {level:?}. {problem}");
                     failures += 1;
                 }
             }
@@ -525,23 +538,21 @@ pub async fn doctor(config: &Config) -> Result<()> {
 
 /// Why a permission level will not work for this bridge, or `None` if it will.
 ///
-/// `ask` fails for a reason that is not obvious: meka compares the *session* level against `Ask`
-/// before dispatching any tool, so every call is prompted, read-only ones included, and this bridge
-/// declares `supports_permission_prompts: false`, so meka denies each immediately and the agent
-/// cannot even reply.
-///
 /// Falling short of the moderation tools is not a failure here, since a bridge that never moderates
 /// is correct at `read`; [`moderation_reach`] reports that separately.
 ///
-/// `write` is unreachable from `[session].permission`, which refuses it while parsing, but not from
-/// the level meka reports for a session created against 0.41, which is what that arm is for.
+/// Neither retired level is reachable from `[session].permission`, which refuses both while
+/// parsing. They are reachable from the level meka reports for a session created before it retired
+/// them, which a store carried across the upgrade still points at, and that is what those two arms
+/// are for.
 fn permission_problem(level: &str) -> Option<&'static str> {
     match level {
         "read" | "workspace" | "unrestricted" => None,
         "ask" => Some(
-            "meka prompts for every tool call at `ask`, including read-only ones, and this bridge \
-             cannot answer a prompt, so each is denied at once. That includes send_message, so the \
-             agent can never reply. Use \"read\", \"workspace\" or \"unrestricted\".",
+            "meka 0.46 retired `ask` for an `approvals` switch beside the level, so a session \
+             cannot run at it any more; upgrading meka moves this one to `none`, where every call \
+             is denied including send_message. Set [session].permission to \"read\" and restart: \
+             the bridge reconciles the level before its next turn, so no session reset is needed.",
         ),
         "write" => Some(
             "meka 0.42 retired `write` and split it into `workspace` and `unrestricted`, so a \
@@ -580,9 +591,9 @@ fn level_meka_will_not_create(level: &str, enabled: &[String]) -> Option<String>
 /// warning here would fire on every default install and teach operators to skim them.
 ///
 /// Only the last step of the chain is surprising. `readOnlyHint: false` resolves to `unrestricted`,
-/// and `Permission::allows` then treats `workspace`, `ask` and `unrestricted` as equal, which reads
-/// like `workspace` is enough. But an MCP tool runs in its server's own process, which meka does
-/// not sandbox, so a second gate refuses anything needing `unrestricted` from a `workspace` session
+/// and `Permission::allows` then treats `workspace` and `unrestricted` as equal, which reads like
+/// `workspace` is enough. But an MCP tool runs in its server's own process, which meka does not
+/// sandbox, so a second gate refuses anything needing `unrestricted` from a `workspace` session
 /// rather than promise a confinement it cannot apply.
 fn moderation_reach(level: &str, admin_tools: bool) -> Option<String> {
     if !admin_tools || level == "unrestricted" {
@@ -946,7 +957,10 @@ pub async fn session_show(config: &Config) -> Result<()> {
     match meka.session(session_id).await {
         Ok(info) => {
             println!("title:      {}", info.title);
-            println!("permission: {}", info.permission);
+            println!(
+                "permission: {}",
+                info.permission.as_deref().unwrap_or("unrecorded")
+            );
             println!("cwd:        {}", info.cwd.as_deref().unwrap_or("-"));
             println!(
                 "turn:       {}",
@@ -1360,11 +1374,11 @@ mod tests {
         );
     }
 
-    fn readiness(status: &str, session_db: bool, provider: bool, mcp: bool) -> ReadyStatus {
+    fn readiness(status: &str, session_db: bool, profile: bool, mcp: bool) -> ReadyStatus {
         ReadyStatus {
             status: status.to_string(),
             session_db,
-            provider_configured: provider,
+            profile_configured: profile,
             mcp_servers_healthy: mcp,
         }
     }
@@ -1450,22 +1464,28 @@ mod tests {
     }
 
     #[test]
-    fn ask_and_none_are_reported_as_unworkable() {
-        // `ask` is the subtle one: meka prompts on the session level, so even a read-only call is
-        // gated, and this bridge denies every prompt.
-        let ask = permission_problem("ask").expect("ask must be rejected");
-        assert!(ask.contains("send_message"), "{ask}");
+    fn none_is_reported_as_unworkable() {
         assert!(permission_problem("none").is_some());
     }
 
     #[test]
-    fn the_retired_write_level_is_named_rather_than_lumped_in_with_a_typo() {
-        // The one an operator upgrading meka actually hits. A session cannot be created at it at
-        // all, so the message has to say that and name what replaced it, or the reader concludes
-        // the bridge stopped supporting a level meka still has.
-        let problem = permission_problem("write").expect("write must be rejected");
-        assert!(problem.contains("0.42"), "{problem}");
-        assert!(problem.contains("unrestricted"), "{problem}");
+    fn a_retired_level_is_named_rather_than_lumped_in_with_a_typo() {
+        // What an operator upgrading meka actually hits, since a session created before the level
+        // was retired keeps pointing at it. A session cannot run at either any more, so each
+        // message has to say so and name what replaced it, or the reader concludes the bridge
+        // stopped supporting a level meka still has.
+        //
+        // The version is what separates these from the catch-all arm, which would otherwise
+        // satisfy an assertion on the level name alone.
+        for (level, version, replacement) in [
+            ("write", "0.42", "unrestricted"),
+            ("ask", "0.46", "approvals"),
+        ] {
+            let problem =
+                permission_problem(level).unwrap_or_else(|| panic!("{level} must be rejected"));
+            assert!(problem.contains(version), "{level} got: {problem}");
+            assert!(problem.contains(replacement), "{level} got: {problem}");
+        }
     }
 
     #[test]
@@ -1483,20 +1503,20 @@ mod tests {
 
     #[test]
     fn a_level_meka_does_not_enable_is_caught_before_the_first_message() {
-        // meka's own default set. `ask` is opt-in and absent from it, which is the case worth
-        // catching: without this the session is refused at creation, on the first message, long
-        // after `doctor` said everything was fine.
-        let enabled: Vec<String> = ["none", "read", "workspace", "unrestricted"]
+        // An operator who narrowed `[permissions].enabled` on meka's side and left this bridge
+        // asking for a rung outside it. Without this the session is refused at creation, on the
+        // first message, long after `doctor` said everything was fine.
+        let enabled: Vec<String> = ["none", "read"]
             .iter()
             .map(|level| (*level).to_string())
             .collect();
         assert!(level_meka_will_not_create("read", &enabled).is_none());
-        assert!(level_meka_will_not_create("unrestricted", &enabled).is_none());
-        let refused = level_meka_will_not_create("ask", &enabled).expect("ask is not enabled");
-        assert!(refused.contains("ask"), "{refused}");
+        let refused = level_meka_will_not_create("unrestricted", &enabled)
+            .expect("unrestricted is not enabled");
+        assert!(refused.contains("unrestricted"), "{refused}");
         // The way out has to name what meka would accept; "not enabled" alone leaves the operator
-        // guessing which of five words to try.
-        assert!(refused.contains("workspace"), "{refused}");
+        // guessing which words to try.
+        assert!(refused.contains("read"), "{refused}");
     }
 
     #[test]
@@ -1504,7 +1524,7 @@ mod tests {
         // Empty covers two cases that must not become a guess: a meka too old to report the field,
         // and one `doctor` could not reach at all. Failing either would make `doctor` red over a
         // configuration that is fine.
-        for level in ["read", "ask", "unrestricted", "nonsense"] {
+        for level in ["read", "workspace", "unrestricted", "nonsense"] {
             assert!(level_meka_will_not_create(level, &[]).is_none());
         }
     }

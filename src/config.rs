@@ -360,15 +360,14 @@ pub enum TelegramParseMode {
 
 /// meka permission level a session runs at.
 ///
-/// The five rungs meka 0.42 defines, in its order rather than a sensible-looking one: `ask`
-/// outranks `workspace`, because an approved call at `ask` writes anywhere while `workspace` cannot
-/// leave its roots however often it is invoked.
+/// The four rungs meka 0.46 defines. Asking about a call above the level is no longer a rung of its
+/// own but a switch beside one, which this bridge leaves off: it declares
+/// `supports_permission_prompts: false`, so there is no one here to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     None,
     Read,
     Workspace,
-    Ask,
     Unrestricted,
 }
 
@@ -379,18 +378,17 @@ impl Permission {
             Self::None => "none",
             Self::Read => "read",
             Self::Workspace => "workspace",
-            Self::Ask => "ask",
             Self::Unrestricted => "unrestricted",
         }
     }
 }
 
-/// Hand-written so `write` can be refused by name rather than as one more unknown variant.
+/// Hand-written so the two levels meka has retired can be refused by name rather than as one more
+/// unknown variant.
 ///
-/// meka 0.42 split `write` into `workspace` and `unrestricted`, and its own parser answers the old
-/// spelling with the same explanation. Left to the derive, an operator upgrading meka would meet
-/// `unknown variant 'write', expected one of ...`, which lists the replacement without saying that
-/// it *is* the replacement, and does not say which of the two rungs restores what they had.
+/// Left to the derive, an operator upgrading meka would meet `unknown variant 'ask', expected one
+/// of ...`, which lists the survivors without saying that the level is gone or what took its place.
+/// Both refusals are the same shape as meka's own parser answering the same word.
 impl<'de> Deserialize<'de> for Permission {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -400,8 +398,13 @@ impl<'de> Deserialize<'de> for Permission {
             "none" => Ok(Self::None),
             "read" => Ok(Self::Read),
             "workspace" => Ok(Self::Workspace),
-            "ask" => Ok(Self::Ask),
             "unrestricted" => Ok(Self::Unrestricted),
+            "ask" => Err(serde::de::Error::custom(
+                "permission `ask` was retired in meka 0.46, which replaced it with an `approvals` \
+                 switch beside the level, so a session cannot be created at it at all. This bridge \
+                 has nobody to put an approval to and never turns that switch on. Use \"read\" to \
+                 answer messages, or \"unrestricted\" to also moderate",
+            )),
             "write" => Err(serde::de::Error::custom(
                 "permission `write` was retired in meka 0.42 and split in two: `workspace` for \
                  writes confined to the session's roots, `unrestricted` for none. Only \
@@ -409,7 +412,7 @@ impl<'de> Deserialize<'de> for Permission {
                  page",
             )),
             other => Err(serde::de::Error::custom(format!(
-                "unknown permission `{other}`: expected `none`, `read`, `workspace`, `ask` or \
+                "unknown permission `{other}`: expected `none`, `read`, `workspace` or \
                  `unrestricted`"
             ))),
         }
@@ -1513,14 +1516,13 @@ token = \"meka-token\"
 
     #[test]
     fn the_permission_ladder_matches_mekas() {
-        // Pinned against meka's own five, because the wire form goes straight into
+        // Pinned against meka's own four, because the wire form goes straight into
         // `POST /v1/sessions` and a level meka cannot parse is a 422 on the first message rather
         // than a startup error anybody sees.
         for (raw, expected) in [
             ("none", Permission::None),
             ("read", Permission::Read),
             ("workspace", Permission::Workspace),
-            ("ask", Permission::Ask),
             ("unrestricted", Permission::Unrestricted),
         ] {
             let text = format!("{MINIMAL}\n[session]\npermission = \"{raw}\"\n");
@@ -1531,18 +1533,21 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn a_config_still_setting_write_is_refused_by_name() {
-        // The upgrade case. meka 0.42 retired the level, so leaving it in place would be a session
-        // creation that 422s on the first message; the error has to name the replacement rather
-        // than read as one more unknown word.
-        let raw = format!("{MINIMAL}\n[session]\npermission = \"write\"\n");
-        let error = parse(&raw).expect_err("a retired level must be refused");
-        let message = error.to_string();
-        // Asserting on `write` and `unrestricted` alone proves nothing: the fallback arm below
-        // names the offending word and lists every valid level, so it satisfies both and the test
-        // passes with this arm deleted. `retired` appears only in the message written for it.
-        assert!(message.contains("retired"), "got: {message}");
-        assert!(message.contains("workspace"), "got: {message}");
+    fn a_config_still_setting_a_retired_level_is_refused_by_name() {
+        // The upgrade cases. meka retired `write` in 0.42 and `ask` in 0.46, so leaving either in
+        // place would be a session creation that 422s on the first message; each error has to name
+        // the replacement rather than read as one more unknown word.
+        //
+        // Asserting on the level and its replacement alone proves nothing: the fallback arm names
+        // the offending word and lists every valid level, so it satisfies both and the test passes
+        // with these arms deleted. `retired` appears only in the messages written for them.
+        for (level, replacement) in [("write", "workspace"), ("ask", "approvals")] {
+            let raw = format!("{MINIMAL}\n[session]\npermission = \"{level}\"\n");
+            let error = parse(&raw).expect_err("a retired level must be refused");
+            let message = error.to_string();
+            assert!(message.contains("retired"), "{level} got: {message}");
+            assert!(message.contains(replacement), "{level} got: {message}");
+        }
     }
 
     #[test]

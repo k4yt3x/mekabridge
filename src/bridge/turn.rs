@@ -321,8 +321,9 @@ impl TurnRunner {
                     tracing::error!(
                         tool = %tool_name,
                         "meka asked for permission, but this bridge has no approval channel; the \
-                         turn will stall and deny. meka only prompts at [session].permission = \
-                         \"ask\", so that is what to change; use \"read\" or \"unrestricted\"."
+                         turn will stall and deny. meka only asks when its [permissions].approvals \
+                         is on for the session, so turn that off and raise [session].permission if \
+                         the tool is one the agent should reach."
                     );
                 }
                 _ => {}

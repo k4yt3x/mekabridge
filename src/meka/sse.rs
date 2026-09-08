@@ -54,9 +54,14 @@ pub enum TurnEvent {
         replaced_count: u64,
         generation: u64,
     },
-    /// Emitted when a gated tool needs approval. The bridge does not offer an approval UI, so this
-    /// only ever means the session was configured at `ask`, where the turn will stall for 60
-    /// seconds and then auto-deny.
+    /// Emitted when a gated tool needs approval, which for this bridge means the session has
+    /// meka's `approvals` switch on.
+    ///
+    /// The turn does not stall on it. Every session here is created with
+    /// `supports_permission_prompts: false`, which meka answers by denying the call at once with a
+    /// notice rather than parking it on the SSE channel for the 30 minutes a request stays
+    /// answerable. So this arrives as a record of a call that was refused, and the level is what
+    /// needs raising.
     PermissionRequired {
         request_id: String,
         tool_name: String,
@@ -80,7 +85,7 @@ pub enum TurnEvent {
 }
 
 impl TurnEvent {
-    /// Whether this event ends the stream. `turn.finished`, `turn.failed`, and `turn.cancelled` are
+    /// Whether this event ends the stream. `turn.finished`, `turn.failed`, and `turn.canceled` are
     /// terminal per meka's HTTP API.
     pub const fn is_terminal(&self) -> bool {
         matches!(
@@ -195,7 +200,13 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         },
-        "turn.cancelled" => TurnEvent::Cancelled {
+        // meka 0.46 respelled this with one `l` and kept no alias. Both are matched because a
+        // terminal event that falls through to `Unknown` fails silently rather than loudly:
+        // `is_terminal` says no, the reader waits for a terminal that has already been and gone,
+        // and the closed connection is then read as a dropped one and reported as an outcome
+        // nobody can establish. The endpoint renames in the same release fail visibly, so they
+        // follow 0.46 alone.
+        "turn.canceled" | "turn.cancelled" => TurnEvent::Cancelled {
             reason: string("reason"),
         },
         other => TurnEvent::Unknown {
@@ -320,7 +331,7 @@ mod tests {
                 .is_terminal()
         );
         assert!(
-            parse("turn.cancelled", r#"{"reason":"client"}"#)
+            parse("turn.canceled", r#"{"reason":"client"}"#)
                 .expect("parses")
                 .expect("event")
                 .is_terminal()
@@ -337,6 +348,27 @@ mod tests {
                 .expect("event")
                 .is_terminal()
         );
+    }
+
+    /// The spelling meka 0.46 moved to, and the one it moved from. Reading only one of them is not
+    /// a parse failure but a hang: an unmatched terminal is `Unknown`, which is not terminal, so
+    /// the reader keeps waiting, the closed connection reads as a dropped one, and a turn that was
+    /// cleanly cancelled is reported as an outcome nobody could establish.
+    #[test]
+    fn both_spellings_of_a_cancelled_turn_are_terminal() {
+        for name in ["turn.canceled", "turn.cancelled"] {
+            let event = parse(name, r#"{"reason":"sse_lag"}"#)
+                .expect("parses")
+                .expect("event");
+            assert_eq!(
+                event,
+                TurnEvent::Cancelled {
+                    reason: "sse_lag".to_string()
+                },
+                "{name} must not fall through to Unknown"
+            );
+            assert!(event.is_terminal(), "{name} must end the stream");
+        }
     }
 
     #[test]

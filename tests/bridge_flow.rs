@@ -64,7 +64,7 @@ enum FailureKind {
     /// either. More attempts only delay the notice saying an operator is needed.
     Unrepairable,
     /// What meka sends when it stops a turn whose stream nobody is watching any more: a
-    /// `turn.cancelled` with `reason: "client"`, not an error. The work stopped partway.
+    /// `turn.canceled` with `reason: "client"`, not an error. The work stopped partway.
     Cancelled,
     /// The same, but the agent had already sent something when it was stopped.
     CancelledAfterActing,
@@ -440,7 +440,7 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                     "retry: 3000\n\n\
                      event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
                      {acted}\
-                     event: turn.cancelled\nid: 2\ndata: {{\"reason\":\"client\"}}\n\n"
+                     event: turn.canceled\nid: 2\ndata: {{\"reason\":\"client\"}}\n\n"
                 ),
             )
                 .into_response();
@@ -697,7 +697,7 @@ async fn ready(State(recorder): State<Arc<MekaRecorder>>) -> axum::response::Res
         None => axum::Json(serde_json::json!({
             "status": "ok",
             "session_db": true,
-            "provider_configured": true,
+            "profile_configured": true,
             "mcp_servers_healthy": true,
         }))
         .into_response(),
@@ -712,9 +712,11 @@ async fn get_session(
         .turn_in_flight
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // `none` rather than the config's level, so the reconcile path is the one under test. It is
+    // also what meka 0.46 migrates an `ask` session to, which is the case that most needs moving.
     axum::Json(serde_json::json!({
         "id": id,
-        "permission": "write",
+        "permission": "none",
         "title": "stub",
         "turn_in_flight": in_flight,
     }))
@@ -1811,7 +1813,7 @@ fn attempts_at(harness: &Harness, conversation: &str) -> usize {
 async fn a_cancelled_turn_is_not_counted_as_delivered() {
     // The second door into the same silent loss the rejoin closed. meka stops a turn whose stream
     // has had no subscriber for `[serve].stream_reattach_grace` and reports it as a cancellation
-    // with `reason: "client"`, so a rejoin landing after the kill gets `turn.cancelled` back. That
+    // with `reason: "client"`, so a rejoin landing after the kill gets `turn.canceled` back. That
     // is a turn stopped partway through work nobody has seen, and filing it as a success loses the
     // message exactly as surely as reading an idle session as a finished turn did. At
     // `stream_reattach_grace = "0s"`, which meka offers, every dropped stream ends this way.
@@ -4094,7 +4096,7 @@ async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
         503,
-        r#"{"status":"degraded","session_db":false,"provider_configured":true,
+        r#"{"status":"degraded","session_db":false,"profile_configured":true,
             "mcp_servers_healthy":true}"#
             .to_string(),
     ));
@@ -4112,7 +4114,7 @@ async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
         !ready.session_db,
         "the blocker meka named was lost on the way"
     );
-    assert!(ready.provider_configured);
+    assert!(ready.profile_configured);
 
     // A 503 that is *not* meka's own answer is a different thing entirely: something in front of
     // meka, which is worth retrying rather than reporting as a considered verdict.

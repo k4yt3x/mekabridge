@@ -20,6 +20,27 @@ use crate::{
 /// Starter config written by `mekabridge config init`.
 const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
+/// The oldest meka this bridge can drive, as `(major, minor)`.
+///
+/// A floor rather than a recommendation. Turns carry `options.unanswered_message`, and meka refuses
+/// an unknown member of `options` rather than ignoring it, so against an older one every turn is a
+/// 422 that no retry clears and no message is ever answered.
+const MEKA_MINIMUM: (u64, u64) = (0, 48);
+
+/// Whether `version` is older than [`MEKA_MINIMUM`], or `None` when it cannot be read as one.
+///
+/// Unreadable is no opinion rather than a failure. The field carries meka's own package version
+/// today, and a `doctor` that failed a deployment over a version string it did not recognise would
+/// be wrong more often than this check is right.
+fn meka_is_too_old(version: &str) -> Option<bool> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    // The patch component is not compared, so a pre-release suffix riding it (`0.48.0-rc1`) needs
+    // no special handling.
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor) < MEKA_MINIMUM)
+}
+
 /// One line `doctor` prints, and whether it counts against the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
@@ -243,6 +264,17 @@ pub async fn doctor(config: &Config) -> Result<()> {
     match meka.info().await {
         Ok(info) => {
             println!("  ok     reachable, version {}", info.version);
+            if meka_is_too_old(&info.version) == Some(true) {
+                // Ahead of everything else this block reports: on a meka this old none of it
+                // matters, because no turn will run at all.
+                println!(
+                    "  fail   this bridge needs meka {}.{} or later. Every turn against an older \
+                     one is refused as an invalid body, because turns carry \
+                     `options.unanswered_message` and meka refuses an option it does not know",
+                    MEKA_MINIMUM.0, MEKA_MINIMUM.1
+                );
+                failures += 1;
+            }
             // A separate call since meka 0.44, which took `model` off `/v1/info` because the word
             // there named a backend while the same word on `POST /v1/sessions` names a profile.
             match meka.profiles().await {
@@ -1461,6 +1493,24 @@ mod tests {
         assert!(permission_problem("read").is_none());
         assert!(permission_problem("workspace").is_none());
         assert!(permission_problem("unrestricted").is_none());
+    }
+
+    #[test]
+    fn a_meka_below_the_floor_is_caught_before_the_first_message() {
+        // The failure it prevents is total: an older meka refuses every turn as an invalid body,
+        // so without this the deployment looks healthy and answers nobody.
+        assert_eq!(meka_is_too_old("0.47.1"), Some(true));
+        assert_eq!(meka_is_too_old("0.46.0"), Some(true));
+        assert_eq!(meka_is_too_old("0.48.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.49.0"), Some(false));
+        assert_eq!(meka_is_too_old("1.0.0"), Some(false));
+        // The patch component is never compared, so a pre-release riding it is read as its minor.
+        assert_eq!(meka_is_too_old("0.48.0-rc1"), Some(false));
+        // No opinion beats a wrong one: a build that does not report a version this can read must
+        // not fail an otherwise healthy deployment.
+        for unreadable in ["", "dev", "0", "nightly.1", "0.x.0"] {
+            assert_eq!(meka_is_too_old(unreadable), None, "{unreadable:?}");
+        }
     }
 
     #[test]

@@ -124,6 +124,14 @@ pub struct TurnReport {
     /// a transcript that silently skips. Those events can include a send, which makes
     /// [`Self::had_side_effects`] answer "no" for a turn that did act.
     pub counters_incomplete: bool,
+    /// What meka said it did with the envelope this turn carried, off the terminal event.
+    ///
+    /// `None` where it said nothing: a turn that never began, a turn that finished (there is
+    /// nothing to withdraw from one that worked), and the `sse-lag` failure, which is the stream's
+    /// own event rather than the turn's. Read through [`Self::envelope_kept`] rather than
+    /// directly, since what a caller wants to know is whether the envelope is still in front
+    /// of the agent.
+    pub message_withdrawn: Option<bool>,
 }
 
 impl TurnReport {
@@ -137,7 +145,32 @@ impl TurnReport {
             text_length: 0,
             text_preview: String::new(),
             counters_incomplete: false,
+            message_withdrawn: None,
         }
+    }
+
+    /// Whether the envelope this turn carried is still in front of the agent.
+    ///
+    /// What decides whether the announcements riding on it (the backlog a conversation is owed, the
+    /// count of messages that could not be queued) have been delivered. They are stated once, in
+    /// the envelope, so if meka took the envelope back they were never said and must be said again.
+    ///
+    /// Answered from what meka reports rather than from the stream. meka is explicit that the
+    /// stream cannot be read for this: thinking and a half-composed tool call both look like output
+    /// and neither reaches the conversation, while a reply of nothing but thinking does.
+    ///
+    /// Silence is read as "gone", which is the safe direction. Repeating a backlog costs the agent
+    /// a line it has already seen; dropping one loses messages from every path that would have
+    /// found them again. A turn that finished is the exception and is not silence at all: meka
+    /// withdraws only from a turn that ended badly, so there is nothing for it to report.
+    pub fn envelope_kept(&self) -> bool {
+        if !self.accepted {
+            return false;
+        }
+        if matches!(self.outcome, Ok(TurnOutcome::Finished { .. })) {
+            return true;
+        }
+        self.message_withdrawn == Some(false)
     }
 
     /// A turn that produced text but sent nothing.
@@ -247,6 +280,7 @@ impl TurnRunner {
         let mut text_length = 0_usize;
         let mut text_preview = String::new();
         let mut counters_incomplete = false;
+        let mut message_withdrawn: Option<bool> = None;
 
         let mut accepted = false;
         let result = self
@@ -326,6 +360,19 @@ impl TurnRunner {
                          the tool is one the agent should reach."
                     );
                 }
+                // Both terminals carry it, and only the terminal does. Recorded here rather than
+                // read off the outcome because a failure arrives as a Problem Detail, which this
+                // field deliberately sits beside rather than inside.
+                TurnEvent::Failed {
+                    message_withdrawn: withdrawn,
+                    ..
+                }
+                | TurnEvent::Cancelled {
+                    message_withdrawn: withdrawn,
+                    ..
+                } => {
+                    message_withdrawn = *withdrawn;
+                }
                 _ => {}
                 }
             })
@@ -353,6 +400,7 @@ impl TurnRunner {
             text_length,
             text_preview,
             counters_incomplete,
+            message_withdrawn,
         }
     }
 
@@ -877,6 +925,7 @@ mod tests {
             text_length: 10,
             text_preview: "hello".to_string(),
             counters_incomplete: false,
+            message_withdrawn: None,
         }
     }
 
@@ -884,6 +933,52 @@ mod tests {
     fn a_turn_without_sends_is_reported_as_silent() {
         assert!(report(0).is_silent());
         assert!(!report(1).is_silent());
+    }
+
+    /// What decides whether the backlog and the dropped-message count have been delivered. Both are
+    /// stated once, in the envelope, so the question is only ever whether the envelope survived.
+    #[test]
+    fn the_envelope_is_kept_only_where_meka_says_it_still_holds_it() {
+        let ended = |outcome, accepted, message_withdrawn| TurnReport {
+            outcome,
+            accepted,
+            sends: 0,
+            tool_calls: 0,
+            text_length: 0,
+            text_preview: String::new(),
+            counters_incomplete: false,
+            message_withdrawn,
+        };
+        let finished = || {
+            Ok(TurnOutcome::Finished {
+                stop_reason: "end_turn".to_string(),
+                refusal_text: None,
+                usage: Usage::default(),
+            })
+        };
+        let failed = || Err(MekaError::Timeout(Duration::from_secs(1)));
+
+        // A turn that worked keeps its message, and meka says nothing about a terminal it never
+        // withdraws from, so the absent field here must not read as a withdrawal.
+        assert!(ended(finished(), true, None).envelope_kept());
+        // The reason this exists: withdrawn means the announcements went with it.
+        assert!(!ended(failed(), true, Some(true)).envelope_kept());
+        // Withdrawn only happens for a turn that produced nothing, so a failure meka kept the
+        // message for still showed it.
+        assert!(ended(failed(), true, Some(false)).envelope_kept());
+        // Silence on a turn that ended badly is not a promise. `sse-lag` is the real case: the
+        // failure is the stream's own event and carries no answer.
+        assert!(
+            !ended(failed(), true, None).envelope_kept(),
+            "an unanswered withdrawal must not be read as a keep"
+        );
+        // A submission meka refused never rendered anything to anybody, and says nothing about a
+        // message it never took.
+        assert!(!ended(failed(), false, None).envelope_kept());
+        // Belt to that brace. The runner cannot build this one, since the terminal carrying the
+        // flag is itself an event and any event marks the turn accepted, so the guard is here to
+        // keep a later reading of the flag from answering for a turn that never ran.
+        assert!(!ended(failed(), false, Some(false)).envelope_kept());
     }
 
     #[test]
@@ -900,6 +995,7 @@ mod tests {
             text_length: 400,
             text_preview: "I'll take a look".to_string(),
             counters_incomplete: false,
+            message_withdrawn: None,
         };
         assert!(failed(1, 1).had_side_effects());
         assert!(
@@ -925,6 +1021,7 @@ mod tests {
             text_length: text.chars().count(),
             text_preview: text.to_string(),
             counters_incomplete: false,
+            message_withdrawn: None,
         }
     }
 
@@ -962,6 +1059,7 @@ mod tests {
             text_length: 0,
             text_preview: "[The model returned an empty response.]".to_string(),
             counters_incomplete: false,
+            message_withdrawn: None,
         };
         assert!(!report.produced_nothing());
     }

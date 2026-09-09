@@ -74,9 +74,22 @@ pub enum TurnEvent {
     },
     Failed {
         error: serde_json::Value,
+        /// Whether meka took this turn's envelope back out of the conversation, which it does only
+        /// for a turn that asked for it and then ended before anything from the model landed.
+        ///
+        /// The one fact that says whether a resubmission will be the only copy of the message or a
+        /// second one, and it cannot be inferred from the stream: meka's own guidance is that
+        /// thinking and a half-composed tool call both look like output here and neither reaches
+        /// the conversation. `None` on a turn that never began, where nothing was added to take
+        /// back, and on the `sse-lag` failure, which is the stream's own event and is sent before
+        /// the turn has unwound.
+        message_withdrawn: Option<bool>,
     },
     Cancelled {
         reason: String,
+        /// As [`TurnEvent::Failed::message_withdrawn`]: a cancellation withdraws on the same terms
+        /// a failure does.
+        message_withdrawn: Option<bool>,
     },
     /// An event name this build does not know about.
     Unknown {
@@ -138,6 +151,10 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default()
     };
+    // Absent and `false` mean different things here, so this cannot default like the rest: one is
+    // meka declining to say, the other is meka saying the message is still there.
+    let optional_bool =
+        |key: &str| -> Option<bool> { value.get(key).and_then(serde_json::Value::as_bool) };
 
     let parsed = match event_name {
         "turn.started" => TurnEvent::Started {
@@ -194,11 +211,14 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
                 .unwrap_or_default()
                 .unwrap_or_default(),
         },
+        // `message_withdrawn` sits beside `error` rather than inside it: the Problem Detail is
+        // meka's answer about the failure, this is its answer about the message.
         "turn.failed" => TurnEvent::Failed {
             error: value
                 .get("error")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            message_withdrawn: optional_bool("message_withdrawn"),
         },
         // meka 0.46 respelled this with one `l` and kept no alias. Both are matched because a
         // terminal event that falls through to `Unknown` fails silently rather than loudly:
@@ -208,6 +228,7 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<TurnEvent>, serde_js
         // follow 0.46 alone.
         "turn.canceled" | "turn.cancelled" => TurnEvent::Cancelled {
             reason: string("reason"),
+            message_withdrawn: optional_bool("message_withdrawn"),
         },
         other => TurnEvent::Unknown {
             event: other.to_string(),
@@ -363,11 +384,62 @@ mod tests {
             assert_eq!(
                 event,
                 TurnEvent::Cancelled {
-                    reason: "sse_lag".to_string()
+                    reason: "sse_lag".to_string(),
+                    message_withdrawn: None,
                 },
                 "{name} must not fall through to Unknown"
             );
             assert!(event.is_terminal(), "{name} must end the stream");
+        }
+    }
+
+    /// Absent, `true` and `false` are three different answers, so the field cannot default the way
+    /// the rest of this parser does. Absent means meka declined to say and the envelope has to be
+    /// treated as gone; `false` means it said the envelope is still there.
+    #[test]
+    fn a_terminal_reports_what_became_of_the_message() {
+        let cases = [
+            (
+                r#"{"reason":"client","message_withdrawn":true}"#,
+                Some(true),
+            ),
+            (
+                r#"{"reason":"client","message_withdrawn":false}"#,
+                Some(false),
+            ),
+            (r#"{"reason":"sse_lag"}"#, None),
+        ];
+        for (data, expected) in cases {
+            match parse("turn.canceled", data)
+                .expect("parses")
+                .expect("event")
+            {
+                TurnEvent::Cancelled {
+                    message_withdrawn, ..
+                } => assert_eq!(message_withdrawn, expected, "{data}"),
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        }
+    }
+
+    /// On a failure the field sits beside `error` rather than inside the Problem Detail, so reading
+    /// it off the parsed problem would find nothing.
+    #[test]
+    fn a_failure_reports_the_withdrawal_beside_its_problem_detail() {
+        let data = r#"{"error":{"type":"https://meka.so/errors/provider-unavailable",
+                       "status":502},"message_withdrawn":true}"#;
+        match parse("turn.failed", data).expect("parses").expect("event") {
+            TurnEvent::Failed {
+                error,
+                message_withdrawn,
+            } => {
+                assert_eq!(message_withdrawn, Some(true));
+                assert!(
+                    error.get("message_withdrawn").is_none(),
+                    "the flag is a sibling of the problem, not a member of it"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 

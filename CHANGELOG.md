@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-09
+
+### Changed
+
+- **Breaking:** meka 0.48.0 or later is required; on anything older every turn is refused.
+- A turn meka could not answer takes its message back, so a retry no longer leaves a duplicate.
+- `doctor` fails on a meka too old to drive, instead of leaving it to the first message.
+
+### Fixed
+
+- A backlog announced by a turn whose message was withdrawn is announced again, not lost.
+
 ## [0.11.0] - 2026-09-08
 
 ### Changed
@@ -334,7 +346,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.12.0...HEAD
+[0.12.0]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...0.12.0
 [0.11.0]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...0.9.0

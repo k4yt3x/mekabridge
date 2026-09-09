@@ -755,6 +755,17 @@ impl MekaClient {
     /// this bridge owns one permanent session and an image attached to a turn stays in that context
     /// for its life. Images still reach the model, pulled by `view_attachment` rather than pushed
     /// here.
+    ///
+    /// `unanswered_message: "withdraw"` is on every turn because every turn here is one the queue
+    /// may resubmit. meka keeps a failed turn's message by default, which is right for a person at
+    /// a REPL who can see the error and wrong for a queue that answers a transient 502 by sending
+    /// the same batch again: kept, each attempt leaves another unanswered copy of the envelope in
+    /// the conversation for the life of the session. meka withdraws only when the turn produced
+    /// nothing at all, so an attempt that got as far as a tool call keeps its message either way
+    /// and the resubmission after one is a new turn rather than a replay.
+    ///
+    /// This is what makes meka 0.48 the floor: `options` refuses an unknown field, so an older meka
+    /// answers every turn `422`.
     async fn open_turn(
         &self,
         session_id: Uuid,
@@ -768,6 +779,7 @@ impl MekaClient {
             .json(&serde_json::json!({
                 "message": message,
                 "stream": true,
+                "options": { "unanswered_message": "withdraw" },
             }))
             .send()
             .await?;
@@ -953,10 +965,13 @@ impl MekaClient {
                             usage,
                         });
                     }
-                    TurnEvent::Cancelled { reason } => {
+                    // `message_withdrawn` rides both terminals and is read off the stream by the
+                    // observer above, which is the only consumer: it is a fact about the batch this
+                    // turn carried rather than about how the turn ended.
+                    TurnEvent::Cancelled { reason, .. } => {
                         return Ok(TurnOutcome::Cancelled { reason });
                     }
-                    TurnEvent::Failed { error } => {
+                    TurnEvent::Failed { error, .. } => {
                         let problem: ProblemDetail =
                             serde_json::from_value(error).unwrap_or_default();
                         return Err(MekaError::Problem(problem));

@@ -86,6 +86,10 @@ struct MekaRecorder {
     turns: Mutex<Vec<String>>,
     /// Every `POST /turn`, accepted or refused, for tests that measure submission rate.
     attempts: Mutex<usize>,
+    /// `options.unanswered_message` off each submission, or `"(absent)"`. Recorded because meka
+    /// refuses an option it does not know, so a turn that stops carrying this stops working
+    /// entirely, and because the option is what keeps a retry from duplicating its message.
+    unanswered: Mutex<Vec<String>>,
     /// Turns to fail before starting to succeed, for exercising the retry path.
     fail_first: Mutex<usize>,
     /// What those failures look like, which is what decides whether the batch may be tried again.
@@ -187,6 +191,18 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
+    recorder
+        .unanswered
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(
+            parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/options/unanswered_message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("(absent)")
+                .to_string(),
+        );
     *recorder
         .attempts
         .lock()
@@ -430,6 +446,16 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
         } else {
             ""
         };
+        // What meka 0.48 reports about the message the turn was sent, for a bridge that submits
+        // every turn `unanswered_message: "withdraw"`. It withdraws only when nothing from the
+        // model reached the conversation, so a turn that got a send away keeps its message. The
+        // `sse-lag` failure is the exception and says nothing at all: that event belongs to the
+        // stream and is sent before the turn has unwound.
+        let withdrawn = if kind == FailureKind::Lagged {
+            String::new()
+        } else {
+            format!(",\"message_withdrawn\":{}", acted.is_empty())
+        };
         if matches!(
             kind,
             FailureKind::Cancelled | FailureKind::CancelledAfterActing
@@ -440,7 +466,8 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
                     "retry: 3000\n\n\
                      event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
                      {acted}\
-                     event: turn.canceled\nid: 2\ndata: {{\"reason\":\"client\"}}\n\n"
+                     event: turn.canceled\nid: 2\n\
+                     data: {{\"reason\":\"client\"{withdrawn}}}\n\n"
                 ),
             )
                 .into_response();
@@ -467,7 +494,7 @@ async fn submit_turn(State(recorder): State<Arc<MekaRecorder>>, body: String) ->
             "retry: 3000\n\n\
              event: turn.started\nid: 0\ndata: {{\"turn_id\":\"t\",\"session_id\":\"s\"}}\n\n\
              {acted}\
-             event: turn.failed\nid: 2\ndata: {{\"error\":{error}}}\n\n"
+             event: turn.failed\nid: 2\ndata: {{\"error\":{error}{withdrawn}}}\n\n"
         )
     } else if !compose_for.is_zero() {
         // Split across two chunks with the wait between them, so the composing window has real
@@ -1540,6 +1567,14 @@ impl Harness {
     fn turns(&self) -> Vec<String> {
         self.recorder
             .turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn unanswered(&self) -> Vec<String> {
+        self.recorder
+            .unanswered
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -3167,6 +3202,84 @@ async fn await_history(harness: &Harness, expected: usize, label: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for {label}");
+}
+
+#[tokio::test]
+async fn every_turn_asks_meka_to_withdraw_a_message_it_could_not_answer() {
+    // The option is what stops a resubmission leaving a duplicate: meka keeps a failed turn's
+    // message by default, so a queue that answers a transient 502 by sending the same batch again
+    // deposits one unanswered copy of the envelope per attempt, for the life of the session.
+    //
+    // Asserted per submission rather than once, because meka reads it per turn. It is also the
+    // reason meka 0.48 is a floor: `options` refuses a member it does not know, so a turn without
+    // this is fine on an old meka and a turn with it is a 422, and there is no version in between.
+    let harness = Harness::start(1, 0).await;
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
+        .await;
+
+    let asked = harness.unanswered();
+    assert!(!asked.is_empty(), "no submission was recorded");
+    for option in &asked {
+        assert_eq!(option, "withdraw", "got: {asked:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_backlog_survives_a_turn_whose_message_meka_withdrew() {
+    // The half of the withdrawal that belongs to this side. A conversation's backlog is announced
+    // once, in the envelope, and the watermark used to advance as soon as meka took the turn on the
+    // grounds that a failed turn still reached the agent. That held only while meka kept a failed
+    // turn's message. Now that the bridge asks for it to be withdrawn, the envelope goes with it,
+    // and spending the backlog against a turn that left nothing behind loses those messages from
+    // every path that would have found them again.
+    let harness = Harness::start_failing(1, FailureKind::RateLimited, Setup::default()).await;
+    harness
+        .store
+        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .await
+        .expect("mute");
+
+    for index in 0..3 {
+        harness
+            .sender
+            .send(message(&format!("chatter {index}"), &index.to_string()))
+            .await
+            .expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(harness.turns().is_empty(), "a muted chat costs no turn");
+
+    // Wakes a turn that fails with the message withdrawn, then a retry that succeeds.
+    harness
+        .sender
+        .send(mention("@bot anything from the others?", "9"))
+        .await
+        .expect("queued");
+    // Two, not one: the failed turn is recorded as well, and it is the one still carrying the
+    // backlog, so waiting for a single turn would assert against the envelope that was withdrawn.
+    harness
+        .wait_for("the retry that succeeded", |harness| {
+            harness.turns().len() >= 2
+        })
+        .await;
+
+    let turns = harness.turns();
+    let envelope = turns.last().expect("the delivered turn");
+    assert!(
+        envelope.contains("3 messages you have not seen"),
+        "the withdrawn envelope took the only statement of the backlog with it, so the retry has \
+         to make it again:\n{envelope}"
+    );
+    assert!(
+        envelope.contains("chatter 2"),
+        "and the lookback with it:\n{envelope}"
+    );
 }
 
 #[tokio::test]

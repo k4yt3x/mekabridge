@@ -2,19 +2,37 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
-**meka 0.46.0 or later is required.** It renamed three things the bridge depends on and kept no
-alias for any of them: `GET /v1/providers`, which the bridge reads the running model from, is now
-`GET /v1/profiles`; the terminal SSE event for a stopped turn is `turn.canceled`, one `l`; and the
-`ask` permission level is gone, replaced by an `approvals` switch beside the level.
+**meka 0.48.0 or later is required, and nothing older works at all.** Turns are submitted with
+`options.unanswered_message`, and meka refuses an `options` member it does not recognize rather than
+ignoring it, so on an older meka every turn is a `422` that no retry clears and no message is ever
+answered. `mekabridge doctor` fails on the version for that reason.
 
-Against an older meka the bridge still runs, and what it loses is diagnostic rather than silent:
-`doctor` warns that it could not read the profiles, and so reports neither the model nor a missing
-default profile. Turns themselves are unaffected, because the bridge reads the cancel event and the
-readiness flag under both spellings.
+Three earlier renames are part of the same floor. `GET /v1/providers`, which the bridge reads the
+running model from, is `GET /v1/profiles`; the terminal SSE event for a stopped turn is
+`turn.canceled`, one `l`; and the `ask` permission level is gone, replaced by an `approvals` switch
+beside the level.
 
-0.46 also changes the shape of meka's own `config.toml`, which it refuses to start against until
-converted. meka ships `migrate-0.45-to-0.46.py` as a release asset for that, and its upgrade guide
-is the authority on it. None of the snippets below are affected by the conversion.
+Upgrading across 0.46 also changes the shape of meka's own `config.toml`, which it refuses to start
+against until converted. meka ships `migrate-0.45-to-0.46.py` as a release asset for that, and its
+upgrade guide is the authority on it. None of the snippets below are affected by the conversion.
+
+## Resending a turn that failed
+
+meka keeps a failed turn's message in the conversation by default, which is right for a person at a
+REPL who can see the error and wrong here. This bridge answers a transient failure by resubmitting
+the same batch, so a kept message would leave one unanswered copy of the envelope behind per
+attempt, permanently, for as long as the outage lasted.
+
+Every turn therefore carries `options.unanswered_message = "withdraw"`, and meka takes the message
+back when the turn ended before anything from the model reached the conversation. A turn that got as
+far as one tool call keeps its message either way, and the bridge does not resubmit after one of
+those, so the two rules agree.
+
+The withdrawal reaches further than the message. A conversation's backlog and the count of messages
+that could not be queued are each stated once, in that envelope, so a withdrawn envelope never said
+them. meka reports which happened on the terminal event, as `message_withdrawn`, and the bridge
+re-announces both rather than reading the stream to guess: a half-composed tool call looks like
+output and never reaches the conversation, while a reply of nothing but thinking does.
 
 ## What meka needs from you
 

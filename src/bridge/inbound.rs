@@ -1126,26 +1126,27 @@ async fn deliver(
         return last_turn;
     }
 
-    // Spent for every outcome except a refusal. A turn that failed still reached the agent, and
-    // repeating the whole backlog on each retry would be the worse trade; a turn meka never
-    // accepted did not reach it at all.
+    // Spent only where the envelope that announced it is still in front of the agent. The backlog
+    // and the dropped-message count are each stated once, in that envelope, so an envelope meka
+    // took back never said them and they are owed again.
     //
-    // Keyed on whether the turn was taken, not on which error came back. The `turn-in-flight` 409
-    // used to be the only refusal excepted, and it is far from the only one: a meka restarting
-    // refuses the socket, its concurrency limit answers 429, a rotated token answers 401. Each of
-    // those spent a backlog nobody was shown, leaving the retry to tell the agent nothing had been
-    // said in a chat with thirty messages waiting, and those messages gone from every path that
-    // would have found them again.
-    if !report.accepted {
-        // The counter is restored for the same reason and on the same condition: the envelope it
-        // was rendered into never reached anybody.
+    // Keyed on the envelope rather than on which error came back. A refusal is the obvious case: a
+    // meka restarting refuses the socket, its concurrency limit answers 429, a rotated token
+    // answers 401, and each of those once spent a backlog nobody was shown. Withdrawal is the
+    // subtler one, and it only exists because this bridge asks for it: turns are submitted
+    // `unanswered_message: "withdraw"` so a resubmission does not leave a duplicate behind, and the
+    // message that goes takes the announcements riding on it. Reading the old "the turn was taken"
+    // rule against a withdrawn envelope would trade a duplicate message for a lost backlog.
+    if !report.envelope_kept() {
+        // Restored on the same condition and for the same reason: the envelope it was rendered
+        // into is not in front of anybody.
         if dropped > 0
             && let Err(error) = context.store.note_dropped(dropped).await
         {
             tracing::error!("failed to restore the dropped-message counter: {}", error);
         }
     }
-    for spent in withheld.iter().filter(|_| report.accepted) {
+    for spent in withheld.iter().filter(|_| report.envelope_kept()) {
         if let Err(error) = context
             .store
             .mark_seen(spent.conversation.as_str(), spent.watermark, spent.through)

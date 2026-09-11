@@ -167,13 +167,14 @@ The history covers both directions. What the agent sends is recorded alongside w
 
 That last part is the point of it. A session's own transcript used to be the only record of what it had said, and a transcript is not a store you can query: a sub-agent speaks on the same bot account without the session that spawned it knowing, and compaction eventually drops what a session said from its own memory of the conversation. Now "have I already told them?" is a search rather than a guess.
 
-Three fields say what has happened to a message since:
+Four fields say what has happened to a message since:
 
 | Field | Meaning |
 |-------|---------|
 | `own` | The agent sent this rather than received it |
 | `deleted` | The platform says it has since been retracted. The text is kept and still searchable |
 | `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id` |
+| `previous_account` | It went through a bot account this channel no longer uses, because the bot was deleted and recreated. Its `message_id` belongs to that account, so replying to it, reacting to it, editing it, or deleting it from the current one fails |
 
 A message the agent was woken for is in its context permanently, so the record is the only thing able to tell it afterwards that what it acted on has been withdrawn or rewritten. That is why neither is erased. Both are excluded from `unseen` and from the missed-context lookback, though: a retracted message must never be offered as news.
 

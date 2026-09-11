@@ -660,7 +660,13 @@ pub async fn status(config: &Config) -> Result<()> {
     println!("conversations: {}", conversations.len());
     println!("channels:      {}", config.channels.len());
     for channel in &config.channels {
-        println!("  {} ({})", channel.id, platform_name(channel));
+        // Read from the store rather than probed, so this works while the daemon is down and says
+        // what the daemon last recorded rather than what the platform would say now.
+        let account = match store.current_account(&channel.id).await? {
+            Some(account) => format!("{} (id {})", account.label(), account.platform_id),
+            None => "no account recorded yet".to_string(),
+        };
+        println!("  {} ({}): {account}", channel.id, platform_name(channel));
     }
     Ok(())
 }
@@ -685,7 +691,7 @@ pub async fn queue_list(config: &Config, limit: usize) -> Result<()> {
         println!(
             "  #{:<6} {:<28} attempts {}  received {}",
             message.seq,
-            message.conversation_id,
+            message.conversation,
             message.attempts,
             message.received_at.to_rfc3339()
         );
@@ -721,7 +727,7 @@ pub async fn conversations_list(
     for conversation in conversations {
         println!(
             "  {:<28} {:<8} {:<20} last inbound {}",
-            conversation.id,
+            conversation.address,
             conversation.kind,
             conversation.title.as_deref().unwrap_or("-"),
             conversation
@@ -771,13 +777,13 @@ pub async fn policy_list(config: &Config) -> Result<()> {
             Policy::Block => format!("{} discarded", policy.dropped),
             Policy::Mute => format!(
                 "{} unseen",
-                unseen.get(&policy.conversation_id).copied().unwrap_or(0)
+                unseen.get(&policy.conversation).copied().unwrap_or(0)
             ),
             Policy::Active => "-".to_string(),
         };
         println!(
             "  {:<28} {:<8} {:<34} {:<14} {}",
-            policy.conversation_id,
+            policy.conversation,
             policy.policy.as_str(),
             until,
             withheld,
@@ -814,11 +820,23 @@ pub async fn policy_set(
              `mekabridge conversations list`"
         ))
     })?;
+    // The row a pre-emptive policy mints needs the platform, which only the config can say.
+    let platform = config
+        .channels
+        .iter()
+        .find(|channel| channel.id == conversation.channel())
+        .map(platform_name)
+        .ok_or_else(|| {
+            BridgeError::config(format!(
+                "{conversation} names channel {:?}, which is not configured",
+                conversation.channel()
+            ))
+        })?;
     let conversation = conversation.as_str();
 
     let store = Store::open(&config.storage.path).await?;
     store
-        .set_policy(conversation, policy, until, reason, Utc::now())
+        .set_policy(conversation, platform, policy, until, reason, Utc::now())
         .await?;
     match until {
         Some(until) => println!(
@@ -966,8 +984,15 @@ pub async fn history_show(
             (None, Some(_)) => "  [superseded by a later edit]",
             (None, None) => "",
         };
+        // A message id from a bot account this channel no longer uses cannot be acted on, and
+        // nothing else in the line would say so.
+        let account = if message.previous_account {
+            "  [previous bot account]"
+        } else {
+            ""
+        };
         println!(
-            "{seen}{marker}{side} {}  {:<20} {}{state}",
+            "{seen}{marker}{side} {}  {:<20} {}{state}{account}",
             short_time(message.timestamp),
             message.sender_name,
             message.text.replace('\n', " ")

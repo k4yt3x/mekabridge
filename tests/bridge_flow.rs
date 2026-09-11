@@ -20,7 +20,7 @@ use axum::{Router, extract::State, response::IntoResponse, routing::post};
 use chrono::Utc;
 use mekabridge::{
     bridge::{
-        BridgeSink,
+        BridgeSink, ChannelAccounts,
         inbound::{self, DrainContext},
         turn::{Presence, TurnRunner},
     },
@@ -33,7 +33,7 @@ use mekabridge::{
     config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
-    store::{ConversationRecord, Policy, Store},
+    store::{AccountId, AccountIdentity, ConversationRecord, MessageKey, Policy, Store},
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -1111,16 +1111,17 @@ impl Channel for MockChannel {
 /// The address is unreachable on purpose: only the fetch tools consult meka (for the vision flag),
 /// and a failed probe degrades to "describe rather than show", which is the behaviour under test in
 /// the cases that use this.
-fn sink_for(store: Store, channels: Arc<ChannelRegistry>) -> BridgeSink {
+async fn sink_for(store: Store, channels: Arc<ChannelRegistry>) -> BridgeSink {
     sink_with_storage(
         store,
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::new(Presence::default()),
     )
+    .await
 }
 
-fn sink_with_storage(
+async fn sink_with_storage(
     store: Store,
     channels: Arc<ChannelRegistry>,
     attachment_dir: std::path::PathBuf,
@@ -1133,17 +1134,19 @@ fn sink_with_storage(
         presence,
         ([127, 0, 0, 1], 1).into(),
     )
+    .await
 }
 
 /// The same, pointed at a meka that answers, so the vision probe succeeds and `view_attachment`
 /// reaches the code that decides between an image and a description.
-fn sink_against_meka(
+async fn sink_against_meka(
     store: Store,
     channels: Arc<ChannelRegistry>,
     attachment_dir: std::path::PathBuf,
     presence: Arc<Presence>,
     meka_address: SocketAddr,
 ) -> BridgeSink {
+    let accounts = mock_accounts(&store).await;
     let storage = StorageConfig {
         path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
         attachment_dir,
@@ -1173,6 +1176,7 @@ fn sink_against_meka(
         },
         meka,
         presence,
+        accounts,
     )
 }
 
@@ -1217,13 +1221,12 @@ allowed_users = [1]
     config
 }
 
-fn message(text: &str, external_id: &str) -> InboundEvent {
+fn message(text: &str, message_id: &str) -> InboundEvent {
     InboundEvent::Message(Box::new(InboundMessage {
         channel: ChannelId::new("mock"),
         platform: Platform::Telegram,
         conversation: ConversationId::parse("mock:1").expect("valid"),
-        external_id: external_id.to_string(),
-        message_id: external_id.to_string(),
+        message_id: message_id.to_string(),
         chat_kind: ChatKind::Direct,
         chat_title: None,
         sender: Sender {
@@ -1247,6 +1250,49 @@ fn message(text: &str, external_id: &str) -> InboundEvent {
         attachments: Vec::new(),
         timestamp: Utc::now(),
     }))
+}
+
+/// Register the mock channel's account, as the daemon does for every channel at startup.
+///
+/// The identity is what [`MockChannel::probe`] reports, since that is where the daemon gets it.
+/// Idempotent, so a test may call it as often as it needs the id: the same bot keeps its row.
+async fn mock_account(store: &Store) -> AccountId {
+    store
+        .register_account(
+            "mock",
+            "telegram",
+            &AccountIdentity {
+                platform_id: "1".to_string(),
+                username: Some("mockbot".to_string()),
+                display_name: Some("Mock".to_string()),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("account registers")
+        .account
+}
+
+/// The map the daemon builds at startup, over the mock channel alone.
+async fn mock_accounts(store: &Store) -> Arc<ChannelAccounts> {
+    let account = mock_account(store).await;
+    let mut accounts = ChannelAccounts::default();
+    accounts.add("mock", account, "@mockbot".to_string());
+    Arc::new(accounts)
+}
+
+/// Alice's direct chat, as the writer would have recorded it on her first message.
+fn direct_conversation(address: &str) -> ConversationRecord {
+    ConversationRecord {
+        address: address.to_string(),
+        channel: "mock".to_string(),
+        platform: "telegram".to_string(),
+        title: Some("Alice".to_string()),
+        kind: "direct".to_string(),
+        created_at: Utc::now(),
+        last_inbound_at: Some(Utc::now()),
+        last_outbound_at: None,
+    }
 }
 
 /// Everything a test needs, wired the way the daemon wires it.
@@ -1503,6 +1549,7 @@ impl Harness {
         let store = Store::open(&config.storage.path)
             .await
             .expect("store opens");
+        let accounts = mock_accounts(&store).await;
         let channel = Arc::new(MockChannel::new("mock"));
         let channels = Arc::new(ChannelRegistry::from_channels([
             Arc::clone(&channel) as Arc<dyn Channel>
@@ -1519,7 +1566,8 @@ impl Harness {
             let config = Arc::clone(&config);
             let wake = Arc::clone(&wake);
             let typing = Arc::clone(&typing);
-            async move { inbound::writer(store, config, receiver, wake, typing).await }
+            let accounts = Arc::clone(&accounts);
+            async move { inbound::writer(store, config, receiver, wake, typing, accounts).await }
         });
         tokio::spawn({
             let context = DrainContext {
@@ -1537,7 +1585,7 @@ impl Harness {
                     config.bridge.typing_max,
                     Arc::new(Presence::default()),
                 ),
-                identities: Arc::new(tokio::sync::OnceCell::new()),
+                accounts: Arc::clone(&accounts),
                 permission_checked: Arc::new(tokio::sync::OnceCell::new()),
                 notices: inbound::NoticeLog::default(),
             };
@@ -2623,23 +2671,23 @@ async fn queued_messages_survive_a_restart() {
     {
         let store = Store::open(&database).await.expect("opens");
         store
-            .upsert_conversation(ConversationRecord {
-                id: "mock:1".to_string(),
-                channel_id: "mock".to_string(),
-                platform: "telegram".to_string(),
-                chat: "1".to_string(),
-                thread: None,
-                title: Some("Alice".to_string()),
-                kind: "direct".to_string(),
-                created_at: Utc::now(),
-                last_inbound_at: Some(Utc::now()),
-                last_outbound_at: None,
-            })
+            .upsert_conversation(direct_conversation("mock:1"))
             .await
             .expect("conversation");
+        let account = mock_account(&store).await;
         let payload = serde_json::to_string(&message("do not lose me", "1")).expect("encodes");
         store
-            .enqueue("mock:1", "1", &payload, Utc::now(), 64)
+            .enqueue(
+                MessageKey {
+                    conversation: "mock:1",
+                    account,
+                    message_id: "1",
+                    revision: 0,
+                },
+                &payload,
+                Utc::now(),
+                64,
+            )
             .await
             .expect("enqueued");
         store
@@ -2656,6 +2704,7 @@ async fn queued_messages_survive_a_restart() {
     let store = Store::open(&config.storage.path).await.expect("opens");
     let recovered = store.reset_in_flight().await.expect("recovers");
     assert_eq!(recovered, 1);
+    let accounts = mock_accounts(&store).await;
 
     let channel = Arc::new(MockChannel::new("mock"));
     let channels = Arc::new(ChannelRegistry::from_channels(
@@ -2679,7 +2728,7 @@ async fn queued_messages_survive_a_restart() {
                 Duration::from_secs(30),
                 Arc::new(Presence::default()),
             ),
-            identities: Arc::new(tokio::sync::OnceCell::new()),
+            accounts: Arc::clone(&accounts),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             notices: inbound::NoticeLog::default(),
         };
@@ -2718,18 +2767,7 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
         .await
         .expect("opens");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
 
@@ -2737,7 +2775,7 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = sink_for(store.clone(), channels);
+    let sink = sink_for(store.clone(), channels).await;
 
     let ids = sink
         .send_text("mock:1", "**hello**", SendOptions::default(), None)
@@ -2761,8 +2799,8 @@ async fn the_sink_delivers_to_the_channel_and_records_the_send() {
 }
 
 /// A message that names the agent, which is what wakes a muted conversation.
-fn mention(text: &str, external_id: &str) -> InboundEvent {
-    let mut event = message(text, external_id);
+fn mention(text: &str, message_id: &str) -> InboundEvent {
+    let mut event = message(text, message_id);
     let InboundEvent::Message(inner) = &mut event else {
         panic!("a message was built just above");
     };
@@ -2771,8 +2809,8 @@ fn mention(text: &str, external_id: &str) -> InboundEvent {
 }
 
 /// The same message, in a second direct chat.
-fn message_elsewhere(text: &str, external_id: &str) -> InboundEvent {
-    let mut event = message(text, external_id);
+fn message_elsewhere(text: &str, message_id: &str) -> InboundEvent {
+    let mut event = message(text, message_id);
     let InboundEvent::Message(inner) = &mut event else {
         panic!("a message was built just above");
     };
@@ -2784,8 +2822,8 @@ fn message_elsewhere(text: &str, external_id: &str) -> InboundEvent {
 }
 
 /// A message in a group nobody has ruled on, which is the shape an upgrade inherits.
-fn group_message(text: &str, external_id: &str, addressed: bool) -> InboundEvent {
-    let mut event = message(text, external_id);
+fn group_message(text: &str, message_id: &str, addressed: bool) -> InboundEvent {
+    let mut event = message(text, message_id);
     let InboundEvent::Message(inner) = &mut event else {
         panic!("a message was built just above");
     };
@@ -2881,7 +2919,14 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Block, None, Some("too noisy"), Utc::now())
+        .set_policy(
+            "mock:1",
+            "telegram",
+            Policy::Block,
+            None,
+            Some("too noisy"),
+            Utc::now(),
+        )
         .await
         .expect("block");
 
@@ -3241,7 +3286,7 @@ async fn a_backlog_survives_a_turn_whose_message_meka_withdrew() {
     let harness = Harness::start_failing(1, FailureKind::RateLimited, Setup::default()).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
 
@@ -3287,7 +3332,7 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
 
@@ -3357,6 +3402,7 @@ async fn a_listening_window_closing_actually_reaches_the_agent() {
         .store
         .set_policy(
             "mock:-100",
+            "telegram",
             Policy::Active,
             Some(Utc::now() - chrono::Duration::minutes(1)),
             Some("design discussion"),
@@ -3407,7 +3453,7 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
 
@@ -3415,18 +3461,7 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
     // possible moment for the old window: it opened a heartbeat ago.
     harness
         .store
-        .touch_outbound(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: None,
-            kind: ChatKind::Unknown.as_str().to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: None,
-            last_outbound_at: Some(Utc::now()),
-        })
+        .touch_outbound("mock:1", "telegram", Utc::now())
         .await
         .expect("outbound");
 
@@ -3473,7 +3508,7 @@ async fn a_refusal_that_is_not_the_409_does_not_spend_the_backlog_either() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = 2;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
     for index in 0..4 {
@@ -3531,7 +3566,7 @@ async fn a_refused_submission_does_not_spend_the_backlog_it_reported() {
     let harness = Harness::start_impatient(3).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
     for index in 0..4 {
@@ -3576,7 +3611,7 @@ async fn unmuting_reports_the_backlog_once_and_then_stops() {
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Mute, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())
         .await
         .expect("mute");
     for index in 0..4 {
@@ -3591,7 +3626,7 @@ async fn unmuting_reports_the_backlog_once_and_then_stops() {
 
     harness
         .store
-        .set_policy("mock:1", Policy::Active, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Active, None, None, Utc::now())
         .await
         .expect("unmute");
     harness
@@ -3635,7 +3670,7 @@ async fn an_expired_block_lets_the_next_message_through_and_reports_the_damage()
     let harness = Harness::start(1, 0).await;
     harness
         .store
-        .set_policy("mock:1", Policy::Block, None, None, Utc::now())
+        .set_policy("mock:1", "telegram", Policy::Block, None, None, Utc::now())
         .await
         .expect("block");
     harness
@@ -3652,6 +3687,7 @@ async fn an_expired_block_lets_the_next_message_through_and_reports_the_damage()
         .store
         .set_policy(
             "mock:1",
+            "telegram",
             Policy::Block,
             Some(Utc::now() - chrono::Duration::seconds(1)),
             None,
@@ -3707,7 +3743,7 @@ async fn the_sink_delivers_to_a_conversation_it_has_never_seen() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = sink_for(store.clone(), channels);
+    let sink = sink_for(store.clone(), channels).await;
 
     sink.send_text("mock:999", "hello", SendOptions::default(), None)
         .await
@@ -3724,7 +3760,7 @@ async fn the_sink_delivers_to_a_conversation_it_has_never_seen() {
         .await
         .expect("read")
         .expect("the send registers the conversation");
-    assert_eq!(record.chat, "999");
+    assert_eq!(record.channel, "mock");
     assert_eq!(
         record.kind, "unknown",
         "nothing about the chat's shape is known from a send alone"
@@ -3743,18 +3779,16 @@ async fn an_inbound_message_fills_in_what_a_send_could_not_know() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
     ]));
-    let sink = sink_for(store.clone(), channels);
+    let sink = sink_for(store.clone(), channels).await;
 
     sink.send_text("mock:7", "first contact", SendOptions::default(), None)
         .await
         .expect("sends");
     store
         .upsert_conversation(ConversationRecord {
-            id: "mock:7".to_string(),
-            channel_id: "mock".to_string(),
+            address: "mock:7".to_string(),
+            channel: "mock".to_string(),
             platform: "telegram".to_string(),
-            chat: "7".to_string(),
-            thread: None,
             title: Some("Deploy Crew".to_string()),
             kind: "group".to_string(),
             created_at: Utc::now(),
@@ -3787,7 +3821,7 @@ async fn the_sink_still_refuses_ids_it_cannot_route() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = sink_for(store, channels);
+    let sink = sink_for(store, channels).await;
 
     // Unrestricted means "any chat", not "any string". These two fail here because no channel could
     // act on them at all, which is different from a chat the platform will reject.
@@ -3815,24 +3849,13 @@ async fn the_sink_lists_conversations_for_the_agent() {
         .await
         .expect("opens");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
     ]));
-    let sink = sink_for(store, channels);
+    let sink = sink_for(store, channels).await;
 
     let listed = sink.conversations(None, 10).await.expect("lists");
     assert_eq!(listed.len(), 1);
@@ -4041,18 +4064,7 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
         .await
         .expect("store");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
 
@@ -4062,11 +4074,14 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
 
+    let account = mock_account(&store).await;
     let handle = store
         .register_attachment(mekabridge::store::AttachmentRecord {
-            id: "mock:1:1:0".to_string(),
-            conversation_id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: "1".to_string(),
+            revision: 0,
+            position: 0,
             kind: "video".to_string(),
             file_ref: "AgACvideo".to_string(),
             thumb_ref: Some("AgACthumb".to_string()),
@@ -4086,7 +4101,8 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
         directory.path().to_path_buf(),
         Arc::new(Presence::default()),
         address,
-    );
+    )
+    .await;
     let viewed = sink.view_attachment(&handle).await.expect("resolves");
     shutdown.cancel();
 
@@ -4528,18 +4544,7 @@ async fn attachments_are_announced_with_a_handle_and_nothing_is_downloaded() {
 async fn the_agent_can_view_an_attachment_as_an_image() {
     let store = Store::open_in_memory().await.expect("store");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
 
@@ -4549,11 +4554,14 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
 
+    let account = mock_account(&store).await;
     let handle = store
         .register_attachment(mekabridge::store::AttachmentRecord {
-            id: "mock:1:1:0".to_string(),
-            conversation_id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: "1".to_string(),
+            revision: 0,
+            position: 0,
             kind: "photo".to_string(),
             file_ref: "AgACphoto".to_string(),
             thumb_ref: None,
@@ -4572,7 +4580,8 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
         channels,
         directory.path().to_path_buf(),
         Arc::new(Presence::default()),
-    );
+    )
+    .await;
 
     // meka is unreachable here, so the vision probe fails and the sink degrades to a description
     // rather than pretending the model can see.
@@ -4610,7 +4619,7 @@ async fn an_unknown_attachment_handle_is_a_clear_error() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = sink_for(store, channels);
+    let sink = sink_for(store, channels).await;
 
     let error = sink
         .view_attachment("9999")
@@ -4634,7 +4643,8 @@ async fn a_file_send_with_no_files_is_refused_by_the_sink() {
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::new(Presence::default()),
-    );
+    )
+    .await;
 
     let error = sink
         .send_file("mock:1", &[], None, FileOptions::default(), None)
@@ -4667,7 +4677,8 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::new(Presence::default()),
-    );
+    )
+    .await;
 
     sink.send_text(
         "mock:1",
@@ -4737,18 +4748,7 @@ async fn sending_a_message_stops_the_typing_indicator() {
     // keeps the refresh loop from re-arming an indicator Telegram has already cleared.
     let store = Store::open_in_memory().await.expect("store");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
 
@@ -4762,7 +4762,8 @@ async fn sending_a_message_stops_the_typing_indicator() {
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::clone(&presence),
-    );
+    )
+    .await;
 
     let conversation = ConversationId::parse("mock:1").expect("valid");
     assert!(!presence.has_replied(&conversation));
@@ -4784,18 +4785,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
 
     let store = Store::open_in_memory().await.expect("store");
     store
-        .upsert_conversation(ConversationRecord {
-            id: "mock:1".to_string(),
-            channel_id: "mock".to_string(),
-            platform: "telegram".to_string(),
-            chat: "1".to_string(),
-            thread: None,
-            title: Some("Alice".to_string()),
-            kind: "direct".to_string(),
-            created_at: Utc::now(),
-            last_inbound_at: Some(Utc::now()),
-            last_outbound_at: None,
-        })
+        .upsert_conversation(direct_conversation("mock:1"))
         .await
         .expect("conversation");
 
@@ -4809,7 +4799,8 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::clone(&presence),
-    );
+    )
+    .await;
 
     sink.send_file(
         "mock:1",
@@ -4863,11 +4854,12 @@ async fn a_message_arriving_mid_turn_is_flagged_in_the_next_envelope() {
 }
 
 /// A sink whose history retention can be turned off, for the one test that needs it.
-fn sink_with_retention(
+async fn sink_with_retention(
     store: Store,
     channels: Arc<ChannelRegistry>,
     history_retention: Duration,
 ) -> BridgeSink {
+    let accounts = mock_accounts(&store).await;
     let storage = StorageConfig {
         path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
         attachment_dir: std::env::temp_dir().join("mekabridge-test-attachments"),
@@ -4897,6 +4889,7 @@ fn sink_with_retention(
         },
         meka,
         Arc::new(Presence::default()),
+        accounts,
     )
 }
 
@@ -4912,7 +4905,8 @@ async fn own_message_harness() -> (BridgeSink, Arc<MockChannel>, Store) {
         channels,
         std::env::temp_dir().join("mekabridge-test-attachments"),
         Arc::new(Presence::default()),
-    );
+    )
+    .await;
     (sink, channel, store)
 }
 
@@ -5078,7 +5072,7 @@ async fn history_switched_off_records_nothing_the_agent_sent() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let sink = sink_with_retention(store.clone(), channels, Duration::ZERO);
+    let sink = sink_with_retention(store.clone(), channels, Duration::ZERO).await;
 
     sink.send_text("mock:1", "on it", SendOptions::default(), None)
         .await
@@ -5108,10 +5102,9 @@ async fn an_edit_from_the_platform_supersedes_the_wording_it_replaced() {
         .expect("queued");
     await_history(&harness, 1, "the original to be recorded").await;
 
-    let InboundEvent::Message(mut revision) = message("meet at five", "12:e1") else {
+    let InboundEvent::Message(mut revision) = message("meet at five", "12") else {
         panic!("the builder makes a message");
     };
-    revision.message_id = "12".to_string();
     revision.edited_at = Some(Utc::now());
     harness
         .sender
@@ -5146,11 +5139,16 @@ async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
     // was not the bot's from one nobody bothered to check.
     let (sink, _channel, store) = own_message_harness().await;
     store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    store
         .record_message(mekabridge::store::MessageRecord {
             id: 0,
-            conversation_id: "mock:1".to_string(),
-            external_id: "local".to_string(),
+            conversation: "mock:1".to_string(),
+            account: mock_account(&store).await,
             message_id: "local".to_string(),
+            revision: 0,
             sender_id: Some("1".to_string()),
             sender_name: "Alice".to_string(),
             text: "a locally recorded match".to_string(),
@@ -5163,6 +5161,7 @@ async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
             deleted_at: None,
             superseded_at: None,
             timestamp: Utc::now(),
+            previous_account: false,
         })
         .await
         .expect("record");

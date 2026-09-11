@@ -92,6 +92,9 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `giving up on messages after N attempt(s)` | The batch is `failed`. The chat is told something went wrong, the owner is told what, and the message goes back to being unseen |
 | `inbound queue is full` | Messages are being shed; the agent is told how many in the next envelope |
 | `recovered messages that were in flight` | The previous run died mid-turn |
+| `logged in` | Which account a channel resolved to at startup, which is what every message it records is keyed on |
+| `this channel is logged in as a different account than last time` | The bot behind a channel was replaced. Nothing is lost, but messages recorded under the old account cannot be replied to, reacted to, edited, or deleted from the new one, and the history tools mark them |
+| `could not find out which account this channel is logged in as` | The platform did not answer the startup probe, so the channel is not started this run; the others are unaffected |
 | `meka no longer knows session ...` | The session was deleted in meka; a replacement is created and the agent's memory is gone |
 | `meka asked for permission` | Unexpected: sessions declare they cannot answer prompts, so meka should deny without asking |
 | `the turn was cancelled ... having done nothing` | meka stopped the turn before the agent had acted, most often because the stream went away for longer than `[serve].stream_reattach_grace`. The batch goes back to the queue |
@@ -128,7 +131,9 @@ For a deeper check, `mekabridge doctor` exits non-zero when something would actu
 
 Everything durable is in the SQLite database at `[storage].path`. Back it up with `sqlite3 state.db ".backup out.db"` rather than copying the file, since WAL mode means a plain copy can catch a torn state.
 
-The database holds the session binding, the conversation address book, the queue, and, since 0.3.0, a record of every message from every conversation the agent is not blocking. It does not hold the agent's side of the conversation or its reasoning; that lives inside meka's own session database.
+The database holds the session binding, the account each channel has been logged in as, the conversation address book, the queue, and, since 0.3.0, a record of every message from every conversation the agent is not blocking. It does not hold the agent's side of the conversation or its reasoning; that lives inside meka's own session database.
+
+Upgrading to 0.13.0 rebuilds every table on the first start, which is one-way: an older build refuses to open the result rather than misread it. Take the backup first.
 
 That last part is what `read_history` and `search_history` read, and it makes the file as sensitive as the chats in it. `[storage].history_retention` bounds how far back it goes, and `"0s"` turns it off. See [Security](./security.md).
 
@@ -199,6 +204,8 @@ against `https://api.telegram.org/`, since plain `curl` hides it by falling back
 **The agent says it cannot see an image.** Check that it actually called `view_attachment`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the profile has `vision = false`; `mekabridge doctor` reports the setting.
 
 **The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is blocked. Run with `-v` to see the drop at debug level, and check `mekabridge policy list`.
+
+**The bot was deleted and recreated.** Put the new token in the same channel entry and restart; nothing else is needed. The bridge asks each channel which account it is logged in as at startup and records it, so the next start logs `this channel is logged in as a different account than last time` at warn, and `mekabridge status` names the account. Conversation ids do not change, since a private chat's id is the person's own, and policies and `owner_conversation` carry over. Message ids do: Telegram numbers a private chat per bot, so the new bot starts again at 1, and everything recorded under the old bot is marked `previous_account` by `read_history` and `[previous bot account]` by `mekabridge history`, because the new bot cannot reply to, react to, edit, or delete those. Before 0.13.0 the new bot's messages collided with the old bot's in the database and were silently dropped, not delivered and not recorded, for as long as the old rows were within retention.
 
 **The bot has gone quiet in a group and nothing looks broken.** Most likely it is working as configured: groups default to `mute`, so the agent is woken only when somebody mentions it or replies to it. `mekabridge policy list` shows the defaults and any conversation ruled on individually, and `mekabridge history <id>` shows what is being recorded but withheld. If you want it woken by everything there, `mekabridge policy set <id> active`.
 

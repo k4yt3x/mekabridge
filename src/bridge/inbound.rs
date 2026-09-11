@@ -17,13 +17,17 @@ use uuid::Uuid;
 
 use crate::{
     bridge::{
+        ChannelAccounts,
         envelope::{Envelope, MissedContext, MissedMessage},
         turn::{TurnReport, TurnRunner},
     },
     channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
     meka::{MekaClient, MekaError, TurnOutcome},
-    store::{ConversationRecord, EnqueueOutcome, Policy, PolicyRecord, QueuedMessage, Store},
+    store::{
+        AccountId, ConversationRecord, EnqueueOutcome, MessageKey, Policy, PolicyRecord,
+        QueuedMessage, Store,
+    },
 };
 
 /// Safety-net poll interval. The writer notifies the drain loop directly, so this only covers rows
@@ -169,12 +173,18 @@ impl TypingState {
 /// Persist events from every channel into the queue.
 ///
 /// Runs until the sender side closes, which happens when all channels have stopped.
+///
+/// `accounts` says which account each channel is logged in as, and is part of the identity of
+/// everything written here: a message from a channel whose account is unknown cannot be told apart
+/// from the same message id under a bot that was since replaced, so it is refused rather than
+/// filed.
 pub async fn writer(
     store: Store,
     config: Arc<Config>,
     mut events: mpsc::Receiver<InboundEvent>,
     wake_drain: Arc<Notify>,
     typing: Arc<TypingState>,
+    accounts: Arc<ChannelAccounts>,
 ) {
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
@@ -193,8 +203,16 @@ pub async fn writer(
                 timestamp,
                 ..
             } => {
+                let Some(account) = accounts.get(conversation.channel()) else {
+                    tracing::error!(
+                        conversation = %conversation,
+                        "no account is registered for this channel, so a deletion cannot be \
+                         recorded"
+                    );
+                    continue;
+                };
                 match store
-                    .mark_deleted(conversation.as_str(), message_id, *timestamp)
+                    .mark_deleted(conversation.as_str(), account, message_id, *timestamp)
                     .await
                 {
                     Ok(true) => tracing::debug!(
@@ -220,6 +238,16 @@ pub async fn writer(
                 typing.note(&conversation, author, *timestamp);
                 continue;
             }
+        };
+        let Some(account) = accounts.get(message.channel.as_str()) else {
+            // Unreachable while `run` only starts channels whose account resolved, and refused
+            // rather than recorded under nothing if that ever changes: a row with no account has
+            // no identity to be deduplicated by.
+            tracing::error!(
+                conversation = %conversation,
+                "no account is registered for this channel, so the message cannot be recorded"
+            );
+            continue;
         };
         let disposition = match gate(&store, &config, message).await {
             Ok(disposition) => disposition,
@@ -252,7 +280,7 @@ pub async fn writer(
             tracing::error!(conversation = %conversation, "failed to record conversation: {}", error);
             continue;
         }
-        if let Err(error) = register_attachments(&store, message).await {
+        if let Err(error) = register_attachments(&store, message, account).await {
             // Registration is what mints the handles the agent fetches by, so without it the files
             // are unreachable. The message still goes through: its text is usually the point, and
             // the envelope says the attachment cannot be fetched rather than pretending otherwise.
@@ -264,13 +292,15 @@ pub async fn writer(
         // qualifies: it was queued, or it duplicates one already queued, or it was shed and counted
         // into the notice the next envelope carries. Only a withheld message is genuinely owed.
         let queued = disposition == Disposition::Deliver;
-        if let Err(error) = record_message(&store, &config, message, queued).await {
+        if let Err(error) = record_message(&store, &config, message, account, queued).await {
             tracing::error!(conversation = %conversation, "failed to record a message: {}", error);
         }
 
         // Taken while the message is still borrowed, since the queue path below serializes the
         // whole event and cannot hold that borrow at the same time.
         let sender_id = message.sender.id.clone();
+        let message_id = message.message_id.clone();
+        let revision = message.revision();
 
         // A withheld message stops before the queue. It is recorded, so the agent can read it when
         // something finally does wake this conversation, but it consumes no queue depth and costs
@@ -286,8 +316,12 @@ pub async fn writer(
 
             let outcome = store
                 .enqueue(
-                    conversation.as_str(),
-                    event.external_id(),
+                    MessageKey {
+                        conversation: conversation.as_str(),
+                        account,
+                        message_id: &message_id,
+                        revision,
+                    },
                     &payload,
                     event.timestamp(),
                     config.bridge.max_queue_depth,
@@ -306,7 +340,8 @@ pub async fn writer(
                 Ok(EnqueueOutcome::Duplicate) => {
                     tracing::debug!(
                         conversation = %conversation,
-                        external_id = event.external_id(),
+                        message_id = %message_id,
+                        revision,
                         "ignoring a redelivered message"
                     );
                 }
@@ -597,11 +632,22 @@ async fn missed_context(
     (collected, spent)
 }
 
+/// What identifies `message` in the store, once the account that received it is known.
+fn key_of(message: &InboundMessage, account: AccountId) -> MessageKey<'_> {
+    MessageKey {
+        conversation: message.conversation.as_str(),
+        account,
+        message_id: &message.message_id,
+        revision: message.revision(),
+    }
+}
+
 /// Write one message to the history, unless history is switched off.
 async fn record_message(
     store: &Store,
     config: &Config,
     message: &InboundMessage,
+    account: AccountId,
     queued: bool,
 ) -> Result<(), crate::store::StoreError> {
     if config.storage.history_retention.is_zero() {
@@ -611,18 +657,17 @@ async fn record_message(
         .record_message(crate::store::MessageRecord {
             // Assigned by the store on insert.
             id: 0,
-            conversation_id: message.conversation.as_str().to_string(),
-            external_id: message.external_id.clone(),
+            conversation: message.conversation.as_str().to_string(),
+            account,
             message_id: message.message_id.clone(),
+            revision: message.revision(),
             sender_id: (!message.sender.id.is_empty()).then(|| message.sender.id.clone()),
             sender_name: message.sender.display_name.clone(),
             text: message.text.clone(),
             notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
-            attachments: message
-                .attachments
-                .iter()
-                .filter_map(|attachment| attachment.handle.clone())
-                .collect(),
+            // Read back from the registry rather than written here; the files were registered
+            // against this same key just before.
+            attachments: Vec::new(),
             addressed: message.addressed,
             // A queued message is one the agent is about to be handed, so it is accounted for
             // already and must not also be offered back to it later as context it missed.
@@ -632,6 +677,7 @@ async fn record_message(
             deleted_at: None,
             superseded_at: None,
             timestamp: message.timestamp,
+            previous_account: false,
         })
         .await?;
     // An edit is recorded as a row of its own, since the queue needs a distinct key to deliver it
@@ -639,12 +685,7 @@ async fn record_message(
     // `read_history` returning the old and the new wording as two messages that both look current.
     if let Some(edited_at) = message.edited_at {
         store
-            .supersede_message(
-                message.conversation.as_str(),
-                &message.message_id,
-                &message.external_id,
-                edited_at,
-            )
+            .supersede_message(key_of(message, account), edited_at)
             .await?;
     }
     Ok(())
@@ -657,16 +698,17 @@ async fn record_message(
 async fn register_attachments(
     store: &Store,
     message: &mut InboundMessage,
+    account: AccountId,
 ) -> Result<(), crate::store::StoreError> {
-    super::register_files(
-        store,
-        &message.conversation,
-        &message.channel,
-        &message.external_id,
-        message.timestamp,
-        &mut message.attachments,
-    )
-    .await
+    // Spelled out rather than taken from `key_of`, which would borrow the whole message while the
+    // attachments are borrowed mutably.
+    let key = MessageKey {
+        conversation: message.conversation.as_str(),
+        account,
+        message_id: &message.message_id,
+        revision: crate::channel::revision_of(message.edited_at),
+    };
+    super::register_files(store, key, message.timestamp, &mut message.attachments).await
 }
 
 /// Store the conversation an event came from, so it stays in the address book the agent can list.
@@ -676,11 +718,9 @@ async fn record_conversation(
 ) -> Result<(), crate::store::StoreError> {
     store
         .upsert_conversation(ConversationRecord {
-            id: message.conversation.as_str().to_string(),
-            channel_id: message.channel.as_str().to_string(),
+            address: message.conversation.as_str().to_string(),
+            channel: message.channel.as_str().to_string(),
             platform: message.platform.as_str().to_string(),
-            chat: message.conversation.chat().to_string(),
-            thread: message.conversation.thread().map(str::to_string),
             title: message
                 .chat_title
                 .clone()
@@ -700,8 +740,9 @@ pub struct DrainContext {
     pub meka: MekaClient,
     pub channels: Arc<ChannelRegistry>,
     pub runner: TurnRunner,
-    /// The account the agent appears as on each channel, resolved on first use.
-    pub identities: Arc<tokio::sync::OnceCell<ChannelIdentities>>,
+    /// Which account each channel is logged in as, for the envelope's orientation line and for
+    /// keying what a failed batch owes.
+    pub accounts: Arc<ChannelAccounts>,
     /// Guards the one-per-process reconciliation of the session's permission level.
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
     /// Who is composing right now, so a conversation can be held until they stop.
@@ -775,10 +816,6 @@ pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: Canc
         }
     }
 }
-
-/// Which account the agent appears as on each channel, as `(channel, identity)`. The identity is
-/// `None` when the platform could not be reached to ask.
-pub type ChannelIdentities = Vec<(String, Option<String>)>;
 
 /// When a turn ran, so the next batch can tell which of its messages arrived while it was running.
 #[derive(Debug, Clone, Copy)]
@@ -868,7 +905,7 @@ async fn readiness(context: &DrainContext) -> Readiness {
         // needs a clock skewed by more than the ceiling or a delivery delayed by as much, and the
         // parts still all reach the agent, the later ones flagged `late:`.
         if waited >= settle_max {
-            ready.push(window.conversation_id);
+            ready.push(window.conversation);
             continue;
         }
         let quiet_for = elapsed(window.newest);
@@ -876,8 +913,8 @@ async fn readiness(context: &DrainContext) -> Readiness {
         // somebody is composing, and for the quiet period after they stop, both only where the
         // platform reports typing: without that signal there is nothing to wait on and any wait is
         // a guess.
-        let hold = if !settle.is_zero() && reports_typing(context, &window.conversation_id) {
-            if context.typing.active(&window.conversation_id) {
+        let hold = if !settle.is_zero() && reports_typing(context, &window.conversation) {
+            if context.typing.active(&window.conversation) {
                 // Nothing to count down to yet: look again on the next tick, and let the ceiling
                 // be what eventually forces the issue.
                 let remaining = TYPING_TTL.min(settle_max.saturating_sub(waited));
@@ -896,7 +933,7 @@ async fn readiness(context: &DrainContext) -> Readiness {
             soonest = Some(soonest.map_or(remaining, |soonest| soonest.min(remaining)));
             continue;
         }
-        ready.push(window.conversation_id);
+        ready.push(window.conversation);
     }
     Readiness {
         ready,
@@ -1024,7 +1061,7 @@ async fn deliver(
         }
     };
 
-    let identities = channel_identities(context).await;
+    let identities = context.accounts.identities();
 
     let (missed, withheld) = missed_context(context, &events).await;
 
@@ -1035,7 +1072,7 @@ async fn deliver(
     let message = Envelope {
         events: &events,
         dropped,
-        identities: &identities,
+        identities,
         missed: &missed,
         nonce: &nonce,
         recovered,
@@ -1081,7 +1118,7 @@ async fn deliver(
                 let message = Envelope {
                     events: &events,
                     dropped,
-                    identities: &identities,
+                    identities,
                     // Reused rather than recomputed: taking it again would come back empty, because
                     // the first call marked it seen.
                     missed: &missed,
@@ -1564,19 +1601,15 @@ async fn record_failure(context: &DrainContext, sequences: &[i64], failure: &Fai
     // the two happened rather than promised the recoverable one.
     let mut recoverable = false;
     for message in &outcome.exhausted {
-        match context
-            .store
-            .mark_unseen(&message.conversation_id, &message.external_id)
-            .await
-        {
+        match context.store.mark_unseen(message.key()).await {
             Ok(marked) => recoverable |= marked,
             Err(error) => tracing::error!(
-                conversation = %message.conversation_id,
+                conversation = %message.conversation,
                 "failed to mark an undeliverable message unseen: {}",
                 error
             ),
         }
-        if let Some(conversation) = ConversationId::parse(&message.conversation_id) {
+        if let Some(conversation) = ConversationId::parse(&message.conversation) {
             affected.insert(conversation);
         }
     }
@@ -1742,11 +1775,18 @@ async fn notify(context: &DrainContext, conversation: &ConversationId, text: &st
     // distinguishes it: the row says the account spoke and names no session behind it, so the agent
     // reading the conversation back finds the notice where the people it was sent to see it,
     // instead of finding replies to something it has no record of.
+    let Some(account) = context.accounts.get(channel.id().as_str()) else {
+        tracing::warn!(
+            conversation = %conversation,
+            "not recording the notice: the channel's account is unknown"
+        );
+        return;
+    };
     super::record_own_messages(
         &context.store,
         context.config.storage.history_retention,
         conversation,
-        channel.id(),
+        account,
         None,
         sent,
         None,
@@ -1816,37 +1856,6 @@ impl NoticeLog {
         notice.at = Some(now);
         Some(std::mem::take(&mut notice.suppressed))
     }
-}
-
-/// Which account the agent appears as on each channel, resolved once and remembered.
-///
-/// Cached because it is a network round trip per channel and the answer effectively never changes;
-/// a rename is picked up on the next restart. A failed probe is not cached, so a channel that was
-/// unreachable at first gets named once it comes back.
-async fn channel_identities(context: &DrainContext) -> ChannelIdentities {
-    if let Some(known) = context.identities.get() {
-        return known.clone();
-    }
-    let mut identities = Vec::new();
-    let mut complete = true;
-    for channel in context.channels.iter() {
-        let label = match channel.probe().await {
-            Ok(identity) => identity
-                .username
-                .map(|username| format!("@{username}"))
-                .or(Some(identity.display_name)),
-            Err(error) => {
-                tracing::debug!(channel = %channel.id(), "could not probe identity: {}", error);
-                complete = false;
-                None
-            }
-        };
-        identities.push((channel.id().as_str().to_string(), label));
-    }
-    if complete {
-        let _ = context.identities.set(identities.clone());
-    }
-    identities
 }
 
 /// Bring a session's permission level in line with `[session].permission`.
@@ -1966,7 +1975,6 @@ mod tests {
             channel: ChannelId::new("telegram"),
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:1").expect("valid"),
-            external_id: "1".to_string(),
             message_id: "1".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
@@ -1993,15 +2001,27 @@ mod tests {
         }
     }
 
-    async fn store() -> Store {
+    async fn store() -> (Store, AccountId) {
         let store = Store::open_in_memory().await.expect("opens");
+        let account = store
+            .register_account(
+                "telegram",
+                "telegram",
+                &crate::store::AccountIdentity {
+                    platform_id: "4242".to_string(),
+                    username: Some("mybot".to_string()),
+                    display_name: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("account")
+            .account;
         store
             .upsert_conversation(ConversationRecord {
-                id: "telegram:1".to_string(),
-                channel_id: "telegram".to_string(),
+                address: "telegram:1".to_string(),
+                channel: "telegram".to_string(),
                 platform: "telegram".to_string(),
-                chat: "1".to_string(),
-                thread: None,
                 title: Some("Alice".to_string()),
                 kind: "direct".to_string(),
                 created_at: Utc::now(),
@@ -2010,16 +2030,16 @@ mod tests {
             })
             .await
             .expect("conversation");
-        store
+        (store, account)
     }
 
     #[tokio::test]
     async fn registration_stamps_a_handle_onto_every_attachment() {
         // The handle is the agent's only way to reach the file, and it has to be on the event
         // before the payload is serialized or it does not survive a restart.
-        let store = store().await;
+        let (store, account) = store().await;
         let mut event = event_with(vec![attachment("AgACx1"), attachment("AgACx2")]);
-        register_attachments(&store, &mut event)
+        register_attachments(&store, &mut event, account)
             .await
             .expect("registers");
 
@@ -2043,13 +2063,13 @@ mod tests {
         // Telegram replays updates whose offset was never committed. Minting a second handle for
         // the same file would leave an orphan row the sweep later deletes out from under
         // the agent.
-        let store = store().await;
+        let (store, account) = store().await;
         let mut first = event_with(vec![attachment("AgACx1")]);
-        register_attachments(&store, &mut first)
+        register_attachments(&store, &mut first, account)
             .await
             .expect("registers");
         let mut second = event_with(vec![attachment("AgACx1")]);
-        register_attachments(&store, &mut second)
+        register_attachments(&store, &mut second, account)
             .await
             .expect("registers again");
 
@@ -2060,9 +2080,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_registered_attachment_can_be_looked_up_by_its_handle() {
-        let store = store().await;
+        let (store, account) = store().await;
         let mut event = event_with(vec![attachment("AgACx1")]);
-        register_attachments(&store, &mut event)
+        register_attachments(&store, &mut event, account)
             .await
             .expect("registers");
 
@@ -2077,15 +2097,15 @@ mod tests {
             .expect("query")
             .expect("the handle resolves");
         assert_eq!(record.file_ref, "AgACx1");
-        assert_eq!(record.channel_id, "telegram");
+        assert_eq!(record.channel, "telegram");
         assert!(record.path.is_none(), "nothing is downloaded on arrival");
     }
 
     #[tokio::test]
     async fn a_message_without_attachments_registers_nothing() {
-        let store = store().await;
+        let (store, account) = store().await;
         let mut event = event_with(Vec::new());
-        register_attachments(&store, &mut event)
+        register_attachments(&store, &mut event, account)
             .await
             .expect("registers");
         assert!(store.attachment("1").await.expect("query").is_none());
@@ -2093,7 +2113,7 @@ mod tests {
 
     fn lapsed(policy: Policy, dropped: u64) -> PolicyRecord {
         PolicyRecord {
-            conversation_id: "telegram:1".to_string(),
+            conversation: "telegram:1".to_string(),
             policy,
             until: Some(Utc::now()),
             reason: None,

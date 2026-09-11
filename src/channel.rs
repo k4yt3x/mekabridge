@@ -433,13 +433,12 @@ pub struct InboundMessage {
     pub channel: ChannelId,
     pub platform: Platform,
     pub conversation: ConversationId,
-    /// Queue deduplication key, unique within the conversation.
-    ///
-    /// Usually the platform message id, but not always: an edit carries the *same* message id as
-    /// the message it revises, so an edit derives a distinct key. Use
-    /// [`InboundMessage::message_id`] for anything that addresses the message on the platform.
-    pub external_id: String,
     /// Platform-native message id, which is what a reply or a reaction targets.
+    ///
+    /// Not an identity on its own: an edit carries the *same* id as the message it revises, and a
+    /// bot deleted and recreated under the same channel numbers its chats from 1 again. What
+    /// identifies a message is this together with [`InboundMessage::revision`] and the account
+    /// that received it.
     pub message_id: String,
     pub chat_kind: ChatKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +505,25 @@ pub struct InboundMessage {
     pub timestamp: DateTime<Utc>,
 }
 
+impl InboundMessage {
+    /// Which revision of the platform message this is: the edit time in epoch milliseconds, or
+    /// zero for the original wording.
+    ///
+    /// An edit reuses the id of the message it revises, so without this the queue would take it
+    /// for a redelivery and the agent would never hear about it.
+    pub fn revision(&self) -> i64 {
+        revision_of(self.edited_at)
+    }
+}
+
+/// The revision number for a message edited at `edited_at`, or for the original when `None`.
+///
+/// Milliseconds on every platform, although Telegram only reports edits to the second: one unit
+/// everywhere is what lets a revision be compared without knowing where it came from.
+pub fn revision_of(edited_at: Option<DateTime<Utc>>) -> i64 {
+    edited_at.map_or(0, |edited_at| edited_at.timestamp_millis())
+}
+
 /// Something that happened and should eventually reach the agent.
 ///
 /// An enum rather than a bare message so a scheduler (waking the agent on a timer) or a system
@@ -552,19 +570,6 @@ impl InboundEvent {
             Self::Retraction { conversation, .. } | Self::Typing { conversation, .. } => {
                 conversation
             }
-        }
-    }
-
-    /// Identifier unique within the conversation, used for deduplication.
-    ///
-    /// Only a queued event has one, and only [`Self::Message`] is ever queued. The others answer
-    /// with what identifies them for their own handling: a retraction names the message it
-    /// retracts, and a notice that somebody is typing names nothing at all.
-    pub fn external_id(&self) -> &str {
-        match self {
-            Self::Message(message) => &message.external_id,
-            Self::Retraction { message_id, .. } => message_id,
-            Self::Typing { .. } => "",
         }
     }
 
@@ -1377,7 +1382,6 @@ mod tests {
             channel: ChannelId::new("telegram"),
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:123").expect("valid"),
-            external_id: "42".to_string(),
             message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
@@ -1422,7 +1426,52 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serializes");
         let decoded: InboundEvent = serde_json::from_str(&encoded).expect("deserializes");
         assert_eq!(decoded, event);
-        assert_eq!(decoded.external_id(), "42");
         assert_eq!(decoded.conversation().as_str(), "telegram:123");
+        let InboundEvent::Message(message) = decoded else {
+            panic!("a message round-trips as a message");
+        };
+        assert_eq!(message.revision(), 0, "an original is revision zero");
+    }
+
+    #[test]
+    fn a_payload_queued_before_0_13_0_still_decodes() {
+        // Queued events are stored as JSON and survive an upgrade in the queue. Rows written before
+        // this release carry an `external_id` field that no longer exists, and the message behind
+        // it must still be delivered rather than discarded as undecodable.
+        let legacy = serde_json::json!({
+            "type": "message",
+            "channel": "telegram",
+            "platform": "telegram",
+            "conversation": "telegram:123",
+            "external_id": "42:e1754400600",
+            "message_id": "42",
+            "chat_kind": "direct",
+            "sender": {
+                "id": "123",
+                "display_name": "Alice",
+                "username": null,
+                "is_bot": false,
+                "on_behalf_of_chat": false
+            },
+            "admission": "user",
+            "text": "queued before the upgrade",
+            "edited_at": "2025-08-05T13:30:00Z",
+            "timestamp": "2025-08-05T13:00:00Z"
+        });
+        let decoded: InboundEvent = serde_json::from_value(legacy).expect("decodes");
+        let InboundEvent::Message(message) = decoded else {
+            panic!("a message decodes as a message");
+        };
+        assert_eq!(message.message_id, "42");
+        assert_eq!(message.revision(), 1_754_400_600_000);
+    }
+
+    #[test]
+    fn a_revision_is_the_edit_time_in_milliseconds_and_zero_for_the_original() {
+        // One unit on every platform, so a Telegram edit stamped to the second and a Discord edit
+        // stamped to the millisecond are comparable without knowing which platform wrote them.
+        assert_eq!(revision_of(None), 0);
+        let edited = DateTime::from_timestamp(1_754_400_600, 250_000_000).expect("in range");
+        assert_eq!(revision_of(Some(edited)), 1_754_400_600_250);
     }
 }

@@ -608,18 +608,11 @@ impl DiscordChannel {
         });
 
         let edited_at = message.edited_timestamp.and_then(timestamp_to_chrono);
-        // An edit is a new event rather than a replacement, so it needs an id of its own or the
-        // queue would take it for a redelivery of the original.
-        let external_id = match edited_at {
-            Some(edited_at) => format!("{}:e{}", message.id, edited_at.timestamp_millis()),
-            None => message.id.to_string(),
-        };
 
         Some(InboundEvent::Message(Box::new(InboundMessage {
             channel: self.id.clone(),
             platform: Platform::Discord,
             conversation,
-            external_id,
             message_id: message.id.to_string(),
             chat_kind,
             chat_title: self.names.describe(message.channel_id),
@@ -2936,7 +2929,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_edit_gets_an_id_of_its_own_so_it_is_not_taken_for_a_redelivery() {
+    async fn an_edit_gets_a_revision_of_its_own_so_it_is_not_taken_for_a_redelivery() {
         let channel = identified();
         let original = message(serde_json::json!({}));
         let edited = message(serde_json::json!({
@@ -2953,7 +2946,7 @@ mod tests {
             panic!("the edit is a message");
         };
         assert_eq!(original.message_id, edited.message_id);
-        assert_ne!(original.external_id, edited.external_id);
+        assert_ne!(original.revision(), edited.revision());
         assert!(edited.edited_at.is_some());
     }
 

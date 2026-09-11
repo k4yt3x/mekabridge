@@ -119,6 +119,8 @@ Every message in a private chat is addressed to the agent, since there is nobody
 
 The bot's username is read once at startup, so renaming it in @BotFather needs a restart before mentions are recognised again.
 
+Deleting the bot and creating a new one is handled by putting the new token in the same channel entry. Telegram numbers a private chat's messages per bot, so the new bot starts again at 1 while the conversation ids stay the same; the bridge keys what it records on the bot account as well as the message id, so nothing collides, and the history marks what went through the old bot. See [Operations](./operations.md#troubleshooting).
+
 ## Messages are not held back
 
 Telegram has no way to tell a bot that somebody is typing: the Bot API lets a bot *send* a chat

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-11
+
+### Added
+
+- History entries that went through a previous bot account are marked `previous_account`.
+- A channel logged in as a different account than at its last start is reported at `warn`.
+- `status` names the account each channel is logged in as.
+
+### Changed
+
+- **Breaking:** the database is rebuilt on first start, keying every message on the bot account.
+- `mekabridge history` marks messages that went through a bot account the channel no longer uses.
+- `policy set` refuses a conversation on a channel that is not configured.
+
+### Fixed
+
+- A bot deleted and recreated under the same channel no longer has its messages silently dropped.
+- A recreated bot's files no longer resolve to handles for files only the old bot could fetch.
+- An edit from a recreated bot no longer marks the old bot's message of the same id superseded.
+- The dropped-message counter is updated in one statement, so two writers cannot lose a count.
+
 ## [0.12.0] - 2026-09-09
 
 ### Changed
@@ -346,7 +367,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.12.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.13.0...HEAD
+[0.13.0]: https://github.com/k4yt3x/mekabridge/compare/0.12.0...0.13.0
 [0.12.0]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...0.12.0
 [0.11.0]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...0.11.0
 [0.10.0]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...0.10.0

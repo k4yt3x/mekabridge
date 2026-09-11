@@ -526,7 +526,6 @@ mod tests {
             channel: ChannelId::new("telegram"),
             platform: Platform::Telegram,
             conversation: ConversationId::parse("telegram:123456789").expect("valid"),
-            external_id: "42".to_string(),
             message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,

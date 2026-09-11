@@ -1,4 +1,5 @@
-//! Durable state: the session binding, the conversation address book, and the inbound queue.
+//! Durable state: the session binding, the accounts the bridge speaks as, the conversation address
+//! book, the inbound queue, and the message history.
 //!
 //! One meka session runs one turn at a time, so messages arriving mid-turn have to wait somewhere,
 //! and that cannot be process memory: a crash with a full queue would silently swallow everything a
@@ -10,6 +11,13 @@
 //!
 //! Payloads stay opaque JSON so the state machine can be tested on its own and does not change when
 //! a platform adds fields.
+//!
+//! Three identities are kept apart. An *address* is `<channel>:<chat>[:<thread>]`, the routing
+//! contract the agent and the operator use, and the only form of a conversation this API accepts.
+//! An *account* is who a channel is logged in as, which changes when a bot is deleted and recreated
+//! under the same channel slot. A *message* is identified by [`MessageKey`]: the account that
+//! received it, the address it arrived at, the platform's message id, and which revision of it,
+//! because a platform message id is only unique within the account that issued it.
 
 use std::{
     collections::HashMap,
@@ -19,7 +27,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::OptionalExtension;
+use rusqlite::{
+    OptionalExtension,
+    types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef},
+};
 use uuid::Uuid;
 
 /// Schema statements applied in order. The index of a statement is its schema version, tracked in
@@ -34,6 +45,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_006.sql"),
     include_str!("store/schema_007.sql"),
     include_str!("store/schema_008.sql"),
+    include_str!("store/schema_009.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -65,6 +77,9 @@ const META_SESSION_ID: &str = "session_id";
 const META_DROPPED: &str = "dropped_messages";
 /// `meta` key holding when the last turn completed, for `mekabridge status`.
 const META_LAST_TURN: &str = "last_turn_at";
+
+/// The `kind` recorded for a conversation nothing has arrived from yet.
+const KIND_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -103,15 +118,107 @@ impl From<tokio_rusqlite::Error> for StoreError {
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// A bot account's row id, minted by [`Store::register_account`].
+///
+/// A distinct type rather than a bare `i64` so it cannot be handed to something expecting a paging
+/// cursor or a queue sequence number, both of which are also row ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountId(i64);
+
+impl std::fmt::Display for AccountId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl ToSql for AccountId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0))
+    }
+}
+
+impl FromSql for AccountId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        i64::column_result(value).map(Self)
+    }
+}
+
+/// Who a channel is logged in as, as the platform reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    /// The bot's own user id on the platform.
+    pub platform_id: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+/// An account a channel has been logged in as at some point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub id: AccountId,
+    pub channel: String,
+    pub platform: String,
+    /// Empty on the placeholder that holds rows written before accounts were recorded, whose
+    /// account nothing can establish.
+    pub platform_id: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+impl AccountRecord {
+    /// Whether this is the placeholder for rows written before accounts were recorded.
+    pub fn is_placeholder(&self) -> bool {
+        self.platform_id.is_empty()
+    }
+
+    /// How the account is referred to in prose: `@username` where the platform has one, else the
+    /// display name, else the bare id.
+    pub fn label(&self) -> String {
+        self.username
+            .as_ref()
+            .map(|username| format!("@{username}"))
+            .or_else(|| self.display_name.clone())
+            .unwrap_or_else(|| self.platform_id.clone())
+    }
+}
+
+/// What [`Store::register_account`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRegistration {
+    pub account: AccountId,
+    /// The account this channel was logged in as before, when that was a different one. This is
+    /// the bot-swap signal: everything recorded under it carries message ids the new account
+    /// cannot act on.
+    pub replaced: Option<AccountRecord>,
+}
+
+/// What identifies one platform message, and one revision of it.
+///
+/// The account is part of the key because a platform message id is only unique within the account
+/// that issued it: a Telegram bot deleted and recreated under the same channel slot numbers its
+/// private chats from 1 again, at the same addresses. `revision` is the edit time in epoch
+/// milliseconds, or zero for the original, so an edit is a row of its own without being mistaken
+/// for a redelivery of what it revises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageKey<'a> {
+    /// The `<channel>:<chat>[:<thread>]` address.
+    pub conversation: &'a str,
+    pub account: AccountId,
+    /// Platform-native message id, which is what a reply or a reaction targets.
+    pub message_id: &'a str,
+    pub revision: i64,
+}
+
 /// A conversation the bridge has seen, which is also the set of addresses the agent may send to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationRecord {
-    /// Canonical `<channel>:<chat>[:<thread>]` identifier.
-    pub id: String,
-    pub channel_id: String,
+    /// Canonical `<channel>:<chat>[:<thread>]` address.
+    pub address: String,
+    /// The channel slot, which is also the first segment of the address.
+    pub channel: String,
     pub platform: String,
-    pub chat: String,
-    pub thread: Option<String>,
     /// Human-readable label: a group title, or a person's display name.
     pub title: Option<String>,
     /// `direct`, `group`, `channel`, or `unknown` for a conversation the agent messaged first,
@@ -162,7 +269,8 @@ impl Policy {
 /// When one conversation's waiting messages arrived, as the span the drain loop decides on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWindow {
-    pub conversation_id: String,
+    /// The conversation's address.
+    pub conversation: String,
     /// Bounds how long delivery may be deferred.
     pub oldest: DateTime<Utc>,
     /// Says whether a burst is still in progress.
@@ -220,7 +328,8 @@ impl UnseenSummary {
 /// kind, so this type says "somebody ruled on this one" rather than "this one has a policy".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRecord {
-    pub conversation_id: String,
+    /// The conversation's address.
+    pub conversation: String,
     pub policy: Policy,
     /// When it lapses, or `None` for indefinite. On expiry the record is removed and the
     /// conversation returns to the configured default rather than to `active`, since the default
@@ -261,11 +370,15 @@ pub struct MessageRecord {
     /// timestamp comparison can express "everything before this particular message" when three of
     /// them claim the same instant.
     pub id: i64,
-    pub conversation_id: String,
-    /// Deduplication key, shared with the queue. An edit carries a distinct one.
-    pub external_id: String,
+    /// The conversation's address.
+    pub conversation: String,
+    /// The account this was received through, or sent from.
+    pub account: AccountId,
     /// Platform-native id, which is what a reply or a reaction targets.
     pub message_id: String,
+    /// Which revision of the message this row holds: the edit time in epoch milliseconds, or zero
+    /// for the original wording.
+    pub revision: i64,
     pub sender_id: Option<String>,
     pub sender_name: String,
     pub text: String,
@@ -273,6 +386,10 @@ pub struct MessageRecord {
     /// back as a blank line from somebody.
     pub notes: Option<String>,
     /// Handles for the files this message brought, so something found in history can be opened.
+    ///
+    /// Read back from the attachment registry by the message's own key, which is why
+    /// [`Store::record_message`] ignores it: the files are registered before the message is, so
+    /// their handles travel with the queued payload.
     pub attachments: Vec<String>,
     pub addressed: bool,
     pub seen: bool,
@@ -291,15 +408,34 @@ pub struct MessageRecord {
     /// When a revision of this same message was recorded, making this row the older wording.
     pub superseded_at: Option<DateTime<Utc>>,
     pub timestamp: DateTime<Utc>,
+    /// Whether this went through an account the channel no longer uses, so its `message_id` cannot
+    /// be replied to, reacted to, edited, or deleted from the account now behind the address.
+    ///
+    /// Derived on read and ignored by [`Store::record_message`]. Never set on a row held by the
+    /// placeholder account, whose real account is unknown rather than known to be gone.
+    pub previous_account: bool,
+}
+
+impl MessageRecord {
+    pub fn key(&self) -> MessageKey<'_> {
+        MessageKey {
+            conversation: &self.conversation,
+            account: self.account,
+            message_id: &self.message_id,
+            revision: self.revision,
+        }
+    }
 }
 
 /// A message waiting to be handed to the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessage {
     pub seq: i64,
-    pub conversation_id: String,
-    /// Platform-native message id, used to reject duplicate deliveries.
-    pub external_id: String,
+    /// The conversation's address.
+    pub conversation: String,
+    pub account: AccountId,
+    pub message_id: String,
+    pub revision: i64,
     pub payload: String,
     pub received_at: DateTime<Utc>,
     pub attempts: u32,
@@ -310,6 +446,17 @@ pub struct QueuedMessage {
     /// no such answer, so it is handed over again with the uncertainty stated rather than
     /// hidden.
     pub recovered: bool,
+}
+
+impl QueuedMessage {
+    pub fn key(&self) -> MessageKey<'_> {
+        MessageKey {
+            conversation: &self.conversation,
+            account: self.account,
+            message_id: &self.message_id,
+            revision: self.revision,
+        }
+    }
 }
 
 /// What happened to an [`Store::enqueue`] call.
@@ -350,10 +497,13 @@ pub struct QueueStats {
 /// file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentRecord {
-    /// `<conversation>:<external_id>:<index>`, stable across a redelivery.
-    pub id: String,
-    pub conversation_id: String,
-    pub channel_id: String,
+    /// The conversation's address.
+    pub conversation: String,
+    pub account: AccountId,
+    pub message_id: String,
+    pub revision: i64,
+    /// Where in its message the file sits, so a redelivery finds the handle already issued.
+    pub position: u32,
     pub kind: String,
     /// Platform-native reference used to fetch the file.
     pub file_ref: String,
@@ -369,9 +519,10 @@ pub struct AttachmentRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAttachment {
     pub handle: String,
-    pub id: String,
-    pub conversation_id: String,
-    pub channel_id: String,
+    /// The conversation's address.
+    pub conversation: String,
+    /// The channel that can fetch it.
+    pub channel: String,
     pub kind: String,
     pub file_ref: String,
     pub thumb_ref: Option<String>,
@@ -584,10 +735,23 @@ impl Store {
     }
 
     /// Count a message that was shed because the queue was full.
+    ///
+    /// One statement rather than a read followed by a write, so two callers counting at once cannot
+    /// lose each other's tally.
     pub async fn note_dropped(&self, count: u64) -> Result<()> {
-        let current = self.dropped_count().await?;
-        self.meta_set(META_DROPPED, (current.saturating_add(count)).to_string())
-            .await
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE
+                         SET value = CAST(CAST(meta.value AS INTEGER) + excluded.value AS TEXT)",
+                    rusqlite::params![META_DROPPED, count],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     async fn dropped_count(&self) -> Result<u64> {
@@ -607,6 +771,104 @@ impl Store {
         Ok(count)
     }
 
+    /// Record which account `channel` is logged in as, and return its id.
+    ///
+    /// Called once per channel at every start, which is what keeps `last_seen_at` meaningful: the
+    /// real account seen most recently is the one currently behind the channel, and a row from any
+    /// other is one whose message ids the running bot cannot act on. The registration reports the
+    /// account it displaced, if any, so the swap can be said out loud.
+    pub async fn register_account(
+        &self,
+        channel: &str,
+        platform: &str,
+        identity: &AccountIdentity,
+        at: DateTime<Utc>,
+    ) -> Result<AccountRegistration> {
+        let channel = channel.to_string();
+        let platform = platform.to_string();
+        let identity = identity.clone();
+        let at = to_rfc3339(at);
+        let registration = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let previous = transaction
+                    .query_row(
+                        &format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE {ACCOUNT_CURRENT}"),
+                        [&channel],
+                        row_to_account,
+                    )
+                    .optional()?;
+                transaction.execute(
+                    "INSERT INTO accounts
+                         (channel, platform, platform_id, username, display_name, first_seen_at,
+                          last_seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     ON CONFLICT(channel, platform_id) DO UPDATE SET
+                         platform = excluded.platform,
+                         username = excluded.username,
+                         display_name = excluded.display_name,
+                         last_seen_at = excluded.last_seen_at",
+                    rusqlite::params![
+                        channel,
+                        platform,
+                        identity.platform_id,
+                        identity.username,
+                        identity.display_name,
+                        at,
+                    ],
+                )?;
+                let account = transaction.query_row(
+                    "SELECT id FROM accounts WHERE channel = ?1 AND platform_id = ?2",
+                    rusqlite::params![channel, identity.platform_id],
+                    |row| row.get::<_, AccountId>(0),
+                )?;
+                transaction.commit()?;
+                Ok(AccountRegistration {
+                    account,
+                    replaced: previous
+                        .filter(|previous| previous.platform_id != identity.platform_id),
+                })
+            })
+            .await?;
+        Ok(registration)
+    }
+
+    /// The account `channel` is currently logged in as, if a real one has ever been recorded.
+    pub async fn current_account(&self, channel: &str) -> Result<Option<AccountRecord>> {
+        let channel = channel.to_string();
+        let record = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE {ACCOUNT_CURRENT}"),
+                        [channel],
+                        row_to_account,
+                    )
+                    .optional()
+            })
+            .await?;
+        Ok(record)
+    }
+
+    /// Every account ever recorded, by channel and then most recently seen first.
+    pub async fn accounts(&self) -> Result<Vec<AccountRecord>> {
+        let records = self
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {ACCOUNT_COLUMNS} FROM accounts
+                     ORDER BY channel, last_seen_at DESC, id DESC"
+                ))?;
+                let rows = statement.query_map([], row_to_account)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(records)
+    }
+
     /// Insert or refresh a conversation. `created_at` is preserved across updates so the address
     /// book keeps a stable notion of when a contact was first seen.
     pub async fn upsert_conversation(&self, record: ConversationRecord) -> Result<()> {
@@ -614,10 +876,11 @@ impl Store {
             .call(move |connection| {
                 connection.execute(
                     "INSERT INTO conversations
-                         (id, channel_id, platform, chat, thread, title, kind, created_at,
-                          last_inbound_at, last_outbound_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT(id) DO UPDATE SET
+                         (address, channel, platform, title, kind, created_at, last_inbound_at,
+                          last_outbound_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(address) DO UPDATE SET
+                         platform = excluded.platform,
                          title = COALESCE(excluded.title, conversations.title),
                          kind = excluded.kind,
                          last_inbound_at = COALESCE(
@@ -625,11 +888,9 @@ impl Store {
                          last_outbound_at = COALESCE(
                              excluded.last_outbound_at, conversations.last_outbound_at)",
                     rusqlite::params![
-                        record.id,
-                        record.channel_id,
+                        record.address,
+                        record.channel,
                         record.platform,
-                        record.chat,
-                        record.thread,
                         record.title,
                         record.kind,
                         to_rfc3339(record.created_at),
@@ -643,18 +904,18 @@ impl Store {
         Ok(())
     }
 
-    /// Look up one conversation by canonical id.
-    pub async fn conversation(&self, id: &str) -> Result<Option<ConversationRecord>> {
-        let id = id.to_string();
+    /// Look up one conversation by address.
+    pub async fn conversation(&self, address: &str) -> Result<Option<ConversationRecord>> {
+        let address = address.to_string();
         let record = self
             .connection
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT id, channel_id, platform, chat, thread, title, kind, created_at,
-                                last_inbound_at, last_outbound_at
-                         FROM conversations WHERE id = ?1",
-                        [id],
+                        &format!(
+                            "SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE address = ?1"
+                        ),
+                        [address],
                         row_to_conversation,
                     )
                     .optional()
@@ -670,18 +931,17 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<ConversationRecord>> {
         let channel = channel.map(str::to_string);
-        let limit = limit as i64;
+        let limit = limit.min(i64::MAX as usize) as i64;
         let records = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT id, channel_id, platform, chat, thread, title, kind, created_at,
-                            last_inbound_at, last_outbound_at
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {CONVERSATION_COLUMNS}
                      FROM conversations
-                     WHERE (?1 IS NULL OR channel_id = ?1)
+                     WHERE (?1 IS NULL OR channel = ?1)
                      ORDER BY COALESCE(last_inbound_at, last_outbound_at, created_at) DESC
-                     LIMIT ?2",
-                )?;
+                     LIMIT ?2"
+                ))?;
                 let rows =
                     statement.query_map(rusqlite::params![channel, limit], row_to_conversation)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -693,35 +953,33 @@ impl Store {
     /// Stamp a conversation as having just received an outbound message, registering it first if
     /// the agent messaged somewhere the bridge has never heard from.
     ///
-    /// Only `last_outbound_at` is honoured from `record` on an existing row; everything else is
-    /// insert-time detail. See [`Store::upsert_conversation`] for the inbound direction, which does
-    /// know the title and kind and is allowed to update them.
-    pub async fn touch_outbound(&self, record: ConversationRecord) -> Result<()> {
+    /// Only the timestamp moves on an existing row. The kind is a placeholder standing in for a
+    /// chat nothing is known about, so letting it overwrite a real one would discard what an
+    /// inbound message already established; see [`Store::upsert_conversation`] for the inbound
+    /// direction, which does know the title and kind and is allowed to update them.
+    pub async fn touch_outbound(
+        &self,
+        address: &str,
+        platform: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let address = address.to_string();
+        let platform = platform.to_string();
+        let at = to_rfc3339(at);
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    // An insert rather than an update, because the agent may write to a chat that
-                    // has never written to it and this is then the address book's first news of
-                    // the conversation. On conflict only the timestamp moves:
-                    // the `title` and `kind` passed here stand in for a chat
-                    // nothing is known about, so letting them overwrite a real
-                    // title would discard what an inbound message already
-                    // established.
                     "INSERT INTO conversations
-                         (id, channel_id, platform, chat, thread, title, kind, created_at,
-                          last_inbound_at, last_outbound_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
-                     ON CONFLICT(id) DO UPDATE SET last_outbound_at = excluded.last_outbound_at",
+                         (address, channel, platform, title, kind, created_at, last_inbound_at,
+                          last_outbound_at)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?5)
+                     ON CONFLICT(address) DO UPDATE SET last_outbound_at = excluded.last_outbound_at",
                     rusqlite::params![
-                        record.id,
-                        record.channel_id,
-                        record.platform,
-                        record.chat,
-                        record.thread,
-                        record.title,
-                        record.kind,
-                        to_rfc3339(record.created_at),
-                        record.last_outbound_at.map(to_rfc3339),
+                        &address,
+                        channel_of(&address),
+                        platform,
+                        KIND_UNKNOWN,
+                        at
                     ],
                 )?;
                 Ok(())
@@ -732,6 +990,10 @@ impl Store {
 
     /// Rule on a conversation until `until`, or indefinitely when it is `None`.
     ///
+    /// The conversation need not have written yet: ruling on one pre-emptively is legitimate, so a
+    /// row is minted for it with what the address says and `platform` from the caller, and the
+    /// first message from there fills in the rest.
+    ///
     /// Re-ruling on a conversation resets the drop count, so the tally the agent is eventually
     /// shown belongs to the decision it is being told about rather than to every decision this chat
     /// has ever had.
@@ -741,61 +1003,84 @@ impl Store {
     /// "follow the default", which for a group is `mute`.
     pub async fn set_policy(
         &self,
-        conversation_id: &str,
+        address: &str,
+        platform: &str,
         policy: Policy,
         until: Option<DateTime<Utc>>,
         reason: Option<&str>,
         at: DateTime<Utc>,
     ) -> Result<()> {
-        let conversation_id = conversation_id.to_string();
+        let address = address.to_string();
+        let platform = platform.to_string();
         let reason = reason.map(str::to_string);
         self.connection
             .call({
-                let conversation_id = conversation_id.clone();
+                let address = address.clone();
                 move |connection| {
-                    connection.execute(
-                        "INSERT INTO conversation_policy
-                             (conversation_id, mode, until, reason, dropped, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 0, ?5)
-                         ON CONFLICT(conversation_id) DO UPDATE SET
-                             mode = excluded.mode,
-                             until = excluded.until,
-                             reason = excluded.reason,
-                             dropped = 0,
-                             created_at = excluded.created_at",
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    transaction.execute(
+                        "INSERT INTO conversations
+                             (address, channel, platform, kind, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(address) DO NOTHING",
                         rusqlite::params![
-                            conversation_id,
+                            &address,
+                            channel_of(&address),
+                            platform,
+                            KIND_UNKNOWN,
+                            to_rfc3339(at)
+                        ],
+                    )?;
+                    transaction.execute(
+                        &format!(
+                            "INSERT INTO conversation_policy
+                                 (conversation_id, mode, until, reason, dropped, created_at)
+                             VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, 0, ?5)
+                             ON CONFLICT(conversation_id) DO UPDATE SET
+                                 mode = excluded.mode,
+                                 until = excluded.until,
+                                 reason = excluded.reason,
+                                 dropped = 0,
+                                 created_at = excluded.created_at"
+                        ),
+                        rusqlite::params![
+                            &address,
                             policy.as_str(),
                             until.map(to_rfc3339),
                             reason,
                             to_rfc3339(at),
                         ],
                     )?;
+                    transaction.commit()?;
                     Ok(())
                 }
             })
             .await?;
-        self.forget_cached_policy(&conversation_id);
+        self.forget_cached_policy(&address);
         Ok(())
     }
 
     /// Remove an explicit decision, returning the conversation to the configured default. Returns
     /// whether one was actually in place.
-    pub async fn clear_policy(&self, conversation_id: &str) -> Result<bool> {
-        let conversation_id = conversation_id.to_string();
+    pub async fn clear_policy(&self, address: &str) -> Result<bool> {
+        let address = address.to_string();
         let removed = self
             .connection
             .call({
-                let conversation_id = conversation_id.clone();
+                let address = address.clone();
                 move |connection| {
                     connection.execute(
-                        "DELETE FROM conversation_policy WHERE conversation_id = ?1",
-                        [conversation_id],
+                        &format!(
+                            "DELETE FROM conversation_policy
+                             WHERE conversation_id = {CONVERSATION_ID_OF}"
+                        ),
+                        [address],
                     )
                 }
             })
             .await?;
-        self.forget_cached_policy(&conversation_id);
+        self.forget_cached_policy(&address);
         Ok(removed > 0)
     }
 
@@ -808,25 +1093,24 @@ impl Store {
     /// message. The policy itself is exact, because every write invalidates;
     /// [`PolicyRecord::dropped`] is not, because counting a drop deliberately does not. Use
     /// [`Store::expire_policy`] or [`Store::list_policies`] wherever the tally is what matters.
-    pub async fn policy(&self, conversation_id: &str) -> Result<Option<PolicyRecord>> {
-        if let Some(cached) = self.cached_policy(conversation_id) {
+    pub async fn policy(&self, address: &str) -> Result<Option<PolicyRecord>> {
+        if let Some(cached) = self.cached_policy(address) {
             return Ok(cached);
         }
-        let record = self.read_policy(conversation_id).await?;
-        self.cache_policy(conversation_id, record.clone());
+        let record = self.read_policy(address).await?;
+        self.cache_policy(address, record.clone());
         Ok(record)
     }
 
-    async fn read_policy(&self, conversation_id: &str) -> Result<Option<PolicyRecord>> {
-        let conversation_id = conversation_id.to_string();
+    async fn read_policy(&self, address: &str) -> Result<Option<PolicyRecord>> {
+        let address = address.to_string();
         let record = self
             .connection
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT conversation_id, mode, until, reason, dropped, created_at
-                         FROM conversation_policy WHERE conversation_id = ?1",
-                        [conversation_id],
+                        &format!("SELECT {POLICY_COLUMNS} FROM {POLICY_FROM} WHERE c.address = ?1"),
+                        [address],
                         row_to_policy,
                     )
                     .optional()
@@ -841,33 +1125,37 @@ impl Store {
     /// told about, and reading it through the cache could under-report by up to the cache window.
     /// Doing both under one transaction also means a message arriving alongside the expiry cannot
     /// be counted into a record that is already gone.
-    pub async fn expire_policy(&self, conversation_id: &str) -> Result<Option<PolicyRecord>> {
-        let conversation_id = conversation_id.to_string();
+    pub async fn expire_policy(&self, address: &str) -> Result<Option<PolicyRecord>> {
+        let address = address.to_string();
         let record = self
             .connection
             .call({
-                let conversation_id = conversation_id.clone();
+                let address = address.clone();
                 move |connection| {
                     let transaction = connection
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let record = transaction
                         .query_row(
-                            "SELECT conversation_id, mode, until, reason, dropped, created_at
-                             FROM conversation_policy WHERE conversation_id = ?1",
-                            [&conversation_id],
+                            &format!(
+                                "SELECT {POLICY_COLUMNS} FROM {POLICY_FROM} WHERE c.address = ?1"
+                            ),
+                            [&address],
                             row_to_policy,
                         )
                         .optional()?;
                     transaction.execute(
-                        "DELETE FROM conversation_policy WHERE conversation_id = ?1",
-                        [&conversation_id],
+                        &format!(
+                            "DELETE FROM conversation_policy
+                             WHERE conversation_id = {CONVERSATION_ID_OF}"
+                        ),
+                        [&address],
                     )?;
                     transaction.commit()?;
                     Ok(record)
                 }
             })
             .await?;
-        self.forget_cached_policy(&conversation_id);
+        self.forget_cached_policy(&address);
         Ok(record)
     }
 
@@ -876,10 +1164,9 @@ impl Store {
         let records = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT conversation_id, mode, until, reason, dropped, created_at
-                     FROM conversation_policy ORDER BY created_at",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {POLICY_COLUMNS} FROM {POLICY_FROM} ORDER BY p.created_at"
+                ))?;
                 let rows = statement.query_map([], row_to_policy)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
@@ -891,14 +1178,16 @@ impl Store {
     ///
     /// Only blocked conversations need this. Under `mute` the messages are recorded, so what went
     /// unseen is counted from the history rather than tallied here.
-    pub async fn note_blocked_drop(&self, conversation_id: &str) -> Result<()> {
-        let conversation_id = conversation_id.to_string();
+    pub async fn note_blocked_drop(&self, address: &str) -> Result<()> {
+        let address = address.to_string();
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE conversation_policy SET dropped = dropped + 1
-                     WHERE conversation_id = ?1",
-                    [conversation_id],
+                    &format!(
+                        "UPDATE conversation_policy SET dropped = dropped + 1
+                         WHERE conversation_id = {CONVERSATION_ID_OF}"
+                    ),
+                    [address],
                 )?;
                 Ok(())
             })
@@ -911,13 +1200,13 @@ impl Store {
 
     /// A cached lookup, or `None` when the entry is missing or stale. The inner `Option` is whether
     /// a record exists, which is itself worth caching.
-    fn cached_policy(&self, conversation_id: &str) -> Option<Option<PolicyRecord>> {
+    fn cached_policy(&self, address: &str) -> Option<Option<PolicyRecord>> {
         let cache = self.policies.read().ok()?;
-        let (record, fetched_at) = cache.entries.get(conversation_id)?;
+        let (record, fetched_at) = cache.entries.get(address)?;
         (fetched_at.elapsed() < POLICY_CACHE_TTL).then(|| record.clone())
     }
 
-    fn cache_policy(&self, conversation_id: &str, record: Option<PolicyRecord>) {
+    fn cache_policy(&self, address: &str, record: Option<PolicyRecord>) {
         if let Ok(mut cache) = self.policies.write() {
             // Nothing evicts by age, so a long-running bridge in many conversations would otherwise
             // hold an entry for every one it has ever seen. Dropping the lot on overflow is crude
@@ -927,31 +1216,29 @@ impl Store {
             }
             cache
                 .entries
-                .insert(conversation_id.to_string(), (record, Instant::now()));
+                .insert(address.to_string(), (record, Instant::now()));
         }
     }
 
-    fn forget_cached_policy(&self, conversation_id: &str) {
+    fn forget_cached_policy(&self, address: &str) {
         if let Ok(mut cache) = self.policies.write() {
-            cache.entries.remove(conversation_id);
+            cache.entries.remove(address);
         }
     }
 
     /// Persist an inbound message.
     ///
     /// Enforces `max_depth` against rows still waiting (`pending` plus `in_flight`) so a stalled
-    /// turn cannot let the queue grow without bound. Duplicates are recognised by
-    /// `(conversation_id, external_id)`.
+    /// turn cannot let the queue grow without bound. Duplicates are recognised by the whole of
+    /// `key`, so a message id reused by a recreated bot is a new message rather than a replay.
     pub async fn enqueue(
         &self,
-        conversation_id: &str,
-        external_id: &str,
+        key: MessageKey<'_>,
         payload: &str,
         received_at: DateTime<Utc>,
         max_depth: usize,
     ) -> Result<EnqueueOutcome> {
-        let conversation_id = conversation_id.to_string();
-        let external_id = external_id.to_string();
+        let key = OwnedKey::from(key);
         let payload = payload.to_string();
         let received_at = to_rfc3339(received_at);
         let max_depth = max_depth as i64;
@@ -972,11 +1259,21 @@ impl Store {
                     return Ok(EnqueueOutcome::Dropped);
                 }
                 let changed = transaction.execute(
-                    "INSERT INTO inbound_queue
-                         (conversation_id, external_id, payload, received_at, state, attempts)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', 0)
-                     ON CONFLICT(conversation_id, external_id) DO NOTHING",
-                    rusqlite::params![conversation_id, external_id, payload, received_at],
+                    &format!(
+                        "INSERT INTO inbound_queue
+                             (conversation_id, account_id, message_id, revision, payload,
+                              received_at, state, attempts)
+                         VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6, 'pending', 0)
+                         ON CONFLICT(conversation_id, message_id, account_id, revision) DO NOTHING"
+                    ),
+                    rusqlite::params![
+                        key.conversation,
+                        key.account,
+                        key.message_id,
+                        key.revision,
+                        payload,
+                        received_at
+                    ],
                 )?;
                 transaction.commit()?;
                 Ok(if changed == 0 {
@@ -1006,12 +1303,12 @@ impl Store {
             .call(move |connection| {
                 // `max()` ignores NULLs, so a conversation with one deferred row and ten fresh ones
                 // reports that row's deferral rather than nothing.
-                let mut statement = connection.prepare(
-                    "SELECT conversation_id, min(received_at), max(received_at), max(not_before)
-                     FROM inbound_queue
-                     WHERE state = 'pending'
-                     GROUP BY conversation_id",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT c.address, min(q.received_at), max(q.received_at), max(q.not_before)
+                     FROM {QUEUE_FROM}
+                     WHERE q.state = 'pending'
+                     GROUP BY q.conversation_id"
+                ))?;
                 let rows = statement
                     .query_map([], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -1029,9 +1326,9 @@ impl Store {
                 })
         };
         rows.into_iter()
-            .map(|(conversation_id, oldest, newest, not_before)| {
+            .map(|(conversation, oldest, newest, not_before)| {
                 Ok(PendingWindow {
-                    conversation_id,
+                    conversation,
                     oldest: parse("received_at", &oldest)?,
                     newest: parse("received_at", &newest)?,
                     not_before: not_before
@@ -1042,7 +1339,8 @@ impl Store {
             .collect()
     }
 
-    /// Atomically take up to `limit` pending messages from `ready` and mark them in flight.
+    /// Atomically take up to `limit` pending messages from the conversations in `ready` and mark
+    /// them in flight.
     ///
     /// Claiming and marking happen in one transaction so two drain loops (or a drain loop racing a
     /// restart) cannot hand the same message to two turns.
@@ -1058,7 +1356,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let ready: Vec<String> = ready.to_vec();
-        let limit = limit as i64;
+        let limit = limit.min(i64::MAX as usize) as i64;
         let batch = self
             .connection
             .call(move |connection| {
@@ -1069,16 +1367,15 @@ impl Store {
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let claimed = {
                     let mut statement = transaction.prepare(&format!(
-                        "SELECT seq, conversation_id, external_id, payload, received_at, attempts,
-                                recovered
-                         FROM inbound_queue
-                         WHERE state = 'pending' AND conversation_id IN ({placeholders})
-                         ORDER BY seq
+                        "SELECT {QUEUE_COLUMNS}
+                         FROM {QUEUE_FROM}
+                         WHERE q.state = 'pending' AND c.address IN ({placeholders})
+                         ORDER BY q.seq
                          LIMIT ?"
                     ))?;
                     // Bound in order, the limit last, matching the placeholder order above.
-                    let mut values: Vec<&dyn rusqlite::ToSql> =
-                        ready.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    let mut values: Vec<&dyn ToSql> =
+                        ready.iter().map(|id| id as &dyn ToSql).collect();
                     values.push(&limit);
                     let rows =
                         statement.query_map(rusqlite::params_from_iter(values), row_to_queued)?;
@@ -1106,14 +1403,13 @@ impl Store {
         let rows = self
             .connection
             .call(move |connection| {
-                let mut statement = connection.prepare(
-                    "SELECT seq, conversation_id, external_id, payload, received_at, attempts,
-                                recovered
-                     FROM inbound_queue
-                     WHERE state = 'pending'
-                     ORDER BY seq
-                     LIMIT ?1",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {QUEUE_COLUMNS}
+                     FROM {QUEUE_FROM}
+                     WHERE q.state = 'pending'
+                     ORDER BY q.seq
+                     LIMIT ?1"
+                ))?;
                 let rows = statement.query_map([limit], row_to_queued)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
@@ -1237,9 +1533,7 @@ impl Store {
                             rusqlite::params![sequence, &completed_at],
                         )?;
                         let message = transaction.query_row(
-                            "SELECT seq, conversation_id, external_id, payload, received_at,
-                                    attempts, recovered
-                             FROM inbound_queue WHERE seq = ?1",
+                            &format!("SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.seq = ?1"),
                             [sequence],
                             row_to_queued,
                         )?;
@@ -1358,27 +1652,35 @@ impl Store {
 
     /// Record what somebody said, whether or not the agent was woken for it.
     ///
-    /// Idempotent on `(conversation_id, external_id)`, the same key the queue deduplicates on, so a
-    /// platform replaying an update after a crash does not produce a second copy.
-    pub async fn record_message(&self, record: MessageRecord) -> Result<()> {
-        self.connection
+    /// Idempotent on the message's key, the same one the queue deduplicates on, so a platform
+    /// replaying an update after a crash does not produce a second copy. Returns whether the row
+    /// was written, which is `false` for exactly that replay.
+    ///
+    /// The conversation must already be on file; a message from an address the address book has
+    /// never seen is refused by the schema rather than filed under nothing.
+    pub async fn record_message(&self, record: MessageRecord) -> Result<bool> {
+        let inserted = self
+            .connection
             .call(move |connection| {
                 connection.execute(
-                    "INSERT INTO messages
-                         (conversation_id, external_id, message_id, sender_id, sender_name, text,
-                          notes, attachments, addressed, seen, own, session_id, deleted_at,
-                          superseded_at, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                     ON CONFLICT(conversation_id, external_id) DO NOTHING",
+                    &format!(
+                        "INSERT INTO messages
+                             (conversation_id, account_id, message_id, revision, sender_id,
+                              sender_name, text, notes, addressed, seen, own, session_id,
+                              deleted_at, superseded_at, timestamp)
+                         VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                                 ?12, ?13, ?14, ?15)
+                         ON CONFLICT(conversation_id, message_id, account_id, revision) DO NOTHING"
+                    ),
                     rusqlite::params![
-                        record.conversation_id,
-                        record.external_id,
+                        record.conversation,
+                        record.account,
                         record.message_id,
+                        record.revision,
                         record.sender_id,
                         record.sender_name,
                         record.text,
                         record.notes,
-                        join_handles(&record.attachments),
                         record.addressed,
                         record.seen,
                         record.own,
@@ -1387,11 +1689,10 @@ impl Store {
                         record.superseded_at.map(to_rfc3339),
                         to_rfc3339(record.timestamp),
                     ],
-                )?;
-                Ok(())
+                )
             })
             .await?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     /// Read a conversation back, oldest first, ending at `before` when one is given.
@@ -1407,26 +1708,24 @@ impl Store {
     /// timestamp is not for an edit: it carries the time of the message it revises.
     pub async fn history(
         &self,
-        conversation_id: &str,
+        address: &str,
         limit: usize,
         before: Option<i64>,
     ) -> Result<Vec<MessageRecord>> {
-        let conversation_id = conversation_id.to_string();
+        let address = address.to_string();
         let limit = limit.min(i64::MAX as usize) as i64;
         let mut records = self
             .connection
             .call(move |connection| {
                 let mut statement = connection.prepare(&format!(
                     "SELECT {MESSAGE_COLUMNS}
-                     FROM messages m
-                     WHERE m.conversation_id = ?1 AND (?2 IS NULL OR m.id < ?2)
+                     FROM {MESSAGE_FROM}
+                     WHERE c.address = ?1 AND (?2 IS NULL OR m.id < ?2)
                      ORDER BY m.id DESC
                      LIMIT ?3"
                 ))?;
-                let rows = statement.query_map(
-                    rusqlite::params![conversation_id, before, limit],
-                    row_to_message,
-                )?;
+                let rows = statement
+                    .query_map(rusqlite::params![address, before, limit], row_to_message)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
             .await?;
@@ -1450,12 +1749,16 @@ impl Store {
         let records = self
             .connection
             .call(move |connection| {
+                // Spelled out rather than built on `MESSAGE_FROM`, whose own joins would sit
+                // between `messages` and the `ON` that ties it to the index.
                 let mut statement = connection.prepare(&format!(
                     "SELECT {MESSAGE_COLUMNS}
                      FROM messages_fts f
                      JOIN messages m ON m.id = f.rowid
+                     JOIN conversations c ON c.id = m.conversation_id
+                     JOIN accounts a ON a.id = m.account_id
                      WHERE messages_fts MATCH ?1
-                       AND (?2 IS NULL OR m.conversation_id = ?2)
+                       AND (?2 IS NULL OR c.address = ?2)
                      ORDER BY f.rank
                      LIMIT ?3"
                 ))?;
@@ -1477,11 +1780,11 @@ impl Store {
     /// never at all.
     pub async fn take_unseen(
         &self,
-        conversation_id: &str,
+        address: &str,
         through: DateTime<Utc>,
         context: usize,
     ) -> Result<(u64, Vec<MessageRecord>, i64)> {
-        let conversation_id = conversation_id.to_string();
+        let address = address.to_string();
         let through = to_rfc3339(through);
         let context = context.min(i64::MAX as usize) as i64;
         let (count, mut records, watermark) = self
@@ -1498,23 +1801,23 @@ impl Store {
                 let (count, watermark): (i64, Option<i64>) = transaction.query_row(
                     &format!(
                         "SELECT COUNT(*), MAX(m.id) FROM messages m
-                         WHERE m.conversation_id = ?1 AND m.seen = 0 AND m.timestamp <= ?2
-                           AND {MESSAGE_CURRENT}"
+                         WHERE m.conversation_id = {CONVERSATION_ID_OF} AND m.seen = 0
+                           AND m.timestamp <= ?2 AND {MESSAGE_CURRENT}"
                     ),
-                    rusqlite::params![&conversation_id, &through],
+                    rusqlite::params![&address, &through],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let records = {
                     let mut statement = transaction.prepare(&format!(
                         "SELECT {MESSAGE_COLUMNS}
-                         FROM messages m
-                         WHERE m.conversation_id = ?1 AND m.seen = 0 AND m.timestamp <= ?2
+                         FROM {MESSAGE_FROM}
+                         WHERE c.address = ?1 AND m.seen = 0 AND m.timestamp <= ?2
                            AND {MESSAGE_CURRENT}
                          ORDER BY m.timestamp DESC, m.id DESC
                          LIMIT ?3"
                     ))?;
                     let rows = statement.query_map(
-                        rusqlite::params![&conversation_id, &through, context],
+                        rusqlite::params![&address, &through, context],
                         row_to_message,
                     )?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -1541,19 +1844,22 @@ impl Store {
     /// marked anyway.
     pub async fn mark_seen(
         &self,
-        conversation_id: &str,
+        address: &str,
         through_id: i64,
         through: DateTime<Utc>,
     ) -> Result<usize> {
-        let conversation_id = conversation_id.to_string();
+        let address = address.to_string();
         let through = to_rfc3339(through);
         let marked = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE messages SET seen = 1
-                     WHERE conversation_id = ?1 AND seen = 0 AND id <= ?2 AND timestamp <= ?3",
-                    rusqlite::params![&conversation_id, through_id, &through],
+                    &format!(
+                        "UPDATE messages SET seen = 1
+                         WHERE conversation_id = {CONVERSATION_ID_OF} AND seen = 0
+                           AND id <= ?2 AND timestamp <= ?3"
+                    ),
+                    rusqlite::params![&address, through_id, &through],
                 )
             })
             .await?;
@@ -1569,16 +1875,18 @@ impl Store {
     ///
     /// A `false` return is legitimate: `[storage].history_retention` of zero writes no history, so
     /// there is nothing to un-see.
-    pub async fn mark_unseen(&self, conversation_id: &str, external_id: &str) -> Result<bool> {
-        let conversation_id = conversation_id.to_string();
-        let external_id = external_id.to_string();
+    pub async fn mark_unseen(&self, key: MessageKey<'_>) -> Result<bool> {
+        let key = OwnedKey::from(key);
         let changed = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE messages SET seen = 0
-                     WHERE conversation_id = ?1 AND external_id = ?2",
-                    rusqlite::params![&conversation_id, &external_id],
+                    &format!(
+                        "UPDATE messages SET seen = 0
+                         WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                           AND message_id = ?3 AND revision = ?4"
+                    ),
+                    rusqlite::params![key.conversation, key.account, key.message_id, key.revision],
                 )
             })
             .await?;
@@ -1597,7 +1905,7 @@ impl Store {
     /// `MAX` over the stored text works because RFC 3339 with a fixed `+00:00` offset sorts as text
     /// exactly as it does as time, and chrono's per-row fractional-second precision does not break
     /// that: `+` and `.` both sort below every digit.
-    pub async fn unseen_summary(&self, conversation_id: Option<&str>) -> Result<UnseenSummary> {
+    pub async fn unseen_summary(&self, conversation: Option<&str>) -> Result<UnseenSummary> {
         // Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
         //
         // The unseen pair shares `MESSAGE_CURRENT` rather than spelling that rule out again;
@@ -1614,13 +1922,16 @@ impl Store {
              MAX(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN m.timestamp END),
              MAX(CASE WHEN m.own = 0 AND m.deleted_at IS NULL THEN m.timestamp END)"
         );
-        let conversation_id = conversation_id.map(str::to_string);
+        let conversation = conversation.map(str::to_string);
         let (count, newest, latest): (i64, Option<String>, Option<String>) = self
             .connection
-            .call(move |connection| match conversation_id {
-                Some(conversation_id) => connection.query_row(
-                    &format!("SELECT {columns} FROM messages m WHERE m.conversation_id = ?1"),
-                    [conversation_id],
+            .call(move |connection| match conversation {
+                Some(address) => connection.query_row(
+                    &format!(
+                        "SELECT {columns} FROM messages m
+                         WHERE m.conversation_id = {CONVERSATION_ID_OF}"
+                    ),
+                    [address],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ),
                 None => {
@@ -1655,32 +1966,37 @@ impl Store {
     /// and erasing the record removed the only thing that could later tell it what it acted on was
     /// retracted.
     ///
-    /// Keyed on the platform's message id rather than the queue's `external_id`, since a deletion
-    /// names the message and knows nothing about the edit that may have given it a second row. That
-    /// is also why every row for the message is marked rather than one.
+    /// Keyed on the message rather than on a revision of it, since a deletion names the message and
+    /// knows nothing about the edit that may have given it a second row. That is also why every row
+    /// for the message is marked rather than one. The account is part of the key because the same
+    /// message id under a previous account is a different message.
     pub async fn mark_deleted(
         &self,
-        conversation: &str,
+        address: &str,
+        account: AccountId,
         message_id: &str,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let conversation = conversation.to_string();
+        let address = address.to_string();
         let message_id = message_id.to_string();
         let at = to_rfc3339(at);
         let marked = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE messages SET deleted_at = ?3
-                     WHERE conversation_id = ?1 AND message_id = ?2 AND deleted_at IS NULL",
-                    rusqlite::params![conversation, message_id, at],
+                    &format!(
+                        "UPDATE messages SET deleted_at = ?4
+                         WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                           AND message_id = ?3 AND deleted_at IS NULL"
+                    ),
+                    rusqlite::params![address, account, message_id, at],
                 )
             })
             .await?;
         Ok(marked > 0)
     }
 
-    /// Mark the wordings a message had before `external_id` revised it.
+    /// Mark the wordings a message had before the revision `key` names replaced them.
     ///
     /// Ordered on the revision's own row id rather than "everything that is not this one", which is
     /// the only form that survives being called twice or out of order: a redelivered older edit
@@ -1691,38 +2007,36 @@ impl Store {
     /// A revision that is not in the table, because history was off or retention has taken it,
     /// leaves the subquery `NULL` and marks nothing, leaving the wording it replaced readable
     /// rather than stale with no successor.
-    pub async fn supersede_message(
-        &self,
-        conversation: &str,
-        message_id: &str,
-        external_id: &str,
-        at: DateTime<Utc>,
-    ) -> Result<usize> {
-        let conversation = conversation.to_string();
-        let message_id = message_id.to_string();
-        let external_id = external_id.to_string();
+    pub async fn supersede_message(&self, key: MessageKey<'_>, at: DateTime<Utc>) -> Result<usize> {
+        let key = OwnedKey::from(key);
         let at = to_rfc3339(at);
         let marked = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    // The subquery names the message as well as the row, so a caller pairing an
-                    // external id with the wrong message id marks nothing instead of superseding a
-                    // different message's history. `(conversation_id, external_id)` is unique, so
-                    // the extra clause only ever removes a mismatch.
-                    "UPDATE messages SET superseded_at = ?4
-                     WHERE conversation_id = ?1 AND message_id = ?2 AND superseded_at IS NULL
-                       AND id < (SELECT id FROM messages
-                                 WHERE conversation_id = ?1 AND message_id = ?2
-                                   AND external_id = ?3)",
-                    rusqlite::params![conversation, message_id, external_id, at],
+                    &format!(
+                        "UPDATE messages SET superseded_at = ?5
+                         WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                           AND message_id = ?3 AND superseded_at IS NULL
+                           AND id < (SELECT id FROM messages
+                                     WHERE conversation_id = {CONVERSATION_ID_OF}
+                                       AND account_id = ?2 AND message_id = ?3
+                                       AND revision = ?4)"
+                    ),
+                    rusqlite::params![
+                        key.conversation,
+                        key.account,
+                        key.message_id,
+                        key.revision,
+                        at
+                    ],
                 )
             })
             .await?;
         Ok(marked)
     }
 
-    /// Unseen counts for every conversation that has any, keyed by conversation id.
+    /// Unseen counts for every conversation that has any, keyed by address.
     ///
     /// One grouped query rather than a count per conversation, because the caller is rendering a
     /// list and the alternative is fifty round trips to put a number on fifty rows.
@@ -1731,9 +2045,10 @@ impl Store {
             .connection
             .call(|connection| {
                 let mut statement = connection.prepare(&format!(
-                    "SELECT m.conversation_id, COUNT(*) FROM messages m
+                    "SELECT c.address, COUNT(*)
+                     FROM messages m JOIN conversations c ON c.id = m.conversation_id
                      WHERE m.seen = 0 AND {MESSAGE_CURRENT}
-                     GROUP BY m.conversation_id"
+                     GROUP BY c.address"
                 ))?;
                 let rows = statement.query_map([], |row| {
                     Ok((
@@ -1762,22 +2077,28 @@ impl Store {
 
     /// Register an attachment and return the handle the agent fetches it by.
     ///
-    /// Idempotent on `record.id`: a redelivered message returns the handle already issued rather
-    /// than minting a second one for the same file.
+    /// Idempotent on the message's key and the file's position in it: a redelivered message returns
+    /// the handle already issued rather than minting a second one for the same file.
     pub async fn register_attachment(&self, record: AttachmentRecord) -> Result<String> {
         let handle = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "INSERT INTO attachments
-                         (id, conversation_id, channel_id, kind, file_ref, thumb_ref, file_name,
-                          media_type, bytes, path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                     ON CONFLICT(id) DO NOTHING",
+                    &format!(
+                        "INSERT INTO attachments
+                             (conversation_id, account_id, message_id, revision, position, kind,
+                              file_ref, thumb_ref, file_name, media_type, bytes, path, created_at)
+                         VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                                 ?12, ?13)
+                         ON CONFLICT(conversation_id, message_id, account_id, revision, position)
+                             DO NOTHING"
+                    ),
                     rusqlite::params![
-                        record.id,
-                        record.conversation_id,
-                        record.channel_id,
+                        record.conversation,
+                        record.account,
+                        record.message_id,
+                        record.revision,
+                        record.position,
                         record.kind,
                         record.file_ref,
                         record.thumb_ref,
@@ -1791,8 +2112,18 @@ impl Store {
                 // Read back rather than using `last_insert_rowid`, which reports nothing useful
                 // when the conflict clause suppressed the insert.
                 connection.query_row(
-                    "SELECT handle FROM attachments WHERE id = ?1",
-                    [&record.id],
+                    &format!(
+                        "SELECT handle FROM attachments
+                         WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                           AND message_id = ?3 AND revision = ?4 AND position = ?5"
+                    ),
+                    rusqlite::params![
+                        record.conversation,
+                        record.account,
+                        record.message_id,
+                        record.revision,
+                        record.position
+                    ],
                     |row| row.get::<_, i64>(0),
                 )
             })
@@ -1812,23 +2143,23 @@ impl Store {
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT handle, id, conversation_id, channel_id, kind, file_ref, thumb_ref,
-                                file_name, media_type, bytes, path
-                         FROM attachments WHERE handle = ?1",
+                        "SELECT a.handle, c.address, c.channel, a.kind, a.file_ref, a.thumb_ref,
+                                a.file_name, a.media_type, a.bytes, a.path
+                         FROM attachments a JOIN conversations c ON c.id = a.conversation_id
+                         WHERE a.handle = ?1",
                         [handle],
                         |row| {
                             Ok(StoredAttachment {
                                 handle: row.get::<_, i64>(0)?.to_string(),
-                                id: row.get(1)?,
-                                conversation_id: row.get(2)?,
-                                channel_id: row.get(3)?,
-                                kind: row.get(4)?,
-                                file_ref: row.get(5)?,
-                                thumb_ref: row.get(6)?,
-                                file_name: row.get(7)?,
-                                media_type: row.get(8)?,
-                                bytes: row.get::<_, Option<i64>>(9)?.map(|bytes| bytes as u64),
-                                path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+                                conversation: row.get(1)?,
+                                channel: row.get(2)?,
+                                kind: row.get(3)?,
+                                file_ref: row.get(4)?,
+                                thumb_ref: row.get(5)?,
+                                file_name: row.get(6)?,
+                                media_type: row.get(7)?,
+                                bytes: row.get::<_, Option<i64>>(8)?.map(|bytes| bytes as u64),
+                                path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
                             })
                         },
                     )
@@ -1883,25 +2214,97 @@ impl Store {
     }
 }
 
+/// A [`MessageKey`] that owns its strings, so it can be moved onto the connection thread.
+struct OwnedKey {
+    conversation: String,
+    account: AccountId,
+    message_id: String,
+    revision: i64,
+}
+
+impl From<MessageKey<'_>> for OwnedKey {
+    fn from(key: MessageKey<'_>) -> Self {
+        Self {
+            conversation: key.conversation.to_string(),
+            account: key.account,
+            message_id: key.message_id.to_string(),
+            revision: key.revision,
+        }
+    }
+}
+
 fn to_rfc3339(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
-/// Attachment handles as one column. Handles are decimal row ids, so a comma cannot appear inside
-/// one and the split back is unambiguous.
-fn join_handles(handles: &[String]) -> Option<String> {
-    (!handles.is_empty()).then(|| handles.join(","))
+/// The channel segment of an address, which is everything before the first colon.
+fn channel_of(address: &str) -> &str {
+    address.split(':').next().unwrap_or_default()
 }
 
-/// The columns [`row_to_message`] reads, in the order it reads them.
+/// The row id of the conversation whose address is bound as `?1`.
+///
+/// Every table that hangs off a conversation is keyed on its integer id, while the API deals only
+/// in addresses, so this is how a statement gets from one to the other without a round trip. It
+/// yields NULL for an address the address book has never seen, and a `NOT NULL` column then refuses
+/// the write, which is the schema saying what a lookup would have said.
+const CONVERSATION_ID_OF: &str = "(SELECT id FROM conversations WHERE address = ?1)";
+
+/// The columns [`row_to_conversation`] reads, in the order it reads them.
+const CONVERSATION_COLUMNS: &str =
+    "address, channel, platform, title, kind, created_at, last_inbound_at, last_outbound_at";
+
+/// The columns [`row_to_account`] reads, in the order it reads them.
+const ACCOUNT_COLUMNS: &str =
+    "id, channel, platform, platform_id, username, display_name, first_seen_at, last_seen_at";
+
+/// The account currently behind the channel bound as `?1`: the real one seen most recently.
+///
+/// The placeholder never qualifies. Its rows are ones whose account is unknown, and treating the
+/// placeholder as "what the channel used to be" would mark every message recorded before accounts
+/// existed as unanswerable on every deployment that never swapped a bot.
+const ACCOUNT_CURRENT: &str =
+    "channel = ?1 AND platform_id <> '' ORDER BY last_seen_at DESC, id DESC LIMIT 1";
+
+/// The columns [`row_to_policy`] reads, over [`POLICY_FROM`].
+const POLICY_COLUMNS: &str = "c.address, p.mode, p.until, p.reason, p.dropped, p.created_at";
+
+const POLICY_FROM: &str = "conversation_policy p JOIN conversations c ON c.id = p.conversation_id";
+
+/// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
+const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
+     q.received_at, q.attempts, q.recovered";
+
+const QUEUE_FROM: &str = "inbound_queue q JOIN conversations c ON c.id = q.conversation_id";
+
+/// The columns [`row_to_message`] reads, in the order it reads them, over [`MESSAGE_FROM`].
 ///
 /// One constant shared by every query that returns a [`MessageRecord`], and aliased because the
 /// search join puts `messages` next to an FTS table that also has a `text` column. Written out
-/// rather than `m.*` so the order is fixed here: with sixteen positional `row.get` calls, a column
+/// rather than `m.*` so the order is fixed here: with eighteen positional `row.get` calls, a column
 /// added to one query and not another reads back as the wrong field instead of failing.
-const MESSAGE_COLUMNS: &str = "m.id, m.conversation_id, m.external_id, m.message_id, m.sender_id,
-     m.sender_name, m.text, m.notes, m.attachments, m.addressed, m.seen, m.own, m.session_id,
-     m.deleted_at, m.superseded_at, m.timestamp";
+///
+/// Two columns are derived. The handles come from the attachment registry by the message's own
+/// key, in the order the files sat in the message; `group_concat` with its own `ORDER BY` needs
+/// SQLite 3.44, which the bundled build is well past. Whether the account is a previous one
+/// compares the row's account against the channel's current one and is false, not NULL, when the
+/// channel has no current account yet; the placeholder is excluded for the reason on
+/// [`ACCOUNT_CURRENT`].
+const MESSAGE_COLUMNS: &str = "m.id, c.address, m.account_id, m.message_id, m.revision,
+     m.sender_id, m.sender_name, m.text, m.notes,
+     (SELECT group_concat(t.handle, ',' ORDER BY t.position) FROM attachments t
+      WHERE t.conversation_id = m.conversation_id AND t.message_id = m.message_id
+        AND t.account_id = m.account_id AND t.revision = m.revision),
+     m.addressed, m.seen, m.own, m.session_id, m.deleted_at, m.superseded_at, m.timestamp,
+     COALESCE(a.platform_id <> '' AND a.id <> (SELECT r.id FROM accounts r
+                                               WHERE r.channel = c.channel
+                                                 AND r.platform_id <> ''
+                                               ORDER BY r.last_seen_at DESC, r.id DESC
+                                               LIMIT 1), 0)";
+
+const MESSAGE_FROM: &str = "messages m
+     JOIN conversations c ON c.id = m.conversation_id
+     JOIN accounts a ON a.id = m.account_id";
 
 /// What excludes a recorded message from everything the agent is owed.
 ///
@@ -1912,30 +2315,32 @@ const MESSAGE_COLUMNS: &str = "m.id, m.conversation_id, m.external_id, m.message
 const MESSAGE_CURRENT: &str = "m.deleted_at IS NULL AND m.superseded_at IS NULL";
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
-    let attachments: Option<String> = row.get(8)?;
-    let deleted_at: Option<String> = row.get(13)?;
-    let superseded_at: Option<String> = row.get(14)?;
-    let timestamp: String = row.get(15)?;
+    let attachments: Option<String> = row.get(9)?;
+    let deleted_at: Option<String> = row.get(14)?;
+    let superseded_at: Option<String> = row.get(15)?;
+    let timestamp: String = row.get(16)?;
     Ok(MessageRecord {
         id: row.get(0)?,
-        conversation_id: row.get(1)?,
-        external_id: row.get(2)?,
+        conversation: row.get(1)?,
+        account: row.get(2)?,
         message_id: row.get(3)?,
-        sender_id: row.get(4)?,
-        sender_name: row.get(5)?,
-        text: row.get(6)?,
-        notes: row.get(7)?,
+        revision: row.get(4)?,
+        sender_id: row.get(5)?,
+        sender_name: row.get(6)?,
+        text: row.get(7)?,
+        notes: row.get(8)?,
         attachments: attachments
             .as_deref()
             .map(|joined| joined.split(',').map(str::to_string).collect())
             .unwrap_or_default(),
-        addressed: row.get(9)?,
-        seen: row.get(10)?,
-        own: row.get(11)?,
-        session_id: row.get(12)?,
+        addressed: row.get(10)?,
+        seen: row.get(11)?,
+        own: row.get(12)?,
+        session_id: row.get(13)?,
         deleted_at: deleted_at.as_deref().map(parse_rfc3339).transpose()?,
         superseded_at: superseded_at.as_deref().map(parse_rfc3339).transpose()?,
         timestamp: parse_rfc3339(&timestamp)?,
+        previous_account: row.get(17)?,
     })
 }
 
@@ -1944,7 +2349,7 @@ fn row_to_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRecord> {
     let until: Option<String> = row.get(2)?;
     let created_at: String = row.get(5)?;
     Ok(PolicyRecord {
-        conversation_id: row.get(0)?,
+        conversation: row.get(0)?,
         policy: Policy::parse(&mode).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 1,
@@ -1972,33 +2377,48 @@ fn parse_rfc3339(raw: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Erro
 }
 
 fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRecord> {
-    let created_at: String = row.get(7)?;
-    let last_inbound_at: Option<String> = row.get(8)?;
-    let last_outbound_at: Option<String> = row.get(9)?;
+    let created_at: String = row.get(5)?;
+    let last_inbound_at: Option<String> = row.get(6)?;
+    let last_outbound_at: Option<String> = row.get(7)?;
     Ok(ConversationRecord {
-        id: row.get(0)?,
-        channel_id: row.get(1)?,
+        address: row.get(0)?,
+        channel: row.get(1)?,
         platform: row.get(2)?,
-        chat: row.get(3)?,
-        thread: row.get(4)?,
-        title: row.get(5)?,
-        kind: row.get(6)?,
+        title: row.get(3)?,
+        kind: row.get(4)?,
         created_at: parse_rfc3339(&created_at)?,
         last_inbound_at: last_inbound_at.as_deref().map(parse_rfc3339).transpose()?,
         last_outbound_at: last_outbound_at.as_deref().map(parse_rfc3339).transpose()?,
     })
 }
 
+fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
+    let first_seen_at: String = row.get(6)?;
+    let last_seen_at: String = row.get(7)?;
+    Ok(AccountRecord {
+        id: row.get(0)?,
+        channel: row.get(1)?,
+        platform: row.get(2)?,
+        platform_id: row.get(3)?,
+        username: row.get(4)?,
+        display_name: row.get(5)?,
+        first_seen_at: parse_rfc3339(&first_seen_at)?,
+        last_seen_at: parse_rfc3339(&last_seen_at)?,
+    })
+}
+
 fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
-    let received_at: String = row.get(4)?;
+    let received_at: String = row.get(6)?;
     Ok(QueuedMessage {
         seq: row.get(0)?,
-        conversation_id: row.get(1)?,
-        external_id: row.get(2)?,
-        payload: row.get(3)?,
+        conversation: row.get(1)?,
+        account: row.get(2)?,
+        message_id: row.get(3)?,
+        revision: row.get(4)?,
+        payload: row.get(5)?,
         received_at: parse_rfc3339(&received_at)?,
-        attempts: row.get(5)?,
-        recovered: row.get::<_, i64>(6).unwrap_or(0) != 0,
+        attempts: row.get(7)?,
+        recovered: row.get::<_, i64>(8).unwrap_or(0) != 0,
     })
 }
 
@@ -2012,18 +2432,99 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn conversation(id: &str) -> ConversationRecord {
+    fn identity(platform_id: &str) -> AccountIdentity {
+        AccountIdentity {
+            platform_id: platform_id.to_string(),
+            username: Some("mybot".to_string()),
+            display_name: Some("My Bot".to_string()),
+        }
+    }
+
+    async fn register(store: &Store, channel: &str, platform_id: &str) -> AccountId {
+        store
+            .register_account(channel, "telegram", &identity(platform_id), now())
+            .await
+            .expect("register")
+            .account
+    }
+
+    fn conversation(address: &str) -> ConversationRecord {
         ConversationRecord {
-            id: id.to_string(),
-            channel_id: "telegram".to_string(),
+            address: address.to_string(),
+            channel: channel_of(address).to_string(),
             platform: "telegram".to_string(),
-            chat: "123".to_string(),
-            thread: None,
             title: Some("Alice".to_string()),
             kind: "direct".to_string(),
             created_at: now(),
             last_inbound_at: Some(now()),
             last_outbound_at: None,
+        }
+    }
+
+    /// A store logged in on `telegram`, with the given conversations on file.
+    ///
+    /// Every write that names a message needs both: the account is part of a message's identity,
+    /// and the schema refuses a message from an address the address book has never seen.
+    async fn seeded(addresses: &[&str]) -> (Store, AccountId) {
+        let store = Store::open_in_memory().await.expect("opens");
+        let account = register(&store, "telegram", "111").await;
+        for address in addresses {
+            store
+                .upsert_conversation(conversation(address))
+                .await
+                .expect("upsert");
+        }
+        (store, account)
+    }
+
+    fn key<'a>(account: AccountId, conversation: &'a str, message_id: &'a str) -> MessageKey<'a> {
+        MessageKey {
+            conversation,
+            account,
+            message_id,
+            revision: 0,
+        }
+    }
+
+    fn message(
+        account: AccountId,
+        conversation: &str,
+        message_id: &str,
+        text: &str,
+    ) -> MessageRecord {
+        MessageRecord {
+            id: 0,
+            conversation: conversation.to_string(),
+            account,
+            message_id: message_id.to_string(),
+            revision: 0,
+            sender_id: Some("42".to_string()),
+            sender_name: "Alice".to_string(),
+            text: text.to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            seen: false,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: now(),
+            previous_account: false,
+        }
+    }
+
+    /// An edit of `message_id`, as its own row.
+    fn revision(
+        account: AccountId,
+        conversation: &str,
+        message_id: &str,
+        revision: i64,
+        text: &str,
+    ) -> MessageRecord {
+        MessageRecord {
+            revision,
+            ..message(account, conversation, message_id, text)
         }
     }
 
@@ -2038,9 +2539,141 @@ mod tests {
             .await
             .expect("windows")
             .into_iter()
-            .map(|window| window.conversation_id)
+            .map(|window| window.conversation)
             .collect();
         store.claim_batch(&ready, limit).await.expect("claim")
+    }
+
+    #[tokio::test]
+    async fn registering_an_account_is_idempotent_and_reports_a_swap() {
+        let store = Store::open_in_memory().await.expect("opens");
+        let first = store
+            .register_account("telegram", "telegram", &identity("111"), now())
+            .await
+            .expect("register");
+        assert!(
+            first.replaced.is_none(),
+            "nothing preceded the first account"
+        );
+
+        let again = store
+            .register_account(
+                "telegram",
+                "telegram",
+                &identity("111"),
+                now() + chrono::Duration::days(1),
+            )
+            .await
+            .expect("register again");
+        assert_eq!(again.account, first.account, "the same bot keeps its id");
+        assert!(again.replaced.is_none(), "the same bot is not a swap");
+
+        // The bot was deleted and recreated under the same channel slot.
+        let swapped = store
+            .register_account(
+                "telegram",
+                "telegram",
+                &identity("222"),
+                now() + chrono::Duration::days(2),
+            )
+            .await
+            .expect("register the new bot");
+        assert_ne!(swapped.account, first.account);
+        let replaced = swapped.replaced.expect("the swap is reported");
+        assert_eq!(replaced.id, first.account);
+        assert_eq!(replaced.platform_id, "111");
+        assert_eq!(replaced.label(), "@mybot");
+
+        let current = store
+            .current_account("telegram")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            current.id, swapped.account,
+            "the newest real account is current"
+        );
+        assert_eq!(store.accounts().await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_bot_reusing_message_ids_is_not_a_duplicate() {
+        // The bug this whole shape exists for. A Telegram bot deleted and recreated under the same
+        // channel slot numbers its private chats from 1 again, at the same addresses. Keyed on the
+        // address and the message id alone, every message whose id the old bot had already used was
+        // swallowed by the unique constraint: never queued, never recorded, and nothing said so.
+        let (store, old_bot) = seeded(&["telegram:123"]).await;
+        store
+            .record_message(message(old_bot, "telegram:123", "1", "said to the old bot"))
+            .await
+            .expect("record");
+        store
+            .enqueue(key(old_bot, "telegram:123", "1"), "old", now(), 10)
+            .await
+            .expect("enqueue");
+
+        let new_bot = register(&store, "telegram", "222").await;
+        assert!(
+            store
+                .record_message(message(new_bot, "telegram:123", "1", "said to the new bot"))
+                .await
+                .expect("record"),
+            "the same message id under a different account is a different message"
+        );
+        assert_eq!(
+            store
+                .enqueue(key(new_bot, "telegram:123", "1"), "new", now(), 10)
+                .await
+                .expect("enqueue"),
+            EnqueueOutcome::Queued,
+            "and it has to reach the agent"
+        );
+
+        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let texts: Vec<(&str, bool)> = history
+            .iter()
+            .map(|row| (row.text.as_str(), row.previous_account))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("said to the old bot", true),
+                ("said to the new bot", false)
+            ],
+            "both are kept, and the old bot's row says its message id can no longer be acted on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivery_under_the_same_account_is_still_recognised() {
+        // The other half of the contract: scoping by account must not turn Telegram replaying an
+        // unconfirmed batch into a second delivery.
+        let (store, account) = seeded(&["telegram:123"]).await;
+        store
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
+            .await
+            .expect("first");
+        assert_eq!(
+            store
+                .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
+                .await
+                .expect("second"),
+            EnqueueOutcome::Duplicate
+        );
+        assert_eq!(store.pending_count().await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_message_from_an_unknown_address_is_refused_rather_than_filed_under_nothing() {
+        let (store, account) = seeded(&[]).await;
+        let error = store
+            .record_message(message(account, "telegram:404", "1", "lost"))
+            .await
+            .expect_err("no conversation row exists for the address");
+        assert!(
+            error.to_string().contains("NOT NULL"),
+            "the schema is what refuses it: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2053,9 +2686,10 @@ mod tests {
         let sent_at = now();
         {
             let store = Store::open(&path).await.expect("opens");
-            let mut record = conversation("telegram:-100");
-            record.last_outbound_at = Some(sent_at);
-            store.touch_outbound(record).await.expect("outbound");
+            store
+                .touch_outbound("telegram:-100", "telegram", sent_at)
+                .await
+                .expect("outbound");
         }
 
         let reopened = Store::open(&path).await.expect("reopens");
@@ -2065,6 +2699,8 @@ mod tests {
             .expect("read")
             .expect("the conversation is on file");
         assert_eq!(record.last_outbound_at, Some(sent_at));
+        assert_eq!(record.channel, "telegram");
+        assert_eq!(record.kind, "unknown");
     }
 
     #[tokio::test]
@@ -2074,6 +2710,7 @@ mod tests {
         store
             .set_policy(
                 "telegram:1",
+                "telegram",
                 Policy::Block,
                 Some(until),
                 Some("standup spam"),
@@ -2086,11 +2723,56 @@ mod tests {
             .await
             .expect("read")
             .expect("present");
+        assert_eq!(record.conversation, "telegram:1");
         assert_eq!(record.policy, Policy::Block);
         assert_eq!(record.until, Some(until));
         assert_eq!(record.reason.as_deref(), Some("standup spam"));
         assert_eq!(record.dropped, 0);
         assert!(store.policy("telegram:2").await.expect("read").is_none());
+    }
+
+    #[tokio::test]
+    async fn ruling_on_a_chat_that_has_not_written_puts_it_in_the_address_book() {
+        // Pre-emptive, which is legitimate, and the row it mints is what the foreign key needs.
+        // The first message from there then fills in what the address cannot say.
+        let (store, account) = seeded(&[]).await;
+        store
+            .set_policy("telegram:-100", "telegram", Policy::Mute, None, None, now())
+            .await
+            .expect("set");
+        let minted = store
+            .conversation("telegram:-100")
+            .await
+            .expect("read")
+            .expect("minted by the policy");
+        assert_eq!(minted.kind, "unknown");
+        assert_eq!(minted.channel, "telegram");
+        assert_eq!(minted.title, None);
+
+        let mut arrived = conversation("telegram:-100");
+        arrived.kind = "group".to_string();
+        arrived.title = Some("Deploy Crew".to_string());
+        store.upsert_conversation(arrived).await.expect("upsert");
+        let filled = store
+            .conversation("telegram:-100")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(filled.kind, "group");
+        assert_eq!(filled.title.as_deref(), Some("Deploy Crew"));
+        assert_eq!(
+            store
+                .policy("telegram:-100")
+                .await
+                .expect("read")
+                .map(|record| record.policy),
+            Some(Policy::Mute),
+            "and the decision made before it wrote still stands"
+        );
+        store
+            .record_message(message(account, "telegram:-100", "1", "hello"))
+            .await
+            .expect("the minted row is a real conversation");
     }
 
     #[tokio::test]
@@ -2100,7 +2782,7 @@ mod tests {
         let store = Store::open_in_memory().await.expect("opens");
         for policy in [Policy::Active, Policy::Mute, Policy::Block] {
             store
-                .set_policy("telegram:1", policy, None, None, now())
+                .set_policy("telegram:1", "telegram", policy, None, None, now())
                 .await
                 .expect("set");
             let record = store
@@ -2118,7 +2800,7 @@ mod tests {
         let store = Store::open_in_memory().await.expect("opens");
         assert!(!store.clear_policy("telegram:1").await.expect("clear"));
         store
-            .set_policy("telegram:1", Policy::Mute, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Mute, None, None, now())
             .await
             .expect("set");
         assert!(store.clear_policy("telegram:1").await.expect("clear"));
@@ -2132,7 +2814,7 @@ mod tests {
         let store = Store::open_in_memory().await.expect("opens");
         assert!(store.policy("telegram:1").await.expect("read").is_none());
         store
-            .set_policy("telegram:1", Policy::Block, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Block, None, None, now())
             .await
             .expect("set");
         let record = store
@@ -2155,7 +2837,7 @@ mod tests {
         // reported rather than to every decision this conversation has ever had.
         let store = Store::open_in_memory().await.expect("opens");
         store
-            .set_policy("telegram:1", Policy::Block, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Block, None, None, now())
             .await
             .expect("set");
         store.note_blocked_drop("telegram:1").await.expect("count");
@@ -2166,7 +2848,7 @@ mod tests {
         assert_eq!(listed[0].dropped, 2);
 
         store
-            .set_policy("telegram:1", Policy::Block, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Block, None, None, now())
             .await
             .expect("re-set");
         let listed = store.list_policies().await.expect("list");
@@ -2177,7 +2859,7 @@ mod tests {
     async fn expiring_a_policy_returns_the_exact_drop_count_and_removes_it() {
         let store = Store::open_in_memory().await.expect("opens");
         store
-            .set_policy("telegram:1", Policy::Block, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Block, None, None, now())
             .await
             .expect("set");
         store.note_blocked_drop("telegram:1").await.expect("count");
@@ -2200,12 +2882,13 @@ mod tests {
     async fn policies_are_listed_for_the_operator() {
         let store = Store::open_in_memory().await.expect("opens");
         store
-            .set_policy("telegram:1", Policy::Mute, None, None, now())
+            .set_policy("telegram:1", "telegram", Policy::Mute, None, None, now())
             .await
             .expect("set");
         store
             .set_policy(
                 "telegram:2",
+                "telegram",
                 Policy::Block,
                 Some(now() + chrono::Duration::hours(1)),
                 None,
@@ -2215,9 +2898,9 @@ mod tests {
             .expect("set");
         let listed = store.list_policies().await.expect("list");
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].conversation_id, "telegram:1");
+        assert_eq!(listed[0].conversation, "telegram:1");
         assert_eq!(listed[0].policy, Policy::Mute);
-        assert_eq!(listed[1].conversation_id, "telegram:2");
+        assert_eq!(listed[1].conversation, "telegram:2");
         assert_eq!(listed[1].policy, Policy::Block);
     }
 
@@ -2232,34 +2915,15 @@ mod tests {
             .expect("no row is not an error");
     }
 
-    fn message(conversation: &str, external_id: &str, text: &str) -> MessageRecord {
-        MessageRecord {
-            id: 0,
-            conversation_id: conversation.to_string(),
-            external_id: external_id.to_string(),
-            message_id: external_id.to_string(),
-            sender_id: Some("42".to_string()),
-            sender_name: "Alice".to_string(),
-            text: text.to_string(),
-            notes: None,
-            attachments: Vec::new(),
-            addressed: false,
-            seen: false,
-            own: false,
-            session_id: None,
-            deleted_at: None,
-            superseded_at: None,
-            timestamp: now(),
-        }
-    }
-
     #[tokio::test]
     async fn a_recorded_message_reads_back() {
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut record = message("telegram:1", "10", "the deploy is stuck");
-        record.attachments = vec!["7".to_string(), "8".to_string()];
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut record = message(account, "telegram:1", "10", "the deploy is stuck");
         record.notes = Some("photo".to_string());
-        store.record_message(record.clone()).await.expect("record");
+        assert!(
+            store.record_message(record.clone()).await.expect("record"),
+            "a first recording is a write"
+        );
         let history = store.history("telegram:1", 10, None).await.expect("read");
         // The id is assigned on insert, so it is the one field the caller cannot predict.
         assert_eq!(history.len(), 1);
@@ -2271,12 +2935,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_reads_back_with_the_handles_of_its_files_in_order() {
+        // The handles are no longer a column of the message: they come from the registry by the
+        // message's own key, so a row can never quote a handle the sweep has already taken. The
+        // order is the order the files sat in the message, which is what "the second picture"
+        // means.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut handles = Vec::new();
+        for position in [1, 0, 2] {
+            handles.push((
+                position,
+                store
+                    .register_attachment(attachment_record(account, "10", position, 0, None))
+                    .await
+                    .expect("register"),
+            ));
+        }
+        handles.sort_by_key(|(position, _)| *position);
+        store
+            .record_message(message(account, "telegram:1", "10", "three photos"))
+            .await
+            .expect("record");
+        store
+            .record_message(message(account, "telegram:1", "11", "no photos"))
+            .await
+            .expect("record");
+
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        assert_eq!(
+            history[0].attachments,
+            handles
+                .into_iter()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>(),
+            "in position order, whatever order they were registered in"
+        );
+        assert!(history[1].attachments.is_empty());
+    }
+
+    #[tokio::test]
     async fn recording_the_same_message_twice_keeps_one_copy() {
         // A platform replaying updates after a crash must not double the history.
-        let store = Store::open_in_memory().await.expect("opens");
-        let record = message("telegram:1", "10", "hello");
-        store.record_message(record.clone()).await.expect("record");
-        store.record_message(record).await.expect("re-record");
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let record = message(account, "telegram:1", "10", "hello");
+        assert!(store.record_message(record.clone()).await.expect("record"));
+        assert!(
+            !store.record_message(record).await.expect("re-record"),
+            "a replay is reported as one rather than written"
+        );
         assert_eq!(
             store
                 .history("telegram:1", 10, None)
@@ -2289,9 +2995,14 @@ mod tests {
 
     #[tokio::test]
     async fn history_returns_the_most_recent_in_the_order_they_were_said() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         for index in 0..5 {
-            let mut record = message("telegram:1", &index.to_string(), &format!("line {index}"));
+            let mut record = message(
+                account,
+                "telegram:1",
+                &index.to_string(),
+                &format!("line {index}"),
+            );
             record.timestamp = now() + chrono::Duration::seconds(index);
             store.record_message(record).await.expect("record");
         }
@@ -2309,10 +3020,15 @@ mod tests {
         // Telegram stamps to the second, so a burst shares one timestamp. Paging on the timestamp
         // alone would drop every message in the second the previous page ended in, and the caller
         // would never know: the pages would simply not add up.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let stamp = now();
         for index in 0..6 {
-            let mut record = message("telegram:1", &index.to_string(), &format!("line {index}"));
+            let mut record = message(
+                account,
+                "telegram:1",
+                &index.to_string(),
+                &format!("line {index}"),
+            );
             // Two distinct seconds, three messages in each.
             record.timestamp = stamp + chrono::Duration::seconds(i64::from(index / 3));
             store.record_message(record).await.expect("record");
@@ -2336,13 +3052,13 @@ mod tests {
 
     #[tokio::test]
     async fn history_is_scoped_to_one_conversation() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1", "telegram:2"]).await;
         store
-            .record_message(message("telegram:1", "1", "ours"))
+            .record_message(message(account, "telegram:1", "1", "ours"))
             .await
             .expect("record");
         store
-            .record_message(message("telegram:2", "1", "theirs"))
+            .record_message(message(account, "telegram:2", "1", "theirs"))
             .await
             .expect("record");
         let history = store.history("telegram:1", 10, None).await.expect("read");
@@ -2352,9 +3068,10 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_a_message_and_can_be_narrowed_to_one_chat() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1", "telegram:2"]).await;
         store
             .record_message(message(
+                account,
                 "telegram:1",
                 "1",
                 "the certificate expires on friday",
@@ -2363,6 +3080,7 @@ mod tests {
             .expect("record");
         store
             .record_message(message(
+                account,
                 "telegram:2",
                 "1",
                 "certificate renewal is automated",
@@ -2370,7 +3088,7 @@ mod tests {
             .await
             .expect("record");
         store
-            .record_message(message("telegram:1", "2", "lunch?"))
+            .record_message(message(account, "telegram:1", "2", "lunch?"))
             .await
             .expect("record");
 
@@ -2385,19 +3103,24 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].conversation_id, "telegram:2");
+        assert_eq!(scoped[0].conversation, "telegram:2");
     }
 
     #[tokio::test]
     async fn pruning_history_takes_the_search_index_with_it() {
         // External-content FTS5 keeps no copy of the text, so a delete that skipped the trigger
         // would leave the index pointing at rows that no longer exist.
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut old = message("telegram:1", "1", "ancient business");
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut old = message(account, "telegram:1", "1", "ancient business");
         old.timestamp = now() - chrono::Duration::days(40);
         store.record_message(old).await.expect("record");
         store
-            .record_message(message("telegram:1", "2", "ancient history repeats"))
+            .record_message(message(
+                account,
+                "telegram:1",
+                "2",
+                "ancient history repeats",
+            ))
             .await
             .expect("record");
 
@@ -2411,14 +3134,19 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(hits.len(), 1, "the pruned row must leave the index too");
-        assert_eq!(hits[0].external_id, "2");
+        assert_eq!(hits[0].message_id, "2");
     }
 
     #[tokio::test]
     async fn taking_unseen_counts_everything_and_returns_only_the_tail() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         for index in 0..10 {
-            let mut record = message("telegram:1", &index.to_string(), &format!("line {index}"));
+            let mut record = message(
+                account,
+                "telegram:1",
+                &index.to_string(),
+                &format!("line {index}"),
+            );
             record.timestamp = now() + chrono::Duration::seconds(index);
             store.record_message(record).await.expect("record");
         }
@@ -2436,14 +3164,14 @@ mod tests {
         // The reversal of the earlier behaviour, which removed the row. A message the agent was
         // shown is in its session for good, so the record is the only thing that can later tell it
         // the message was withdrawn; erasing the row erased the notice along with the text.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .record_message(message("telegram:1", "1", "said too much"))
+            .record_message(message(account, "telegram:1", "1", "said too much"))
             .await
             .expect("record");
 
         let marked = store
-            .mark_deleted("telegram:1", "1", now())
+            .mark_deleted("telegram:1", account, "1", now())
             .await
             .expect("mark");
         assert!(marked, "the row was there to mark");
@@ -2462,24 +3190,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deletion_names_the_message_of_one_account_only() {
+        // The same message id under the old bot is a different message, and a deletion reported
+        // to the new bot says nothing about it.
+        let (store, old_bot) = seeded(&["telegram:1"]).await;
+        store
+            .record_message(message(
+                old_bot,
+                "telegram:1",
+                "1",
+                "the old bot's message 1",
+            ))
+            .await
+            .expect("record");
+        let new_bot = register(&store, "telegram", "222").await;
+        store
+            .record_message(message(
+                new_bot,
+                "telegram:1",
+                "1",
+                "the new bot's message 1",
+            ))
+            .await
+            .expect("record");
+
+        assert!(
+            store
+                .mark_deleted("telegram:1", new_bot, "1", now())
+                .await
+                .expect("mark")
+        );
+        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let deleted: Vec<&str> = history
+            .iter()
+            .filter(|row| row.deleted_at.is_some())
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(deleted, vec!["the new bot's message 1"]);
+    }
+
+    #[tokio::test]
     async fn marking_a_deletion_twice_keeps_the_first_time() {
         // A platform can report the same deletion more than once, and a redelivery must not move
         // the time it happened forward.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .record_message(message("telegram:1", "1", "said too much"))
+            .record_message(message(account, "telegram:1", "1", "said too much"))
             .await
             .expect("record");
         let first = now();
         assert!(
             store
-                .mark_deleted("telegram:1", "1", first)
+                .mark_deleted("telegram:1", account, "1", first)
                 .await
                 .expect("mark")
         );
         assert!(
             !store
-                .mark_deleted("telegram:1", "1", first + chrono::Duration::hours(1))
+                .mark_deleted(
+                    "telegram:1",
+                    account,
+                    "1",
+                    first + chrono::Duration::hours(1)
+                )
                 .await
                 .expect("mark"),
             "the second report changes nothing"
@@ -2497,17 +3270,22 @@ mod tests {
         // Both rows stay, because "what did they say before they changed it" is worth answering,
         // but only one of them is current. Without the mark `read_history` returns the two wordings
         // as separate messages that both look like the live one.
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut original = message("telegram:1", "7", "meet at four");
-        original.message_id = "7".to_string();
-        store.record_message(original).await.expect("record");
-
-        let mut revision = message("telegram:1", "7:e1", "meet at five");
-        revision.message_id = "7".to_string();
-        store.record_message(revision).await.expect("record");
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .record_message(message(account, "telegram:1", "7", "meet at four"))
+            .await
+            .expect("record");
+        let edit = revision(
+            account,
+            "telegram:1",
+            "7",
+            1_754_400_600_000,
+            "meet at five",
+        );
+        store.record_message(edit.clone()).await.expect("record");
 
         let marked = store
-            .supersede_message("telegram:1", "7", "7:e1", now())
+            .supersede_message(edit.key(), now())
             .await
             .expect("supersede");
         assert_eq!(marked, 1, "only the older wording is marked");
@@ -2537,7 +3315,7 @@ mod tests {
         // Redelivery is the reachable path. The writer records before it enqueues, and the queue's
         // duplicate branch exists because a lost `getUpdates` confirmation re-offers a batch, so an
         // older edit arriving a second time is ordinary rather than exotic.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let current = async || {
             store
                 .history("telegram:1", 10, None)
@@ -2548,23 +3326,24 @@ mod tests {
                 .map(|row| row.text)
                 .collect::<Vec<_>>()
         };
-        for (external_id, text) in [("9", "one"), ("9:e1", "two"), ("9:e2", "three")] {
-            let mut record = message("telegram:1", external_id, text);
-            record.message_id = "9".to_string();
-            store.record_message(record).await.expect("record");
+        for (edit, text) in [(0, "one"), (1_000, "two"), (2_000, "three")] {
+            let record = revision(account, "telegram:1", "9", edit, text);
+            store.record_message(record.clone()).await.expect("record");
             store
-                .supersede_message("telegram:1", "9", external_id, now())
+                .supersede_message(record.key(), now())
                 .await
                 .expect("supersede");
         }
         assert_eq!(current().await, vec!["three"], "the last edit is current");
 
         // The same edit again, the way a replayed batch delivers it.
-        let mut replayed = message("telegram:1", "9:e1", "two");
-        replayed.message_id = "9".to_string();
-        store.record_message(replayed).await.expect("record");
+        let replayed = revision(account, "telegram:1", "9", 1_000, "two");
         store
-            .supersede_message("telegram:1", "9", "9:e1", now())
+            .record_message(replayed.clone())
+            .await
+            .expect("record");
+        store
+            .supersede_message(replayed.key(), now())
             .await
             .expect("supersede");
         assert_eq!(
@@ -2579,24 +3358,23 @@ mod tests {
         // Offering a retracted message, or wording that has since been rewritten, as "here is what
         // you missed" presents something untrue as news. The count and the excerpt have to agree on
         // that, or the agent is told about messages it is never shown.
-        let store = Store::open_in_memory().await.expect("opens");
-        for (external_id, text) in [("1", "kept"), ("2", "retracted"), ("3", "the old wording")] {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for (message_id, text) in [("1", "kept"), ("2", "retracted"), ("3", "the old wording")] {
             store
-                .record_message(message("telegram:1", external_id, text))
+                .record_message(message(account, "telegram:1", message_id, text))
                 .await
                 .expect("record");
         }
         store
-            .mark_deleted("telegram:1", "2", now())
+            .mark_deleted("telegram:1", account, "2", now())
             .await
             .expect("mark");
         // Recorded rather than merely named: superseding is ordered against the revision's own row,
         // so a replacement that is not in the table marks nothing, which is the point.
-        let mut revision = message("telegram:1", "3:e1", "the new wording");
-        revision.message_id = "3".to_string();
-        store.record_message(revision).await.expect("record");
+        let edit = revision(account, "telegram:1", "3", 1_000, "the new wording");
+        store.record_message(edit.clone()).await.expect("record");
         store
-            .supersede_message("telegram:1", "3", "3:e1", now())
+            .supersede_message(edit.key(), now())
             .await
             .expect("supersede");
 
@@ -2632,15 +3410,15 @@ mod tests {
         // survive that filter, so the arithmetic only works if the row it hides sorts below the row
         // it keeps. If it did not, the older wording would sit unseen forever: skipped by the
         // filter on the way out and left behind by `mark_seen` on the way back.
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut original = message("telegram:1", "5", "meet at four");
-        original.message_id = "5".to_string();
-        store.record_message(original).await.expect("record");
-        let mut revision = message("telegram:1", "5:e1", "meet at five");
-        revision.message_id = "5".to_string();
-        store.record_message(revision).await.expect("record");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .supersede_message("telegram:1", "5", "5:e1", now())
+            .record_message(message(account, "telegram:1", "5", "meet at four"))
+            .await
+            .expect("record");
+        let edit = revision(account, "telegram:1", "5", 1_000, "meet at five");
+        store.record_message(edit.clone()).await.expect("record");
+        store
+            .supersede_message(edit.key(), now())
             .await
             .expect("supersede");
 
@@ -2683,8 +3461,8 @@ mod tests {
     async fn a_recorded_message_remembers_which_side_it_came_from() {
         // The columns that make the history cover both directions. Read back wrong, the agent's own
         // messages would be indistinguishable from another bot's in the same chat.
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut record = message("telegram:1", "1", "on it");
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut record = message(account, "telegram:1", "1", "on it");
         record.own = true;
         record.session_id = Some("scheduled-news".to_string());
         record.seen = true;
@@ -2709,9 +3487,9 @@ mod tests {
     async fn asking_what_is_unseen_does_not_spend_it() {
         // The whole reason this exists alongside `take_unseen`. A watcher asks on a timer, and if
         // asking consumed the backlog the turn it went on to trigger would find an empty room.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .record_message(message("telegram:1", "1", "the deploy is stuck"))
+            .record_message(message(account, "telegram:1", "1", "the deploy is stuck"))
             .await
             .expect("record");
 
@@ -2738,13 +3516,13 @@ mod tests {
         // A watcher fires on this string changing, so a new message has to change it and nothing
         // else may. Both halves matter and the second is the one that costs turns: firing on
         // something other than a message sends the agent to read a room that has not moved.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1", "telegram:2"]).await;
         let marker = async || store.unseen_summary(None).await.expect("summary").marker();
 
         let quiet = marker().await;
         assert_eq!(quiet, "never", "a bridge that has heard nothing says so");
 
-        let mut first = message("telegram:1", "1", "one");
+        let mut first = message(account, "telegram:1", "1", "one");
         first.timestamp = now();
         store.record_message(first).await.expect("record");
         let after_one = marker().await;
@@ -2765,7 +3543,7 @@ mod tests {
             "being shown the backlog is not news of a new message"
         );
 
-        let mut second = message("telegram:2", "2", "two");
+        let mut second = message(account, "telegram:2", "2", "two");
         second.timestamp = now() + chrono::Duration::seconds(30);
         store.record_message(second).await.expect("record");
         assert_ne!(
@@ -2782,15 +3560,15 @@ mod tests {
         // fired on the main session having spoken and spent a turn reading a room whose only new
         // message was the agent's own. Nothing was recorded here before, which is why the marker
         // was safe; keeping it safe now means saying so.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let marker = async || store.unseen_summary(None).await.expect("summary").marker();
 
-        let mut theirs = message("telegram:1", "1", "the deploy is stuck");
+        let mut theirs = message(account, "telegram:1", "1", "the deploy is stuck");
         theirs.timestamp = now();
         store.record_message(theirs).await.expect("record");
         let after_theirs = marker().await;
 
-        let mut ours = message("telegram:1", "2", "on it");
+        let mut ours = message(account, "telegram:1", "2", "on it");
         ours.own = true;
         ours.seen = true;
         ours.timestamp = now() + chrono::Duration::seconds(30);
@@ -2807,21 +3585,21 @@ mod tests {
         // Documented on `marker` as news of a kind, and it used to happen for free because a
         // deletion removed the row. Now the row is kept, so the marker has to skip it deliberately
         // or a watcher never learns that the message it last fired on has been withdrawn.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let marker = async || store.unseen_summary(None).await.expect("summary").marker();
 
-        let mut first = message("telegram:1", "1", "one");
+        let mut first = message(account, "telegram:1", "1", "one");
         first.timestamp = now();
         store.record_message(first).await.expect("record");
         let after_first = marker().await;
 
-        let mut second = message("telegram:1", "2", "spoke too soon");
+        let mut second = message(account, "telegram:1", "2", "spoke too soon");
         second.timestamp = now() + chrono::Duration::seconds(30);
         store.record_message(second).await.expect("record");
         assert_ne!(marker().await, after_first);
 
         store
-            .mark_deleted("telegram:1", "2", now())
+            .mark_deleted("telegram:1", account, "2", now())
             .await
             .expect("mark");
         assert_eq!(
@@ -2835,9 +3613,9 @@ mod tests {
     async fn the_marker_and_the_backlog_answer_different_questions() {
         // The count is what a person wants and the marker is what a watcher can use. Keeping both
         // is the point: collapsing them either fires spuriously or reports nothing useful.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .record_message(message("telegram:1", "1", "one"))
+            .record_message(message(account, "telegram:1", "1", "one"))
             .await
             .expect("record");
         store
@@ -2864,13 +3642,13 @@ mod tests {
 
     #[tokio::test]
     async fn unseen_can_be_asked_about_one_chat_or_all_of_them() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1", "telegram:2"]).await;
         store
-            .record_message(message("telegram:1", "1", "one"))
+            .record_message(message(account, "telegram:1", "1", "one"))
             .await
             .expect("record");
         store
-            .record_message(message("telegram:2", "2", "two"))
+            .record_message(message(account, "telegram:2", "2", "two"))
             .await
             .expect("record");
 
@@ -2899,9 +3677,9 @@ mod tests {
 
     #[tokio::test]
     async fn unseen_is_not_reported_twice() {
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
-            .record_message(message("telegram:1", "1", "first"))
+            .record_message(message(account, "telegram:1", "1", "first"))
             .await
             .expect("record");
         let through = now() + chrono::Duration::hours(1);
@@ -2935,11 +3713,11 @@ mod tests {
     async fn unseen_ignores_anything_after_the_message_that_woke_the_agent() {
         // The cut-off is the waking message's own timestamp, so a message that lands while the turn
         // is being assembled stays unseen and is reported next time rather than silently marked.
-        let store = Store::open_in_memory().await.expect("opens");
-        let mut earlier = message("telegram:1", "1", "before");
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut earlier = message(account, "telegram:1", "1", "before");
         earlier.timestamp = now();
         store.record_message(earlier).await.expect("record");
-        let mut later = message("telegram:1", "2", "after");
+        let mut later = message(account, "telegram:1", "2", "after");
         later.timestamp = now() + chrono::Duration::minutes(5);
         store.record_message(later).await.expect("record");
 
@@ -2966,17 +3744,17 @@ mod tests {
         // window and opens this one: an edit carries its *original* message's timestamp, so it is
         // recorded with a low id and a high time. It falls outside the ceiling, so it is never
         // counted or shown, and inside the watermark, so it is marked anyway.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let ceiling = now();
 
         // Recorded first, so it has the lower id, but stamped after the ceiling: an ordinary
         // message that arrived while an older edit was still being processed.
-        let mut later = message("telegram:1", "1", "after the ceiling");
+        let mut later = message(account, "telegram:1", "1", "after the ceiling");
         later.timestamp = ceiling + chrono::Duration::minutes(5);
         store.record_message(later).await.expect("record");
 
         // An edit of something old: higher id, lower timestamp, so it is what sets the watermark.
-        let mut edit = message("telegram:1", "2", "edit of an old message");
+        let mut edit = message(account, "telegram:1", "2", "edit of an old message");
         edit.timestamp = ceiling - chrono::Duration::hours(1);
         store.record_message(edit).await.expect("record");
 
@@ -3006,9 +3784,9 @@ mod tests {
         // and from the CLI predicate. Not a narrow window either. Telegram stamps to whole seconds
         // so a burst shares one, and an edit carries the *original* message's time, so an edit of
         // anything older lands inside it however long the turn took.
-        let store = Store::open_in_memory().await.expect("opens");
+        let (store, account) = seeded(&["telegram:1"]).await;
         let asked_about = now();
-        let mut first = message("telegram:1", "1", "before the turn");
+        let mut first = message(account, "telegram:1", "1", "before the turn");
         first.timestamp = asked_about;
         store.record_message(first).await.expect("record");
 
@@ -3019,7 +3797,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Arrives while the turn is running, sharing the second the count was taken at.
-        let mut during = message("telegram:1", "2", "arrived mid-turn");
+        let mut during = message(account, "telegram:1", "2", "arrived mid-turn");
         during.timestamp = asked_about;
         store.record_message(during).await.expect("record");
 
@@ -3035,15 +3813,6 @@ mod tests {
         );
     }
 
-    async fn store_with_conversation() -> Store {
-        let store = Store::open_in_memory().await.expect("opens");
-        store
-            .upsert_conversation(conversation("telegram:123"))
-            .await
-            .expect("upsert");
-        store
-    }
-
     #[tokio::test]
     async fn session_id_round_trips_and_clears() {
         let store = Store::open_in_memory().await.expect("opens");
@@ -3057,9 +3826,14 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_then_claim_then_complete() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         let outcome = store
-            .enqueue("telegram:123", "m1", "{\"text\":\"hi\"}", now(), 10)
+            .enqueue(
+                key(account, "telegram:123", "m1"),
+                "{\"text\":\"hi\"}",
+                now(),
+                10,
+            )
             .await
             .expect("enqueue");
         assert_eq!(outcome, EnqueueOutcome::Queued);
@@ -3068,6 +3842,8 @@ mod tests {
         let batch = claim_all(&store, 10).await;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].payload, "{\"text\":\"hi\"}");
+        assert_eq!(batch[0].conversation, "telegram:123");
+        assert_eq!(batch[0].key(), key(account, "telegram:123", "m1"));
         assert_eq!(store.pending_count().await.expect("count"), 0);
 
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
@@ -3079,9 +3855,9 @@ mod tests {
 
     #[tokio::test]
     async fn peek_does_not_claim_rows() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         let peeked = store.peek_pending(10).await.expect("peek");
@@ -3093,23 +3869,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_external_ids_are_rejected() {
-        let store = store_with_conversation().await;
-        store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
-            .await
-            .expect("first");
-        let second = store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
-            .await
-            .expect("second");
-        assert_eq!(second, EnqueueOutcome::Duplicate);
-        assert_eq!(store.pending_count().await.expect("count"), 1);
-    }
-
-    #[tokio::test]
     async fn a_pending_window_spans_oldest_to_newest() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         assert!(
             store.pending_windows().await.expect("query").is_empty(),
             "an empty queue has no window to debounce against"
@@ -3118,17 +3879,17 @@ mod tests {
         let first = now() - chrono::Duration::seconds(30);
         let last = now();
         store
-            .enqueue("telegram:123", "m1", "a", first, 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", first, 10)
             .await
             .expect("first");
         store
-            .enqueue("telegram:123", "m2", "b", last, 10)
+            .enqueue(key(account, "telegram:123", "m2"), "b", last, 10)
             .await
             .expect("second");
 
         let windows = store.pending_windows().await.expect("query");
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].conversation_id, "telegram:123");
+        assert_eq!(windows[0].conversation, "telegram:123");
         assert_eq!(windows[0].oldest.timestamp(), first.timestamp());
         assert_eq!(windows[0].newest.timestamp(), last.timestamp());
     }
@@ -3138,19 +3899,19 @@ mod tests {
         // The reason this is grouped at all. One window over the whole queue meant a chat still
         // mid-burst deferred delivery for every other chat, which on a platform holding for
         // somebody to stop typing would be a busy room stalling a direct message.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123", "telegram:999"]).await;
         let old = now() - chrono::Duration::seconds(30);
         store
-            .enqueue("telegram:123", "m1", "a", old, 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", old, 10)
             .await
             .expect("first");
         store
-            .enqueue("telegram:999", "m2", "b", now(), 10)
+            .enqueue(key(account, "telegram:999", "m2"), "b", now(), 10)
             .await
             .expect("second");
 
         let mut windows = store.pending_windows().await.expect("query");
-        windows.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        windows.sort_by(|left, right| left.conversation.cmp(&right.conversation));
         assert_eq!(windows.len(), 2, "got {windows:?}");
         assert_eq!(windows[0].newest.timestamp(), old.timestamp());
         assert_ne!(
@@ -3164,13 +3925,13 @@ mod tests {
     async fn a_conversation_that_is_not_ready_is_left_alone() {
         // The claim narrows to the conversations the drain loop decided had settled. Without that
         // it would take the oldest rows in the queue whatever it had just concluded about them.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123", "telegram:999"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("first");
         store
-            .enqueue("telegram:999", "m2", "b", now(), 10)
+            .enqueue(key(account, "telegram:999", "m2"), "b", now(), 10)
             .await
             .expect("second");
 
@@ -3179,7 +3940,7 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].conversation_id, "telegram:999");
+        assert_eq!(batch[0].conversation, "telegram:999");
         assert_eq!(
             store.pending_count().await.expect("count"),
             1,
@@ -3192,9 +3953,9 @@ mod tests {
         // By far the most common tick, since usually nothing has settled yet. Note this passes
         // either way: SQLite accepts `IN ()` and evaluates it false, so the early return is an
         // optimisation and this test only pins that an empty ask is answered rather than refused.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         assert!(store.claim_batch(&[], 10).await.expect("claim").is_empty());
@@ -3205,9 +3966,9 @@ mod tests {
     async fn claimed_rows_leave_the_pending_window() {
         // The drain loop debounces on this, so an in-flight batch must not keep holding the window
         // open and defer the messages behind it.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         claim_all(&store, 10).await;
@@ -3216,16 +3977,24 @@ mod tests {
 
     #[tokio::test]
     async fn an_edit_is_not_mistaken_for_a_redelivery() {
-        // A platform edit reuses the id of the message it revises. The channel layer derives a
-        // distinct key for that reason; this pins the queue half of the contract, because keying an
-        // edit on the bare message id makes it vanish into the duplicate check.
-        let store = store_with_conversation().await;
+        // A platform edit reuses the id of the message it revises. The revision is what tells the
+        // two apart; this pins the queue half of the contract, because keying an edit on the bare
+        // message id makes it vanish into the duplicate check.
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "meet at 5", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "meet at 5", now(), 10)
             .await
             .expect("original");
         let edit = store
-            .enqueue("telegram:123", "m1:e1754400000", "meet at 6", now(), 10)
+            .enqueue(
+                MessageKey {
+                    revision: 1_754_400_000_000,
+                    ..key(account, "telegram:123", "m1")
+                },
+                "meet at 6",
+                now(),
+                10,
+            )
             .await
             .expect("edit");
         assert_eq!(edit, EnqueueOutcome::Queued);
@@ -3234,16 +4003,21 @@ mod tests {
 
     #[tokio::test]
     async fn queue_depth_is_enforced_against_waiting_rows() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         for index in 0..2 {
             let outcome = store
-                .enqueue("telegram:123", &format!("m{index}"), "a", now(), 2)
+                .enqueue(
+                    key(account, "telegram:123", &format!("m{index}")),
+                    "a",
+                    now(),
+                    2,
+                )
                 .await
                 .expect("enqueue");
             assert_eq!(outcome, EnqueueOutcome::Queued);
         }
         let overflow = store
-            .enqueue("telegram:123", "m2", "a", now(), 2)
+            .enqueue(key(account, "telegram:123", "m2"), "a", now(), 2)
             .await
             .expect("enqueue");
         assert_eq!(overflow, EnqueueOutcome::Dropped);
@@ -3252,7 +4026,7 @@ mod tests {
         // without bound.
         claim_all(&store, 2).await;
         let still_full = store
-            .enqueue("telegram:123", "m3", "a", now(), 2)
+            .enqueue(key(account, "telegram:123", "m3"), "a", now(), 2)
             .await
             .expect("enqueue");
         assert_eq!(still_full, EnqueueOutcome::Dropped);
@@ -3260,12 +4034,11 @@ mod tests {
 
     #[tokio::test]
     async fn claim_preserves_arrival_order() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         for index in 0..5 {
             store
                 .enqueue(
-                    "telegram:123",
-                    &format!("m{index}"),
+                    key(account, "telegram:123", &format!("m{index}")),
                     &index.to_string(),
                     now(),
                     10,
@@ -3287,9 +4060,9 @@ mod tests {
         // delivery: it now does that routinely for background tasks and scheduled wakes. Spending
         // an attempt on it would let a busy session declare a message undeliverable that meka never
         // saw, which is exactly what happened in the field.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
 
@@ -3318,9 +4091,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_batch_retries_then_exhausts() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 10).await;
@@ -3342,6 +4115,7 @@ mod tests {
             .expect("fail");
         assert!(second.retrying.is_empty());
         assert_eq!(second.exhausted.len(), 1);
+        assert_eq!(second.exhausted[0].conversation, "telegram:123");
         assert_eq!(store.pending_count().await.expect("count"), 0);
         assert_eq!(store.queue_stats().await.expect("stats").failed, 1);
     }
@@ -3351,9 +4125,9 @@ mod tests {
         // What stops the drain loop coming straight back to a provider that has just rate limited
         // it. Without the column the retry lands inside the same window and spends the budget for
         // nothing.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 10).await;
@@ -3375,9 +4149,9 @@ mod tests {
         // `max()` rather than `min()`, and the reason is ordering: the drain loop claims by `seq`,
         // so releasing the fresh message while its predecessor waits out a rate limit would hand
         // the agent the second half of an exchange before the first.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 10).await;
@@ -3389,7 +4163,7 @@ mod tests {
             .expect("fail");
 
         store
-            .enqueue("telegram:123", "m2", "b", now(), 10)
+            .enqueue(key(account, "telegram:123", "m2"), "b", now(), 10)
             .await
             .expect("enqueue");
 
@@ -3407,8 +4181,8 @@ mod tests {
         // about to be handed it. Running out of attempts is exactly when that assumption fails, and
         // without this the message is neither delivered nor owed: absent from `unseen`, from the
         // missed-context lookback, and from the `mekabridge unseen` predicate.
-        let store = store_with_conversation().await;
-        let mut record = message("telegram:123", "m1", "are you there?");
+        let (store, account) = seeded(&["telegram:123"]).await;
+        let mut record = message(account, "telegram:123", "m1", "are you there?");
         record.seen = true;
         store.record_message(record).await.expect("record");
         assert_eq!(
@@ -3422,7 +4196,7 @@ mod tests {
 
         assert!(
             store
-                .mark_unseen("telegram:123", "m1")
+                .mark_unseen(key(account, "telegram:123", "m1"))
                 .await
                 .expect("unsee")
         );
@@ -3438,7 +4212,7 @@ mod tests {
 
         assert!(
             !store
-                .mark_unseen("telegram:123", "nothing-here")
+                .mark_unseen(key(account, "telegram:123", "nothing-here"))
                 .await
                 .expect("unsee"),
             "a message that was never recorded cannot be un-seen"
@@ -3447,9 +4221,9 @@ mod tests {
 
     #[tokio::test]
     async fn zero_retries_fails_on_first_attempt() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 10).await;
@@ -3464,9 +4238,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_rows_are_recovered_at_startup() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "m1", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
         claim_all(&store, 10).await;
@@ -3502,11 +4276,8 @@ mod tests {
         let mut older = conversation("telegram:1");
         older.last_inbound_at = Some(now() - chrono::Duration::hours(2));
         let mut newer = conversation("telegram:2");
-        newer.chat = "2".to_string();
         newer.last_inbound_at = Some(now());
-        let mut other_channel = conversation("second:9");
-        other_channel.id = "second:9".to_string();
-        other_channel.channel_id = "second".to_string();
+        let other_channel = conversation("second:9");
 
         store.upsert_conversation(older).await.expect("upsert");
         store.upsert_conversation(newer).await.expect("upsert");
@@ -3517,14 +4288,15 @@ mod tests {
 
         let all = store.list_conversations(None, 10).await.expect("list");
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].id, "telegram:2");
+        assert_eq!(all[0].address, "telegram:2");
 
         let filtered = store
             .list_conversations(Some("second"), 10)
             .await
             .expect("list");
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, "second:9");
+        assert_eq!(filtered[0].address, "second:9");
+        assert_eq!(filtered[0].channel, "second");
     }
 
     #[tokio::test]
@@ -3560,9 +4332,9 @@ mod tests {
         // stranded by a hard kill was in the hands of a turn nobody saw the end of: replaying it
         // silently presents work that may already be done as though it were new, and with the
         // attempt uncharged a batch that kills the process is replayed for ever.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "a", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
             .await
             .expect("enqueue");
         let claimed = claim_all(&store, 1).await;
@@ -3590,9 +4362,9 @@ mod tests {
         // which marks a delivered message unseen and tells the owner it was lost. The drain loop is
         // serial so no live path does this today, but the store is the wrong place to rely on that:
         // a second process, or `mekabridge queue clear`, reaches these directly.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
-            .enqueue("telegram:123", "a", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 1).await;
@@ -3623,7 +4395,7 @@ mod tests {
         // Without the guard on `complete_batch` a late completion from an abandoned attempt marks a
         // message delivered while it is still waiting to be delivered, and it is never sent.
         store
-            .enqueue("telegram:123", "b", "b", now(), 10)
+            .enqueue(key(account, "telegram:123", "b"), "b", now(), 10)
             .await
             .expect("enqueue");
         let batch = claim_all(&store, 1).await;
@@ -3645,10 +4417,10 @@ mod tests {
         // `pending_windows`, so newer messages in the same conversation are delivered ahead of them
         // until the next restart -- a real ordering violation on top of the stall. Reachable from
         // `mekabridge queue clear` against a running bridge.
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         for id in ["a", "b"] {
             store
-                .enqueue("telegram:123", id, id, now(), 10)
+                .enqueue(key(account, "telegram:123", id), id, now(), 10)
                 .await
                 .expect("enqueue");
         }
@@ -3658,7 +4430,7 @@ mod tests {
         let vanished = batch.get(1).expect("second").seq;
         store.clear_queue().await.expect("clear");
         store
-            .enqueue("telegram:123", "a", "a", now(), 10)
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
             .await
             .expect("re-enqueue");
         let restored = claim_all(&store, 10).await;
@@ -3677,11 +4449,10 @@ mod tests {
 
     #[tokio::test]
     async fn prune_delivered_only_removes_completed_rows() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(
-                "telegram:123",
-                "done",
+                key(account, "telegram:123", "done"),
                 "a",
                 now() - chrono::Duration::days(30),
                 10,
@@ -3690,8 +4461,7 @@ mod tests {
             .expect("enqueue");
         store
             .enqueue(
-                "telegram:123",
-                "waiting",
+                key(account, "telegram:123", "waiting"),
                 "b",
                 now() - chrono::Duration::days(30),
                 10,
@@ -3732,13 +4502,21 @@ mod tests {
         assert_eq!(store.pending_count().await.expect("count"), 1);
     }
 
-    fn attachment_record(id: &str, age_days: i64, path: Option<PathBuf>) -> AttachmentRecord {
+    fn attachment_record(
+        account: AccountId,
+        message_id: &str,
+        position: u32,
+        age_days: i64,
+        path: Option<PathBuf>,
+    ) -> AttachmentRecord {
         AttachmentRecord {
-            id: id.to_string(),
-            conversation_id: "telegram:123".to_string(),
-            channel_id: "telegram".to_string(),
+            conversation: "telegram:1".to_string(),
+            account,
+            message_id: message_id.to_string(),
+            revision: 0,
+            position,
             kind: "photo".to_string(),
-            file_ref: format!("ref-{id}"),
+            file_ref: format!("ref-{message_id}-{position}"),
             thumb_ref: None,
             file_name: None,
             media_type: Some("image/jpeg".to_string()),
@@ -3750,13 +4528,13 @@ mod tests {
 
     #[tokio::test]
     async fn registering_an_attachment_returns_a_reusable_handle() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:1"]).await;
         let first = store
-            .register_attachment(attachment_record("a1", 0, None))
+            .register_attachment(attachment_record(account, "a1", 0, 0, None))
             .await
             .expect("register");
         let again = store
-            .register_attachment(attachment_record("a1", 0, None))
+            .register_attachment(attachment_record(account, "a1", 0, 0, None))
             .await
             .expect("register again");
         assert_eq!(
@@ -3765,17 +4543,35 @@ mod tests {
         );
 
         let other = store
-            .register_attachment(attachment_record("a2", 0, None))
+            .register_attachment(attachment_record(account, "a1", 1, 0, None))
             .await
             .expect("register");
-        assert_ne!(first, other);
+        assert_ne!(first, other, "the next file in the same message is its own");
+    }
+
+    #[tokio::test]
+    async fn a_recreated_bot_does_not_inherit_the_old_bots_file_handles() {
+        // The worst of the collisions. A file id on Telegram is bound to the bot that received it,
+        // so handing the new bot the old bot's handle for message 1 pointed `view_attachment` at a
+        // file the new bot cannot fetch, or at the wrong picture.
+        let (store, old_bot) = seeded(&["telegram:1"]).await;
+        let old = store
+            .register_attachment(attachment_record(old_bot, "1", 0, 0, None))
+            .await
+            .expect("register");
+        let new_bot = register(&store, "telegram", "222").await;
+        let new = store
+            .register_attachment(attachment_record(new_bot, "1", 0, 0, None))
+            .await
+            .expect("register");
+        assert_ne!(old, new);
     }
 
     #[tokio::test]
     async fn an_attachment_resolves_by_handle() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:1"]).await;
         let handle = store
-            .register_attachment(attachment_record("a1", 0, None))
+            .register_attachment(attachment_record(account, "a1", 0, 0, None))
             .await
             .expect("register");
         let record = store
@@ -3783,8 +4579,9 @@ mod tests {
             .await
             .expect("query")
             .expect("resolves");
-        assert_eq!(record.file_ref, "ref-a1");
-        assert_eq!(record.channel_id, "telegram");
+        assert_eq!(record.file_ref, "ref-a1-0");
+        assert_eq!(record.channel, "telegram");
+        assert_eq!(record.conversation, "telegram:1");
         assert!(record.path.is_none());
     }
 
@@ -3792,7 +4589,7 @@ mod tests {
     async fn a_handle_that_is_not_a_number_resolves_to_nothing() {
         // The agent supplies this string, so a hallucinated value has to fail cleanly rather than
         // erroring out of the query layer.
-        let store = store_with_conversation().await;
+        let (store, _) = seeded(&["telegram:1"]).await;
         assert!(
             store
                 .attachment("not-a-handle")
@@ -3805,9 +4602,9 @@ mod tests {
 
     #[tokio::test]
     async fn marking_a_download_makes_the_file_sweepable() {
-        let store = store_with_conversation().await;
-        let handle = store
-            .register_attachment(attachment_record("a1", 40, None))
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .register_attachment(attachment_record(account, "a1", 0, 40, None))
             .await
             .expect("register");
         // Before the download there is no file, so the sweep has nothing to unlink.
@@ -3820,11 +4617,9 @@ mod tests {
         );
 
         let handle = store
-            .register_attachment(attachment_record("a2", 40, None))
+            .register_attachment(attachment_record(account, "a2", 0, 40, None))
             .await
-            .expect("register")
-            .to_string()
-            .max(handle);
+            .expect("register");
         store
             .mark_attachment_downloaded(&handle, Path::new("/tmp/a2.jpg"))
             .await
@@ -3838,10 +4633,12 @@ mod tests {
 
     #[tokio::test]
     async fn expired_attachments_are_returned_for_unlinking() {
-        let store = store_with_conversation().await;
+        let (store, account) = seeded(&["telegram:1"]).await;
         store
             .register_attachment(attachment_record(
+                account,
                 "a1",
+                0,
                 40,
                 Some(PathBuf::from("/tmp/a1.jpg")),
             ))
@@ -3849,7 +4646,9 @@ mod tests {
             .expect("register");
         store
             .register_attachment(attachment_record(
+                account,
                 "a2",
+                0,
                 0,
                 Some(PathBuf::from("/tmp/a2.jpg")),
             ))
@@ -3871,6 +4670,27 @@ mod tests {
         );
     }
 
+    /// A database at schema version `version`, built the way every release up to it built one.
+    async fn legacy_database(
+        path: &Path,
+        version: usize,
+        populate: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<()> + Send + 'static,
+    ) {
+        let connection = tokio_rusqlite::Connection::open(path).await.expect("opens");
+        connection
+            .call(move |connection| {
+                for (index, statements) in MIGRATIONS.iter().enumerate().take(version) {
+                    connection.execute_batch(statements)?;
+                    connection.pragma_update(None, "user_version", (index + 1) as i64)?;
+                }
+                populate(connection)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("build a legacy database");
+        connection.close().await.expect("closes");
+    }
+
     #[tokio::test]
     async fn two_openers_racing_the_same_upgrade_both_survive() {
         // What a real upgrade looks like: systemd starts the daemon while an operator runs
@@ -3880,18 +4700,7 @@ mod tests {
         // was added to prevent.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.db");
-        let connection = tokio_rusqlite::Connection::open(&path)
-            .await
-            .expect("opens");
-        connection
-            .call(|connection| {
-                connection.execute_batch(include_str!("store/schema_001.sql"))?;
-                connection.pragma_update(None, "user_version", 1_i64)?;
-                Ok::<(), tokio_rusqlite::Error>(())
-            })
-            .await
-            .expect("build a version 1 database");
-        connection.close().await.expect("closes");
+        legacy_database(&path, 1, |_| Ok(())).await;
 
         let opens = (0..4).map(|_| Store::open(&path));
         for outcome in futures::future::join_all(opens).await {
@@ -3937,30 +4746,22 @@ mod tests {
         // database would pass everything else and fail on the first real bridge to restart.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.db");
-        let connection = tokio_rusqlite::Connection::open(&path)
-            .await
-            .expect("opens");
-        connection
-            .call(|connection| {
-                connection.execute_batch(include_str!("store/schema_001.sql"))?;
-                connection.pragma_update(None, "user_version", 1_i64)?;
-                connection.execute("INSERT INTO meta (key, value) VALUES ('session_id', ?1)", [
-                    Uuid::nil().to_string(),
-                ])?;
-                // A message that was already waiting when the daemon was stopped to upgrade it.
-                // Written without the columns later migrations add, so it is the row most likely to
-                // trip one of them up.
-                connection.execute(
-                    "INSERT INTO inbound_queue
-                         (conversation_id, external_id, payload, received_at, state)
-                     VALUES ('telegram:123', 'pending-across-the-upgrade', 'a', ?1, 'pending')",
-                    [to_rfc3339(now())],
-                )?;
-                Ok::<(), tokio_rusqlite::Error>(())
-            })
-            .await
-            .expect("build a version 1 database");
-        connection.close().await.expect("closes");
+        legacy_database(&path, 1, |connection| {
+            connection.execute("INSERT INTO meta (key, value) VALUES ('session_id', ?1)", [
+                Uuid::nil().to_string(),
+            ])?;
+            // A message that was already waiting when the daemon was stopped to upgrade it.
+            // Written without the columns later migrations add, so it is the row most likely to
+            // trip one of them up, and with no conversation row, since nothing required one.
+            connection.execute(
+                "INSERT INTO inbound_queue
+                     (conversation_id, external_id, payload, received_at, state)
+                 VALUES ('telegram:123', 'pending-across-the-upgrade', 'a', ?1, 'pending')",
+                [to_rfc3339(now())],
+            )?;
+            Ok(())
+        })
+        .await;
 
         let store = Store::open(&path).await.expect("upgrades");
         assert_eq!(
@@ -3980,14 +4781,24 @@ mod tests {
             1,
             "a message queued before the upgrade must still be deliverable after it"
         );
-        store
-            .set_policy("telegram:1", Policy::Mute, None, None, now())
+        assert_eq!(claimed[0].message_id, "pending-across-the-upgrade");
+        let adopted = store
+            .conversation("telegram:123")
             .await
-            .expect("the table added by the upgrade is usable");
+            .expect("read")
+            .expect("a conversation row was made for the orphaned queue row");
+        assert_eq!(adopted.channel, "telegram");
+        assert_eq!(adopted.kind, "unknown");
+
+        let account = register(&store, "telegram", "111").await;
         store
-            .record_message(message("telegram:1", "1", "after the upgrade"))
+            .set_policy("telegram:1", "telegram", Policy::Mute, None, None, now())
             .await
-            .expect("the history added by the upgrade is usable");
+            .expect("the policy table is usable");
+        store
+            .record_message(message(account, "telegram:1", "1", "after the upgrade"))
+            .await
+            .expect("the history is usable");
     }
 
     #[tokio::test]
@@ -3999,28 +4810,18 @@ mod tests {
         // deleted nor superseded, which is what they are.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.db");
-        let connection = tokio_rusqlite::Connection::open(&path)
-            .await
-            .expect("opens");
-        connection
-            .call(|connection| {
-                for (version, statements) in MIGRATIONS.iter().enumerate().take(7) {
-                    connection.execute_batch(statements)?;
-                    connection.pragma_update(None, "user_version", (version + 1) as i64)?;
-                }
-                connection.execute(
-                    "INSERT INTO messages
-                         (conversation_id, external_id, message_id, sender_id, sender_name, text,
-                          notes, attachments, addressed, seen, timestamp)
-                     VALUES ('telegram:1', '4', '4', '111', 'Alice', 'said before the upgrade',
-                             NULL, NULL, 0, 0, ?1)",
-                    [to_rfc3339(now())],
-                )?;
-                Ok::<(), tokio_rusqlite::Error>(())
-            })
-            .await
-            .expect("build a version 7 database");
-        connection.close().await.expect("closes");
+        legacy_database(&path, 7, |connection| {
+            connection.execute(
+                "INSERT INTO messages
+                     (conversation_id, external_id, message_id, sender_id, sender_name, text,
+                      notes, attachments, addressed, seen, timestamp)
+                 VALUES ('telegram:1', '4', '4', '111', 'Alice', 'said before the upgrade',
+                         NULL, NULL, 0, 0, ?1)",
+                [to_rfc3339(now())],
+            )?;
+            Ok(())
+        })
+        .await;
 
         let store = Store::open(&path).await.expect("upgrades");
         let history = store.history("telegram:1", 10, None).await.expect("read");
@@ -4048,24 +4849,15 @@ mod tests {
         // silently start delivering mentions from chats somebody had switched off entirely.
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("state.db");
-        let connection = tokio_rusqlite::Connection::open(&path)
-            .await
-            .expect("opens");
-        connection
-            .call(|connection| {
-                connection.execute_batch(include_str!("store/schema_001.sql"))?;
-                connection.execute_batch(include_str!("store/schema_002.sql"))?;
-                connection.pragma_update(None, "user_version", 2_i64)?;
-                connection.execute(
-                    "INSERT INTO mutes (conversation_id, until, reason, dropped, created_at)
-                     VALUES ('telegram:-100', NULL, 'endless standup chatter', 41, ?1)",
-                    [to_rfc3339(now())],
-                )?;
-                Ok::<(), tokio_rusqlite::Error>(())
-            })
-            .await
-            .expect("build a version 2 database");
-        connection.close().await.expect("closes");
+        legacy_database(&path, 2, |connection| {
+            connection.execute(
+                "INSERT INTO mutes (conversation_id, until, reason, dropped, created_at)
+                 VALUES ('telegram:-100', NULL, 'endless standup chatter', 41, ?1)",
+                [to_rfc3339(now())],
+            )?;
+            Ok(())
+        })
+        .await;
 
         let store = Store::open(&path).await.expect("upgrades");
         let carried = store
@@ -4076,6 +4868,198 @@ mod tests {
         assert_eq!(carried.policy, Policy::Block);
         assert_eq!(carried.reason.as_deref(), Some("endless standup chatter"));
         assert_eq!(carried.dropped, 41, "the tally has to come across too");
+    }
+
+    #[tokio::test]
+    async fn history_recorded_before_0_13_0_is_carried_across_and_stays_clear_of_a_new_bot() {
+        // The shape 0.13.0 exists for. Everything written before it belongs to whichever bot was
+        // behind the channel at the time, which nothing recorded, so those rows go to a placeholder
+        // account: distinct from every real one, so a recreated bot reusing the old ids collides
+        // with nothing, and never reported as a previous account, since on a deployment that never
+        // swapped bots it is the same one.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        let old_cursor = 40_i64;
+        legacy_database(&path, 8, move |connection| {
+            connection.execute(
+                "INSERT INTO conversations
+                     (id, channel_id, platform, chat, thread, title, kind, created_at,
+                      last_inbound_at)
+                 VALUES ('telegram:123', 'telegram', 'telegram', '123', NULL, 'Alice', 'direct',
+                         ?1, ?1)",
+                [to_rfc3339(now())],
+            )?;
+            // The original, a Telegram edit of it (seconds), and an edit the bridge made of its
+            // own message (milliseconds), which is the mixture a real database holds.
+            for (id, external_id, message_id, text, own) in [
+                (old_cursor, "1", "1", "hello", 0),
+                (old_cursor + 1, "1:e1754400600", "1", "hello there", 0),
+                (old_cursor + 2, "2", "2", "on it", 1),
+                (old_cursor + 3, "2:e1754400600500", "2", "on it now", 1),
+            ] {
+                connection.execute(
+                    "INSERT INTO messages
+                         (id, conversation_id, external_id, message_id, sender_id, sender_name,
+                          text, notes, attachments, addressed, seen, own, timestamp)
+                     VALUES (?1, 'telegram:123', ?2, ?3, '111', 'Alice', ?4, NULL, NULL, 0, 1,
+                             ?5, ?6)",
+                    rusqlite::params![id, external_id, message_id, text, own, to_rfc3339(now())],
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO inbound_queue
+                     (conversation_id, external_id, payload, received_at, state, completed_at)
+                 VALUES ('telegram:123', '1', 'a', ?1, 'done', ?1)",
+                [to_rfc3339(now())],
+            )?;
+            // A file on the original, and one on the edit, in a threaded conversation nothing else
+            // mentions so the address itself carries a colon.
+            connection.execute(
+                "INSERT INTO attachments
+                     (handle, id, conversation_id, channel_id, kind, file_ref, created_at)
+                 VALUES (7, 'telegram:123:1:0', 'telegram:123', 'telegram', 'photo', 'old-photo',
+                         ?1),
+                        (8, 'telegram:-100:77:12:e1754400600:1', 'telegram:-100:77', 'telegram',
+                         'photo', 'threaded-photo', ?1)",
+                [to_rfc3339(now())],
+            )?;
+            Ok(())
+        })
+        .await;
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let placeholder = store
+            .accounts()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(AccountRecord::is_placeholder)
+            .expect("the legacy rows have an account to belong to");
+        assert_eq!(placeholder.channel, "telegram");
+        assert_eq!(placeholder.platform, "telegram");
+        assert!(
+            store
+                .current_account("telegram")
+                .await
+                .expect("read")
+                .is_none(),
+            "a placeholder is not a current account"
+        );
+
+        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let carried: Vec<(i64, &str, i64, bool, bool)> = history
+            .iter()
+            .map(|row| {
+                (
+                    row.id,
+                    row.message_id.as_str(),
+                    row.revision,
+                    row.own,
+                    row.previous_account,
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                (old_cursor, "1", 0, false, false),
+                (old_cursor + 1, "1", 1_754_400_600_000, false, false),
+                (old_cursor + 2, "2", 0, true, false),
+                (old_cursor + 3, "2", 1_754_400_600_500, true, false),
+            ],
+            "ids survive, the edit time is normalised to milliseconds whichever unit wrote it, \
+             and nothing is reported as a previous account"
+        );
+        assert_eq!(
+            history[0].attachments,
+            vec!["7".to_string()],
+            "a file registered under the old key is still found from its message"
+        );
+        let threaded = store
+            .attachment("8")
+            .await
+            .expect("query")
+            .expect("the handle survives");
+        assert_eq!(threaded.conversation, "telegram:-100:77");
+        assert_eq!(threaded.channel, "telegram");
+        assert_eq!(threaded.file_ref, "threaded-photo");
+        assert_eq!(
+            store
+                .search_messages("hello", None, 10)
+                .await
+                .expect("search")
+                .len(),
+            2,
+            "the search index is rebuilt over the carried rows rather than left empty"
+        );
+
+        // The bot was recreated. Its first message reuses id 1, which the old bot had used.
+        let new_bot = register(&store, "telegram", "999").await;
+        assert!(
+            store
+                .record_message(message(new_bot, "telegram:123", "1", "hello again"))
+                .await
+                .expect("record"),
+            "the recreated bot's first message must be recorded"
+        );
+        assert_eq!(
+            store
+                .enqueue(key(new_bot, "telegram:123", "1"), "b", now(), 10)
+                .await
+                .expect("enqueue"),
+            EnqueueOutcome::Queued,
+            "and delivered, despite the old bot's message 1 still being in the queue"
+        );
+        let new_handle = store
+            .register_attachment(AttachmentRecord {
+                conversation: "telegram:123".to_string(),
+                account: new_bot,
+                message_id: "1".to_string(),
+                revision: 0,
+                position: 0,
+                kind: "photo".to_string(),
+                file_ref: "new-photo".to_string(),
+                thumb_ref: None,
+                file_name: None,
+                media_type: None,
+                bytes: None,
+                path: None,
+                created_at: now(),
+            })
+            .await
+            .expect("register");
+        assert_ne!(new_handle, "7", "and its photo is not the old bot's photo");
+
+        let history = store.history("telegram:123", 10, None).await.expect("read");
+        assert!(
+            history.iter().all(|row| !row.previous_account),
+            "the placeholder is unknown rather than previous, so nothing is flagged yet"
+        );
+
+        // A second swap, this time between two accounts the bridge knew, is reported.
+        let newer_bot = register(&store, "telegram", "1000").await;
+        store
+            .record_message(message(
+                newer_bot,
+                "telegram:123",
+                "1",
+                "hello a third time",
+            ))
+            .await
+            .expect("record");
+        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let flagged: Vec<(&str, bool)> = history
+            .iter()
+            .map(|row| (row.text.as_str(), row.previous_account))
+            .collect();
+        assert_eq!(flagged, vec![
+            ("hello", false),
+            ("hello there", false),
+            ("on it", false),
+            ("on it now", false),
+            ("hello again", true),
+            ("hello a third time", false),
+        ]);
     }
 
     #[tokio::test]

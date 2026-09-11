@@ -11,7 +11,7 @@ pub mod inbound;
 pub mod turn;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -40,7 +40,7 @@ use crate::{
         ToolSurface, ViewedAttachment, serve,
     },
     meka::MekaClient,
-    store::{Policy, Store, UnseenSummary},
+    store::{AccountId, AccountIdentity, MessageKey, Policy, Store, UnseenSummary},
 };
 
 /// Buffer between the channel pollers and the durable writer.
@@ -87,6 +87,121 @@ const MAX_VIEW_BASE64_BYTES: usize = 10 * 1024 * 1024;
 /// is too big to show than handed a picture with nothing in it.
 const MAX_VIEW_BYTES: u64 = 3_750_000;
 
+/// Which account each channel is logged in as, resolved once at startup.
+///
+/// The account is part of every recorded message's identity, so the writer and the sink both need
+/// it, and it cannot change while the process runs: a swapped token means a restart.
+#[derive(Debug, Default)]
+pub struct ChannelAccounts {
+    by_channel: HashMap<String, AccountId>,
+    /// `(channel, label)` for the envelope's orientation line, in the order the channels were
+    /// added. The label is `None` for a channel whose account could not be resolved.
+    identities: Vec<(String, Option<String>)>,
+}
+
+impl ChannelAccounts {
+    /// Record that `channel` is logged in as `account`, known to people as `label`.
+    pub fn add(&mut self, channel: &str, account: AccountId, label: String) {
+        self.by_channel.insert(channel.to_string(), account);
+        self.identities.push((channel.to_string(), Some(label)));
+    }
+
+    /// Record that `channel` could not say who it is logged in as.
+    pub fn add_unknown(&mut self, channel: &str) {
+        self.identities.push((channel.to_string(), None));
+    }
+
+    /// The account behind `channel`, if it could be resolved.
+    pub fn get(&self, channel: &str) -> Option<AccountId> {
+        self.by_channel.get(channel).copied()
+    }
+
+    /// Whether no channel at all resolved its account.
+    pub fn is_empty(&self) -> bool {
+        self.by_channel.is_empty()
+    }
+
+    /// Which account the agent appears as on each channel, for the envelope.
+    pub fn identities(&self) -> &[(String, Option<String>)] {
+        &self.identities
+    }
+}
+
+/// Ask each channel which account it is logged in as, and record the answer.
+///
+/// Done before anything is written because the account is part of every message's identity: a
+/// message recorded without one could not be told apart from the same message id under a bot that
+/// was since deleted and recreated. A channel that cannot answer is left out of the map, and
+/// [`run`] then does not start it, which is the outcome its own login failing would have had.
+///
+/// A channel answering with a different account than last time is a bot swap, said at `warn`
+/// because everything recorded under the old account carries message ids the new one cannot act
+/// on.
+async fn register_accounts(store: &Store, channels: &ChannelRegistry) -> ChannelAccounts {
+    let mut accounts = ChannelAccounts::default();
+    // By id rather than in the registry's own order, which is a hash map's, so the envelope names
+    // the accounts in the same order on every start.
+    let mut channels: Vec<&Arc<dyn Channel>> = channels.iter().collect();
+    channels.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+    for channel in channels {
+        let identity = match channel.probe().await {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::error!(
+                    channel = %channel.id(),
+                    "could not find out which account this channel is logged in as, so it will \
+                     not be started: {}",
+                    error
+                );
+                accounts.add_unknown(channel.id().as_str());
+                continue;
+            }
+        };
+        let label = identity.username.as_ref().map_or_else(
+            || identity.display_name.clone(),
+            |username| format!("@{username}"),
+        );
+        let registration = match store
+            .register_account(
+                channel.id().as_str(),
+                channel.platform().as_str(),
+                &AccountIdentity {
+                    platform_id: identity.id,
+                    username: identity.username,
+                    display_name: Some(identity.display_name),
+                },
+                Utc::now(),
+            )
+            .await
+        {
+            Ok(registration) => registration,
+            Err(error) => {
+                tracing::error!(
+                    channel = %channel.id(),
+                    "could not record which account this channel is logged in as, so it will not \
+                     be started: {}",
+                    error
+                );
+                accounts.add_unknown(channel.id().as_str());
+                continue;
+            }
+        };
+        if let Some(previous) = registration.replaced {
+            tracing::warn!(
+                channel = %channel.id(),
+                now = %label,
+                before = %previous.label(),
+                "this channel is logged in as a different account than last time; messages \
+                 recorded under the old one cannot be replied to, reacted to, edited or deleted \
+                 from this one, and read_history marks them as from a previous account"
+            );
+        }
+        tracing::info!(channel = %channel.id(), account = %label, "logged in");
+        accounts.add(channel.id().as_str(), registration.account, label);
+    }
+    accounts
+}
+
 /// Run the bridge until a shutdown signal arrives.
 pub async fn run(config: Config) -> Result<()> {
     // First, and here rather than in the caller, because this is a property of the daemon and not
@@ -130,6 +245,16 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::info!("MCP endpoint bound to {}{}", address, config.mcp.path);
     }
 
+    // After the bind, so a port conflict is still found before any platform is asked anything,
+    // and before the sink and the writer exist, since both key what they write on the answer.
+    let accounts = Arc::new(register_accounts(&store, &channels).await);
+    if accounts.is_empty() {
+        return Err(crate::error::BridgeError::command(
+            "no channel could say which account it is logged in as, so nothing it heard could be \
+             recorded; the errors above say why",
+        ));
+    }
+
     let shutdown = CancellationToken::new();
     // Fires when the last channel stops, as distinct from an operator asking the process to stop.
     // The two are kept apart so the exit status can say which happened.
@@ -146,6 +271,7 @@ pub async fn run(config: Config) -> Result<()> {
         config.bridge.default_policy,
         meka.clone(),
         Arc::clone(&presence),
+        Arc::clone(&accounts),
     ));
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -167,9 +293,16 @@ pub async fn run(config: Config) -> Result<()> {
     // for, and staying up in that state is the worst of both: a supervisor sees a healthy service
     // while every message goes unheard. One dead channel out of several is different, and is left
     // alone.
-    let live_channels = Arc::new(AtomicUsize::new(channels.count()));
-    for channel in channels.iter() {
-        let channel = Arc::clone(channel);
+    //
+    // Only channels whose account resolved are started. The rest are dead from the outset, which
+    // is what they would have been had their own login failed, and they count as such.
+    let running: Vec<Arc<dyn Channel>> = channels
+        .iter()
+        .filter(|channel| accounts.get(channel.id().as_str()).is_some())
+        .map(Arc::clone)
+        .collect();
+    let live_channels = Arc::new(AtomicUsize::new(running.len()));
+    for channel in running {
         let sender = event_sender.clone();
         let shutdown = shutdown.clone();
         let live_channels = Arc::clone(&live_channels);
@@ -204,7 +337,10 @@ pub async fn run(config: Config) -> Result<()> {
         let config = Arc::clone(&config);
         let wake_drain = Arc::clone(&wake_drain);
         let typing = Arc::clone(&typing);
-        async move { inbound::writer(store, config, event_receiver, wake_drain, typing).await }
+        let accounts = Arc::clone(&accounts);
+        async move {
+            inbound::writer(store, config, event_receiver, wake_drain, typing, accounts).await
+        }
     });
 
     tasks.spawn({
@@ -222,7 +358,7 @@ pub async fn run(config: Config) -> Result<()> {
                 config.bridge.typing_max,
                 Arc::clone(&presence),
             ),
-            identities: Arc::new(tokio::sync::OnceCell::new()),
+            accounts: Arc::clone(&accounts),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             notices: inbound::NoticeLog::default(),
         };
@@ -404,24 +540,24 @@ async fn shutdown_signal() {
 /// not send it can still open it. Without this the bridge's own attachments would be the only ones
 /// in the history that could not be viewed.
 ///
-/// The handle id is `<conversation>:<external_id>:<index>`, stable across a redelivery so a replay
-/// reuses the handle already issued rather than minting a second one for the same file. Outbound
-/// messages use their platform message id as the external id, which cannot collide with an inbound
-/// one; see the note in [`record_own_messages`] for why not, which differs per platform.
+/// Keyed by the message and the file's position in it, stable across a redelivery so a replay
+/// reuses the handle already issued rather than minting a second one for the same file. The key
+/// carries the account, so a bot recreated under the same channel never inherits a handle to a file
+/// only the old bot could fetch.
 async fn register_files(
     store: &Store,
-    conversation: &ConversationId,
-    channel: &crate::channel::ChannelId,
-    external_id: &str,
+    key: MessageKey<'_>,
     timestamp: chrono::DateTime<Utc>,
     attachments: &mut [crate::channel::Attachment],
 ) -> std::result::Result<(), crate::store::StoreError> {
-    for (index, attachment) in attachments.iter_mut().enumerate() {
+    for (position, attachment) in attachments.iter_mut().enumerate() {
         let handle = store
             .register_attachment(crate::store::AttachmentRecord {
-                id: format!("{conversation}:{external_id}:{index}"),
-                conversation_id: conversation.as_str().to_string(),
-                channel_id: channel.as_str().to_string(),
+                conversation: key.conversation.to_string(),
+                account: key.account,
+                message_id: key.message_id.to_string(),
+                revision: key.revision,
+                position: u32::try_from(position).unwrap_or(u32::MAX),
                 kind: attachment.kind.as_str().to_string(),
                 file_ref: attachment.file_ref.clone(),
                 thumb_ref: attachment.thumb_ref.clone(),
@@ -457,6 +593,9 @@ pub struct BridgeSink {
     /// Cached because it cannot change without restarting meka, and queried lazily rather than at
     /// startup because the bridge deliberately comes up before meka does.
     vision: tokio::sync::OnceCell<bool>,
+    /// Which account each channel speaks as, which is part of the identity of everything the
+    /// agent sends.
+    accounts: Arc<ChannelAccounts>,
 }
 
 impl BridgeSink {
@@ -468,6 +607,7 @@ impl BridgeSink {
         default_policy: DefaultPolicy,
         meka: MekaClient,
         presence: Arc<Presence>,
+        accounts: Arc<ChannelAccounts>,
     ) -> Self {
         Self {
             store,
@@ -477,6 +617,7 @@ impl BridgeSink {
             meka,
             presence,
             vision: tokio::sync::OnceCell::new(),
+            accounts,
         }
     }
 
@@ -516,10 +657,10 @@ impl BridgeSink {
             .ok_or_else(|| SinkError::UnknownAttachment(handle.to_string()))?;
         let channel = self
             .channels
-            .get(&record.channel_id)
+            .get(&record.channel)
             .ok_or_else(|| SinkError::UnknownChannel {
-                conversation: record.conversation_id.clone(),
-                channel: record.channel_id.clone(),
+                conversation: record.conversation.clone(),
+                channel: record.channel.clone(),
             })?
             .clone();
         Ok((record, channel))
@@ -622,11 +763,18 @@ impl BridgeSink {
         sent: Vec<crate::channel::SentMessage>,
         revised_at: Option<chrono::DateTime<Utc>>,
     ) {
+        let Some(account) = self.accounts.get(channel.id().as_str()) else {
+            tracing::warn!(
+                conversation = %conversation,
+                "not recording a message the agent sent: the channel's account is unknown"
+            );
+            return;
+        };
         record_own_messages(
             &self.store,
             self.storage.history_retention,
             conversation,
-            channel.id(),
+            account,
             session,
             sent,
             revised_at,
@@ -640,23 +788,9 @@ impl BridgeSink {
         conversation: &ConversationId,
         platform: crate::channel::Platform,
     ) {
-        let now = Utc::now();
         if let Err(error) = self
             .store
-            .touch_outbound(crate::store::ConversationRecord {
-                id: conversation.as_str().to_string(),
-                channel_id: conversation.channel().to_string(),
-                platform: platform.as_str().to_string(),
-                chat: conversation.chat().to_string(),
-                thread: conversation.thread().map(str::to_string),
-                // Both unknown when the agent messages first, and both left alone on a conversation
-                // that already exists.
-                title: None,
-                kind: crate::channel::ChatKind::Unknown.as_str().to_string(),
-                created_at: now,
-                last_inbound_at: None,
-                last_outbound_at: Some(now),
-            })
+            .touch_outbound(conversation.as_str(), platform.as_str(), Utc::now())
             .await
         {
             tracing::warn!("failed to record an outbound message: {}", error);
@@ -677,14 +811,13 @@ impl BridgeSink {
 /// call would tell the agent its message did not go out when it did.
 ///
 /// `seen` is true on every row, or the bridge's own output would count as a backlog and be offered
-/// back to the agent as context it missed. `revised_at` gives a revision a deduplication key of its
-/// own, since it keeps the message id it revises and the unique constraint would otherwise swallow
-/// it.
+/// back to the agent as context it missed. `revised_at` gives a revision a key of its own, since it
+/// keeps the message id it revises and the unique constraint would otherwise swallow it.
 async fn record_own_messages(
     store: &Store,
     history_retention: Duration,
     conversation: &ConversationId,
-    channel: &crate::channel::ChannelId,
+    account: AccountId,
     session: Option<&str>,
     mut sent: Vec<crate::channel::SentMessage>,
     revised_at: Option<chrono::DateTime<Utc>>,
@@ -692,16 +825,16 @@ async fn record_own_messages(
     if history_retention.is_zero() {
         return;
     }
+    let revision = crate::channel::revision_of(revised_at);
     for message in &mut sent {
-        if let Err(error) = register_files(
-            store,
-            conversation,
-            channel,
-            &message.message_id,
-            message.timestamp,
-            &mut message.attachments,
-        )
-        .await
+        let key = MessageKey {
+            conversation: conversation.as_str(),
+            account,
+            message_id: &message.message_id,
+            revision,
+        };
+        if let Err(error) =
+            register_files(store, key, message.timestamp, &mut message.attachments).await
         {
             tracing::warn!(
                 conversation = %conversation,
@@ -709,36 +842,26 @@ async fn record_own_messages(
                 error
             );
         }
-        // The platform's message id serves as the deduplication key too, and cannot collide with an
-        // inbound one, though for a different reason on each platform: Telegram numbers a chat's
-        // messages in one sequence covering both directions, and Discord's snowflakes are unique
-        // everywhere. Neither ever hands the bridge its own message as an inbound event in any
-        // case.
+        // The same key an inbound message gets, and it cannot collide with one, though for a
+        // different reason on each platform: Telegram numbers a chat's messages in one sequence
+        // covering both directions, and Discord's snowflakes are unique everywhere. Neither ever
+        // hands the bridge its own message as an inbound event in any case.
         //
-        // A revision carries the id it revises, so it takes the inbound path's `<id>:e<time>` shape
-        // at millisecond rather than second resolution. Two edits sharing a key would leave the
-        // second unrecorded, which two API round trips inside one millisecond cannot reach, and
-        // superseding orders against the revision's own row so even a shared key marks correctly.
-        let external_id = match revised_at {
-            Some(revised_at) => {
-                format!("{}:e{}", message.message_id, revised_at.timestamp_millis())
-            }
-            None => message.message_id.clone(),
-        };
+        // A revision keeps the id it revises and is told apart by its time, in milliseconds. Two
+        // edits sharing a key would leave the second unrecorded, which two API round trips inside
+        // one millisecond cannot reach, and superseding orders against the revision's own row so
+        // even a shared key marks correctly.
         let record = crate::store::MessageRecord {
             id: 0,
-            conversation_id: conversation.as_str().to_string(),
-            external_id: external_id.clone(),
+            conversation: conversation.as_str().to_string(),
+            account,
             message_id: message.message_id.clone(),
+            revision,
             sender_id: (!message.sender.id.is_empty()).then(|| message.sender.id.clone()),
             sender_name: message.sender.display_name.clone(),
             text: message.text.clone(),
             notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
-            attachments: message
-                .attachments
-                .iter()
-                .filter_map(|attachment| attachment.handle.clone())
-                .collect(),
+            attachments: Vec::new(),
             addressed: false,
             seen: true,
             own: true,
@@ -746,6 +869,7 @@ async fn record_own_messages(
             deleted_at: None,
             superseded_at: None,
             timestamp: message.timestamp,
+            previous_account: false,
         };
         if let Err(error) = store.record_message(record).await {
             tracing::warn!(
@@ -760,14 +884,7 @@ async fn record_own_messages(
             continue;
         }
         if let Some(revised_at) = revised_at
-            && let Err(error) = store
-                .supersede_message(
-                    conversation.as_str(),
-                    &message.message_id,
-                    &external_id,
-                    revised_at,
-                )
-                .await
+            && let Err(error) = store.supersede_message(key, revised_at).await
         {
             tracing::warn!(
                 conversation = %conversation,
@@ -986,17 +1103,26 @@ impl OutboundSink for BridgeSink {
         // the agent removed reads back as removed rather than as one that was never there. Failing
         // here would report a deletion that did happen as an error, so it is logged instead.
         let conversation = self.canonical(&conversation).await;
-        if let Err(error) = self
-            .store
-            .mark_deleted(conversation.as_str(), message_id, Utc::now())
-            .await
-        {
-            tracing::warn!(
+        match self.accounts.get(channel.id().as_str()) {
+            Some(account) => {
+                if let Err(error) = self
+                    .store
+                    .mark_deleted(conversation.as_str(), account, message_id, Utc::now())
+                    .await
+                {
+                    tracing::warn!(
+                        conversation = %conversation,
+                        message_id = %message_id,
+                        "could not mark a deleted message in the history: {}",
+                        error
+                    );
+                }
+            }
+            None => tracing::warn!(
                 conversation = %conversation,
                 message_id = %message_id,
-                "could not mark a deleted message in the history: {}",
-                error
-            );
+                "could not mark a deleted message in the history: the channel's account is unknown"
+            ),
         }
         Ok(())
     }
@@ -1316,6 +1442,11 @@ impl OutboundSink for BridgeSink {
         // Parsed but not required to be in the address book: ruling on a conversation before it has
         // said anything is a legitimate pre-emptive move, and the row is keyed by id either way.
         let conversation = self.resolve(conversation)?;
+        let platform = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?
+            .platform();
         let existing = self
             .store
             .policy(conversation.as_str())
@@ -1342,7 +1473,14 @@ impl OutboundSink for BridgeSink {
         }
 
         self.store
-            .set_policy(conversation.as_str(), policy, until, reason, Utc::now())
+            .set_policy(
+                conversation.as_str(),
+                platform.as_str(),
+                policy,
+                until,
+                reason,
+                Utc::now(),
+            )
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
 
@@ -1468,6 +1606,7 @@ impl OutboundSink for BridgeSink {
                             session: None,
                             deleted: false,
                             superseded: false,
+                            previous_account: false,
                             timestamp: message.timestamp.to_rfc3339(),
                             // Not a row in the bridge's history, so there is nothing to page back
                             // from. Zero is the value `read_history` already treats as no cursor.
@@ -1510,9 +1649,9 @@ impl OutboundSink for BridgeSink {
             .map(|record| {
                 let policy = policies
                     .iter()
-                    .find(|policy| policy.conversation_id == record.id)
+                    .find(|policy| policy.conversation == record.address)
                     .cloned();
-                let unseen = unseen.get(&record.id).copied().unwrap_or_default();
+                let unseen = unseen.get(&record.address).copied().unwrap_or_default();
                 self.summarize(record, policy, unseen)
             })
             .collect())
@@ -1532,7 +1671,7 @@ impl OutboundSink for BridgeSink {
         };
         let policy = self
             .store
-            .policy(&record.id)
+            .policy(&record.address)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         let unseen = self
@@ -1540,7 +1679,7 @@ impl OutboundSink for BridgeSink {
             .unseen_counts()
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?
-            .get(&record.id)
+            .get(&record.address)
             .copied()
             .unwrap_or_default();
         Ok(Some(self.summarize(record, policy, unseen)))
@@ -1550,7 +1689,7 @@ impl OutboundSink for BridgeSink {
 /// Translate a stored message into what the history tools hand back.
 fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
     HistoryEntry {
-        conversation: record.conversation_id,
+        conversation: record.conversation,
         message_id: record.message_id,
         sender: record.sender_name,
         sender_id: record.sender_id,
@@ -1562,6 +1701,7 @@ fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
         session: record.session_id,
         deleted: record.deleted_at.is_some(),
         superseded: record.superseded_at.is_some(),
+        previous_account: record.previous_account,
         timestamp: record.timestamp.to_rfc3339(),
         cursor: record.id,
     }
@@ -1647,8 +1787,8 @@ impl BridgeSink {
             |policy| policy.policy,
         );
         ConversationSummary {
-            id: record.id,
-            channel: record.channel_id,
+            id: record.address,
+            channel: record.channel,
             platform: record.platform,
             title: record.title,
             kind: record.kind,

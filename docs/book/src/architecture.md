@@ -20,7 +20,7 @@ Inbound goes left to right and stops at the queue. Outbound starts when the agen
 | Module | Responsibility |
 |--------|----------------|
 | `config` | The on-disk TOML shape, and the validated form everything else uses |
-| `store` | SQLite: session binding, conversation address book, durable inbound queue |
+| `store` | SQLite: session binding, the accounts each channel speaks as, conversation address book, durable inbound queue, message history |
 | `meka` | meka's HTTP API, including consuming a turn's SSE stream |
 | `mcp` | The MCP server and its outbound tool surface |
 | `channel` | The platform abstraction; one submodule per platform |
@@ -114,6 +114,8 @@ The parse is shared. `render.rs` turns Markdown into blocks and spans and does t
 `<channel>:<chat>` or `<channel>:<chat>:<thread>`, for example `telegram:-1001234567890:77`.
 
 This is a public contract, not an internal detail: the agent passes it to `send_message`, and it appears in logs and in `mekabridge conversations list`. Parsing uses `splitn(3, ':')`, so the thread segment may itself contain colons and a future platform with structured thread ids needs no new format.
+
+The address is deliberately not the whole identity of what is stored under it. A platform message id is only unique within the bot account that issued it: a Telegram bot deleted and recreated under the same channel numbers its private chats from 1 again, at the same addresses. So the store records which account each channel is logged in as, asked of the platform at startup, and keys every message, queue row, and attachment on the account, the address, the platform message id, and the revision (the edit time, or zero for the original). The address itself stays stable across a bot swap, which is what keeps policies, `owner_conversation`, and the ids in the agent's memory working; what changes is that messages recorded under the previous account are marked `previous_account` when read back, since their ids cannot be acted on from the new one.
 
 ## Extension points
 

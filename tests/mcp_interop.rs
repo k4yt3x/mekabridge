@@ -319,6 +319,7 @@ impl OutboundSink for RecordingSink {
             session: None,
             deleted: false,
             superseded: false,
+            previous_account: false,
             timestamp: "2026-08-11T09:30:00+00:00".to_string(),
             cursor: 41,
         }])

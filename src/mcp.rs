@@ -290,6 +290,11 @@ pub struct HistoryEntry {
     /// separate entry carrying the same `message_id`.
     #[serde(skip_serializing_if = "is_false")]
     pub superseded: bool,
+    /// Whether this went through a bot account the channel no longer uses, because the bot was
+    /// deleted and recreated. Its `message_id` belongs to that account: replying to it, reacting
+    /// to it, editing it, or deleting it from the current one will fail.
+    #[serde(skip_serializing_if = "is_false")]
+    pub previous_account: bool,
     pub timestamp: String,
     /// Opaque marker for paging. Pass the oldest one back as `before` to read further back.
     pub cursor: i64,
@@ -1631,8 +1636,11 @@ impl BridgeMcpServer {
                        `own`, so you can check what you already told somebody even if another \
                        session said it. An entry marked `deleted` was retracted by whoever sent \
                        it, and one marked `superseded` is the wording a later edit replaced, with \
-                       the revision elsewhere in the list under the same `message_id`. Pass the \
-                       oldest `cursor` you were given back as `before` to page further back.",
+                       the revision elsewhere in the list under the same `message_id`. One marked \
+                       `previous_account` went through a bot account this channel no longer uses, \
+                       so its `message_id` cannot be replied to, reacted to, edited or deleted. \
+                       Pass the oldest `cursor` you were given back as `before` to page further \
+                       back.",
         annotations(title = "Read history", read_only_hint = true, open_world_hint = false)
     )]
     async fn read_history(
@@ -3102,6 +3110,7 @@ mod tests {
             session: None,
             deleted: false,
             superseded: false,
+            previous_account: false,
             // Derived from the id so entries in one test are distinguishable by time.
             timestamp: format!("2026-08-11T09:3{message_id}:00+00:00"),
             cursor: 1,
@@ -3175,6 +3184,7 @@ mod tests {
                 session: None,
                 deleted: false,
                 superseded: false,
+                previous_account: false,
                 timestamp: "2026-08-11T09:30:00+00:00".to_string(),
                 cursor: 7,
             }],
@@ -3576,6 +3586,7 @@ mod tests {
                 session: None,
                 deleted: false,
                 superseded: false,
+                previous_account: false,
                 timestamp: "2026-08-11T09:30:00+00:00".to_string(),
                 cursor: 8_212,
             }],

@@ -558,13 +558,6 @@ impl TelegramChannel {
             channel: self.id.clone(),
             platform: Platform::Telegram,
             conversation,
-            // An edit reuses the id of the message it revises, so keying the queue on the bare id
-            // would let the dedupe constraint swallow it. The revision timestamp makes each edit a
-            // distinct row while `message_id` still addresses the original for replies.
-            external_id: match edited_at {
-                Some(edited_at) => format!("{}:e{}", message.id.0, edited_at.timestamp()),
-                None => message.id.0.to_string(),
-            },
             message_id: message.id.0.to_string(),
             chat_kind,
             chat_title: message.chat.title().map(str::to_string),
@@ -2625,16 +2618,17 @@ mod tests {
             .expect("allowlisted message becomes an event");
         let message = inbound(event);
         assert_eq!(message.message_id, "4471");
-        assert_eq!(message.external_id, "4471");
+        assert_eq!(message.revision(), 0);
         assert_eq!(message.admission, Admission::User);
         assert!(!message.sender.is_bot);
         assert!(!message.sender.on_behalf_of_chat);
     }
 
     #[tokio::test]
-    async fn an_edit_gets_a_distinct_queue_key_but_keeps_its_message_id() {
+    async fn an_edit_gets_a_revision_of_its_own_but_keeps_its_message_id() {
         // The bug this pins: an edit reuses the original's message id, so keying the queue on it
-        // sent every edit into the duplicate check and the agent never heard about it.
+        // alone sent every edit into the duplicate check and the agent never heard about it. The
+        // revision is the edit time in milliseconds, though Telegram reports it to the second.
         let channel = channel(vec![111], vec![]);
         let event = channel
             .to_event(&private_message(serde_json::json!({
@@ -2645,7 +2639,7 @@ mod tests {
             .expect("edits reach the agent");
         let message = inbound(event);
         assert_eq!(message.message_id, "4471");
-        assert_eq!(message.external_id, "4471:e1754400600");
+        assert_eq!(message.revision(), 1_754_400_600_000);
         assert!(message.edited_at.is_some());
     }
 
@@ -2670,7 +2664,7 @@ mod tests {
                 .await
                 .expect("second edit"),
         );
-        assert_ne!(first.external_id, second.external_id);
+        assert_ne!(first.revision(), second.revision());
     }
 
     #[tokio::test]

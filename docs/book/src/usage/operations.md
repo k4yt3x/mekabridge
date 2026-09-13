@@ -102,7 +102,7 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `lost the turn stream ...; rejoining it` | The connection to meka dropped and is being resumed from the last event seen. The turn keeps running and nothing is delivered twice |
 | `could not rejoin the turn stream ...; trying again` | The rejoin request itself failed. Retried while meka still holds the turn open; only repeated lines are a concern |
 | `lost the turn stream and could not rejoin it` | Resuming failed too, so what the turn did is unknown. The batch goes back to the queue, which may deliver the same messages twice |
-| `meka notice: Replay buffer ...` or `Fell behind ...` | The rejoin could not replay everything, so some events are gone. The batch is closed rather than retried; the owner is told only if the turn then failed as well |
+| `meka notice: the replay does not reach your Last-Event-ID ...` or `Fell behind ...` | The rejoin could not replay everything, so some events are gone. The batch is closed rather than retried; the owner is told only if the turn then failed as well |
 | `the agent viewed an attachment` | An image was fetched and passed to the model. `preview=true` means it was a still frame, not the file |
 | `the agent downloaded an attachment` | A file was written to `[storage].attachment_dir` |
 | `the agent turned a conversation down` | Muted or blocked. `mekabridge policy clear` undoes it |

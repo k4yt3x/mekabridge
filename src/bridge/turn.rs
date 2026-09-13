@@ -65,14 +65,18 @@ impl Presence {
 
 /// Whether a meka `notice` is telling the caller that events went missing.
 ///
-/// Two wordings mean it, and they are different situations: the replay ring no longer reaching the
-/// position asked for, and the re-attached subscription itself falling behind afterwards. Matched
-/// on prose because the event carries no code, which is fragile in the safe direction. A rewording
-/// on meka's side means the counters are believed again, which is where they stood before any of
-/// this existed, rather than a batch being wrongly discarded. Worth asking meka for a flag on the
-/// event.
+/// Two situations mean it: the replay ring no longer reaching the position asked for, and the
+/// re-attached subscription falling behind afterwards. Matched on prose because the event carries
+/// no code, which is fragile in the safe direction: a rewording means the counters are believed
+/// again, which is where they stood before any of this existed, rather than a batch being wrongly
+/// discarded. Worth asking meka for a flag on the event.
+///
+/// The gap notice is matched on the clause it has kept across rewordings rather than on its
+/// opening, which is what went stale: meka 0.46 replaced "Replay buffer does not reach" with "the
+/// replay does not reach", so a match on the first two words stopped firing a release before this
+/// bridge's own floor and nothing failed to say so.
 fn notice_reports_lost_events(text: &str) -> bool {
-    text.contains("Replay buffer") || text.contains("Fell behind")
+    text.contains("does not reach your Last-Event-ID") || text.contains("Fell behind")
 }
 
 /// The MCP tool name meka exposes for this bridge's `send_message`, used to tell "the agent
@@ -502,11 +506,23 @@ mod tests {
         meka::sse::Usage,
     };
 
-    /// Both of meka's wordings, copied from the emitting sites rather than paraphrased. They are
-    /// the only signal that a rejoin lost events, so a drift in either silently restores the bug
-    /// where a turn that had already sent gets handed back to send again.
+    /// Every wording meka has emitted, copied from the emitting sites rather than paraphrased.
+    /// They are the only signal that a rejoin lost events, so a drift in any of them silently
+    /// restores the bug where a turn that had already sent gets handed back to send again.
+    ///
+    /// Both spellings of the gap notice are here because pinning only the one this bridge was
+    /// written against is what hid the drift: meka reworded it in 0.46, the assertion and the
+    /// matcher agreed with each other on a string meka no longer sent, and the test went on
+    /// passing.
     #[test]
-    fn both_of_mekas_lost_event_notices_are_recognised() {
+    fn every_wording_of_mekas_lost_event_notices_is_recognised() {
+        // meka 0.46 onwards, which is this bridge's floor.
+        assert!(notice_reports_lost_events(
+            "the replay does not reach your Last-Event-ID, so events were dropped; read `GET \
+             /v1/sessions/{id}/messages` for the full transcript"
+        ));
+        // Before 0.46. Kept because reading a gap notice wrongly is the expensive direction, and
+        // matching a string no meka still sends costs nothing.
         assert!(notice_reports_lost_events(
             "Replay buffer does not reach your Last-Event-ID; some events were dropped."
         ));

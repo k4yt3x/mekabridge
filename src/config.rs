@@ -35,14 +35,27 @@ const APP_DIR: &str = "mekabridge";
 /// anybody types.
 const DEFAULT_COALESCE_FLOOR: Duration = Duration::from_secs(1);
 
-/// First wait between attempts at a batch whose turn failed, doubled on each further attempt.
+/// First wait before a hand-over meka did not accept is posted again, doubled on each further one.
 ///
-/// A failed turn used to be reoffered on the very next pass of the drain loop, which for the
-/// failure this exists for is the wrong move twice over: the upstream said it was out of quota or
-/// overloaded, and coming straight back spends the next attempt inside the same window. Ten seconds
-/// is long enough to be past a burst and short enough that somebody waiting on a reply is not left
-/// wondering.
+/// meka's own inbox waits ten seconds before its first retry and doubles from there, so a batch
+/// waits on the same schedule whether it is the bridge or meka that cannot get through. Coming
+/// straight back would spend the next post inside the same outage.
 const DEFAULT_RETRY_BASE: Duration = Duration::from_secs(10);
+
+/// How long a batch may go unaccepted before it is given up on, matching the hour meka gives an
+/// item it has accepted before it reports `inbox.failed`.
+const DEFAULT_HAND_OVER_WITHIN: Duration = Duration::from_secs(60 * 60);
+
+/// How often meka is asked about a hand-over it has held longer than an outcome can take. Bounds
+/// the cost of asking about one it is legitimately holding for the next turn.
+const DEFAULT_STRAGGLER_SWEEP: Duration = Duration::from_secs(5 * 60);
+
+/// Extra offers of a message whose item was taken back unread, or whose turn came back empty.
+///
+/// Both are rare and both are cheap to try again, and neither says anything about when it might
+/// stop happening, so the bound exists to stop a message being offered for ever rather than to
+/// size a wait.
+const DEFAULT_MAX_OFFERS: u32 = 3;
 
 /// How often the typing indicator is renewed while it is up.
 ///
@@ -54,13 +67,11 @@ const DEFAULT_TYPING_REFRESH: Duration = Duration::from_secs(4);
 
 /// Ceiling on one composing window, when the operator has not pinned `[bridge].typing_max`.
 ///
-/// Sized for the thing the indicator now tracks: a model writing one message's arguments, which
-/// takes seconds and not minutes even for a long reply. It used to follow `[meka].turn_timeout`,
-/// thirty minutes, which was correct while the indicator covered a whole turn. Under the current
-/// design that made it unable to fire at all, and it is the only thing that closes a window whose
-/// closing event never comes: a stream going quiet after `tool_call.composing` emits neither of the
-/// events that would end it, and the rejoin spends minutes trying to get back on. Two minutes is
-/// generous against real composition and still short enough that a chat is not lied to for long.
+/// Sized for the thing the indicator tracks: a model writing one message's arguments, which takes
+/// seconds and not minutes even for a long reply. It is the only thing that closes a window whose
+/// closing event never comes: a feed going quiet after `tool_call.composing` emits neither of the
+/// events that would end it. Two minutes is generous against real composition and still short
+/// enough that a chat is not lied to for long.
 const DEFAULT_TYPING_MAX: Duration = Duration::from_secs(120);
 
 /// Ceiling on `[bridge].mute_context`. The lookback is charged to every turn a muted conversation
@@ -89,8 +100,6 @@ pub struct MekaConfig {
     pub base_url: Url,
     pub token: Secret,
     pub connect_timeout: Duration,
-    /// Wall-clock ceiling on a single turn, including the whole SSE stream.
-    pub turn_timeout: Duration,
     /// Attempts made against retryable failures (connect errors, 5xx, 429) before giving up.
     pub max_retries: u32,
 }
@@ -110,6 +119,11 @@ pub struct BridgeConfig {
     /// Conversation that receives operator notifications, such as a turn that failed every retry.
     pub owner_conversation: Option<String>,
     pub max_queue_depth: usize,
+    /// Ceiling on how many messages one pass claims, renders and posts.
+    ///
+    /// Not a ceiling on what one turn reads: meka takes every item posted around it, so a burst
+    /// wider than this is posted over consecutive passes and still reaches the agent in one
+    /// turn. What it bounds is how much work is in flight on this side at once.
     pub batch_max_messages: usize,
     /// Quiet period a conversation goes through before its messages are handed to the agent, on
     /// platforms that report when somebody is typing.
@@ -134,22 +148,32 @@ pub struct BridgeConfig {
     /// typing signal is a heartbeat, so a client that keeps sending it, or a compose box left
     /// open, would otherwise hold a chat open for as long as it liked.
     pub settle_max: Duration,
-    /// Extra attempts for a batch whose turn failed. `0` means a failed batch is never retried.
-    ///
-    /// Spaced out rather than made back to back: the failure this budget exists for is an upstream
-    /// out of quota, and a second attempt in the same second lands in the same window as the
-    /// first.
-    pub turn_retries: u32,
     /// How often the typing indicator is renewed while the model writes a message. See
     /// [`BridgeConfig::retry_base`] for why this is not in the file format either.
     pub typing_refresh: Duration,
-    /// How long the first of those attempts waits, doubling thereafter.
+    /// How long the first repeat of a hand-over meka did not accept waits, doubling thereafter.
     ///
     /// Absent from the file format for the same reason as [`BridgeConfig::coalesce_floor`]: it
-    /// describes how an upstream behaves under load rather than anything an operator has a
-    /// preference about. Together with [`BridgeConfig::turn_retries`] it decides how long somebody
-    /// waits before being told there will be no answer, and that is the knob worth having.
+    /// describes how meka behaves when it cannot be reached rather than anything an operator has a
+    /// preference about, and it mirrors the schedule meka's own inbox retries on.
     pub retry_base: Duration,
+    /// How long a hand-over may go unaccepted by meka before it is given up on, from when it was
+    /// rendered.
+    ///
+    /// The same hour meka gives an item it has accepted, so a message waits the same length of
+    /// time whichever side of the hand-over the outage is on. Not in the file format: the test
+    /// harness shrinks it, and an operator has no better number.
+    pub hand_over_within: Duration,
+    /// Extra times a message is offered after an item carrying it was taken back unread, or after
+    /// the model came back empty. Not in the file format for the same reason.
+    pub max_offers: u32,
+    /// How often meka is asked about hand-overs it has held longer than an outcome can take.
+    ///
+    /// On a clock rather than on the queue's own round, because a hand-over can sit unresolved for
+    /// a long time with nothing wrong: meka holds an item a tool round carried into the
+    /// conversation for whatever turn comes next, which on a quiet session is hours away, and
+    /// asking will not hurry it. Not in the file format; the test harness shrinks it.
+    pub straggler_sweep: Duration,
     /// Whether a chat is told when a message from it could not be delivered to the agent.
     ///
     /// The one exception to the bridge writing no chat content of its own, so it is defeatable.
@@ -169,7 +193,7 @@ pub struct BridgeConfig {
     pub typing_max: Duration,
     /// What happens to a conversation nobody has ruled on, decided by its chat kind.
     pub default_policy: DefaultPolicy,
-    /// Messages of missed context rendered into the envelope when a muted conversation wakes.
+    /// Messages of missed context rendered into an item when a muted conversation wakes.
     ///
     /// A mention in a busy chat is usually meaningless on its own, and a tool round trip to
     /// recover what it referred to costs a whole model call. `0` withholds them and leaves the
@@ -517,8 +541,6 @@ struct FileMeka {
     token_file: Option<PathBuf>,
     #[serde(default = "default_connect_timeout", with = "humantime_serde")]
     connect_timeout: Duration,
-    #[serde(default = "default_turn_timeout", with = "humantime_serde")]
-    turn_timeout: Duration,
     #[serde(default = "default_max_retries")]
     max_retries: u32,
 }
@@ -547,13 +569,11 @@ struct FileBridge {
     settle: Duration,
     #[serde(default = "default_settle_max", with = "humantime_serde")]
     settle_max: Duration,
-    #[serde(default = "default_turn_retries")]
-    turn_retries: u32,
     #[serde(default = "default_true")]
     notify_failures: bool,
     #[serde(default = "default_true")]
     typing_indicator: bool,
-    /// Unset follows `[meka].turn_timeout`, which is resolved once both are known.
+    /// Unset takes the built-in ceiling.
     #[serde(default, with = "humantime_serde")]
     typing_max: Option<Duration>,
     #[serde(default)]
@@ -710,15 +730,6 @@ impl FileConfig {
                 self.meka.base_url
             ))
         })?;
-        if self.meka.turn_timeout.is_zero() {
-            // Every turn would time out on the spot, and worse, the budget doubles as the ceiling
-            // on how long a batch may wait out a turn meka is running for itself. At
-            // zero that wait ends before it starts, and the batch is requeued and
-            // resubmitted as fast as the two processes can trade requests.
-            return Err(BridgeError::config(
-                "[meka].turn_timeout must be greater than zero",
-            ));
-        }
         let meka = MekaConfig {
             base_url,
             token: secret::resolve(
@@ -733,7 +744,6 @@ impl FileConfig {
                 &mut warnings,
             )?,
             connect_timeout: self.meka.connect_timeout,
-            turn_timeout: self.meka.turn_timeout,
             max_retries: self.meka.max_retries,
         };
 
@@ -1064,7 +1074,9 @@ impl FileConfig {
                 typing_refresh: DEFAULT_TYPING_REFRESH,
                 settle: self.bridge.settle,
                 settle_max: self.bridge.settle_max,
-                turn_retries: self.bridge.turn_retries,
+                hand_over_within: DEFAULT_HAND_OVER_WITHIN,
+                max_offers: DEFAULT_MAX_OFFERS,
+                straggler_sweep: DEFAULT_STRAGGLER_SWEEP,
                 notify_failures: self.bridge.notify_failures,
                 typing_indicator: self.bridge.typing_indicator,
                 typing_max: self.bridge.typing_max.unwrap_or(DEFAULT_TYPING_MAX),
@@ -1139,7 +1151,6 @@ impl Default for FileBridge {
             batch_max_messages: default_batch_max_messages(),
             settle: default_settle(),
             settle_max: default_settle_max(),
-            turn_retries: default_turn_retries(),
             notify_failures: true,
             typing_indicator: true,
             typing_max: None,
@@ -1196,10 +1207,6 @@ const fn default_connect_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
-const fn default_turn_timeout() -> Duration {
-    Duration::from_secs(30 * 60)
-}
-
 const fn default_max_retries() -> u32 {
     3
 }
@@ -1237,16 +1244,6 @@ const fn default_settle_max() -> Duration {
 
 const fn default_batch_max_messages() -> usize {
     32
-}
-
-/// Four attempts in all, spaced 10s, 20s and 40s apart, so a batch survives a little over a minute
-/// of an upstream being unavailable.
-///
-/// One retry was defensible only while the retries were free and instant. Now that each costs a
-/// real wait, this is the number that decides how long somebody is left with no answer before they
-/// are told there will not be one, and a minute is about as long as silence reads as thinking.
-const fn default_turn_retries() -> u32 {
-    3
 }
 
 const fn default_mcp_transport() -> McpTransport {
@@ -1413,23 +1410,9 @@ token = \"meka-token\"
 
     #[test]
     fn the_typing_ceiling_is_sized_for_one_message_not_a_whole_turn() {
-        // It followed `[meka].turn_timeout`, which reads sensibly and was right while the indicator
-        // covered a whole turn. Once it covered only the window in which a message is written, that
-        // default made it unable to ever fire -- and it is the sole backstop for a window whose
-        // closing event never arrives, so a stalled stream showed "typing" for half an hour.
+        // It is the sole backstop for a window whose closing event never arrives, so a ceiling
+        // sized for a whole turn showed "typing" for half an hour when a feed went quiet.
         let config = parse(MINIMAL).expect("valid");
-        assert_eq!(config.bridge.typing_max, Duration::from_secs(120));
-        assert!(
-            config.bridge.typing_max < config.meka.turn_timeout,
-            "a ceiling at the turn budget cannot close a window that outlives its events"
-        );
-
-        // Raising `turn_timeout` must not drag it back up with it.
-        let raw = MINIMAL.replace(
-            "token = \"meka-token\"",
-            "token = \"meka-token\"\nturn_timeout = \"45m\"",
-        );
-        let config = parse(&raw).expect("valid");
         assert_eq!(config.bridge.typing_max, Duration::from_secs(120));
 
         // And an operator who pins it is still obeyed.
@@ -1495,16 +1478,22 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn a_zero_turn_budget_is_refused() {
-        // It is also the ceiling on waiting out a turn meka is running for itself. At zero that
-        // wait ends before it begins, and the batch is requeued and resubmitted as fast as
-        // the two processes can trade requests, which is the spin this rejects outright.
+    fn the_retired_turn_knobs_are_refused_by_name() {
+        // Both stopped meaning anything when hand-over moved to meka's inbox: the bridge no longer
+        // holds a turn open to time out, and meka retries a hand-over it accepted itself. A file
+        // still carrying either is refused rather than read with the knob silently inert, so an
+        // operator is not left reading their own config as the explanation for behaviour it no
+        // longer controls.
         let raw = MINIMAL.replace(
             "token = \"meka-token\"",
-            "token = \"meka-token\"\nturn_timeout = \"0s\"",
+            "token = \"meka-token\"\nturn_timeout = \"30m\"",
         );
-        let error = parse(&raw).expect_err("a zero turn budget cannot be honoured");
+        let error = parse(&raw).expect_err("a retired key must not be accepted");
         assert!(error.to_string().contains("turn_timeout"), "got: {error}");
+
+        let raw = format!("{MINIMAL}\n[bridge]\nturn_retries = 3\n");
+        let error = parse(&raw).expect_err("a retired key must not be accepted");
+        assert!(error.to_string().contains("turn_retries"), "got: {error}");
     }
 
     #[test]
@@ -1864,7 +1853,6 @@ allowed_users = [1]
         let raw = r#"
 [meka]
 token = "meka-token"
-turn_timeout = "90s"
 connect_timeout = "2s"
 
 [[channels.telegram]]
@@ -1873,7 +1861,6 @@ token = "bot-token"
 allowed_users = [123]
 "#;
         let config = parse(raw).expect("humantime durations parse");
-        assert_eq!(config.meka.turn_timeout, Duration::from_secs(90));
         assert_eq!(config.meka.connect_timeout, Duration::from_secs(2));
     }
 

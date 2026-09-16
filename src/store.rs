@@ -1,13 +1,17 @@
 //! Durable state: the session binding, the accounts the bridge speaks as, the conversation address
 //! book, the inbound queue, and the message history.
 //!
-//! One meka session runs one turn at a time, so messages arriving mid-turn have to wait somewhere,
-//! and that cannot be process memory: a crash with a full queue would silently swallow everything a
-//! user typed. Every message is written before it is acknowledged and marked done only once the
-//! turn carrying it completed.
+//! The queue is the hand-off buffer between the platforms and meka's inbox. A message is written
+//! before it is acknowledged to the platform, since a crash with a full buffer in memory would
+//! silently swallow everything a user typed, and it stays here until meka has said the item
+//! carrying it is durable on its side. Rows are claimed into a *batch*, one inbox item carrying one
+//! rendered envelope; the batch row is what a retry, a reconciliation, or a restart posts again
+//! under the same key, and it is where what the envelope stated once is kept until the item
+//! reaches the model or provably never will.
 //!
-//! A row's state is a column rather than an in-memory flag so that anything left `in_flight` at
-//! startup is evidence of a crash mid-turn and can be returned to `pending`.
+//! A row's state is a column rather than an in-memory flag so that a restart finds every hand-over
+//! where it was: rows claimed but never bound into a batch go back to `pending`, and a batch is
+//! posted again or asked about rather than guessed at.
 //!
 //! Payloads stay opaque JSON so the state machine can be tested on its own and does not change when
 //! a platform adds fields.
@@ -46,6 +50,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_007.sql"),
     include_str!("store/schema_008.sql"),
     include_str!("store/schema_009.sql"),
+    include_str!("store/schema_010.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -77,6 +82,9 @@ const META_SESSION_ID: &str = "session_id";
 const META_DROPPED: &str = "dropped_messages";
 /// `meta` key holding when the last turn completed, for `mekabridge status`.
 const META_LAST_TURN: &str = "last_turn_at";
+/// Prefix of the `meta` key holding the last feed event handled for a session, so a restart resumes
+/// the feed from there. Keyed by session because ids start again on a new one.
+const META_FEED_POSITION: &str = "feed_position:";
 
 /// The `kind` recorded for a conversation nothing has arrived from yet.
 const KIND_UNKNOWN: &str = "unknown";
@@ -266,7 +274,7 @@ impl Policy {
     }
 }
 
-/// When one conversation's waiting messages arrived, as the span the drain loop decides on.
+/// When one conversation's waiting messages arrived, as the span readiness is decided on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWindow {
     /// The conversation's address.
@@ -427,7 +435,12 @@ impl MessageRecord {
     }
 }
 
-/// A message waiting to be handed to the agent.
+/// A message waiting to be handed to the agent, and, once claimed, the hand-over it became.
+///
+/// One row is one inbox item. It outlives the request that posts it, so a retry after an ambiguous
+/// failure, or after a restart on either side, posts the same [`Self::key`] and the same
+/// [`Self::body`], and meka answers with the item it already made and that item's current state,
+/// which is also how a hand-over whose feed events were missed is reconciled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessage {
     pub seq: i64,
@@ -438,14 +451,30 @@ pub struct QueuedMessage {
     pub revision: i64,
     pub payload: String,
     pub received_at: DateTime<Utc>,
+    pub state: QueueState,
+    /// The `Idempotency-Key` the item is posted under, minted once when the row is held.
+    pub key: Option<String>,
+    /// The rendered item, byte for byte. Dropped once the row reaches [`QueueState::Failed`],
+    /// where it would only be a second copy of [`Self::payload`] that nothing will ever post.
+    pub body: Option<String>,
+    /// The meka session the item is, or will be, posted to.
+    pub session_id: Option<Uuid>,
+    /// meka's id for the item, from the 202.
+    pub item_id: Option<String>,
+    /// The dropped-message count this item reported, owed back if the item never delivers.
+    pub dropped: u64,
+    /// Hand-overs this row has been part of.
     pub attempts: u32,
-    /// Whether crash recovery put this row back, as opposed to a failed turn.
-    ///
-    /// A failed turn was watched, so the bridge knows whether the agent acted and refuses to
-    /// replay a batch that may already have been answered. A row stranded by a hard kill has
-    /// no such answer, so it is handed over again with the uncertainty stated rather than
-    /// hidden.
-    pub recovered: bool,
+    /// Posts made of the current item, successful or not.
+    pub posts: u32,
+    /// When the row may be claimed again, while it is pending, or posted again, while it is in
+    /// flight.
+    pub not_before: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    /// When the item was rendered.
+    pub held_at: Option<DateTime<Utc>>,
+    /// When meka accepted it.
+    pub posted_at: Option<DateTime<Utc>>,
 }
 
 impl QueuedMessage {
@@ -470,23 +499,103 @@ pub enum EnqueueOutcome {
     Dropped,
 }
 
-/// Outcome of marking a batch failed.
+/// Where a queue row is in its hand-over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueState {
+    /// Waiting to be claimed.
+    Pending,
+    /// Claimed and rendered, and meka has not accepted it yet.
+    InFlight,
+    /// meka has the item; the feed says what becomes of it.
+    Posted,
+    /// The model read it.
+    Done,
+    /// It will never reach the model, and no offers are left.
+    Failed,
+}
+
+impl QueueState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InFlight => "in_flight",
+            Self::Posted => "posted",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "in_flight" => Some(Self::InFlight),
+            "posted" => Some(Self::Posted),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// What became of a row offered again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailureOutcome {
-    /// Rows returned to `pending` for another attempt.
-    pub retrying: Vec<i64>,
-    /// Rows that exhausted their attempts and are now `failed`. These are what an operator needs
-    /// to hear about: the agent was never handed them, and nothing will hand them over now.
-    /// What is still possible is [`Store::mark_unseen`], which puts them back among what it is
-    /// owed.
-    pub exhausted: Vec<QueuedMessage>,
+pub enum Offer {
+    /// Back in the queue, for a hand-over of its own under a new key.
+    Retrying,
+    /// Out of offers, and now `failed`. This is what an operator needs to hear about: the agent was
+    /// never handed it, and nothing will hand it over now. What is still possible is
+    /// [`Store::mark_unseen`], which puts it back among what the agent is owed.
+    Exhausted(Box<QueuedMessage>),
+    /// Something else had already closed it, so nothing changed.
+    Closed,
+}
+
+/// A rendered item, and what it takes with it when its row is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandOver<'a> {
+    /// The `Idempotency-Key` it is posted under, minted once and never again, so every post of
+    /// this row is the same request to meka.
+    pub key: &'a str,
+    /// The rendered item, byte for byte. meka refuses the same key with other words.
+    pub body: &'a str,
+    /// The meka session it is, or will be, posted to. meka scopes keys per session.
+    pub session_id: Uuid,
+    /// The dropped-message count it states, which comes off the counter as it is stored.
+    pub dropped: u64,
+    /// The conversation backlog it states, on the item stating one.
+    pub accounted: Option<Backlog>,
+}
+
+/// One conversation's backlog as an item reported it: the two bounds that describe exactly what
+/// [`Store::take_unseen`] counted.
+///
+/// Both are needed. The timestamp is the ceiling asked about and the id is the high-water mark of
+/// the rows that answered; either alone marks a set the agent was never shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backlog {
+    pub watermark: i64,
+    pub through: DateTime<Utc>,
+}
+
+/// What a restart found in the queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Rows claimed but never rendered, returned to `pending`.
+    pub orphaned: usize,
+    /// Rows meka never accepted, which are posted again under their own key.
+    pub unposted: usize,
+    /// Rows meka has, whose fate the feed's replay or a reconciliation settles.
+    pub posted: usize,
 }
 
 /// Queue row counts by state, for `mekabridge status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueStats {
     pub pending: u64,
+    /// Rendered, and not yet accepted by meka.
     pub in_flight: u64,
+    /// With meka, waiting for the feed to say what became of them.
+    pub posted: u64,
     pub done: u64,
     pub failed: u64,
 }
@@ -683,16 +792,6 @@ impl Store {
         Ok(())
     }
 
-    async fn meta_delete(&self, key: &'static str) -> Result<()> {
-        self.connection
-            .call(move |connection| {
-                connection.execute("DELETE FROM meta WHERE key = ?1", [key])?;
-                Ok(())
-            })
-            .await?;
-        Ok(())
-    }
-
     /// The meka session this bridge owns, if one has been created.
     pub async fn session_id(&self) -> Result<Option<Uuid>> {
         let Some(raw) = self.meta_get(META_SESSION_ID).await? else {
@@ -711,9 +810,64 @@ impl Store {
         self.meta_set(META_SESSION_ID, session_id.to_string()).await
     }
 
-    /// Forget the session binding. The next turn creates a fresh session.
+    /// Forget the session binding, and where its feed had been read to. The next start creates a
+    /// fresh session.
     pub async fn clear_session_id(&self) -> Result<()> {
-        self.meta_delete(META_SESSION_ID).await
+        self.connection
+            .call(|connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                transaction.execute("DELETE FROM meta WHERE key = ?1", [META_SESSION_ID])?;
+                transaction.execute(
+                    "DELETE FROM meta WHERE substr(key, 1, ?2) = ?1",
+                    rusqlite::params![META_FEED_POSITION, META_FEED_POSITION.len()],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The last feed event handled for `session_id`, so a restart resumes the feed from there.
+    pub async fn feed_position(&self, session_id: Uuid) -> Result<Option<u64>> {
+        let key = format!("{META_FEED_POSITION}{session_id}");
+        let raw = self
+            .connection
+            .call({
+                let key = key.clone();
+                move |connection| {
+                    connection
+                        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .optional()
+                }
+            })
+            .await?;
+        raw.map(|raw| {
+            raw.parse::<u64>().map_err(|error| StoreError::Corrupt {
+                key: key.clone(),
+                message: format!("{raw:?} is not an event id: {error}"),
+            })
+        })
+        .transpose()
+    }
+
+    /// Record the last feed event handled for `session_id`.
+    pub async fn set_feed_position(&self, session_id: Uuid, id: u64) -> Result<()> {
+        let key = format!("{META_FEED_POSITION}{session_id}");
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![key, id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// When the last turn completed, if one ever has.
@@ -754,21 +908,17 @@ impl Store {
         Ok(())
     }
 
-    async fn dropped_count(&self) -> Result<u64> {
+    /// How many messages have been shed since an item last reported it.
+    ///
+    /// Read only. What an item reports comes off the counter when that item is stored, in
+    /// [`Self::hold`], so a crash between rendering and storing loses the item and keeps the count
+    /// rather than the reverse.
+    pub async fn peek_dropped(&self) -> Result<u64> {
         Ok(self
             .meta_get(META_DROPPED)
             .await?
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(0))
-    }
-
-    /// Read and reset the dropped-message counter.
-    pub async fn take_dropped(&self) -> Result<u64> {
-        let count = self.dropped_count().await?;
-        if count > 0 {
-            self.meta_delete(META_DROPPED).await?;
-        }
-        Ok(count)
     }
 
     /// Record which account `channel` is logged in as, and return its id.
@@ -1342,13 +1492,14 @@ impl Store {
     /// Atomically take up to `limit` pending messages from the conversations in `ready` and mark
     /// them in flight.
     ///
-    /// Claiming and marking happen in one transaction so two drain loops (or a drain loop racing a
-    /// restart) cannot hand the same message to two turns.
+    /// Claiming and marking happen in one transaction so two session tasks (or one racing a
+    /// restart) cannot hand the same message over twice.
     ///
-    /// A batch may still span conversations, which is what makes several chats that all became
-    /// ready together cost one turn rather than one each. `ready` narrows which are eligible, not
-    /// how many may share a batch.
-    pub async fn claim_batch(&self, ready: &[String], limit: usize) -> Result<Vec<QueuedMessage>> {
+    /// One pass may span conversations, which is what makes several chats that all became ready
+    /// together reach the agent in one turn rather than one each: meka reads every item waiting for
+    /// it into the turn it opens. `ready` narrows which are eligible, not how many may be claimed
+    /// at once.
+    pub async fn claim(&self, ready: &[String], limit: usize) -> Result<Vec<QueuedMessage>> {
         // SQLite does accept `IN ()` and evaluates it false, so this is for the round trip rather
         // than for correctness: nothing being ready is by far the most common tick, and there is no
         // reason to reach the database to be told so.
@@ -1396,8 +1547,8 @@ impl Store {
 
     /// Read pending rows without claiming them.
     ///
-    /// Distinct from [`Self::claim_batch`] because an inspection command must not move rows into
-    /// `in_flight`: doing so would hide them from the drain loop until the next crash recovery.
+    /// Distinct from [`Self::claim`] because an inspection command must not move rows into
+    /// `in_flight`: doing so would hide them from the session task until the next restart.
     pub async fn peek_pending(&self, limit: usize) -> Result<Vec<QueuedMessage>> {
         let limit = limit.min(i64::MAX as usize) as i64;
         let rows = self
@@ -1417,8 +1568,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// Mark a batch as delivered.
-    pub async fn complete_batch(&self, sequences: &[i64]) -> Result<()> {
+    /// Close claimed rows as delivered without any of them having been handed over.
+    ///
+    /// For a payload this build cannot decode, which will never become readable and would otherwise
+    /// wedge the queue behind it for ever. Guarded on nothing having been rendered yet, like
+    /// [`Self::unclaim`]: once a key is minted, meka may hold the item under it, and only the
+    /// hand-over's own outcome may close the row.
+    pub async fn complete(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
         let completed_at = to_rfc3339(Utc::now());
         self.connection
@@ -1429,7 +1585,7 @@ impl Store {
                     transaction.execute(
                         "UPDATE inbound_queue
                          SET state = 'done', last_error = NULL, completed_at = ?2
-                         WHERE seq = ?1 AND state = 'in_flight'",
+                         WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
                         rusqlite::params![sequence, &completed_at],
                     )?;
                 }
@@ -1440,13 +1596,17 @@ impl Store {
         Ok(())
     }
 
-    /// Return a batch to the queue without spending an attempt.
+    /// Return claimed rows to the queue without spending an offer.
     ///
-    /// For a batch that was never handed over, as distinct from one that failed. meka refusing a
-    /// submission because a turn is already running is the case this exists for: nothing reached
-    /// the agent, nothing was lost, and counting it as a failed delivery would let a busy session
-    /// exhaust the retry budget and declare a message undeliverable that was never even attempted.
-    pub async fn release_batch(&self, sequences: &[i64]) -> Result<()> {
+    /// For rows that were never rendered, as distinct from ones that failed: nothing was made for
+    /// anybody, nothing reached the agent, and counting it as a failed delivery would let a run of
+    /// store errors exhaust the offer budget and declare a message undeliverable that was never
+    /// even attempted.
+    ///
+    /// A row with a key is refused. Its item exists under that key, so meka may already hold it,
+    /// and putting the row back would hand the same message over twice; [`Self::reoffer`] is what
+    /// takes a rendered row back, and it sheds the key on the way.
+    pub async fn unclaim(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
         self.connection
             .call(move |connection| {
@@ -1455,7 +1615,7 @@ impl Store {
                 for sequence in sequences {
                     transaction.execute(
                         "UPDATE inbound_queue SET state = 'pending'
-                         WHERE seq = ?1 AND state = 'in_flight'",
+                         WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
                         [sequence],
                     )?;
                 }
@@ -1466,118 +1626,352 @@ impl Store {
         Ok(())
     }
 
-    /// Record that a batch's turn failed.
+    /// Stamp a rendered item onto a claimed row, and take off what the item states only once.
     ///
-    /// Each row's attempt counter is incremented; rows still within `max_attempts` return to
-    /// `pending` for another try, the rest become `failed` and are reported back so the operator
-    /// can be told which messages the agent will never be handed.
+    /// One transaction, because the writes describe one fact. The key is minted here and never
+    /// again, so every post of this row is the same request to meka. The dropped-message count the
+    /// item reported comes off the counter in the same write, so a crash between rendering and this
+    /// call loses the item and keeps the count rather than the reverse. And the backlog the item
+    /// states is marked seen here, stamped with this row's `seq`, which is what lets a second
+    /// hand-over be outstanding for the same conversation without restating what the first one
+    /// already said, and lets a hand-over that dies give back exactly the slice it took.
     ///
-    /// `retry_at` is when a retrying row may be offered again. `None` means at once, which is right
-    /// for a failure that says nothing about when it might stop happening, and wrong for the one
-    /// this argument exists for: coming straight back from a provider's rate limit spends the next
-    /// attempt inside the same window it just bounced off.
-    pub async fn fail_batch(
-        &self,
-        sequences: &[i64],
-        error: &str,
-        max_attempts: u32,
-        retry_at: Option<DateTime<Utc>>,
-    ) -> Result<FailureOutcome> {
-        let sequences = sequences.to_vec();
-        let error = error.to_string();
-        let completed_at = to_rfc3339(Utc::now());
-        let retry_at = retry_at.map(to_rfc3339);
-        let outcome = self
+    /// `false` when the row was not a fresh claim any more, which nothing here acts on further.
+    pub async fn hold(&self, seq: i64, item: HandOver<'_>, at: DateTime<Utc>) -> Result<bool> {
+        let key = item.key.to_string();
+        let body = item.body.to_string();
+        let session = item.session_id.to_string();
+        let dropped_count = i64::try_from(item.dropped).unwrap_or(i64::MAX);
+        let held_at = to_rfc3339(at);
+        let accounted = item
+            .accounted
+            .map(|backlog| (backlog.watermark, to_rfc3339(backlog.through)));
+        let held = self
             .connection
             .call(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let mut retrying = Vec::new();
-                let mut exhausted = Vec::new();
-                for sequence in sequences {
-                    // Guarded like the state writes below. Unguarded, a row that is no longer in
-                    // flight was still charged an attempt, and the exhausted arm then told the
-                    // owner a message was permanently lost while the row sat in `pending` waiting
-                    // to be delivered.
-                    let charged = transaction.execute(
-                        "UPDATE inbound_queue
-                         SET attempts = attempts + 1, last_error = ?2, not_before = ?3
-                         WHERE seq = ?1 AND state = 'in_flight'",
-                        rusqlite::params![sequence, error, retry_at],
+                let changed = transaction.execute(
+                    "UPDATE inbound_queue
+                     SET key = ?2, body = ?3, session_id = ?4, dropped = ?5, held_at = ?6,
+                         posts = 0, not_before = NULL, last_error = NULL
+                     WHERE seq = ?1 AND state = 'in_flight' AND key IS NULL",
+                    rusqlite::params![seq, key, body, session, dropped_count, held_at],
+                )?;
+                if changed == 0 {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                if dropped_count > 0 {
+                    // Clamped at zero. The counter can only have moved up since it was read, and a
+                    // write racing this one is a count the next item reports.
+                    transaction.execute(
+                        "UPDATE meta
+                         SET value = CAST(MAX(CAST(value AS INTEGER) - ?1, 0) AS TEXT)
+                         WHERE key = ?2",
+                        rusqlite::params![dropped_count, META_DROPPED],
                     )?;
-                    if charged == 0 {
-                        continue;
-                    }
-                    // `optional` rather than `?`: a sequence that is gone yields
-                    // `QueryReturnedNoRows`, which rolled back the whole transaction and left every
-                    // *other* row in the batch stuck `in_flight` until the next restart. Those rows
-                    // are invisible to `pending_windows`, so newer messages in the same
-                    // conversation are then delivered ahead of them.
-                    // `complete_batch` already skips silently; the
-                    // asymmetry was the bug. Reachable from `mekabridge queue clear` against a
-                    // running bridge.
-                    let Some(attempts) = transaction
-                        .query_row(
-                            "SELECT attempts FROM inbound_queue WHERE seq = ?1",
-                            [sequence],
-                            |row| row.get::<_, u32>(0),
-                        )
-                        .optional()?
-                    else {
-                        continue;
-                    };
-                    if attempts > max_attempts {
-                        transaction.execute(
-                            "UPDATE inbound_queue SET state = 'failed', completed_at = ?2
-                             WHERE seq = ?1 AND state = 'in_flight'",
-                            rusqlite::params![sequence, &completed_at],
-                        )?;
-                        let message = transaction.query_row(
-                            &format!("SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.seq = ?1"),
-                            [sequence],
-                            row_to_queued,
-                        )?;
-                        exhausted.push(message);
-                    } else {
-                        transaction.execute(
-                            "UPDATE inbound_queue SET state = 'pending'
-                             WHERE seq = ?1 AND state = 'in_flight'",
-                            [sequence],
-                        )?;
-                        retrying.push(sequence);
-                    }
+                }
+                if let Some((watermark, through)) = accounted {
+                    // Both bounds together are the set `take_unseen` counted, and neither alone is.
+                    // On the timestamp alone, a row written between the count and this call at or
+                    // below the ceiling is marked without ever being shown, which is not a narrow
+                    // window: Telegram stamps to whole seconds, and an edit carries the original
+                    // message's time. On the id alone, that same edit sweeps the other way: a low
+                    // id with a high timestamp, never counted and marked regardless.
+                    transaction.execute(
+                        "UPDATE messages SET seen = 1, accounted_by = ?1
+                         WHERE conversation_id =
+                                   (SELECT q.conversation_id FROM inbound_queue q WHERE q.seq = ?1)
+                           AND seen = 0 AND id <= ?2 AND timestamp <= ?3",
+                        rusqlite::params![seq, watermark, through],
+                    )?;
                 }
                 transaction.commit()?;
-                Ok(FailureOutcome {
-                    retrying,
-                    exhausted,
-                })
+                Ok(true)
             })
             .await?;
-        Ok(outcome)
+        Ok(held)
     }
 
-    /// Return rows stranded `in_flight` by a crash to `pending`. Called once at startup.
-    pub async fn reset_in_flight(&self) -> Result<usize> {
-        let reset = self
-            .connection
-            .call(|connection| {
+    /// Record that meka has the row's item, on `session_id`.
+    ///
+    /// Accepted on a row already posted as well as on one waiting: a reconciliation that finds meka
+    /// with no record of the item posts it afresh, and the new id is the one the feed will name.
+    /// The session is written because a row held before a rebind is posted to the session the
+    /// bridge has now.
+    pub async fn posted(
+        &self,
+        seq: i64,
+        session_id: Uuid,
+        item_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let session_id = session_id.to_string();
+        let item_id = item_id.to_string();
+        let at = to_rfc3339(at);
+        self.connection
+            .call(move |connection| {
                 connection.execute(
-                    // The attempt is charged and the row flagged. Charged because a batch whose
-                    // turn kills the process would otherwise be replayed for ever, its counter
-                    // never moving. Flagged because nothing else can tell this apart from an
-                    // ordinary requeue afterwards, and the agent is owed the difference.
                     "UPDATE inbound_queue
-                     SET state = 'pending', attempts = attempts + 1, recovered = 1
-                     WHERE state = 'in_flight'",
-                    [],
+                     SET state = 'posted', session_id = ?2, item_id = ?3, posted_at = ?4,
+                         posts = posts + 1, not_before = NULL, last_error = NULL
+                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
+                    rusqlite::params![seq, session_id, item_id, at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Record that a post did not go through, and when it may be made again.
+    pub async fn defer(&self, seq: i64, error: &str, not_before: DateTime<Utc>) -> Result<()> {
+        let error = error.to_string();
+        let not_before = to_rfc3339(not_before);
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE inbound_queue
+                     SET posts = posts + 1, last_error = ?2, not_before = ?3
+                     WHERE seq = ?1 AND state = 'in_flight'",
+                    rusqlite::params![seq, error, not_before],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Close a row the model has read.
+    ///
+    /// `false` for a row already closed: the feed replays an outcome after a reconnect, and the
+    /// second reading must change nothing.
+    pub async fn delivered(&self, seq: i64, at: DateTime<Utc>) -> Result<bool> {
+        let at = to_rfc3339(at);
+        let closed = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE inbound_queue
+                     SET state = 'done', last_error = NULL, completed_at = ?2
+                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
+                    rusqlite::params![seq, at],
                 )
             })
             .await?;
-        Ok(reset)
+        Ok(closed > 0)
     }
 
-    /// Number of messages waiting to be delivered.
+    /// Close a row that will never reach the model, and give back what its item had taken.
+    ///
+    /// Returns the row so the caller can put it among what the agent is owed and say who lost what,
+    /// and nothing for a row something else had already closed. The rendered body goes, since
+    /// nothing will ever post it again and keeping it would pin a second copy of somebody's message
+    /// for the life of the database; the key and the item id stay, because they are what names this
+    /// hand-over in meka's own logs.
+    pub async fn failed(
+        &self,
+        seq: i64,
+        error: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueuedMessage>> {
+        let error = error.to_string();
+        let at = to_rfc3339(at);
+        let row = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let closed = transaction.execute(
+                    "UPDATE inbound_queue
+                     SET state = 'failed', body = NULL, last_error = ?2, completed_at = ?3
+                     WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
+                    rusqlite::params![seq, error, at],
+                )?;
+                if closed == 0 {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                restore(&transaction, seq)?;
+                let row = read_row(&transaction, seq)?;
+                transaction.commit()?;
+                Ok(row)
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// Offer a row again, spending one of its offers.
+    ///
+    /// For the two ways a hand-over comes apart without the message having been answered: meka took
+    /// the item back before the model read it, and the model read it and came back with nothing at
+    /// all, no text and no tool call. Either way the row goes back to `pending`, held until
+    /// `not_before` when one is given, and the next claim renders it afresh under a new key. A row
+    /// past `max_offers` fails instead and comes back so the caller can say so.
+    pub async fn reoffer(
+        &self,
+        seq: i64,
+        error: &str,
+        max_offers: u32,
+        not_before: Option<DateTime<Utc>>,
+        at: DateTime<Utc>,
+    ) -> Result<Offer> {
+        let error = error.to_string();
+        let not_before = not_before.map(to_rfc3339);
+        let at = to_rfc3339(at);
+        let offer = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let changed = transaction.execute(
+                    "UPDATE inbound_queue SET attempts = attempts + 1, last_error = ?2
+                     WHERE seq = ?1 AND state IN ('in_flight', 'posted', 'done')",
+                    rusqlite::params![seq, error],
+                )?;
+                if changed == 0 {
+                    transaction.commit()?;
+                    return Ok(Offer::Closed);
+                }
+                restore(&transaction, seq)?;
+                let attempts: u32 = transaction.query_row(
+                    "SELECT attempts FROM inbound_queue WHERE seq = ?1",
+                    [seq],
+                    |row| row.get(0),
+                )?;
+                if attempts > max_offers {
+                    transaction.execute(
+                        "UPDATE inbound_queue
+                         SET state = 'failed', body = NULL, completed_at = ?2
+                         WHERE seq = ?1",
+                        rusqlite::params![seq, at],
+                    )?;
+                    let row = read_row(&transaction, seq)?;
+                    transaction.commit()?;
+                    return Ok(row.map_or(Offer::Closed, |row| Offer::Exhausted(Box::new(row))));
+                }
+                transaction.execute(
+                    &format!(
+                        "UPDATE inbound_queue SET state = 'pending', not_before = ?2, {QUEUE_CLEARED}
+                         WHERE seq = ?1"
+                    ),
+                    rusqlite::params![seq, not_before],
+                )?;
+                transaction.commit()?;
+                Ok(Offer::Retrying)
+            })
+            .await?;
+        Ok(offer)
+    }
+
+    /// One row by sequence.
+    pub async fn row(&self, seq: i64) -> Result<Option<QueuedMessage>> {
+        let row = self
+            .connection
+            .call(move |connection| read_row(connection, seq))
+            .await?;
+        Ok(row)
+    }
+
+    /// Several rows by sequence, in delivery order.
+    pub async fn rows(&self, sequences: &[i64]) -> Result<Vec<QueuedMessage>> {
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sequences = sequences.to_vec();
+        let rows = self
+            .connection
+            .call(move |connection| {
+                let placeholders = std::iter::repeat_n("?", sequences.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM}
+                     WHERE q.seq IN ({placeholders})
+                     ORDER BY q.seq"
+                ))?;
+                let rows =
+                    statement.query_map(rusqlite::params_from_iter(sequences), row_to_queued)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// The row meka knows as `item_id`, if any.
+    pub async fn row_by_item(&self, item_id: &str) -> Result<Option<QueuedMessage>> {
+        let item_id = item_id.to_string();
+        let row = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &format!("SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.item_id = ?1"),
+                        [item_id],
+                        row_to_queued,
+                    )
+                    .optional()
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// Every row in `state`, oldest first.
+    pub async fn rows_in(&self, state: QueueState) -> Result<Vec<QueuedMessage>> {
+        let rows = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.state = ?1 ORDER BY q.seq"
+                ))?;
+                let rows = statement.query_map([state.as_str()], row_to_queued)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Put the queue back the way a restart needs it, and say what was found. Called once at
+    /// startup.
+    ///
+    /// Only rows claimed and never rendered move: the process died between the claim and
+    /// [`Self::hold`], so nothing was rendered for them and nothing reached meka. A row that was
+    /// rendered is left where it is, since it is either posted again under its own key or asked
+    /// about, and either answer is better than a guess.
+    pub async fn recover(&self) -> Result<Recovered> {
+        let recovered = self
+            .connection
+            .call(|connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let orphaned = transaction.execute(
+                    "UPDATE inbound_queue SET state = 'pending'
+                     WHERE state = 'in_flight' AND key IS NULL",
+                    [],
+                )?;
+                let count = |state: QueueState| -> rusqlite::Result<usize> {
+                    transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM inbound_queue WHERE state = ?1",
+                            [state.as_str()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|count| count.max(0) as usize)
+                };
+                let unposted = count(QueueState::InFlight)?;
+                let posted = count(QueueState::Posted)?;
+                transaction.commit()?;
+                Ok(Recovered {
+                    orphaned,
+                    unposted,
+                    posted,
+                })
+            })
+            .await?;
+        Ok(recovered)
+    }
+
     pub async fn pending_count(&self) -> Result<u64> {
         let count = self
             .connection
@@ -1597,21 +1991,22 @@ impl Store {
         let stats = self
             .connection
             .call(|connection| {
+                let mut stats = QueueStats::default();
                 let mut statement = connection
                     .prepare("SELECT state, COUNT(*) FROM inbound_queue GROUP BY state")?;
                 let rows = statement.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })?;
-                let mut stats = QueueStats::default();
                 for row in rows {
                     let (state, count) = row?;
                     let count = count.max(0) as u64;
-                    match state.as_str() {
-                        "pending" => stats.pending = count,
-                        "in_flight" => stats.in_flight = count,
-                        "done" => stats.done = count,
-                        "failed" => stats.failed = count,
-                        _ => {}
+                    match QueueState::parse(&state) {
+                        Some(QueueState::Pending) => stats.pending = count,
+                        Some(QueueState::InFlight) => stats.in_flight = count,
+                        Some(QueueState::Posted) => stats.posted = count,
+                        Some(QueueState::Done) => stats.done = count,
+                        Some(QueueState::Failed) => stats.failed = count,
+                        None => {}
                     }
                 }
                 Ok(stats)
@@ -1621,10 +2016,32 @@ impl Store {
     }
 
     /// Delete every queue row regardless of state. Backs `mekabridge queue clear`.
+    ///
+    /// A hand-over that was still out gives back what its item took first, exactly as if it had
+    /// failed. Deleting the row alone would not do it: `ON DELETE SET NULL` clears the stamp on the
+    /// backlog that item reported but cannot un-see it, so a muted chat's messages would be marked
+    /// as shown to an agent that never saw them, and nothing would ever offer them again. Rows that
+    /// are already `done` are left alone, since their backlog really was read.
     pub async fn clear_queue(&self) -> Result<usize> {
         let deleted = self
             .connection
-            .call(|connection| connection.execute("DELETE FROM inbound_queue", []))
+            .call(|connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let outstanding: Vec<i64> = {
+                    let mut statement = transaction.prepare(
+                        "SELECT seq FROM inbound_queue WHERE state IN ('in_flight', 'posted')",
+                    )?;
+                    let rows = statement.query_map([], |row| row.get(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for seq in outstanding {
+                    restore(&transaction, seq)?;
+                }
+                let deleted = transaction.execute("DELETE FROM inbound_queue", [])?;
+                transaction.commit()?;
+                Ok(deleted)
+            })
             .await?;
         Ok(deleted)
     }
@@ -1632,7 +2049,9 @@ impl Store {
     /// Drop delivered rows older than `before`.
     ///
     /// Completed rows are kept for a window rather than deleted immediately because they are what
-    /// makes duplicate detection work across a restart.
+    /// makes duplicate detection work across a restart. Going takes the rendered item with them,
+    /// which is the copy of somebody's message worth not keeping; a row that ends `failed` had its
+    /// body dropped when it failed, so it costs nothing to keep for the operator to find.
     pub async fn prune_delivered(&self, before: DateTime<Utc>) -> Result<usize> {
         let before = to_rfc3339(before);
         let deleted = self
@@ -1643,7 +2062,7 @@ impl Store {
                     // behaviour rather than becoming immortal.
                     "DELETE FROM inbound_queue
                      WHERE state = 'done' AND coalesce(completed_at, received_at) < ?1",
-                    [before],
+                    [&before],
                 )
             })
             .await?;
@@ -1828,42 +2247,6 @@ impl Store {
             .await?;
         records.reverse();
         Ok((count, records, watermark))
-    }
-
-    /// Mark everything a conversation withheld up to `through` as accounted for.
-    ///
-    /// Split from [`Self::take_unseen`] so the backlog is only spent once a turn carrying it has
-    /// reached meka: marking at read time meant a submission meka refused threw away the envelope
-    /// *and* the count.
-    ///
-    /// Both bounds together are the set [`Self::take_unseen`] counted, and neither alone is. On the
-    /// timestamp alone, a row written between the count and this call at or below the ceiling is
-    /// marked without ever being shown, which is not a narrow window: Telegram stamps to whole
-    /// seconds, and an edit carries the *original* message's time. On the id alone, that same edit
-    /// sweeps the other way, having a low id and a high timestamp, so it was never counted and is
-    /// marked anyway.
-    pub async fn mark_seen(
-        &self,
-        address: &str,
-        through_id: i64,
-        through: DateTime<Utc>,
-    ) -> Result<usize> {
-        let address = address.to_string();
-        let through = to_rfc3339(through);
-        let marked = self
-            .connection
-            .call(move |connection| {
-                connection.execute(
-                    &format!(
-                        "UPDATE messages SET seen = 1
-                         WHERE conversation_id = {CONVERSATION_ID_OF} AND seen = 0
-                           AND id <= ?2 AND timestamp <= ?3"
-                    ),
-                    rusqlite::params![&address, through_id, &through],
-                )
-            })
-            .await?;
-        Ok(marked)
     }
 
     /// Put one message back among what the agent is owed.
@@ -2273,9 +2656,17 @@ const POLICY_FROM: &str = "conversation_policy p JOIN conversations c ON c.id = 
 
 /// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
 const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
-     q.received_at, q.attempts, q.recovered";
+     q.received_at, q.state, q.key, q.body, q.session_id, q.item_id, q.dropped, q.attempts,
+     q.posts, q.not_before, q.last_error, q.held_at, q.posted_at";
 
 const QUEUE_FROM: &str = "inbound_queue q JOIN conversations c ON c.id = q.conversation_id";
+
+/// Everything a row sheds when it goes back to the queue for a hand-over of its own.
+///
+/// `last_error` is deliberately not in it: why the last offer came apart is the one thing worth
+/// still being able to read on a row that is waiting to be tried again.
+const QUEUE_CLEARED: &str = "key = NULL, body = NULL, session_id = NULL, item_id = NULL,
+     dropped = 0, posts = 0, held_at = NULL, posted_at = NULL, completed_at = NULL";
 
 /// The columns [`row_to_message`] reads, in the order it reads them, over [`MESSAGE_FROM`].
 ///
@@ -2409,6 +2800,11 @@ fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
 
 fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
     let received_at: String = row.get(6)?;
+    let state: String = row.get(7)?;
+    let session_id: Option<String> = row.get(10)?;
+    let not_before: Option<String> = row.get(15)?;
+    let held_at: Option<String> = row.get(17)?;
+    let posted_at: Option<String> = row.get(18)?;
     Ok(QueuedMessage {
         seq: row.get(0)?,
         conversation: row.get(1)?,
@@ -2417,9 +2813,75 @@ fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
         revision: row.get(4)?,
         payload: row.get(5)?,
         received_at: parse_rfc3339(&received_at)?,
-        attempts: row.get(7)?,
-        recovered: row.get::<_, i64>(8).unwrap_or(0) != 0,
+        state: QueueState::parse(&state).ok_or_else(|| {
+            corrupt_column(
+                7,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{state:?} is not a queue state"),
+                ),
+            )
+        })?,
+        key: row.get(8)?,
+        body: row.get(9)?,
+        session_id: session_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|error| corrupt_column(10, error))?,
+        item_id: row.get(11)?,
+        dropped: row.get::<_, i64>(12)?.max(0) as u64,
+        attempts: row.get(13)?,
+        posts: row.get(14)?,
+        not_before: not_before.as_deref().map(parse_rfc3339).transpose()?,
+        last_error: row.get(16)?,
+        held_at: held_at.as_deref().map(parse_rfc3339).transpose()?,
+        posted_at: posted_at.as_deref().map(parse_rfc3339).transpose()?,
     })
+}
+
+/// One row by sequence, on a connection or a transaction already in hand.
+fn read_row(
+    connection: &rusqlite::Connection,
+    seq: i64,
+) -> rusqlite::Result<Option<QueuedMessage>> {
+    connection
+        .query_row(
+            &format!("SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM} WHERE q.seq = ?1"),
+            [seq],
+            row_to_queued,
+        )
+        .optional()
+}
+
+/// Give back everything the hand-over at `seq` took when it was rendered.
+///
+/// The dropped-message count goes back on the counter, so the next item reports it; the backlog it
+/// stated goes back among what the agent is owed, exactly and only the rows it named, which is what
+/// `accounted_by` is for. Both are idempotent against a second call only because every caller
+/// guards on the state transition that precedes it.
+fn restore(connection: &rusqlite::Connection, seq: i64) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE meta
+         SET value = CAST(CAST(value AS INTEGER)
+                          + (SELECT dropped FROM inbound_queue WHERE seq = ?1) AS TEXT)
+         WHERE key = ?2 AND (SELECT dropped FROM inbound_queue WHERE seq = ?1) > 0",
+        rusqlite::params![seq, META_DROPPED],
+    )?;
+    connection.execute(
+        "UPDATE messages SET seen = 0, accounted_by = NULL WHERE accounted_by = ?1",
+        [seq],
+    )?;
+    Ok(())
+}
+
+/// A value that is not what its column promised, reported the way `rusqlite` reports one so it
+/// travels the same path as every other row-reading failure.
+fn corrupt_column(
+    index: usize,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
 }
 
 #[cfg(test)]
@@ -2528,11 +2990,76 @@ mod tests {
         }
     }
 
+    /// Render claimed rows into hand-overs with nothing to say beyond their bodies.
+    async fn hold_all(store: &Store, rows: &[QueuedMessage]) -> Vec<QueuedMessage> {
+        hold_reporting(store, rows, 0, None).await
+    }
+
+    /// The same, with the first row carrying a dropped count and a backlog.
+    async fn hold_reporting(
+        store: &Store,
+        rows: &[QueuedMessage],
+        dropped: u64,
+        backlog: Option<Backlog>,
+    ) -> Vec<QueuedMessage> {
+        let mut held = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let first = index == 0;
+            let key = format!("key-{}-{}", row.seq, row.attempts);
+            assert!(
+                store
+                    .hold(
+                        row.seq,
+                        HandOver {
+                            key: &key,
+                            body: "body",
+                            session_id: Uuid::nil(),
+                            dropped: if first { dropped } else { 0 },
+                            accounted: first.then_some(backlog).flatten(),
+                        },
+                        now(),
+                    )
+                    .await
+                    .expect("hold"),
+                "a claimed row must take its hand-over"
+            );
+            held.push(store.row(row.seq).await.expect("read").expect("row"));
+        }
+        held
+    }
+
+    /// Enqueue one message and hand it over, which is what `accounted_by` hangs off.
+    ///
+    /// The queue row is synthetic: it carries no history of its own, so what it accounts for is
+    /// exactly the backlog handed in.
+    async fn hand_over(
+        store: &Store,
+        account: AccountId,
+        conversation: &str,
+        message_id: &str,
+        backlog: Option<Backlog>,
+    ) -> i64 {
+        store
+            .enqueue(key(account, conversation, message_id), "{}", now(), 1_000)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim(&[conversation.to_string()], 100)
+            .await
+            .expect("claim");
+        let row = claimed
+            .iter()
+            .find(|row| row.message_id == message_id)
+            .expect("the row just enqueued was claimed");
+        hold_reporting(store, std::slice::from_ref(row), 0, backlog).await;
+        row.seq
+    }
+
     /// Claim from every conversation with something waiting.
     ///
-    /// What `claim_batch` meant before readiness became per conversation. These tests are about
-    /// queue mechanics rather than about which chats have settled, so they say "all of them" once
-    /// here instead of naming ids at twenty call sites.
+    /// What `claim` meant before readiness became per conversation. These tests are about queue
+    /// mechanics rather than about which chats have settled, so they say "all of them" once here
+    /// instead of naming ids at twenty call sites.
     async fn claim_all(store: &Store, limit: usize) -> Vec<QueuedMessage> {
         let ready: Vec<String> = store
             .pending_windows()
@@ -2541,7 +3068,7 @@ mod tests {
             .into_iter()
             .map(|window| window.conversation)
             .collect();
-        store.claim_batch(&ready, limit).await.expect("claim")
+        store.claim(&ready, limit).await.expect("claim")
     }
 
     #[tokio::test]
@@ -3432,10 +3959,14 @@ mod tests {
             context.first().map(|row| row.text.as_str()),
             Some("meet at five")
         );
-        store
-            .mark_seen("telegram:1", watermark, through)
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-1",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
 
         assert_eq!(
             store
@@ -3533,10 +4064,17 @@ mod tests {
         // The one that used to fire wrongly. An ordinary turn sweeps the backlog to zero, which
         // moved a count-carrying marker and sent the watcher to announce news the agent had just
         // been handed.
-        store
-            .mark_seen("telegram:1", i64::MAX, now() + chrono::Duration::hours(1))
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-everything",
+            Some(Backlog {
+                watermark: i64::MAX,
+                through: now() + chrono::Duration::hours(1),
+            }),
+        )
+        .await;
         assert_eq!(
             marker().await,
             after_one,
@@ -3618,10 +4156,17 @@ mod tests {
             .record_message(message(account, "telegram:1", "1", "one"))
             .await
             .expect("record");
-        store
-            .mark_seen("telegram:1", i64::MAX, now() + chrono::Duration::hours(1))
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-everything",
+            Some(Backlog {
+                watermark: i64::MAX,
+                through: now() + chrono::Duration::hours(1),
+            }),
+        )
+        .await;
 
         let summary = store
             .unseen_summary(Some("telegram:1"))
@@ -3697,10 +4242,14 @@ mod tests {
             .expect("take");
         assert_eq!(count, 1, "reading it again must not consume it");
 
-        store
-            .mark_seen("telegram:1", watermark, through)
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-2",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
         let (count, context, _) = store
             .take_unseen("telegram:1", through, 5)
             .await
@@ -3727,10 +4276,17 @@ mod tests {
             .await
             .expect("take");
         assert_eq!(count, 1);
-        store
-            .mark_seen("telegram:1", watermark, cutoff)
-            .await
-            .expect("mark");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-3",
+            Some(Backlog {
+                watermark,
+                through: cutoff,
+            }),
+        )
+        .await;
         let (count, ..) = store
             .take_unseen("telegram:1", now() + chrono::Duration::hours(1), 5)
             .await
@@ -3764,10 +4320,17 @@ mod tests {
             .expect("take");
         assert_eq!(count, 1, "only the edit is inside the ceiling");
 
-        store
-            .mark_seen("telegram:1", watermark, ceiling)
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-4",
+            Some(Backlog {
+                watermark,
+                through: ceiling,
+            }),
+        )
+        .await;
 
         let summary = store.unseen_summary(None).await.expect("summary");
         assert_eq!(
@@ -3801,10 +4364,17 @@ mod tests {
         during.timestamp = asked_about;
         store.record_message(during).await.expect("record");
 
-        store
-            .mark_seen("telegram:1", watermark, asked_about)
-            .await
-            .expect("mark seen");
+        hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "accounting-5",
+            Some(Backlog {
+                watermark,
+                through: asked_about,
+            }),
+        )
+        .await;
 
         let summary = store.unseen_summary(None).await.expect("summary");
         assert_eq!(
@@ -3847,7 +4417,7 @@ mod tests {
         assert_eq!(store.pending_count().await.expect("count"), 0);
 
         let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
-        store.complete_batch(&sequences).await.expect("complete");
+        store.complete(&sequences).await.expect("complete");
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!(stats.done, 1);
         assert_eq!(stats.pending, 0);
@@ -3862,7 +4432,7 @@ mod tests {
             .expect("enqueue");
         let peeked = store.peek_pending(10).await.expect("peek");
         assert_eq!(peeked.len(), 1);
-        // The drain loop must still see it; an inspection command that consumed rows would strand
+        // The session task must still see it; an inspection command that consumed rows would strand
         // undelivered messages.
         assert_eq!(store.pending_count().await.expect("count"), 1);
         assert_eq!(claim_all(&store, 10).await.len(), 1);
@@ -3936,7 +4506,7 @@ mod tests {
             .expect("second");
 
         let batch = store
-            .claim_batch(&["telegram:999".to_string()], 10)
+            .claim(&["telegram:999".to_string()], 10)
             .await
             .expect("claim");
         assert_eq!(batch.len(), 1);
@@ -3958,7 +4528,7 @@ mod tests {
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
-        assert!(store.claim_batch(&[], 10).await.expect("claim").is_empty());
+        assert!(store.claim(&[], 10).await.expect("claim").is_empty());
         assert_eq!(store.pending_count().await.expect("count"), 1);
     }
 
@@ -4055,11 +4625,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_released_batch_keeps_its_attempt_budget() {
-        // meka refusing a submission because a turn is already running is a deferral, not a failed
-        // delivery: it now does that routinely for background tasks and scheduled wakes. Spending
-        // an attempt on it would let a busy session declare a message undeliverable that meka never
-        // saw, which is exactly what happened in the field.
+    async fn an_unclaimed_row_keeps_its_offer_budget() {
+        // Rows claimed and handed back before a batch was made of them were never offered to
+        // meka: the process died, or the envelope could not be built. Spending an attempt on that
+        // would let a fault of the bridge's own declare a message undeliverable that meka never
+        // saw.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
@@ -4067,77 +4637,84 @@ mod tests {
             .expect("enqueue");
 
         for _ in 0..5 {
-            let batch = claim_all(&store, 10).await;
-            assert_eq!(batch.len(), 1, "the message must stay claimable");
-            assert_eq!(batch[0].attempts, 0, "a deferral is not an attempt");
-            let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
-            store.release_batch(&sequences).await.expect("release");
+            let claimed = claim_all(&store, 10).await;
+            assert_eq!(claimed.len(), 1, "the message must stay claimable");
+            assert_eq!(claimed[0].attempts, 0, "an unclaim is not a spent offer");
+            let sequences: Vec<i64> = claimed.iter().map(|message| message.seq).collect();
+            store.unclaim(&sequences).await.expect("unclaim");
             assert_eq!(store.pending_count().await.expect("count"), 1);
         }
 
-        // And the budget is still intact for a genuine failure afterwards.
-        let batch = claim_all(&store, 10).await;
-        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
-        let outcome = store
-            .fail_batch(&sequences, "provider 502", 1, None)
-            .await
-            .expect("fail");
+        // And the budget is still intact for a genuine offer afterwards.
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
         assert_eq!(
-            outcome.retrying, sequences,
-            "the first real failure retries"
+            store
+                .reoffer(held[0].seq, "withdrawn", 1, None, now())
+                .await
+                .expect("reoffer"),
+            Offer::Retrying,
+            "the first real offer puts it back"
         );
         assert_eq!(store.queue_stats().await.expect("stats").failed, 0);
     }
 
     #[tokio::test]
-    async fn failed_batch_retries_then_exhausts() {
+    async fn a_row_is_offered_again_and_then_given_up_on() {
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = claim_all(&store, 10).await;
-        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        let seq = held[0].seq;
 
-        let first = store
-            .fail_batch(&sequences, "provider 502", 1, None)
-            .await
-            .expect("fail");
-        assert_eq!(first.retrying, sequences);
-        assert!(first.exhausted.is_empty());
+        assert_eq!(
+            store
+                .reoffer(seq, "withdrawn", 1, None, now())
+                .await
+                .expect("reoffer"),
+            Offer::Retrying
+        );
         assert_eq!(store.pending_count().await.expect("count"), 1);
 
-        let batch = claim_all(&store, 10).await;
-        assert_eq!(batch[0].attempts, 1);
+        let claimed = claim_all(&store, 10).await;
+        assert_eq!(claimed[0].attempts, 1);
+        let again = hold_all(&store, &claimed).await;
+        assert_ne!(
+            again[0].key, held[0].key,
+            "a hand-over of its own is a key of its own"
+        );
         let second = store
-            .fail_batch(&sequences, "provider 502", 1, None)
+            .reoffer(seq, "withdrawn", 1, None, now())
             .await
-            .expect("fail");
-        assert!(second.retrying.is_empty());
-        assert_eq!(second.exhausted.len(), 1);
-        assert_eq!(second.exhausted[0].conversation, "telegram:123");
+            .expect("reoffer");
+        let Offer::Exhausted(exhausted) = second else {
+            panic!("the second offer runs it out: {second:?}");
+        };
+        assert_eq!(exhausted.conversation, "telegram:123");
         assert_eq!(store.pending_count().await.expect("count"), 0);
         assert_eq!(store.queue_stats().await.expect("stats").failed, 1);
     }
 
     #[tokio::test]
     async fn a_deferred_row_reports_when_it_may_be_offered_again() {
-        // What stops the drain loop coming straight back to a provider that has just rate limited
-        // it. Without the column the retry lands inside the same window and spends the budget for
-        // nothing.
+        // What stops a row whose item was taken back going straight into a new batch, which for a
+        // turn an operator just cancelled would hand the agent the same thing at once.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = claim_all(&store, 10).await;
-        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
 
         let retry_at = now() + chrono::Duration::seconds(30);
         store
-            .fail_batch(&sequences, "rate limited", 3, Some(retry_at))
+            .reoffer(held[0].seq, "withdrawn", 3, Some(retry_at), now())
             .await
-            .expect("fail");
+            .expect("reoffer");
 
         let windows = store.pending_windows().await.expect("windows");
         assert_eq!(windows.len(), 1);
@@ -4146,21 +4723,21 @@ mod tests {
 
     #[tokio::test]
     async fn one_deferred_row_defers_its_whole_conversation() {
-        // `max()` rather than `min()`, and the reason is ordering: the drain loop claims by `seq`,
-        // so releasing the fresh message while its predecessor waits out a rate limit would hand
-        // the agent the second half of an exchange before the first.
+        // `max()` rather than `min()`, and the reason is ordering: rows are claimed by `seq`, so
+        // releasing the fresh message while its predecessor waits would hand the agent the second
+        // half of an exchange before the first.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = claim_all(&store, 10).await;
-        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
         let retry_at = now() + chrono::Duration::seconds(30);
         store
-            .fail_batch(&sequences, "rate limited", 3, Some(retry_at))
+            .reoffer(held[0].seq, "withdrawn", 3, Some(retry_at), now())
             .await
-            .expect("fail");
+            .expect("reoffer");
 
         store
             .enqueue(key(account, "telegram:123", "m2"), "b", now(), 10)
@@ -4220,36 +4797,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_retries_fails_on_first_attempt() {
+    async fn zero_offers_fails_on_the_first_release() {
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
             .await
             .expect("enqueue");
-        let batch = claim_all(&store, 10).await;
-        let sequences: Vec<i64> = batch.iter().map(|message| message.seq).collect();
-        let outcome = store
-            .fail_batch(&sequences, "boom", 0, None)
-            .await
-            .expect("fail");
-        assert_eq!(outcome.exhausted.len(), 1);
-        assert!(outcome.retrying.is_empty());
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        assert!(matches!(
+            store
+                .reoffer(held[0].seq, "boom", 0, None, now())
+                .await
+                .expect("reoffer"),
+            Offer::Exhausted(_)
+        ));
     }
 
     #[tokio::test]
-    async fn in_flight_rows_are_recovered_at_startup() {
+    async fn a_restart_returns_only_the_rows_nothing_was_rendered_for() {
+        // Two rows claimed at once; the process died after binding the first into a batch and
+        // before binding the second. The bound one is a hand-over meka may already have and is
+        // left for the post or the feed to settle; the other was never rendered for anybody.
         let (store, account) = seeded(&["telegram:123"]).await;
-        store
-            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
-            .await
-            .expect("enqueue");
-        claim_all(&store, 10).await;
+        for id in ["a", "b"] {
+            store
+                .enqueue(key(account, "telegram:123", id), id, now(), 10)
+                .await
+                .expect("enqueue");
+        }
+        let first = claim_all(&store, 1).await;
+        let held = hold_all(&store, &first).await;
+        claim_all(&store, 1).await;
         assert_eq!(store.pending_count().await.expect("count"), 0);
 
-        // Simulates a crash between claiming a batch and completing its turn.
-        let recovered = store.reset_in_flight().await.expect("reset");
-        assert_eq!(recovered, 1);
+        let recovered = store.recover().await.expect("recover");
+        assert_eq!(recovered, Recovered {
+            orphaned: 1,
+            unposted: 1,
+            posted: 0,
+        });
         assert_eq!(store.pending_count().await.expect("count"), 1);
+        let rendered = store
+            .row(held[0].seq)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(rendered.state, QueueState::InFlight);
+        assert_eq!(rendered.message_id, "a");
+
+        store
+            .posted(held[0].seq, Uuid::nil(), "item-1", now())
+            .await
+            .expect("post");
+        let recovered = store.recover().await.expect("recover");
+        assert_eq!(recovered, Recovered {
+            orphaned: 0,
+            unposted: 0,
+            posted: 1,
+        });
     }
 
     #[tokio::test]
@@ -4261,13 +4867,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropped_counter_accumulates_and_resets() {
-        let store = Store::open_in_memory().await.expect("opens");
-        assert_eq!(store.take_dropped().await.expect("take"), 0);
+    async fn the_dropped_count_comes_off_when_an_item_reports_it() {
+        // Read and folded in two steps on purpose. The count is rendered into an envelope first,
+        // and only the batch that carries that envelope takes it off the counter; a crash between
+        // the two loses the envelope and keeps the count, where taking it at read time lost both.
+        let (store, account) = seeded(&["telegram:123"]).await;
+        assert_eq!(store.peek_dropped().await.expect("peek"), 0);
         store.note_dropped(2).await.expect("note");
         store.note_dropped(3).await.expect("note");
-        assert_eq!(store.take_dropped().await.expect("take"), 5);
-        assert_eq!(store.take_dropped().await.expect("take"), 0);
+        assert_eq!(store.peek_dropped().await.expect("peek"), 5);
+        assert_eq!(
+            store.peek_dropped().await.expect("peek"),
+            5,
+            "reading does not spend it"
+        );
+
+        store
+            .enqueue(key(account, "telegram:123", "m1"), "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let claimed = claim_all(&store, 10).await;
+        // One more shed while the item was being rendered, which the next item reports.
+        store.note_dropped(1).await.expect("note");
+        let held = hold_reporting(&store, &claimed, 5, None).await;
+        assert_eq!(held[0].dropped, 5);
+        assert_eq!(store.peek_dropped().await.expect("peek"), 1);
+        // And the item failing gives it back.
+        store
+            .failed(held[0].seq, "gone", now())
+            .await
+            .expect("fail");
+        assert_eq!(store.peek_dropped().await.expect("peek"), 6);
     }
 
     #[tokio::test]
@@ -4326,52 +4956,368 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_recovered_from_a_crash_is_marked_and_charged() {
-        // The two ways a row returns to the queue are not the same, and only one of them is
-        // understood. A failed turn was watched, so the bridge knows whether the agent acted. A row
-        // stranded by a hard kill was in the hands of a turn nobody saw the end of: replaying it
-        // silently presents work that may already be done as though it were new, and with the
-        // attempt uncharged a batch that kills the process is replayed for ever.
+    async fn a_row_carries_its_own_key_and_what_its_item_stated() {
+        let (store, account) = seeded(&["telegram:123", "telegram:456"]).await;
+        for (conversation, id) in [("telegram:123", "a"), ("telegram:456", "b")] {
+            store
+                .enqueue(key(account, conversation, id), id, now(), 10)
+                .await
+                .expect("enqueue");
+        }
+        let claimed = claim_all(&store, 10).await;
+        let session = Uuid::new_v4();
+        let first = claimed[0].seq;
+        let item = HandOver {
+            key: "mekabridge-1",
+            body: "body",
+            session_id: session,
+            dropped: 0,
+            accounted: None,
+        };
+        assert!(store.hold(first, item, now()).await.expect("hold"));
+        let held = store.row(first).await.expect("read").expect("on file");
+        assert_eq!(held.state, QueueState::InFlight);
+        assert_eq!(held.key.as_deref(), Some("mekabridge-1"));
+        assert_eq!(held.body.as_deref(), Some("body"));
+        assert_eq!(held.session_id, Some(session));
+        assert_eq!(held.held_at, Some(now()));
+        // A second render of the same row is refused: the key it would post under is already
+        // minted, and a row with two keys is two items to meka.
+        assert!(
+            !store
+                .hold(
+                    first,
+                    HandOver {
+                        key: "mekabridge-2",
+                        body: "other",
+                        ..item
+                    },
+                    now()
+                )
+                .await
+                .expect("hold")
+        );
+
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!((stats.in_flight, stats.posted), (2, 0));
+        assert_eq!(
+            store
+                .rows_in(QueueState::InFlight)
+                .await
+                .expect("list")
+                .len(),
+            2
+        );
+
+        // A post that did not go through is written down with its wait.
+        let later = now() + chrono::Duration::seconds(10);
+        store
+            .defer(first, "connection refused", later)
+            .await
+            .expect("defer");
+        let deferred = store.row(first).await.expect("read").expect("present");
+        assert_eq!(deferred.posts, 1);
+        assert_eq!(deferred.attempts, 0, "a failed post is not a spent offer");
+        assert_eq!(deferred.not_before, Some(later));
+        assert_eq!(deferred.last_error.as_deref(), Some("connection refused"));
+
+        // And the 202 moves it on, clearing what the failed post left.
+        store
+            .posted(first, session, "item-9", now())
+            .await
+            .expect("post");
+        let posted = store.row(first).await.expect("read").expect("present");
+        assert_eq!(posted.state, QueueState::Posted);
+        assert_eq!(posted.item_id.as_deref(), Some("item-9"));
+        assert_eq!(posted.posts, 2);
+        assert_eq!(posted.posted_at, Some(now()));
+        assert_eq!(posted.not_before, None);
+        assert_eq!(posted.last_error, None);
+        assert_eq!(
+            store.row_by_item("item-9").await.expect("read"),
+            Some(posted),
+            "the feed names items, so a row has to be found by one"
+        );
+        assert_eq!(store.row_by_item("nobody").await.expect("read"), None);
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!((stats.in_flight, stats.posted), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn delivering_a_row_closes_it_once() {
+        let (store, account) = seeded(&["telegram:123"]).await;
+        store
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        let seq = held[0].seq;
+        store
+            .posted(seq, Uuid::nil(), "item-1", now())
+            .await
+            .expect("post");
+
+        assert!(store.delivered(seq, now()).await.expect("deliver"));
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!((stats.done, stats.in_flight, stats.posted), (1, 0, 0));
+        // The feed replays an outcome after a reconnect, and the second reading changes nothing.
+        assert!(!store.delivered(seq, now()).await.expect("deliver"));
+        assert!(
+            store
+                .failed(seq, "late withdrawal", now())
+                .await
+                .expect("fail")
+                .is_none(),
+            "a delivered row is not reopened by a later event"
+        );
+        assert_eq!(store.queue_stats().await.expect("stats").done, 1);
+    }
+
+    #[tokio::test]
+    async fn a_delivered_row_can_be_offered_again_when_the_model_said_nothing() {
+        let (store, account) = seeded(&["telegram:123"]).await;
+        store
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        let seq = held[0].seq;
+        store
+            .posted(seq, Uuid::nil(), "item-1", now())
+            .await
+            .expect("post");
+        store.delivered(seq, now()).await.expect("deliver");
+
+        assert_eq!(
+            store
+                .reoffer(seq, "empty response", 1, None, now())
+                .await
+                .expect("reoffer"),
+            Offer::Retrying
+        );
+        let again = claim_all(&store, 10).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].attempts, 1);
+        assert_eq!(
+            (again[0].key.as_deref(), again[0].item_id.as_deref()),
+            (None, None),
+            "a row offered again sheds the hand-over that came apart"
+        );
+        assert_eq!(
+            again[0].last_error.as_deref(),
+            Some("empty response"),
+            "and keeps why, which is the one thing worth reading on a row waiting to be tried again"
+        );
+        // A row still pending is not this function's to touch.
+        store.unclaim(&[seq]).await.expect("unclaim");
+        assert_eq!(
+            store
+                .reoffer(seq, "empty response", 1, None, now())
+                .await
+                .expect("reoffer"),
+            Offer::Closed
+        );
+        assert_eq!(store.queue_stats().await.expect("stats").pending, 1);
+    }
+
+    #[tokio::test]
+    async fn failing_a_row_closes_it_and_hands_it_back() {
+        let (store, account) = seeded(&["telegram:123"]).await;
+        store
+            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
+            .await
+            .expect("enqueue");
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        let seq = held[0].seq;
+
+        let closed = store
+            .failed(seq, "no turn could deliver it", now())
+            .await
+            .expect("fail")
+            .expect("the row it closed comes back");
+        assert_eq!(closed.message_id, "a");
+        assert_eq!(closed.state, QueueState::Failed);
+        assert_eq!(
+            closed.last_error.as_deref(),
+            Some("no turn could deliver it")
+        );
+        assert_eq!(
+            closed.body, None,
+            "nothing will post it again, so a second copy of the message is not kept"
+        );
+        assert_eq!(
+            closed.key.as_deref(),
+            Some("key-1-0"),
+            "the key stays: it is what names this hand-over in meka's own logs"
+        );
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!((stats.failed, stats.in_flight), (1, 0));
+        assert!(
+            !store
+                .delivered(seq, now())
+                .await
+                .expect("a closed row must not fail the write"),
+            "a closed row is not reopened by a later event"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_an_item_states_once_is_owed_back_exactly_when_it_dies() {
+        // The whole reason the backlog is accounted against the row that stated it. Two hand-overs
+        // can be outstanding for one conversation at once, so "what has been reported" is a set
+        // rather than a watermark, and only the rows the dead one named may be owed again.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for id in ["old-1", "old-2"] {
+            store
+                .record_message(message(account, "telegram:1", id, "said earlier"))
+                .await
+                .expect("record");
+        }
+        let through = now() + chrono::Duration::hours(1);
+        let (count, _, watermark) = store
+            .take_unseen("telegram:1", through, 10)
+            .await
+            .expect("take");
+        assert_eq!(count, 2);
+
+        store.note_dropped(4).await.expect("note");
+        let stating = hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "stating",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
+        store
+            .hold(
+                stating,
+                HandOver {
+                    key: "unused",
+                    body: "body",
+                    session_id: Uuid::nil(),
+                    dropped: 4,
+                    accounted: None,
+                },
+                now(),
+            )
+            .await
+            .expect("a second hold is refused");
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            0,
+            "the backlog is spent when the item stating it is rendered, not when it is read"
+        );
+
+        // A message that lands afterwards is a backlog of its own, and a second hand-over states
+        // only that rather than restating what the first one already said.
+        store
+            .record_message(message(account, "telegram:1", "later", "said since"))
+            .await
+            .expect("record");
+        let (count, _, second_watermark) = store
+            .take_unseen("telegram:1", now() + chrono::Duration::hours(2), 10)
+            .await
+            .expect("take");
+        assert_eq!(count, 1, "only what the first hand-over did not state");
+        let second = hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "second",
+            Some(Backlog {
+                watermark: second_watermark,
+                through: now() + chrono::Duration::hours(2),
+            }),
+        )
+        .await;
+
+        // The first one dies. Exactly its two rows come back, and the count it reported with them.
+        store.failed(stating, "gone", now()).await.expect("fail");
+        let owed = store
+            .history("telegram:1", 10, None)
+            .await
+            .expect("read")
+            .into_iter()
+            .filter(|row| !row.seen)
+            .map(|row| row.message_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owed,
+            vec!["old-1".to_string(), "old-2".to_string()],
+            "the dead hand-over owes back its own slice and nothing the live one stated"
+        );
+        assert_eq!(
+            store.peek_dropped().await.expect("peek"),
+            4,
+            "and the dropped count it reported, which nobody read"
+        );
+
+        // And the survivor still owns its own slice, which is given back only if it dies too.
+        store
+            .reoffer(second, "withdrawn", 3, None, now())
+            .await
+            .expect("reoffer");
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn the_feed_position_is_kept_per_session_and_goes_with_the_binding() {
+        let store = Store::open_in_memory().await.expect("opens");
+        let session = Uuid::new_v4();
+        assert_eq!(store.feed_position(session).await.expect("read"), None);
+        store.set_feed_position(session, 41).await.expect("write");
+        store
+            .set_feed_position(session, 42)
+            .await
+            .expect("overwrite");
+        assert_eq!(store.feed_position(session).await.expect("read"), Some(42));
+        // Ids start again on a new session, so a position is never read across one.
+        assert_eq!(
+            store.feed_position(Uuid::new_v4()).await.expect("read"),
+            None
+        );
+
+        store.set_session_id(session).await.expect("bind");
+        store.clear_session_id().await.expect("unbind");
+        assert_eq!(store.session_id().await.expect("read"), None);
+        assert_eq!(
+            store.feed_position(session).await.expect("read"),
+            None,
+            "a position outliving its session would be sent to the next one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_row_cannot_be_released_back_into_the_queue() {
+        // Every terminal write is guarded on the row still being in flight. Unguarded, a `done` row
+        // could be released to `pending` and handed to the agent a second time. The session task
+        // is serial so no live path does this today, but the store is the wrong place to rely on
+        // that: a second process, or `mekabridge queue clear`, reaches these directly.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
             .await
             .expect("enqueue");
         let claimed = claim_all(&store, 1).await;
-        assert!(!claimed.first().expect("claimed").recovered);
+        let seq = claimed.first().expect("claimed").seq;
+        store.complete(&[seq]).await.expect("complete");
 
-        let reset = store.reset_in_flight().await.expect("recover");
-        assert_eq!(reset, 1);
-
-        let back = claim_all(&store, 1).await;
-        let row = back.first().expect("reclaimed");
-        assert!(
-            row.recovered,
-            "a row stranded by a crash is indistinguishable from an ordinary retry"
-        );
-        assert_eq!(
-            row.attempts, 1,
-            "the interrupted attempt was not charged, so a poison batch replays without bound"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_delivered_row_cannot_be_released_or_failed_back_into_the_queue() {
-        // Every terminal write is guarded on the row still being in flight. Unguarded, a `done` row
-        // could be released to `pending` and handed to the agent a second time, or re-failed --
-        // which marks a delivered message unseen and tells the owner it was lost. The drain loop is
-        // serial so no live path does this today, but the store is the wrong place to rely on that:
-        // a second process, or `mekabridge queue clear`, reaches these directly.
-        let (store, account) = seeded(&["telegram:123"]).await;
-        store
-            .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
-            .await
-            .expect("enqueue");
-        let batch = claim_all(&store, 1).await;
-        let seq = batch.first().expect("claimed").seq;
-        store.complete_batch(&[seq]).await.expect("complete");
-
-        store.release_batch(&[seq]).await.expect("release");
+        store.unclaim(&[seq]).await.expect("unclaim");
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!(
             stats.done, 1,
@@ -4379,101 +5325,223 @@ mod tests {
         );
         assert_eq!(stats.pending, 0);
 
-        let outcome = store
-            .fail_batch(&[seq], "boom", 0, None)
-            .await
-            .expect("fail");
-        assert!(
-            outcome.exhausted.is_empty(),
-            "a delivered message was reported to the owner as permanently lost"
-        );
-        let stats = store.queue_stats().await.expect("stats");
-        assert_eq!(stats.done, 1, "a delivered row was re-failed");
-        assert_eq!(stats.failed, 0);
-
         // And the other direction: a row released back to the queue must not then be completable.
-        // Without the guard on `complete_batch` a late completion from an abandoned attempt marks a
+        // Without the guard on `complete` a late completion from an abandoned attempt marks a
         // message delivered while it is still waiting to be delivered, and it is never sent.
         store
             .enqueue(key(account, "telegram:123", "b"), "b", now(), 10)
             .await
             .expect("enqueue");
-        let batch = claim_all(&store, 1).await;
-        let seq = batch.first().expect("claimed").seq;
-        store.release_batch(&[seq]).await.expect("release");
-        store.complete_batch(&[seq]).await.expect("complete");
+        let claimed = claim_all(&store, 1).await;
+        let seq = claimed.first().expect("claimed").seq;
+        store.unclaim(&[seq]).await.expect("unclaim");
+        store.complete(&[seq]).await.expect("complete");
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!(
             stats.pending, 1,
             "a row waiting in the queue was marked delivered: {stats:?}"
         );
         assert_eq!(stats.done, 1, "and nothing new was counted as delivered");
+
+        // A rendered row is not unclaimable either: its key is minted and meka may already have the
+        // item, so putting it back would hand the same message over twice.
+        let claimed = claim_all(&store, 1).await;
+        let held = hold_all(&store, &claimed).await;
+        store.unclaim(&[held[0].seq]).await.expect("unclaim");
+        assert_eq!(
+            store.queue_stats().await.expect("stats").in_flight,
+            1,
+            "a rendered row was put back in the queue under a key meka may hold"
+        );
     }
 
     #[tokio::test]
-    async fn one_vanished_row_does_not_strand_the_rest_of_its_batch() {
-        // `fail_batch` used to `?` on a row that had gone, rolling back the whole transaction and
-        // leaving every other row in the batch `in_flight`. Those are invisible to
-        // `pending_windows`, so newer messages in the same conversation are delivered ahead of them
-        // until the next restart -- a real ordering violation on top of the stall. Reachable from
-        // `mekabridge queue clear` against a running bridge.
+    async fn a_row_cleared_under_a_hand_over_settles_without_error() {
+        // `mekabridge queue clear` against a running bridge takes the rows out from under the
+        // session task, which then hears from the feed about an item it posted. Every write has to
+        // shrug at that rather than fail the loop.
         let (store, account) = seeded(&["telegram:123"]).await;
-        for id in ["a", "b"] {
-            store
-                .enqueue(key(account, "telegram:123", id), id, now(), 10)
-                .await
-                .expect("enqueue");
-        }
-        let batch = claim_all(&store, 10).await;
-        assert_eq!(batch.len(), 2);
-        let live = batch.first().expect("first").seq;
-        let vanished = batch.get(1).expect("second").seq;
-        store.clear_queue().await.expect("clear");
         store
             .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
             .await
-            .expect("re-enqueue");
-        let restored = claim_all(&store, 10).await;
-        let live = restored.first().map_or(live, |row| row.seq);
-
+            .expect("enqueue");
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        let seq = held[0].seq;
         store
-            .fail_batch(&[live, vanished], "boom", 3, None)
+            .posted(seq, Uuid::nil(), "item-1", now())
             .await
-            .expect("a missing row must not abort the batch");
-        let stats = store.queue_stats().await.expect("stats");
+            .expect("post");
+        assert_eq!(store.clear_queue().await.expect("clear"), 1);
+        assert_eq!(store.row_by_item("item-1").await.expect("read"), None);
+
+        assert!(
+            !store
+                .delivered(seq, now())
+                .await
+                .expect("a vanished row must not fail the write")
+        );
+        assert!(
+            store
+                .failed(seq, "gone", now())
+                .await
+                .expect("a vanished row must not fail the write")
+                .is_none()
+        );
         assert_eq!(
-            stats.in_flight, 0,
-            "a live row was stranded in flight by a sibling that had gone: {stats:?}"
+            store
+                .reoffer(seq, "gone", 3, None, now())
+                .await
+                .expect("a vanished row must not fail the write"),
+            Offer::Closed
+        );
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!(stats, QueueStats::default(), "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn clearing_the_queue_owes_back_what_an_outstanding_hand_over_took() {
+        // `queue clear` against a running bridge takes the rows out from under hand-overs that are
+        // still out. Their items were never read, so what those items stated once has to go back:
+        // the foreign key clears the stamp on the backlog but cannot un-see it, and a message
+        // marked as shown to an agent that never saw it is offered by nothing ever again.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for id in ["old-1", "old-2"] {
+            store
+                .record_message(message(account, "telegram:1", id, "said earlier"))
+                .await
+                .expect("record");
+        }
+        let through = now() + chrono::Duration::hours(1);
+        let (count, _, watermark) = store
+            .take_unseen("telegram:1", through, 10)
+            .await
+            .expect("take");
+        assert_eq!(count, 2);
+        store.note_dropped(3).await.expect("note");
+
+        let seq = hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "outstanding",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
+        store
+            .posted(seq, Uuid::nil(), "item-1", now())
+            .await
+            .expect("post");
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            0,
+            "the backlog is spent while the item is with meka"
+        );
+
+        assert_eq!(store.clear_queue().await.expect("clear"), 1);
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            2,
+            "an item nobody read has to leave its backlog owed"
+        );
+        assert_eq!(
+            store.peek_dropped().await.expect("peek"),
+            3,
+            "and the shed count it reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_a_delivered_row_leaves_the_backlog_it_stated_seen() {
+        // The other side of the same foreign key. A row swept for age was read, so its backlog was
+        // genuinely shown; `ON DELETE SET NULL` must take the stamp and leave `seen` alone, or
+        // seven days after every delivery the agent would be offered the whole thing again.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .record_message(message(account, "telegram:1", "old-1", "said earlier"))
+            .await
+            .expect("record");
+        let through = now() + chrono::Duration::hours(1);
+        let (_, _, watermark) = store
+            .take_unseen("telegram:1", through, 10)
+            .await
+            .expect("take");
+        let seq = hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "delivered",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
+        store.delivered(seq, now()).await.expect("deliver");
+
+        assert_eq!(
+            store
+                .prune_delivered(Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .expect("prune"),
+            1
+        );
+        assert_eq!(
+            store
+                .unseen_summary(Some("telegram:1"))
+                .await
+                .expect("summary")
+                .count,
+            0,
+            "a backlog the agent was shown must not come back when its row is swept"
+        );
+        assert!(
+            store
+                .history("telegram:1", 10, None)
+                .await
+                .expect("read")
+                .iter()
+                .all(|row| row.seen)
+        );
+        let stamped: i64 = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE accounted_by IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            stamped, 0,
+            "the stamp names a row that no longer exists, so the foreign key has to clear it"
         );
     }
 
     #[tokio::test]
     async fn prune_delivered_only_removes_completed_rows() {
         let (store, account) = seeded(&["telegram:123"]).await;
-        store
-            .enqueue(
-                key(account, "telegram:123", "done"),
-                "a",
-                now() - chrono::Duration::days(30),
-                10,
-            )
-            .await
-            .expect("enqueue");
-        store
-            .enqueue(
-                key(account, "telegram:123", "waiting"),
-                "b",
-                now() - chrono::Duration::days(30),
-                10,
-            )
-            .await
-            .expect("enqueue");
-        let batch = claim_all(&store, 1).await;
-        store
-            .complete_batch(&[batch[0].seq])
-            .await
-            .expect("complete");
-        store.reset_in_flight().await.expect("reset");
+        for id in ["done", "waiting"] {
+            store
+                .enqueue(
+                    key(account, "telegram:123", id),
+                    "a",
+                    now() - chrono::Duration::days(30),
+                    10,
+                )
+                .await
+                .expect("enqueue");
+        }
+        let claimed = claim_all(&store, 1).await;
+        let held = hold_all(&store, &claimed).await;
+        store.delivered(held[0].seq, now()).await.expect("deliver");
 
         // Both rows carry a 30-day-old `received_at`, because that is the platform's send time and
         // an edit inherits the original message's. Retention is measured from delivery instead, so
@@ -4500,6 +5568,22 @@ mod tests {
             .expect("prune");
         assert_eq!(pruned, 1);
         assert_eq!(store.pending_count().await.expect("count"), 1);
+
+        // A row that ends `failed` is never swept: it dropped its rendered item when it failed, so
+        // keeping it costs a line rather than a copy of somebody's message, and it is the one thing
+        // an operator has to find out what went wrong.
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
+        store
+            .failed(held[0].seq, "gave up", now())
+            .await
+            .expect("fail");
+        let pruned = store
+            .prune_delivered(Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .expect("prune");
+        assert_eq!(pruned, 0, "a failed row is not swept");
+        assert_eq!(store.queue_stats().await.expect("stats").failed, 1);
     }
 
     fn attachment_record(
@@ -5060,6 +6144,85 @@ mod tests {
             ("hello again", true),
             ("hello a third time", false),
         ]);
+    }
+
+    #[tokio::test]
+    async fn a_message_a_0_13_turn_held_goes_back_to_the_queue_on_upgrade() {
+        // What a deployment stopped mid-turn to upgrade looks like: a row the old drain loop had
+        // claimed, and marked as recovered once already. The turn it was in ran to its end or was
+        // cut off with the bridge none the wiser, and nothing can say which, so the row is offered
+        // again as the previous release's startup would have offered it, and the column that
+        // carried the uncertainty is gone with the uncertainty.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        legacy_database(&path, 9, |connection| {
+            connection.execute(
+                "INSERT INTO accounts
+                     (id, channel, platform, platform_id, first_seen_at, last_seen_at)
+                 VALUES (1, 'telegram', 'telegram', '111', ?1, ?1)",
+                [to_rfc3339(now())],
+            )?;
+            connection.execute(
+                "INSERT INTO conversations (id, address, channel, platform, kind, created_at)
+                 VALUES (1, 'telegram:123', 'telegram', 'telegram', 'direct', ?1)",
+                [to_rfc3339(now())],
+            )?;
+            connection.execute(
+                "INSERT INTO inbound_queue
+                     (conversation_id, account_id, message_id, revision, payload, received_at,
+                      state, attempts, recovered)
+                 VALUES (1, 1, 'held-by-a-turn', 0, 'a', ?1, 'in_flight', 1, 1)",
+                [to_rfc3339(now())],
+            )?;
+            Ok(())
+        })
+        .await;
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let stats = store.queue_stats().await.expect("stats");
+        assert_eq!((stats.pending, stats.in_flight), (1, 0), "{stats:?}");
+        let claimed = claim_all(&store, 10).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].message_id, "held-by-a-turn");
+        assert_eq!(claimed[0].attempts, 1, "what was charged stays charged");
+        assert_eq!(claimed[0].key, None, "and nothing is rendered for it yet");
+        let columns: Vec<String> = store
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(inbound_queue)")?;
+                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+                names.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .expect("columns");
+        assert!(
+            !columns.iter().any(|name| name == "recovered"),
+            "{columns:?}"
+        );
+        for added in [
+            "key",
+            "body",
+            "session_id",
+            "item_id",
+            "dropped",
+            "posts",
+            "held_at",
+        ] {
+            assert!(columns.iter().any(|name| name == added), "{columns:?}");
+        }
+        let accounted: Vec<String> = store
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
+                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+                names.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .expect("columns");
+        assert!(
+            accounted.iter().any(|name| name == "accounted_by"),
+            "{accounted:?}"
+        );
     }
 
     #[tokio::test]

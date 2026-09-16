@@ -50,7 +50,7 @@ Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` 
 - **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
 - **`admitted`** carries two facts. First the grant that let the message through: `user allowlist` (a direct message from somebody you named), `chat allowlist` (the room is allowed), or `open channel` (nothing was checked). Then, separately, whether the sender's own account is on `allowed_users` at all. Since that list reaches direct messages only, somebody you named writing in an allowlisted group is admitted *by the group*, and the second clause is what still identifies them. The bridge reports both; what to make of them belongs in the agent's instructions.
 - **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
-- **`album`** ties the parts of a multi-photo post together, so a batch of pictures does not read as several unrelated ones.
+- **`album`** ties the parts of a multi-photo post together, so a run of pictures does not read as several unrelated ones.
 - **`attachment`** ends with a handle for the fetch tools. See [Attachments](#attachments).
 
 A sender who is another bot is marked `[bot]`. An anonymous group admin, who posts as the chat rather than as an account, reads as `Deploy Crew (posted as the chat itself, no individual account)` rather than being dressed up as a person.
@@ -124,15 +124,15 @@ Deleting the bot and creating a new one is handled by putting the new token in t
 ## Messages are not held back
 
 Telegram has no way to tell a bot that somebody is typing: the Bot API lets a bot *send* a chat
-action and never receive one. So a message here starts a turn as soon as it arrives, rather than
+action and never receive one. So a message here is handed over as soon as it arrives, rather than
 waiting to see whether more is coming. `[bridge].settle` does not apply.
 
-The trade is that two messages a few seconds apart produce two turns, and the agent may answer the
-first before reading the second. If the second lands while the agent is still working on the first, it
-arrives flagged `late:`, so the agent knows its reply was written without it and can revise with
-`edit_message`. The alternative was a fixed wait on every
-message, which is a long time to sit still for somebody who only ever meant to send one. See
-[Group attention](./group-attention.md).
+The trade is that two messages a few seconds apart are handed over separately, and the agent may
+answer the first before reading the second. If the second lands while the agent is still working on
+the first, meka reads it into that same turn at its next round boundary, under a header saying it
+arrived while the agent was working, so the agent can account for it before it finishes or revise
+with `edit_message`. The alternative was a fixed wait on every message, which is a long time to sit
+still for somebody who only ever meant to send one. See [Group attention](./group-attention.md).
 
 Everything is still held for one second, which is not configurable and is not about typing: an
 album arrives as one update per photo, and without that floor a post would reach the agent as a
@@ -164,7 +164,7 @@ If rendering ever misbehaves on a particular message, `parse_mode = "none"` send
 
 ## Attachments
 
-**Nothing is downloaded on arrival.** The envelope announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `view_attachment` to look at a picture or `download_attachment` to get the file on disk.
+**Nothing is downloaded on arrival.** The item announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `view_attachment` to look at a picture or `download_attachment` to get the file on disk.
 
 ```
 attachment: photo, image/jpeg, 1920x1080, 2.1 MiB [417]
@@ -216,14 +216,15 @@ Outbound calls go through teloxide's `Throttle` adaptor. Telegram allows roughly
 
 ## Typing indicators
 
-When a turn starts, the chats it came from show a typing indicator, refreshed every four seconds because Telegram clears it after about five.
+While the model is writing a message, the chats it is answering show a typing indicator, refreshed every four seconds because Telegram clears it after about five. Not while the agent reads, searches or thinks: only in the interval meka reports between a send tool's arguments starting and finishing.
 
 It stops on whichever comes first:
 
+- **The arguments are written.** Whatever tool meka announces next closes the window, which is also what covers a call the model abandoned halfway.
 - **The agent sends a message there.** Telegram already clears the status when a message from the bot arrives, so re-arming it afterwards would tell somebody who was just answered that a second message is coming.
-- **Thirty seconds pass.** A turn still running after that is working through tool calls, not composing a sentence. Telegram's own guidance is to use the action when a reply will take a *noticeable* time to arrive, not as a general busy light, and no person types for ten minutes.
+- **`[bridge].typing_max` passes**, two minutes by default. It is the only thing that closes a window whose closing event never arrives.
 
-The restraint is deliberate. The indicator is a claim that a message is about to arrive, and the bridge cannot actually know that: the agent is free to read something and say nothing, which is a supported outcome. Showing "typing" for a whole turn that ends in silence is worse than showing nothing, because it is a promise the bridge was never in a position to make.
+The restraint is deliberate. The indicator is a claim that a message is about to arrive, and the bridge can only make it for the moment meka says the model is writing one: the agent is free to read something and say nothing, which is a supported outcome. Showing "typing" for a whole turn that ends in silence is worse than showing nothing, because it is a promise the bridge was never in a position to make.
 
 Sending a file declares the upload instead, so a large attachment shows "sending a photo" or "sending a file" rather than transferring in silence.
 

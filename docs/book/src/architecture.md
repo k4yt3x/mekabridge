@@ -4,16 +4,17 @@
 
 ```
   Telegram ──long poll──►  channel  ──►  writer  ──►  SQLite queue
-  Discord  ──gateway────►
-                              ▲                          │
-                              │                          ▼
-                             sink  ◄──  MCP server    drain loop
-                                            ▲             │
-                                            │             ▼
-                                       meka serve  ◄── POST /turn (SSE)
+  Discord  ──gateway────►                                │
+                              ▲                          ▼
+                             sink  ◄──  MCP server    session task ──POST /inbox──┐
+                                            ▲             ▲                       │
+                                            │             │                       ▼
+                                       meka serve  ◄──  feed reader ◄──GET /stream─┘
 ```
 
 Inbound goes left to right and stops at the queue. Outbound starts when the agent calls a tool, and never before.
+
+Two connections to meka, and they do opposite things. Messages go **out** through the session inbox, which answers as soon as the item is durable on meka's side and never waits for a turn. What became of them comes **back** on the session feed, one long-lived connection carrying every turn on the session, whoever started it.
 
 ## Modules
 
@@ -21,53 +22,71 @@ Inbound goes left to right and stops at the queue. Outbound starts when the agen
 |--------|----------------|
 | `config` | The on-disk TOML shape, and the validated form everything else uses |
 | `store` | SQLite: session binding, the accounts each channel speaks as, conversation address book, durable inbound queue, message history |
-| `meka` | meka's HTTP API, including consuming a turn's SSE stream |
+| `meka` | meka's HTTP API: the session inbox, the session feed, and the error taxonomy |
 | `mcp` | The MCP server and its outbound tool surface |
 | `channel` | The platform abstraction; one submodule per platform |
-| `bridge` | Wiring, the queue-to-turn loop, envelope construction, and the outbound sink |
+| `bridge` | Wiring, the feed reader, the session task, inbox-item construction, and the outbound sink |
 
 `config` is parsed into a different type than it is deserialized into. Everything prefixed `File` is the raw table and is private to the module; the public types are what you get after credentials are resolved, paths are expanded, and cross-field invariants hold. Downstream code never has to ask whether something was validated.
 
 ## Why the queue is durable
 
-One meka session runs one turn at a time, so anything arriving mid-turn has to wait somewhere. That somewhere cannot be process memory: a crash with a full queue would silently swallow messages people had already sent, and they would have no way to know.
+A message is written down before the platform is told it arrived. That cannot be process memory: a crash with a full buffer would silently swallow messages people had already sent, and they would have no way to know.
 
-Rows move through `pending` → `in_flight` → `done` or `failed`. A row left `in_flight` at startup is evidence of a crash mid-turn and goes back to `pending`, which is why the state is a column rather than an in-memory flag.
+It stays there until meka says the item carrying it is durable on *its* side, and is only marked delivered once the feed says the model actually read it. A row moves through `pending` → `in_flight` → `posted` → `done` or `failed`, and its state is a column rather than an in-memory flag so a restart finds every hand-over where it was.
 
-Two tasks, deliberately separate:
+Three tasks, deliberately separate:
 
 - The **writer** persists every event before acknowledging it.
-- The **drain loop** claims batches and runs turns. It is the only thing that talks to meka, which is what enforces "one turn at a time" without any locking: there is exactly one of it.
+- The **feed reader** holds `GET /v1/sessions/{id}/stream` open and hands every frame straight on. It touches nothing and decides nothing, which is what keeps meka's per-consumer buffer drained while the session task is busy with a request of its own.
+- The **session task** claims messages, renders and posts them, and acts on what the feed says. It is the only writer of queue state, so the bridge never races itself.
 
-Claiming and marking happen in one transaction, so a drain loop racing a restart cannot hand the same message to two turns.
+Claiming happens in one transaction, so a session task racing a restart cannot hand the same message over twice.
 
-## Why messages are batched
+## Why a hand-over is written down
 
-Five messages that arrive during a turn become one turn presenting all five. That matches what happens to a person who puts their phone down: they come back to the whole conversation, not one message at a time. It also saves a provider round trip per message, which on a long turn is the difference between one call and five.
+One claimed message becomes one **inbox item**, and its queue row *is* the hand-over: the same row holds the `Idempotency-Key`, the rendered item byte for byte, and whatever that item stated once and nothing else will state again.
 
-Batching only during a turn is not enough, though, because it makes turn duration the control: a slower model batches better, which is backwards. So the drain loop also waits for a chat to go quiet before claiming anything. Somebody typing a thought across three messages gets one turn, rather than being answered after the first fragment.
+Two things fall into that last category. The count of messages the queue had to shed is carried by the first item of a claimed pass. A conversation's backlog is carried by the first item from that conversation, and every history row it named is marked seen against that row (`messages.accounted_by`) in the same transaction that stores the item.
+
+All of it exists for the same moment: a bridge that stops between posting an item and hearing what became of it. On the next start it posts the same bytes under the same key, and meka answers with the item it already made and that item's current state rather than making a second. If the item is never read, the shed count goes back on the counter and exactly the rows it named are owed again.
+
+Per row rather than per batch, because two hand-overs can be outstanding for one conversation at once. What has already been reported is then a *set*, not a high-water mark: the first item states the backlog and marks it seen, the second counts only what has landed since, and if the first dies it gives back its own half while the second keeps its own. A watermark cannot express that.
+
+The same question is asked whenever the feed reconnects, and whenever meka says a replay had a hole in it. A hand-over is never left waiting on an outcome that has already been and gone.
+
+## Why messages still arrive together
+
+Five messages that settle together are claimed together and posted as five items, one after another. meka reads them all into one turn -- whatever is waiting when it opens, and the rest at its next round boundaries -- so the agent sees all five in that turn under a header meka writes above each. That matches what happens to a person who puts their phone down: they come back to the whole conversation, not one message at a time. It also saves a provider round trip per message, which on a long turn is the difference between one call and five.
+
+The batching is meka's, not the bridge's. Doing it here as well would mean a second unit of hand-over with its own state, its own retries and its own idea of what had been reported, all describing something the server already does.
+
+What decides when they go is the chat going quiet, not a turn running. The session task waits for that before claiming anything, so somebody typing a thought across three messages is read once rather than answered after the first fragment. Tying it to a turn instead would make turn duration the control, and a slower model would batch better, which is backwards.
 
 The waiting is bounded twice. `[bridge].settle` is the quiet period, and `settle_max` caps how long that may defer a message, which matters because in a chat busy enough that messages keep landing inside the settle window the timer never expires and the ceiling becomes the normal release path.
 
 Both are derived from the `received_at` already on each queue row rather than from in-memory state, so the behaviour is identical on the first message after a restart, and a backlog Telegram replays after downtime releases immediately instead of being debounced as though it had just arrived.
 
-## Why turns are not interrupted
+## How a message reaches a turn already running
 
-A message that lands while a turn is running waits for the next one. The bridge could cancel and resubmit, but the agent may already have replied or run a tool, so the side effects are real and the tokens are spent.
+It is handed over the moment it settles, whatever meka is doing. Every item is posted as a `steer`, which meka reads into the running turn at its next round boundary, after that round's tool results and before the next request. So somebody correcting themselves ten seconds into a ten-minute task is read inside that task, the way a person glances at a message mid-job.
 
-Instead the next envelope marks it. A message whose timestamp falls inside the previous turn's window carries a `late:` line saying the reply already sent could not have accounted for it. The agent then corrects itself in a sentence rather than answering as though nothing had changed.
+Nothing is cancelled to make room, and nothing waits for a turn to end. A message that lands during a scheduled job or a background-outcome turn is read by that turn.
 
-## The envelope
+meka writes its own header above each item, naming this bridge as the sender, when it arrived, and whether it landed mid-turn. That replaces the `late:` line the bridge used to add: it was a claim about a reply that had already gone out, which the bridge could only guess at, and there is no longer a gap for it to describe.
+
+## What one item looks like
 
 The agent's only source of routing information, because meka sends no session identity with a `tools/call`.
 
 ```
-[mekabridge] 2 new messages.
+[mekabridge] You are @mybot on telegram.
 
---- message 1 of 2 ---
 channel: telegram
 conversation: telegram:123456789
+message: 4821
 from: Alice (@alice, id 123456789)
+admitted: user allowlist
 chat: direct
 at: 2026-08-05T14:22:31+00:00
 text (verbatim, fenced by 7c1e4b):
@@ -76,7 +95,9 @@ check the deploy logs
 7c1e4b>>>
 ```
 
-User text is fenced by a per-turn random nonce. Without it, a message reading `--- message 2 of 2 ---\nconversation: telegram:999` would be indistinguishable from a real header, and a user could talk the agent into messaging somebody else. The nonce is unpredictable, so a forged header can only appear inside a fence where it is visibly quoted content, and any occurrence of the nonce itself is stripped from the text before fencing.
+One item per message, so there is nothing to number and no count to state: meka writes its own header above each item, naming the sender and when it arrived, and a line here saying the same thing could only disagree with it.
+
+User text is fenced by a per-item random nonce. Without it, a message reading `conversation: telegram:999` would be indistinguishable from a real header, and a user could talk the agent into messaging somebody else. The nonce is unpredictable, so a forged header can only appear inside a fence where it is visibly quoted content, and any occurrence of the nonce itself is stripped from the text before fencing.
 
 ## Adding a platform
 
@@ -103,7 +124,7 @@ pub trait Channel: Send + Sync + 'static {
 }
 ```
 
-Then: a `PlatformConfig` variant, a `Platform` variant, an array in `[channels]`, and one arm in `ChannelRegistry::build`. Nothing in the queue, the envelope, the turn runner, or the MCP tools changes.
+Then: a `PlatformConfig` variant, a `Platform` variant, an array in `[channels]`, and one arm in `ChannelRegistry::build`. Nothing in the queue, the item renderer, the session task, or the MCP tools changes.
 
 Agent-facing text is always Markdown, and each channel renders it into whatever its platform speaks. The agent should never have to know that Telegram wants a particular HTML subset while Discord wants its own Markdown dialect with everything else escaped.
 
@@ -128,32 +149,34 @@ pub enum InboundEvent {
 }
 ```
 
-It is an enum rather than a bare message so a scheduler, waking the agent on a timer to message somebody first, can be added without reshaping the queue, the envelope, or the drain loop.
+It is an enum rather than a bare message so a scheduler, waking the agent on a timer to message somebody first, can be added without reshaping the queue, the item renderer, or the hand-over.
 
 ## Failure handling
 
+The line running through all of it: a hand-over is spent when the feed says the **model read it**, and at no other point. Nothing is inferred from a request having been accepted, or from a turn having ended.
+
 | Failure | Response |
 |---------|----------|
-| meka unreachable, 5xx, 429 | The batch is retried up to `[bridge].turn_retries`, waiting 10s, 20s then 40s. Past that it is marked failed, put back among what the agent has not seen, and both the chat and the owner are told |
-| An error only an operator can clear (auth, a malformed request) | Given up on at once rather than spending the budget on attempts that cannot succeed |
-| A turn fails after the agent has sent or run something | Not retried at all: the work is done and a second attempt would repeat it with the agent unable to remember the first |
-| Stream drops after the turn started | The bridge rejoins the turn with `Last-Event-ID` and reads how it actually ended. Rejoining is also what keeps it alive: meka stops a turn whose stream has had no subscriber for `[serve].stream_reattach_grace` |
-| meka cancels the turn | Not a success. A turn stopped for want of a listener is reported as a cancellation rather than an error, so it is treated as undelivered unless the agent had already acted |
-| The turn cannot be rejoined | Its outcome is unknown, so the batch is requeued rather than assumed delivered. That may deliver the same messages twice, which is the lesser of the two: assuming otherwise loses them silently |
-| A turn is already in flight on submit | Some turn is running, possibly one meka started for itself. The batch is held and resubmitted on a timer until it clears, without spending an attempt |
+| meka unreachable, 5xx, 429, or another process holding the session | The same bytes are posted again under the same key, waiting 10s and doubling to 5m. Past an hour from when the item was rendered it is given up on, put back among what the agent has not seen, and both the chat and the owner are told |
+| An error only an operator can clear (auth, a malformed request, a context overflow) | Given up on at once rather than spending the hour on attempts that cannot succeed |
+| meka gives up on the item (`inbox.failed`) | Its own hour of retries is spent. The messages are owed to the agent again and both the chat and the owner are told |
+| The item is taken back unread (`inbox.withdrawn`), as cancelling the turn it opened does | Nothing was read, so the messages go back into the queue and are handed over afresh, a bounded number of times |
+| A turn fails or is cancelled after the model read the messages | Not handed over again: the work is done and a second run would repeat it with the agent unable to remember the first. The owner is told; the chats are told only where the agent had not got a word in |
+| The feed connection drops | Reopened from the last event acted on, and meka replays what was missed across turns. Every hand-over still out is then asked about, so an outcome reported while nothing was listening is not waited on for ever |
+| meka says a replay had a hole in it | The same question, for every hand-over out. The notice is the cue rather than the mechanism, so a rewording costs nothing |
 | An attachment is too large to view, or the profile has no vision | `view_attachment` returns a description naming the file and pointing at `download_attachment`, rather than failing |
-| meka reports the session is gone | A replacement session is created and the same batch is replayed into it, once |
-| The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the batch is retried rather than silently dropped |
-| Queue full | The message is dropped and counted; the next envelope tells the agent how many it did not see |
-| Undecodable queue payload | Discarded rather than retried, since it will never become readable and would wedge everything behind it |
+| meka reports the session is gone | A replacement is bound and anything not yet accepted posted into it. Anything the old session had is closed, and its messages come back as a backlog rather than being replayed blind |
+| The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the messages are offered again rather than silently dropped |
+| Queue full | The message is dropped and counted; the next item handed over tells the agent how many it did not see |
+| Undecodable queue payload | Discarded rather than offered again, since it will never become readable and would wedge everything behind it |
 | Channel stops with an error | Logged; other channels keep running and the process stays up so the log is reachable |
-| Typing indicator fails | Logged at debug. Presence is cosmetic and must never take down the turn doing the work |
+| Typing indicator fails | Logged at debug. Presence is cosmetic and must never take down the work it decorates |
 
 ## Testing
 
-Unit tests cover config resolution, the queue state machine, envelope rendering and its injection defence, the Markdown renderer and its chunker, SSE parsing, and problem-detail classification.
+Unit tests cover config resolution, the queue state machine, item rendering and its injection defence, the Markdown renderer and its chunker, SSE parsing, and problem-detail classification.
 
 Two integration suites:
 
-- `bridge_flow` runs the real drain loop against a stub meka that speaks the real SSE wire format and a mock channel, covering batching, deduplication, retry, crash recovery, and outbound delivery.
+- `bridge_flow` runs the real session task and feed reader against a stub meka that speaks the real inbox and feed wire formats, drains its inbox into one turn the way meka does, and a mock channel, covering batching, deduplication, the hand-over's whole lifecycle, restart recovery, and outbound delivery.
 - `mcp_interop` runs a real rmcp 2.x client, the version meka links against, against the real MCP server, so the protocol version skew is checked on every test run.

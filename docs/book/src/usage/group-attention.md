@@ -37,7 +37,7 @@ woke you: nothing here named you; this chat was being heard in full when it arri
 ```
 
 The third is written in the past tense on purpose. It reports why the message was delivered, which
-is not always the same as how the conversation is set now: a batch can sit in the queue through a
+is not always the same as how the conversation is set now: a message can sit in the queue through a
 turn lasting minutes, and the agent may have muted the room in the meantime.
 
 The line is stated for every such message, including the ones nothing addressed. Printing it only
@@ -48,7 +48,7 @@ and a chat being heard in full would render identically.
 
 Before 0.7.0 the bridge kept a muted conversation open for five minutes after the agent spoke, on
 the theory that an exchange already under way should carry on without a second mention. In a busy
-room it delivered the room, in envelopes indistinguishable from a message addressed to the agent,
+room it delivered the room, in items indistinguishable from a message addressed to the agent,
 and each reply the agent was nudged into making pushed the window out again. It is gone.
 
 What replaces it is three things the agent asks for, none of which involves the bridge guessing.
@@ -163,7 +163,7 @@ conversation while somebody is composing in it, plus `settle` after they stop, c
 `settle_max`.
 
 **Telegram cannot.** The Bot API lets a bot *send* a chat action and never receive one; there is no
-update for it. So nothing on Telegram is held waiting for anybody, and a message starts a turn as
+update for it. So nothing on Telegram is held waiting for anybody, and a message is handed over as
 soon as it arrives.
 
 That asymmetry is deliberate rather than an omission. Without the signal any wait is a guess, and
@@ -171,10 +171,11 @@ there is no number that works for both cases: a few seconds is nowhere near long
 second sentence, and long enough for that is a long time to make somebody wait who only ever meant
 to send one message. So the wait exists only where it can end when the person actually stops.
 
-The consequence on Telegram is worth stating plainly: two messages a few seconds apart produce two
-turns, and the agent may answer the first before reading the second. If the second lands while the agent is still working on the first, it arrives
-flagged `late:`, so the agent knows its reply was written without it and can correct itself with
-`edit_message`.
+The consequence on Telegram is worth stating plainly: two messages a few seconds apart are handed
+over separately, and the agent may answer the first before reading the second. If the second lands
+while the agent is still working on the first, meka reads it into that same turn at its next round
+boundary, under a header saying it arrived while the agent was working, so the agent can account for
+it before finishing or correct itself with `edit_message`.
 
 Every conversation is held for one second regardless, on every platform, unless its oldest waiting
 message is already older than `settle_max`, which only happens after downtime or under a badly

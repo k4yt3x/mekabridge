@@ -10,8 +10,6 @@ base_url = "http://127.0.0.1:8080"
 # Bearer token from meka's [[serve.tokens]]. It needs the `sessions:r` and `sessions:w` scopes.
 # Prefer ${ENV_VAR} or `token_file` over an inline literal.
 token = "${MEKA_BRIDGE_TOKEN}"
-# Longest a single turn may run before it is cancelled.
-turn_timeout = "30m"
 
 [session]
 # Working directory for the agent's session. Defaults to meka's own working directory.
@@ -41,12 +39,7 @@ permission = "read"
 # only in the logs.
 notify_failures = true
 
-# Extra attempts at a batch whose turn failed, waiting 10s, then 20s, then 40s, so a message
-# survives about a minute of the provider being out of quota or overloaded. Past that the chat is
-# told rather than left in silence. 0 gives up after the first failure.
-turn_retries = 3
-
-# Messages that arrive during a turn are batched into the next one.
+# Most messages handed to the agent in one go. Messages that settle together become one hand-over.
 batch_max_messages = 32
 max_queue_depth = 256
 

@@ -637,7 +637,6 @@ impl DiscordChannel {
             group_id: None,
             attachments: self.attachments(message),
             notes,
-            arrived_mid_turn: false,
             timestamp: timestamp_to_chrono(message.timestamp).unwrap_or_else(Utc::now),
         })))
     }

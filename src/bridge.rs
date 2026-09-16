@@ -7,6 +7,7 @@
 //! this bridge is marked `required`, runs turns with no tool to answer anybody.
 
 pub mod envelope;
+pub mod feed;
 pub mod inbound;
 pub mod turn;
 
@@ -14,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -22,13 +23,13 @@ use std::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     bridge::{
-        inbound::DrainContext,
-        turn::{Presence, TurnRunner},
+        inbound::SessionContext,
+        turn::{Presence, TurnTypist},
     },
     channel::{
         Channel, ChannelRegistry, ChatKind, ConversationId, FileOptions, InboundEvent, SendOptions,
@@ -46,7 +47,7 @@ use crate::{
 /// Buffer between the channel pollers and the durable writer.
 ///
 /// A durability bound, not a throughput knob. teloxide advances its `getUpdates` offset the moment
-/// a batch arrives and confirms it once its own buffer has drained into this channel, so blocking
+/// a burst arrives and confirms it once its own buffer has drained into this channel, so blocking
 /// the poller when this is full is what holds that confirmation back. Whatever sits here unwritten
 /// when it goes out is acknowledged to Telegram and never sent again, which makes this depth the
 /// number of messages a hard kill can lose.
@@ -54,6 +55,14 @@ use crate::{
 /// Not one, though: Discord's typing notices ride the same channel on a `try_send` and are dropped
 /// when it is full, so a depth an ordinary burst fills would stop the settle window working.
 const EVENT_BUFFER: usize = 8;
+
+/// Buffer between the feed reader and the session task.
+///
+/// Sized so a model streaming a reply never has the reader waiting on a session task that is in
+/// the middle of a request. meka drops a feed reader that falls behind its own 256-event ring, so
+/// the reader has to be able to take a burst several times that size off the wire while the
+/// session task is busy.
+const FEED_BUFFER: usize = 4096;
 
 /// How long shutdown waits for an in-flight turn before giving up on it.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -94,7 +103,7 @@ const MAX_VIEW_BYTES: u64 = 3_750_000;
 #[derive(Debug, Default)]
 pub struct ChannelAccounts {
     by_channel: HashMap<String, AccountId>,
-    /// `(channel, label)` for the envelope's orientation line, in the order the channels were
+    /// `(channel, label)` for the item's orientation line, in the order the channels were
     /// added. The label is `None` for a channel whose account could not be resolved.
     identities: Vec<(String, Option<String>)>,
 }
@@ -121,7 +130,7 @@ impl ChannelAccounts {
         self.by_channel.is_empty()
     }
 
-    /// Which account the agent appears as on each channel, for the envelope.
+    /// Which account the agent appears as on each channel, for the item's orientation line.
     pub fn identities(&self) -> &[(String, Option<String>)] {
         &self.identities
     }
@@ -139,7 +148,7 @@ impl ChannelAccounts {
 /// on.
 async fn register_accounts(store: &Store, channels: &ChannelRegistry) -> ChannelAccounts {
     let mut accounts = ChannelAccounts::default();
-    // By id rather than in the registry's own order, which is a hash map's, so the envelope names
+    // By id rather than in the registry's own order, which is a hash map's, so an item names
     // the accounts in the same order on every start.
     let mut channels: Vec<&Arc<dyn Channel>> = channels.iter().collect();
     channels.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
@@ -215,15 +224,6 @@ pub async fn run(config: Config) -> Result<()> {
     let config = Arc::new(config);
 
     let store = Store::open(&config.storage.path).await?;
-    let recovered = store.reset_in_flight().await?;
-    if recovered > 0 {
-        // Rows left in flight mean the previous run died mid-turn. The messages were never
-        // delivered, so they go back in the queue.
-        tracing::warn!(
-            count = recovered,
-            "recovered messages that were in flight when the bridge last stopped"
-        );
-    }
 
     // Stated every startup rather than only when it is unusual. This is what decides whether a
     // group wakes the agent at all, and the symptom of getting it wrong is a bot that looks broken
@@ -329,8 +329,8 @@ pub async fn run(config: Config) -> Result<()> {
     // The writer ends when every channel has dropped its sender, so this handle must not linger.
     drop(event_sender);
 
-    // Written by the writer and read by the drain loop, which is why it is shared rather than owned
-    // by either.
+    // Written by the writer and read by the session task, which is why it is shared rather than
+    // owned by either.
     let typing = Arc::new(inbound::TypingState::default());
     tasks.spawn({
         let store = store.clone();
@@ -343,28 +343,43 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
+    // The session task binds the session and publishes it here; the reader opens the feed once
+    // it has, and again on a rebind. The position is the last event the session task handled,
+    // read by the reader on every connection so meka replays strictly after it.
+    let (session_sender, session_receiver) = watch::channel::<Option<uuid::Uuid>>(None);
+    let position = Arc::new(AtomicU64::new(0));
+    let (feed_sender, feed_receiver) = mpsc::channel(FEED_BUFFER);
     tasks.spawn({
-        let context = DrainContext {
+        let meka = meka.clone();
+        let position = Arc::clone(&position);
+        let shutdown = shutdown.clone();
+        async move { feed::feed_reader(meka, session_receiver, position, feed_sender, shutdown).await }
+    });
+
+    tasks.spawn({
+        let context = SessionContext {
             store: store.clone(),
             config: Arc::clone(&config),
             meka: meka.clone(),
             channels: Arc::clone(&channels),
             typing,
-            runner: TurnRunner::new(
-                meka.clone(),
-                Arc::clone(&channels),
-                config.bridge.typing_indicator,
-                config.bridge.typing_refresh,
-                config.bridge.typing_max,
-                Arc::clone(&presence),
-            ),
             accounts: Arc::clone(&accounts),
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
+            pending_session: Arc::default(),
             notices: inbound::NoticeLog::default(),
+            session: session_sender,
+            position,
         };
+        let typist = TurnTypist::new(
+            Arc::clone(&channels),
+            config.bridge.typing_indicator,
+            config.bridge.typing_refresh,
+            config.bridge.typing_max,
+            Arc::clone(&presence),
+        );
         let wake_drain = Arc::clone(&wake_drain);
         let shutdown = shutdown.clone();
-        async move { inbound::drain_loop(context, wake_drain, shutdown).await }
+        async move { inbound::session_loop(context, typist, feed_receiver, wake_drain, shutdown).await }
     });
 
     tasks.spawn({
@@ -395,8 +410,8 @@ pub async fn run(config: Config) -> Result<()> {
     {
         Ok(()) => tracing::info!("all tasks stopped cleanly"),
         Err(_elapsed) => {
-            // An in-flight turn can legitimately outlive the drain window. Its batch stays
-            // `in_flight` and the next start recovers it.
+            // A hand-over in flight is durable on whichever side it reached; the next start posts
+            // it again under the same key or asks meka what became of it.
             tracing::warn!(
                 "shutdown timed out after {}s; abandoning in-flight work",
                 SHUTDOWN_DRAIN_TIMEOUT.as_secs()
@@ -576,7 +591,7 @@ async fn register_files(
 /// Implements the MCP server's outbound port over the channel registry.
 ///
 /// Sends are not restricted to conversations the bridge has seen. The agent may write to any id its
-/// channel accepts, including one it was given in its system prompt rather than in an envelope,
+/// channel accepts, including one it was given in its system prompt rather than in an item,
 /// which is what lets it message somebody first. A hallucinated id therefore fails at the platform
 /// rather than here, and the platform's own wording is the more useful error anyway.
 pub struct BridgeSink {
@@ -804,7 +819,7 @@ impl BridgeSink {
 /// several with several ids, and a single row could carry only one of them, so an id read back from
 /// history would edit or react to the first part alone.
 ///
-/// A free function rather than a method on [`BridgeSink`], because the drain loop's own failure
+/// A free function rather than a method on [`BridgeSink`], because the session task's own failure
 /// notice is outbound too and reaches its channel directly rather than through a sink.
 ///
 /// Errors are logged rather than propagated: the send has already happened, and failing the tool

@@ -1,8 +1,10 @@
 //! mekabridge relays messages between third-party chat platforms and a single, permanent
 //! [meka](https://github.com/k4yt3x/meka) agent session.
 //!
-//! Inbound messages are queued and handed over in batches because one meka session runs one turn at
-//! a time, and interrupting a turn mid-flight is not something the protocol supports gracefully.
+//! Inbound messages are queued and handed over one at a time, through meka's session inbox, which
+//! is where a message waits for the agent. meka reads them all into one turn, so messages that
+//! settle together still cost one provider round trip, and one that lands while the agent is
+//! working is read by that same turn rather than waiting for it.
 //!
 //! Outbound messages are *only* ever sent because the agent called an MCP tool. The bridge authors
 //! no chat content of its own, so replying, staying quiet, and replying somewhere else are all the

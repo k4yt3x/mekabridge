@@ -4,7 +4,7 @@ mekabridge connects a [meka](https://github.com/k4yt3x/meka) agent to messaging 
 
 The design treats the agent as a person with a phone.
 
-- **Inbound** messages from every configured channel are queued and handed to the agent in batches. One meka session runs one turn at a time, so anything that arrives mid-turn waits, the same way messages wait while somebody is in a meeting.
+- **Inbound** messages from every configured channel are queued and handed to the agent through meka's session inbox, one item per message. meka reads them all into one turn, so a burst costs one turn rather than one each, and something that arrives while the agent is working reaches it inside that same turn, the way a person glances at a message mid-task.
 - **Outbound** messages happen only because the agent called a tool. The bridge never writes chat content of its own. Replying, staying quiet, replying to somebody else, replying on a different platform, or messaging first tomorrow morning are all the agent's decisions.
 
 One mekabridge instance owns exactly one meka session, permanently. That session is the agent's memory: everyone it has talked to, on every platform, in one continuous context.
@@ -23,16 +23,16 @@ The bridge reports facts and supplies capabilities; who counts as trusted, and w
                   MCP (streamable HTTP)
     meka serve  ──────── tools/call ────────►  mekabridge  ◄──── long poll ────  Telegram
                                                           ◄──── gateway ──────  Discord
-      :8080     ◄─ POST /v1/sessions/{id}/turn ─┘   │
-                                                    └── SQLite: session, queue, conversations
+      :8080     ◄─ POST /v1/sessions/{id}/inbox ┘   │
+                ── GET /v1/sessions/{id}/stream ►   └── SQLite: session, queue, conversations
 ```
 
-meka and mekabridge each act as the other's client. meka calls the bridge's MCP tools to send messages; the bridge calls meka's HTTP API to run turns.
+meka and mekabridge each act as the other's client. meka calls the bridge's MCP tools to send messages; the bridge puts messages in meka's inbox and follows the session's event feed to learn what became of them.
 
 > **Start the bridge first where you can**, and set `required = true` on meka's server entry for it. meka retries a failed MCP connect in the background, so the wrong order heals itself within a few minutes; without `required` it runs turns meanwhile, with no tool to answer anybody. See [meka Integration](./usage/meka-integration.md).
 
 ## Status
 
-Telegram and Discord are the supported platforms. The channel layer is where a platform's differences live, so adding another is a new module plus a factory arm; nothing in the queue, envelope, or turn machinery changes.
+Telegram and Discord are the supported platforms. The channel layer is where a platform's differences live, so adding another is a new module plus a factory arm; nothing in the queue, the item renderer, or the hand-over changes.
 
 Continue to [Installation](./getting-started/installation.md).

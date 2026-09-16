@@ -45,7 +45,7 @@ The platform remains the real gate, and it is stricter than it looks: Telegram w
 
 Anyone who can message the bot can put words in front of the model, and forwarded messages can put a third party's words there. Two mechanisms make the structure trustworthy; neither makes the *content* trustworthy.
 
-**The envelope cannot be forged.** Routing headers sit outside a per-turn random nonce that fences user text. A message reading `conversation: telegram:999` arrives visibly quoted inside the fence rather than as a header, and any occurrence of the nonce itself is stripped before fencing.
+**A message's headers cannot be forged.** Routing headers sit outside a per-item random nonce that fences user text. A message reading `conversation: telegram:999` arrives visibly quoted inside the fence rather than as a header, and any occurrence of the nonce itself is stripped before fencing.
 
 **Provenance is always stated.** `from:`, `admitted:`, and `forwarded from:` mean the agent never has to guess whose words it is reading.
 

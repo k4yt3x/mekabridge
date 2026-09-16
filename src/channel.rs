@@ -493,15 +493,6 @@ pub struct InboundMessage {
     /// Rendered as a descriptor line so the message is never silently empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    /// Set at delivery time when this arrived while the previous turn was already running, so
-    /// anything that turn sent was written without it. Deliberately not phrased as "the reply",
-    /// because a turn can fail or legitimately stay silent, and claiming a reply that never
-    /// happened would be worse than saying nothing.
-    ///
-    /// Not persisted with the queued payload: whether a message was late depends on when it is
-    /// eventually delivered, which is not known when it is written.
-    #[serde(skip)]
-    pub arrived_mid_turn: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -527,7 +518,7 @@ pub fn revision_of(edited_at: Option<DateTime<Utc>>) -> i64 {
 /// Something that happened and should eventually reach the agent.
 ///
 /// An enum rather than a bare message so a scheduler (waking the agent on a timer) or a system
-/// notice can be added later without reshaping the queue, the envelope, or the drain loop.
+/// notice can be added later without reshaping the queue, the envelope, or the hand-over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundEvent {
@@ -1406,7 +1397,6 @@ mod tests {
             }),
             group_id: Some("13294839284".to_string()),
             notes: Vec::new(),
-            arrived_mid_turn: false,
             attachments: vec![Attachment {
                 kind: AttachmentKind::Photo,
                 file_name: Some("photo.jpg".to_string()),

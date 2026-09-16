@@ -5,7 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.0] - 2026-09-16
+
+### Added
+
+- Messages reach the agent through meka's session inbox, so nothing waits for a turn to end.
+- One hand-over per message, keyed and written down, so a restart repeats and loses nothing.
+- The session feed is followed for every turn's outcome, including turns meka starts for itself.
+- `queue list` and `status` report each message's hand-over state, and `doctor` counts them.
+
+### Changed
+
+- **Breaking:** meka 0.55.0 or later is required; nothing older has an inbox or a session feed.
+- **Breaking:** the database is rebuilt on first start; an older build will not open the result.
+- **Breaking:** `[meka].turn_timeout` and `[bridge].turn_retries` are refused at startup by name.
+- A message that lands mid-turn is read by that turn instead of being marked `late:` in the next.
+- A message is delivered when meka says the model read it, not when a turn ended.
+- A hand-over meka does not accept is retried for an hour, matching meka's own inbox ceiling.
+- Each message is its own inbox item, and meka reads them all into one turn.
+- `[bridge].batch_max_messages` now bounds one claim and post pass, not what one turn reads.
+- `session reset` closes any hand-over out and puts its messages back among the unseen.
+
+### Removed
+
+- The turn submission, its timeout, its retry budget, and the rejoin that kept its stream alive.
+- The `[mekabridge] N new messages.` line and `--- message N of N ---`; meka now heads each item.
+
+### Fixed
+
+- A restart mid-turn no longer hands a message over twice, nor waits on an outcome it missed.
+- A store that cannot record a new session no longer leaves a fresh meka session behind per retry.
 
 ## [0.13.1] - 2026-09-13
 
@@ -373,7 +402,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.13.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.14.0...HEAD
+[0.14.0]: https://github.com/k4yt3x/mekabridge/compare/0.13.1...0.14.0
 [0.13.1]: https://github.com/k4yt3x/mekabridge/compare/0.13.0...0.13.1
 [0.13.0]: https://github.com/k4yt3x/mekabridge/compare/0.12.0...0.13.0
 [0.12.0]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...0.12.0

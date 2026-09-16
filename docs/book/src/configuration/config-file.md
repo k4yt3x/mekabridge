@@ -27,10 +27,11 @@ How to reach `meka serve`.
 | `base_url` | `http://127.0.0.1:8080` | Where meka is listening |
 | `token` / `token_file` | *(required)* | Bearer token; needs the `sessions:r` and `sessions:w` scopes |
 | `connect_timeout` | `10s` | TCP connect budget |
-| `turn_timeout` | `30m` | Ceiling on one turn. On expiry the turn is cancelled server-side so meka stops burning provider tokens. Must be greater than zero, since it also bounds how long a batch waits out a turn meka is running for itself |
 | `max_retries` | `3` | Attempts against retryable failures on read-only calls |
 
-Turn submission is never retried at this layer. A replayed `POST /turn` can bill twice and send a second round of messages, so turn-level retry belongs to the queue's attempt counter instead.
+Handing a message over is never retried at this layer. The schedule belongs on the row instead, where it survives a restart and `mekabridge queue list` can show it.
+
+> **`turn_timeout` was removed in 0.14.0 and a config still setting it is refused at startup by name.** It was a ceiling on a turn this bridge held open end to end, and it holds none: a message goes into meka's inbox and meka runs the turn. Delete the line. Since meka 0.51 nothing times out a reply on either side, so if you want a ceiling it belongs in meka rather than in a client that is no longer watching.
 
 ## `[session]`
 
@@ -82,9 +83,8 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `notify_failures` | `true` | Tell the affected chat, in one line and no detail, when its message could not be delivered |
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
-| `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a batch waiting out a retry |
-| `batch_max_messages` | `32` | Most messages handed to the agent in one turn |
-| `turn_retries` | `3` | Extra attempts for a batch whose turn failed, waiting 10s, 20s then 40s between them |
+| `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a message waiting out a retry |
+| `batch_max_messages` | `32` | Most messages claimed, rendered and posted in one pass. Not a limit on what one turn reads: meka takes every item posted around it |
 | `typing_indicator` | `true` | Show a typing state in the originating chats while the model is writing a message, and at no other time |
 | `typing_max` | `2m` | Ceiling on how long one such window may last. Not a safety net: it is the only thing that closes a window whose closing event never arrives |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
@@ -99,15 +99,19 @@ The indicator tracks one thing: the interval in which the model is writing the a
 
 That is narrower than it used to be. The indicator previously went up when a turn started and stayed up for its whole length, which for a turn spent on a dozen tool calls was a claim that a reply was seconds away for minutes at a time. The cost of the change is that a long turn now looks like silence; the benefit is that when the indicator is up it is true.
 
-Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-chat-completions` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn was submitted for rather than the message's eventual target; those are the same thing unless one batch spanned several chats.
+Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-chat-completions` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn read items from rather than the message's eventual target; those are the same thing unless the turn read items from several chats.
 
-`typing_max` used to follow `[meka].turn_timeout`, which was right while the indicator covered a whole turn and wrong once it covered only the writing of one message. A window is normally closed by the next tool call meka announces, but a stream that goes quiet after `tool_call.composing` produces no such event, and the rejoin can spend minutes trying to get back on. At the turn budget the ceiling could never fire, so a chat showed "typing" for half an hour and then fell silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
+`typing_max` is the only thing that closes a window whose closing event never arrives. A window is normally closed by the next tool call meka announces, but a feed that goes quiet after `tool_call.composing` produces no such event. Sized for a whole turn, as it once was, the ceiling could never fire and a chat showed "typing" for half an hour before falling silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
 
 How often the indicator is renewed is not configurable: Telegram clears the status after about five seconds and Discord after ten, so the interval is fixed at four to look continuous on both.
 
-A message that runs out of attempts produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
+> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for an hour, and the bridge posts one it has not accepted on the same schedule, so the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
+
+A message that could not be delivered produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
 
 Both are rate limited to one message per conversation per fifteen minutes, and the owner's notice says how many failures went unreported in between, so a provider out of quota for an hour reads as an hour rather than as a blip.
+
+A chat is told only where the agent had not already answered it. A turn that sent something and then died has left work half done, which is worth telling the owner about, but an apology in a chat the agent had just replied in would contradict what it said there.
 
 Those two are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the first. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
 
@@ -115,11 +119,11 @@ Those two are the only places the bridge writes chat content of its own, and `no
 
 The message is also put back among what the agent has not seen, so `unseen` counts it and it comes back as missed context the next time that conversation wakes.
 
-When the queue is full, further messages are dropped and counted, and the next envelope tells the agent how many it did not see. Nothing is discarded silently.
+When the queue is full, further messages are dropped and counted, and the next item handed over tells the agent how many it did not see. Nothing is discarded silently.
 
 `mute_followup` was removed in 0.7.0, and a config still setting it is refused at startup by name. That is deliberate: a knob that silently stopped doing anything would leave an operator reading their own config as the explanation for behaviour it no longer controls. Delete the line. A muted conversation now wakes the agent only when somebody names it or replies to something it said, and following a conversation on is the agent's own call. See [Group attention](../usage/group-attention.md).
 
-`mute_context` trades a few lines of envelope against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `read_history` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
+`mute_context` trades a few lines of the item that wakes a chat against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `read_history` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
 
 ## `[bridge.default_policy]`
 
@@ -237,7 +241,6 @@ At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direc
 [meka]
 base_url = "http://127.0.0.1:8080"
 token_file = "/etc/mekabridge/meka.token"
-turn_timeout = "30m"
 
 [session]
 cwd = "/var/lib/mekabridge/workspace"
@@ -246,7 +249,6 @@ permission = "workspace"
 [bridge]
 owner_conversation = "telegram:123456789"
 batch_max_messages = 32
-turn_retries = 3
 
 [bridge.default_policy]
 direct = "active"

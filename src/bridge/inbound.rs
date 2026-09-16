@@ -1,53 +1,60 @@
-//! The inbound path: channel events into the durable queue, and the queue into turns.
+//! The inbound path: channel events into the durable queue, and the queue into meka's inbox.
 //!
 //! Two tasks, deliberately separate: the writer persists every event before acknowledging it, and
-//! the drain loop claims batches and runs turns. One drain loop means the bridge never races
-//! itself, but not that the session is idle whenever it wants: meka runs background tasks and
-//! scheduled wakes of its own, so a submission can be refused by a turn this bridge knows nothing
-//! about. That refusal is a deferral, not a failure.
+//! the session task claims messages, hands each to meka as an inbox item of its own, and acts on
+//! what the session feed says became of them. One session task means the bridge never races itself
+//! on a row's state.
 //!
-//! Messages piling up during a turn become one turn rather than several, which is what happens to
-//! somebody who puts their phone down and saves a provider round trip per message.
+//! Messages that settle together are claimed together and handed over one after another, which is
+//! what makes somebody who puts their phone down cost one provider round trip rather than several:
+//! meka reads them all into one turn, under a header of its own per item. What arrives while the
+//! agent is working reaches it inside that turn, at its next round boundary; nothing waits for a
+//! turn to end.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
-use tokio::sync::{Notify, mpsc};
+use chrono::{DateTime, Utc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     bridge::{
         ChannelAccounts,
-        envelope::{Envelope, MissedContext, MissedMessage},
-        turn::{TurnReport, TurnRunner},
+        envelope::{Item, MissedContext, MissedMessage},
+        feed::FeedEvent,
+        turn::{TurnTally, TurnTypist, notice_reports_lost_events},
     },
     channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
-    meka::{MekaClient, MekaError, TurnOutcome},
+    meka::{
+        InboxState, MekaClient, MekaError, ProblemDetail, StreamItem,
+        sse::{TurnEvent, TurnSource},
+    },
     store::{
-        AccountId, ConversationRecord, EnqueueOutcome, MessageKey, Policy, PolicyRecord,
-        QueuedMessage, Store,
+        AccountId, Backlog, ConversationRecord, EnqueueOutcome, HandOver, MessageKey, Offer,
+        Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store,
     },
 };
 
-/// Safety-net poll interval. The writer notifies the drain loop directly, so this only covers rows
-/// that became eligible without an enqueue, such as a failed batch returning to `pending`.
+/// Safety-net poll interval. The writer notifies the session task directly, so this only covers
+/// rows that became eligible without an enqueue, such as a released row returning to `pending`.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long to leave a session alone after it refuses a submission because it is already running a
-/// turn.
+/// Ceiling on the wait between posts of a batch meka did not accept, and on a `Retry-After` the
+/// upstream asks for.
 ///
-/// There is nothing to wait on but the next refusal, so this is the whole of the backoff. Short
-/// enough that a chat is answered promptly once meka frees up, long enough that a turn lasting
-/// minutes costs a handful of rejected requests rather than thousands.
-const DEFER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Ceiling on the wait between attempts, and on a `Retry-After` the upstream asks for.
-///
-/// A provider is entitled to ask for an hour. Honouring that would hold a conversation open for an
-/// hour with nobody told, which is worse for the person waiting than being told promptly that it
-/// did not work; the retry budget is meant to ride out a blip, not an outage.
-const RETRY_DELAY_MAX: Duration = Duration::from_secs(120);
+/// The same five minutes meka's own inbox retries cap at. A provider is entitled to ask for an
+/// hour; honouring that would hold a batch for the whole of the hour it has to be accepted in,
+/// with nobody told.
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// How long after the last notice somebody still counts as typing.
 ///
@@ -82,8 +89,8 @@ const NONCE_BYTES: usize = 8;
 ///
 /// In memory only, and deliberately: it decides how long a conversation waits before its messages
 /// are claimed, and after a restart nothing is mid-sentence as far as this process knows, so the
-/// floor alone is the right answer. Written by the inbound writer and read by the drain loop, which
-/// already share state this way.
+/// floor alone is the right answer. Written by the inbound writer and read by the session task,
+/// which already share state this way.
 #[derive(Debug, Default)]
 pub struct TypingState {
     inner: std::sync::Mutex<Typing>,
@@ -511,125 +518,98 @@ fn announce_expiry(
     message.notes.len() > before
 }
 
-/// One conversation's backlog, and the two bounds that describe exactly what was counted.
+/// What one conversation said while the agent was not listening, for the item about to state it.
 ///
-/// Both are needed. The timestamp is the ceiling asked about and the id is the high-water mark of
-/// the rows that answered; either alone marks a set the agent was never shown. See
-/// [`Store::mark_seen`].
-struct Spent {
-    conversation: ConversationId,
-    watermark: i64,
-    through: chrono::DateTime<chrono::Utc>,
-}
-
-/// Collect what each muted conversation in this batch said while the agent was not listening.
+/// Nothing is marked seen here: the bounds come back for [`Store::hold`] to stamp, in the same
+/// transaction that records the rendered item, so the count and the item stating it are written
+/// together or not at all. A hand-over that later dies gives back exactly the rows it named and no
+/// others, which is what `messages.accounted_by` is for and what no watermark could express once
+/// two hand-overs can be outstanding at once.
 ///
-/// Marks it seen in the same call, so a failed turn retried from the queue gets a smaller lookback
-/// the second time. The messages are still in the history, and repeating the count on every attempt
-/// is the worse trade.
+/// Every conversation in a claimed pass is asked, not only the muted ones: unmuting one leaves
+/// behind whatever piled up while it was muted, and asking only the muted ones would report that
+/// backlog to nobody and never clear it.
 ///
-/// Every conversation in the batch is asked, not only the muted ones: unmuting one leaves behind
-/// whatever piled up while it was muted, and asking only the muted ones would report that backlog
-/// to nobody and never clear it.
+/// `through` bounds what may be counted, so anything that lands while the pass is being rendered
+/// stays unseen and is stated next time rather than silently marked.
 async fn missed_context(
-    context: &DrainContext,
-    events: &[InboundEvent],
-) -> (Vec<MissedContext>, Vec<Spent>) {
-    let now = chrono::Utc::now();
-    let mut collected = Vec::new();
-    // What to mark accounted for, once a turn carrying it has actually been accepted. Both bounds
-    // are carried because either alone describes a different set than the one counted; see
-    // `Store::mark_seen`.
-    let mut spent: Vec<Spent> = Vec::new();
-    let mut visited = BTreeSet::new();
-    for event in events {
-        let conversation = event.conversation();
-        if !visited.insert(conversation.clone()) {
-            continue;
+    context: &SessionContext,
+    message: &InboundMessage,
+    through: DateTime<Utc>,
+) -> (Option<MissedContext>, Option<Backlog>) {
+    let conversation = &message.conversation;
+    let now = Utc::now();
+    let policy = match context.store.policy(conversation.as_str()).await {
+        Ok(Some(record)) if !record.expired(now) => record.policy,
+        Ok(_) => context
+            .config
+            .bridge
+            .default_policy
+            .for_kind(message.chat_kind),
+        Err(error) => {
+            tracing::error!(
+                conversation = %conversation,
+                "could not read the conversation's policy: {}",
+                error
+            );
+            return (None, None);
         }
-        let InboundEvent::Message(message) = event else {
-            continue;
-        };
+    };
+    let muted = policy == Policy::Mute;
 
-        let policy = match context.store.policy(conversation.as_str()).await {
-            Ok(Some(record)) if !record.expired(now) => record.policy,
-            Ok(_) => context
-                .config
-                .bridge
-                .default_policy
-                .for_kind(message.chat_kind),
-            Err(error) => {
-                tracing::error!(
-                    conversation = %conversation,
-                    "could not read the conversation's policy: {}",
-                    error
-                );
-                continue;
-            }
-        };
-        let muted = policy == Policy::Mute;
-
-        // Bounded by the newest message in this batch from this conversation, so anything that
-        // lands while the turn is being assembled stays unseen and is reported next time
-        // rather than silently marked.
-        let through = events
-            .iter()
-            .filter(|event| event.conversation() == conversation)
-            .map(InboundEvent::timestamp)
-            .max()
-            .unwrap_or(now);
-        match context
-            .store
-            .take_unseen(
-                conversation.as_str(),
-                through,
-                context.config.bridge.mute_context,
-            )
-            .await
-        {
-            // A conversation being heard in full with nothing owed has nothing to say, so it is
-            // dropped rather than rendered as an empty block. A muted one is still worth a line: it
-            // tells the agent why it is seeing one message out of a conversation.
-            Ok((0, _, watermark)) if !muted => spent.push(Spent {
-                conversation: conversation.clone(),
-                watermark,
-                through,
-            }),
-            Ok((count, recent, watermark)) => {
-                spent.push(Spent {
-                    conversation: conversation.clone(),
-                    watermark,
-                    through,
-                });
-                collected.push(MissedContext {
-                    conversation: conversation.clone(),
-                    muted,
-                    count,
-                    recent: recent
-                        .into_iter()
-                        .map(|record| MissedMessage {
-                            sender: record.sender_name,
-                            // Descriptor lines stand in for a message whose content is not text, so
-                            // a photo does not read back as somebody
-                            // saying nothing.
-                            text: match (record.text.trim().is_empty(), record.notes) {
-                                (true, Some(notes)) => notes,
-                                (true, None) => "[no text]".to_string(),
-                                (false, _) => record.text,
-                            },
-                            timestamp: record.timestamp,
-                        })
-                        .collect(),
-                });
-            }
-            Err(error) => tracing::error!(
+    let (count, recent, watermark) = match context
+        .store
+        .take_unseen(
+            conversation.as_str(),
+            through,
+            context.config.bridge.mute_context,
+        )
+        .await
+    {
+        Ok(taken) => taken,
+        Err(error) => {
+            tracing::error!(
                 conversation = %conversation,
                 "could not read what a conversation withheld: {}",
                 error
-            ),
+            );
+            return (None, None);
         }
+    };
+    // A conversation being heard in full with nothing owed has nothing to say, so it is dropped
+    // rather than rendered as an empty block. A muted one is still worth a line: it tells the agent
+    // why it is seeing one message out of a conversation.
+    if count == 0 {
+        let block = muted.then(|| MissedContext {
+            conversation: conversation.clone(),
+            muted,
+            count,
+            recent: Vec::new(),
+        });
+        return (block, None);
     }
-    (collected, spent)
+    (
+        Some(MissedContext {
+            conversation: conversation.clone(),
+            muted,
+            count,
+            recent: recent
+                .into_iter()
+                .map(|record| MissedMessage {
+                    sender: record.sender_name,
+                    // Descriptor lines stand in for a message whose content is not text, so a photo
+                    // does not read back as somebody saying nothing.
+                    text: match (record.text.trim().is_empty(), record.notes) {
+                        (true, Some(notes)) => notes,
+                        (true, None) => "[no text]".to_string(),
+                        (false, _) => record.text,
+                    },
+                    timestamp: record.timestamp,
+                })
+                .collect(),
+        }),
+        Some(Backlog { watermark, through }),
+    )
 }
 
 /// What identifies `message` in the store, once the account that received it is known.
@@ -733,98 +713,1405 @@ async fn record_conversation(
         .await
 }
 
-/// Everything the drain loop needs.
-pub struct DrainContext {
+/// Everything the session task needs.
+pub struct SessionContext {
     pub store: Store,
     pub config: Arc<Config>,
     pub meka: MekaClient,
     pub channels: Arc<ChannelRegistry>,
-    pub runner: TurnRunner,
     /// Which account each channel is logged in as, for the envelope's orientation line and for
     /// keying what a failed batch owes.
     pub accounts: Arc<ChannelAccounts>,
     /// Guards the one-per-process reconciliation of the session's permission level.
     pub permission_checked: Arc<tokio::sync::OnceCell<()>>,
+    /// A meka session created but not yet written down.
+    ///
+    /// Creating one and recording it are two systems, so a store that refuses the write leaves a
+    /// real session behind on meka's side with nothing referring to it. Remembering it here means
+    /// the retry persists that session instead of minting another, which turns an unbounded leak
+    /// into at most one per process.
+    pub pending_session: Arc<std::sync::Mutex<Option<Uuid>>>,
     /// Who is composing right now, so a conversation can be held until they stop.
     pub typing: Arc<TypingState>,
     /// Who has already been told that something failed, so an outage is reported once rather than
     /// once per batch.
     pub notices: NoticeLog,
+    /// The session the feed follows. Published once bound, and again on a rebind, so the reader
+    /// opens the right feed.
+    pub session: watch::Sender<Option<Uuid>>,
+    /// The last feed event handled, which the reader resumes from on a reconnect.
+    pub position: Arc<AtomicU64>,
 }
 
-/// Claim batches and run turns until `shutdown` fires.
+/// Hand messages to meka and act on what the feed says became of them, until `shutdown` fires.
 ///
-/// A turn already in flight is allowed to finish; only the wait between turns is interruptible.
-/// Cutting a turn off mid-flight would leave its batch `in_flight` for the next start to recover,
-/// having already spent the provider tokens.
-pub async fn drain_loop(context: DrainContext, wake: Arc<Notify>, shutdown: CancellationToken) {
-    // When the previous turn ran, so the next batch can say which of its messages landed while the
-    // agent was mid-turn and therefore could not have shaped the reply it sent.
-    let mut last_turn: Option<TurnWindow> = None;
+/// The one task that talks to meka's inbox and the one writer of queue state, which is what makes
+/// the ordering safe without locks: a post's 202 is recorded before the next feed event is looked
+/// at, so an `inbox.delivered` meka emits before the 202 is even parsed still finds its row.
+///
+/// A post already in flight is allowed to finish; only the waits are interruptible. The row is
+/// durable either way, and a restart posts it again under the same key.
+pub async fn session_loop(
+    context: SessionContext,
+    mut typist: TurnTypist,
+    mut feed: mpsc::Receiver<FeedEvent>,
+    wake: Arc<Notify>,
+    shutdown: CancellationToken,
+) {
+    // Nothing can be handed over or followed without a session, and the bridge comes up before
+    // meka does, so this waits meka out rather than failing the start.
+    let Some(mut session_id) = bind_session(&context, &shutdown).await else {
+        return;
+    };
+    match context.store.recover().await {
+        Ok(recovered) if recovered == Recovered::default() => {}
+        Ok(recovered) => tracing::warn!(
+            orphaned = recovered.orphaned,
+            unposted = recovered.unposted,
+            posted = recovered.posted,
+            "recovered hand-overs the previous run left open"
+        ),
+        Err(error) => tracing::error!("failed to recover the queue: {}", error),
+    }
+    let mut turns: HashMap<String, TurnTally> = HashMap::new();
+    // Nothing is due at startup: `recover` has just run, and the feed opening reconciles everything
+    // handed over before it.
+    let mut swept = tokio::time::Instant::now();
     loop {
-        tokio::select! {
-            () = shutdown.cancelled() => {
-                tracing::info!("drain loop stopping");
-                return;
-            }
-            () = wake.notified() => {}
-            () = tokio::time::sleep(DRAIN_POLL_INTERVAL) => {}
+        if swept.elapsed() >= context.config.bridge.straggler_sweep {
+            settle_stragglers(&context, session_id).await;
+            swept = tokio::time::Instant::now();
         }
-
+        let next_due = work_queue(&context, &mut session_id, &shutdown).await;
+        if shutdown.is_cancelled() {
+            tracing::info!("session task stopping");
+            return;
+        }
+        // Held across the inner loop rather than rebuilt per event, or a busy feed would push the
+        // timer out for ever.
+        let deadline = tokio::time::Instant::now() + next_due.unwrap_or(DRAIN_POLL_INTERVAL);
         loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            // Which conversations have settled, and when to look again for those that have not.
-            // Decided per conversation because the rule differs per conversation: a chat on a
-            // platform that reports typing waits for the person to stop, and one on a platform
-            // that cannot report it waits only for the wire.
-            let Readiness { ready, retry_in } = readiness(&context).await;
-            if ready.is_empty() {
-                let Some(delay) = retry_in else {
-                    break;
-                };
-                // Woken as well as timed. The delay is how long the *soonest* conversation needs,
-                // which under a typing hold can be the whole TTL, and without this branch a message
-                // arriving in any other conversation would sit unlooked-at for that long. That is
-                // the same one-chat-holds-another fault that splitting readiness per conversation
-                // was meant to end.
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = wake.notified() => {}
-                    () = tokio::time::sleep(delay) => {}
+            tokio::select! {
+                () = shutdown.cancelled() => {
+                    tracing::info!("session task stopping");
+                    return;
                 }
-                // Round again rather than claiming straight away: more may have arrived while
-                // waiting, which starts the quiet period afresh.
-                continue;
+                () = wake.notified() => break,
+                event = feed.recv() => match event {
+                    Some(event) => {
+                        let queue_changed = handle_feed(
+                            &context,
+                            &mut session_id,
+                            &mut turns,
+                            &mut typist,
+                            event,
+                            &shutdown,
+                        )
+                        .await;
+                        if queue_changed {
+                            break;
+                        }
+                    }
+                    // The reader only stops on shutdown, which the arm above sees first.
+                    None => return,
+                },
+                () = tokio::time::sleep_until(deadline) => break,
             }
-            let batch = match context
-                .store
-                .claim_batch(&ready, context.config.bridge.batch_max_messages)
-                .await
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    tracing::error!("failed to claim a batch: {}", error);
-                    break;
-                }
-            };
-            if batch.is_empty() {
-                break;
-            }
-            last_turn = deliver(&context, batch, last_turn, &shutdown).await;
         }
     }
 }
 
-/// When a turn ran, so the next batch can tell which of its messages arrived while it was running.
-#[derive(Debug, Clone, Copy)]
-struct TurnWindow {
-    started_at: chrono::DateTime<chrono::Utc>,
-    ended_at: chrono::DateTime<chrono::Utc>,
+/// Bind the meka session, waiting meka out.
+///
+/// `None` only on shutdown. Everything else is retried, because the bridge deliberately comes up
+/// before meka does and a session that cannot be bound now is the ordinary case for the first
+/// seconds of a boot.
+async fn bind_session(context: &SessionContext, shutdown: &CancellationToken) -> Option<Uuid> {
+    let mut attempt = 0_u32;
+    loop {
+        match ensure_session(context).await {
+            Ok(session_id) => {
+                // Read before the reader is told which session to follow, or it opens the feed
+                // from the beginning and replays turns this bridge has already accounted for.
+                match context.store.feed_position(session_id).await {
+                    Ok(Some(position)) => context.position.store(position, Ordering::SeqCst),
+                    Ok(None) => context.position.store(0, Ordering::SeqCst),
+                    Err(error) => {
+                        tracing::error!("could not read where the feed was read to: {}", error);
+                    }
+                }
+                context.session.send_replace(Some(session_id));
+                return Some(session_id);
+            }
+            Err(error) => {
+                let wait = Duration::from_secs(1) * 2_u32.saturating_pow(attempt.min(5));
+                tracing::warn!(
+                    "could not bind the meka session ({}); trying again in {:?}",
+                    error,
+                    wait
+                );
+                attempt += 1;
+                tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+        }
+    }
 }
 
-/// What the drain loop should do this round.
+/// Post what meka has not accepted, then claim what has settled, and say how long until the next
+/// thing that might change without a wake.
+async fn work_queue(
+    context: &SessionContext,
+    session_id: &mut Uuid,
+    shutdown: &CancellationToken,
+) -> Option<Duration> {
+    loop {
+        if shutdown.is_cancelled() {
+            return None;
+        }
+        let waiting = match context.store.rows_in(QueueState::InFlight).await {
+            Ok(waiting) => waiting,
+            Err(error) => {
+                tracing::error!("could not read what is waiting for meka: {}", error);
+                return Some(DRAIN_POLL_INTERVAL);
+            }
+        };
+        // Oldest first, and nothing new is claimed while one waits, so what reaches the agent stays
+        // in the order it was said.
+        if let Some(row) = waiting.into_iter().next() {
+            if let Some(not_before) = row.not_before {
+                // Clamped on the way out as well as on the way in: a host clock stepping backwards
+                // would otherwise hold the message for the whole size of the jump.
+                let remaining = (not_before - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::ZERO)
+                    .min(RETRY_DELAY_MAX);
+                if remaining > Duration::ZERO {
+                    return Some(remaining);
+                }
+            }
+            if !post(context, session_id, &row, shutdown).await {
+                // Nothing was written against the post, so coming straight back would make the same
+                // request again with no error able to stop it.
+                return Some(DRAIN_POLL_INTERVAL);
+            }
+            continue;
+        }
+        let Readiness { ready, retry_in } = readiness(context).await;
+        if ready.is_empty() {
+            return retry_in;
+        }
+        let claimed = match context
+            .store
+            .claim(&ready, context.config.bridge.batch_max_messages)
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::error!("failed to claim messages for the agent: {}", error);
+                return Some(DRAIN_POLL_INTERVAL);
+            }
+        };
+        if claimed.is_empty() {
+            return retry_in;
+        }
+        if !hold(context, *session_id, &claimed).await {
+            return Some(DRAIN_POLL_INTERVAL);
+        }
+    }
+}
+
+/// Render every claimed row into an inbox item, each under a key of its own.
+///
+/// What is stated once rather than per message is stated by the first item entitled to it: the
+/// dropped-message count by the first item of the pass, and a conversation's backlog by the first
+/// item of that conversation. Both are recorded against that row in the same transaction that
+/// stores the item, so a hand-over that dies gives back exactly what it took.
+///
+/// `false` when the store would not take a hand-over, so the rows still to be rendered are back
+/// where they were and rendering them again at once would be a loop.
+async fn hold(context: &SessionContext, session_id: Uuid, claimed: &[QueuedMessage]) -> bool {
+    // Read rather than taken: the count comes off when the item stating it is stored, so a failure
+    // between here and there loses the item and keeps the count.
+    let mut dropped = context.store.peek_dropped().await.unwrap_or_else(|error| {
+        tracing::error!("failed to read the dropped-message counter: {}", error);
+        0
+    });
+
+    let mut events: Vec<(i64, InboundEvent)> = Vec::with_capacity(claimed.len());
+    let mut undecodable = Vec::new();
+    for row in claimed {
+        match serde_json::from_str::<InboundEvent>(&row.payload) {
+            Ok(event) => events.push((row.seq, event)),
+            Err(error) => {
+                // A payload this build cannot read will never become readable, so offering it again
+                // would wedge the queue behind it forever.
+                tracing::error!(
+                    seq = row.seq,
+                    "dropping an undecodable queue payload: {}",
+                    error
+                );
+                undecodable.push(row.seq);
+            }
+        }
+    }
+    if !undecodable.is_empty()
+        && let Err(error) = context.store.complete(&undecodable).await
+    {
+        tracing::error!("failed to discard undecodable payloads: {}", error);
+    }
+
+    // The newest arrival per conversation in this pass, which is the ceiling its backlog may be
+    // counted to: a message claimed alongside is already being handed over, so counting it as
+    // something the agent has not seen would report it twice.
+    let mut newest: HashMap<&str, DateTime<Utc>> = HashMap::new();
+    for (_, event) in &events {
+        let at = event.timestamp();
+        newest
+            .entry(event.conversation().as_str())
+            .and_modify(|newest| *newest = (*newest).max(at))
+            .or_insert(at);
+    }
+
+    let mut stated: BTreeSet<&str> = BTreeSet::new();
+    let mut conversations: BTreeSet<&str> = BTreeSet::new();
+    let mut held = 0_usize;
+    for (index, (seq, event)) in events.iter().enumerate() {
+        let (missed, backlog) = match event {
+            InboundEvent::Message(message) if stated.insert(message.conversation.as_str()) => {
+                let through = newest
+                    .get(message.conversation.as_str())
+                    .copied()
+                    .unwrap_or_else(Utc::now);
+                missed_context(context, message, through).await
+            }
+            _ => (None, None),
+        };
+        let nonce = nonce();
+        let body = Item {
+            event,
+            dropped,
+            identities: context.accounts.identities(),
+            missed: missed.as_ref(),
+            nonce: &nonce,
+        }
+        .render();
+        let key = format!("mekabridge-{}", Uuid::new_v4());
+        let item = HandOver {
+            key: &key,
+            body: &body,
+            session_id,
+            dropped,
+            accounted: backlog,
+        };
+        match context.store.hold(*seq, item, Utc::now()).await {
+            Ok(true) => {
+                // Said once per pass, by whichever item got there first.
+                dropped = 0;
+                held += 1;
+                conversations.insert(event.conversation().as_str());
+            }
+            // Only reachable if something outside this task moved the row, which nothing does.
+            Ok(false) => tracing::warn!(seq, "a claimed message was gone before it was rendered"),
+            Err(error) => {
+                tracing::error!(seq, "failed to record a hand-over: {}", error);
+                // Back to the queue untouched: nothing was rendered for any of them and no offer
+                // was spent.
+                let unrendered: Vec<i64> = events[index..].iter().map(|(seq, _)| *seq).collect();
+                if let Err(error) = context.store.unclaim(&unrendered).await {
+                    tracing::error!("failed to release unrendered messages: {}", error);
+                }
+                return false;
+            }
+        }
+    }
+    if held > 0 {
+        tracing::info!(
+            messages = held,
+            conversations = conversations.len(),
+            "rendered messages for the agent"
+        );
+    }
+    true
+}
+
+/// Hand one message to meka, and write down what came of the attempt.
+///
+/// `false` when the store would not take that outcome, so the row is still `in_flight` with nothing
+/// recorded against it: no item id, no wait, no failure. Posting it again at once would be a
+/// request loop against meka that no error could end, so the caller stops working the queue until
+/// the next round instead.
+async fn post(
+    context: &SessionContext,
+    session_id: &mut Uuid,
+    row: &QueuedMessage,
+    shutdown: &CancellationToken,
+) -> bool {
+    let (key, body) = match (row.key.as_deref(), row.body.as_deref()) {
+        (Some(key), Some(body)) => (key, body),
+        // A claim whose render never landed, which only a crash between the two leaves behind and
+        // which startup recovery puts back. Nothing was minted and meka has nothing, so offering
+        // the message again is free.
+        (None, _) => {
+            tracing::error!(
+                seq = row.seq,
+                "a message is in flight with nothing rendered for it"
+            );
+            if let Err(error) = context.store.unclaim(&[row.seq]).await {
+                tracing::error!("failed to release an unrendered message: {}", error);
+                return false;
+            }
+            return true;
+        }
+        // A key with no request kept behind it, which nothing here produces and only a database
+        // edited by hand could hold. It cannot be posted, and it must not be offered again either:
+        // meka may hold an item under that key already, so a fresh one would hand the same message
+        // over twice. `unclaim` refuses a row that has a key, for that reason, so returning true
+        // here would come straight back to this row and spin. Failing it is the one move that both
+        // ends the round and says so.
+        (Some(_), None) => {
+            tracing::error!(
+                seq = row.seq,
+                "a message is in flight under a key with no request kept for it"
+            );
+            return fail(
+                context,
+                row,
+                "the request it was handed over as was not kept",
+                Retry::Never,
+            )
+            .await;
+        }
+    };
+    let now = Utc::now();
+    match context.meka.post_inbox(*session_id, body, key).await {
+        Ok(receipt) => {
+            if let Err(error) = context
+                .store
+                .posted(row.seq, *session_id, &receipt.item_id, now)
+                .await
+            {
+                tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
+                return false;
+            }
+            tracing::info!(
+                seq = row.seq,
+                item = %receipt.item_id,
+                replayed = receipt.replayed,
+                "handed a message to the agent"
+            );
+            // A replayed key answers with the item's current state, which for a message posted
+            // before a restart may already be its fate.
+            if receipt.replayed {
+                settle_replayed(context, row, receipt.state).await;
+            }
+            true
+        }
+        Err(error) if error.is_session_missing() => {
+            if !context.config.session.recreate_on_missing {
+                tracing::error!(
+                    "meka no longer knows session {session_id}, and [session].recreate_on_missing \
+                     is off; nothing can be handed over until one is bound"
+                );
+                return defer(context, row, &error, now).await;
+            }
+            // The row stays in flight, so the loop posts it into whatever is bound next -- but only
+            // if a replacement was actually bound.
+            rebind(context, session_id, shutdown).await
+        }
+        Err(error) if error.is_retryable() || error.is_session_locked() => {
+            defer(context, row, &error, now).await
+        }
+        Err(error) => {
+            // A failure needing an operator will not stop happening on its own, so spending the
+            // hour on it only delays the notice that says so.
+            tracing::error!(seq = row.seq, "meka refused a message: {}", error);
+            fail(context, row, &error.to_string(), Retry::Never).await
+        }
+    }
+}
+
+/// Write down a post that did not go through, or give up once the message has waited long enough.
+///
+/// `false` when neither could be written, which leaves the row exactly as it was.
+async fn defer(
+    context: &SessionContext,
+    row: &QueuedMessage,
+    error: &MekaError,
+    now: DateTime<Utc>,
+) -> bool {
+    let waited = row.held_at.map_or(Duration::ZERO, |held_at| {
+        (now - held_at).to_std().unwrap_or(Duration::ZERO)
+    });
+    if waited >= context.config.bridge.hand_over_within {
+        tracing::error!(
+            seq = row.seq,
+            posts = row.posts + 1,
+            "giving up on a message meka never accepted: {}",
+            error
+        );
+        return fail(context, row, &error.to_string(), Retry::Unaccepted).await;
+    }
+    let delay = retry_delay(
+        context.config.bridge.retry_base,
+        row.posts,
+        error.retry_after(),
+    );
+    tracing::warn!(
+        seq = row.seq,
+        posts = row.posts + 1,
+        retry_in = ?delay,
+        "meka did not accept a message ({}); trying again",
+        error
+    );
+    let not_before = now + chrono::Duration::from_std(delay).unwrap_or_default();
+    if let Err(error) = context
+        .store
+        .defer(row.seq, &error.to_string(), not_before)
+        .await
+    {
+        tracing::error!(
+            seq = row.seq,
+            "failed to record a deferred hand-over: {}",
+            error
+        );
+        return false;
+    }
+    true
+}
+
+/// Bind a replacement for a session meka no longer knows.
+///
+/// Whatever meka had on the old session died with it, so those hand-overs are closed and their
+/// messages put back among what the agent is owed: the next item from any of those chats reports
+/// them as a backlog, which is how the replacement learns of them. Replaying them into it blind
+/// would be the wrong call, since nothing here can say whether the old session read them before it
+/// went.
+///
+/// `false` when the bridge still holds the same session afterwards, which happens when the stale
+/// binding could not be cleared: [`ensure_session`] then hands the dead id straight back. The
+/// caller has to stop rather than carry on, because nothing was written against the message that
+/// hit the 404 either, so coming back to it would post to the same dead session at whatever rate
+/// the two requests take.
+async fn rebind(
+    context: &SessionContext,
+    session_id: &mut Uuid,
+    shutdown: &CancellationToken,
+) -> bool {
+    let old = *session_id;
+    tracing::warn!(
+        "meka no longer knows session {old}; creating a replacement. The agent's memory of earlier \
+         conversations is gone. If this keeps happening, check meka's `[serve].delete_on_idle`: \
+         with it on, an idle session's row is deleted rather than merely evicted, which wipes the \
+         assistant every idle_timeout."
+    );
+    if let Err(error) = context.store.clear_session_id().await {
+        tracing::error!("failed to clear the stale session binding: {}", error);
+    }
+    context.position.store(0, Ordering::SeqCst);
+    match context.store.rows_in(QueueState::Posted).await {
+        Ok(posted) => {
+            let stranded: Vec<QueuedMessage> = posted
+                .into_iter()
+                .filter(|row| row.session_id == Some(old))
+                .collect();
+            fail_all(
+                context,
+                &stranded,
+                "the session it was handed to no longer exists",
+                Retry::Never,
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::error!("could not read what the old session held: {}", error);
+        }
+    }
+    let Some(replacement) = bind_session(context, shutdown).await else {
+        // Only reachable on shutdown, where every caller's own loop stops next.
+        return false;
+    };
+    *session_id = replacement;
+    if replacement == old {
+        tracing::error!(
+            "the binding to session {old} could not be cleared, so meka's replacement for it              cannot be bound; nothing can be handed over until the store takes a write"
+        );
+        return false;
+    }
+    true
+}
+
+/// Close a hand-over that will never reach the model, and tell whoever is waiting.
+///
+/// `false` when the store would not close it, so it is still open and still refusable.
+async fn fail(context: &SessionContext, row: &QueuedMessage, reason: &str, retry: Retry) -> bool {
+    match context.store.failed(row.seq, reason, Utc::now()).await {
+        // Something else closed it first, so somebody has already been told whatever there was to
+        // tell.
+        Ok(None) => true,
+        Ok(Some(closed)) => {
+            let posts = closed.posts.max(1);
+            give_up(context, std::slice::from_ref(&closed), reason, retry, posts).await;
+            true
+        }
+        Err(error) => {
+            tracing::error!(seq = row.seq, "failed to record a lost message: {}", error);
+            false
+        }
+    }
+}
+
+/// Close several hand-overs that came apart for one reason, and say so once.
+///
+/// Together rather than one notice each, because that is what they are to the person reading them:
+/// a session that went, a reset, one outage. Failures that happen independently still get a notice
+/// each, bounded by [`NoticeLog`].
+async fn fail_all(context: &SessionContext, rows: &[QueuedMessage], reason: &str, retry: Retry) {
+    let mut closed = Vec::with_capacity(rows.len());
+    for row in rows {
+        match context.store.failed(row.seq, reason, Utc::now()).await {
+            Ok(Some(row)) => closed.push(row),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(seq = row.seq, "failed to record a lost message: {}", error);
+            }
+        }
+    }
+    if closed.is_empty() {
+        return;
+    }
+    let posts = closed.iter().map(|row| row.posts).max().unwrap_or(1).max(1);
+    give_up(context, &closed, reason, retry, posts).await;
+}
+
+/// Put messages nothing will deliver back among what the agent is owed, and say so.
+async fn give_up(
+    context: &SessionContext,
+    rows: &[QueuedMessage],
+    reason: &str,
+    retry: Retry,
+    attempts: u32,
+) {
+    tracing::error!(count = rows.len(), "giving up on {} message(s)", rows.len());
+    // Owed to the agent again. A message is marked seen the moment it is queued, on the assumption
+    // that the agent is about to be handed it, and this is exactly where that assumption fails.
+    // Without this it is neither delivered nor owed, so nothing but `read_history` over the right
+    // window would ever turn it up again. What each hand-over reported as a *backlog* is given back
+    // by the store, against the row that reported it.
+    let mut affected: BTreeSet<ConversationId> = BTreeSet::new();
+    // Whether that actually worked, which it cannot when `[storage].history_retention` is zero:
+    // there is no history row to un-see, so the message really is gone. The owner is told which of
+    // the two happened rather than promised the recoverable one.
+    let mut recoverable = false;
+    for message in rows {
+        match context.store.mark_unseen(message.key()).await {
+            Ok(marked) => recoverable |= marked,
+            Err(error) => tracing::error!(
+                conversation = %message.conversation,
+                "failed to mark an undeliverable message unseen: {}",
+                error
+            ),
+        }
+        if let Some(conversation) = ConversationId::parse(&message.conversation) {
+            affected.insert(conversation);
+        }
+    }
+    announce(
+        context,
+        &affected,
+        &Failure {
+            reason,
+            retry,
+            answered: false,
+            delivered: false,
+        },
+        Lost {
+            count: rows.len(),
+            attempts,
+            recoverable,
+        },
+    )
+    .await;
+}
+
+/// Close a hand-over the model read. `false` for one already closed.
+///
+/// Nothing is marked seen here: the backlog this item stated was accounted for against its row when
+/// the item was rendered, which is what lets a second item for the same chat state only what is
+/// left while this one is still outstanding.
+async fn deliver(context: &SessionContext, row: &QueuedMessage) -> bool {
+    match context.store.delivered(row.seq, Utc::now()).await {
+        Ok(true) => {
+            tracing::info!(
+                seq = row.seq,
+                conversation = %row.conversation,
+                "the agent read a message"
+            );
+            true
+        }
+        // The feed replays an outcome after a reconnect, and the second reading changes nothing.
+        Ok(false) => false,
+        Err(error) => {
+            tracing::error!(
+                seq = row.seq,
+                "failed to record a delivered message: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Offer a message again, for a hand-over that came apart with nobody answered.
+///
+/// `delay` holds it back before the next claim. Right for an item meka took back, where whatever
+/// took it back is probably still true a moment later; wrong for a turn that read it and produced
+/// nothing, where the agent is idle and the only cost of waiting is the silence.
+async fn offer_again(
+    context: &SessionContext,
+    row: &QueuedMessage,
+    reason: &str,
+    delay: Option<Duration>,
+) {
+    let now = Utc::now();
+    let not_before = delay.map(|delay| now + chrono::Duration::from_std(delay).unwrap_or_default());
+    let offer = match context
+        .store
+        .reoffer(
+            row.seq,
+            reason,
+            context.config.bridge.max_offers,
+            not_before,
+            now,
+        )
+        .await
+    {
+        Ok(offer) => offer,
+        Err(error) => {
+            tracing::error!(seq = row.seq, "failed to offer a message again: {}", error);
+            return;
+        }
+    };
+    match offer {
+        Offer::Retrying => tracing::warn!(
+            seq = row.seq,
+            conversation = %row.conversation,
+            "a message did not reach the agent ({}); it is offered again",
+            reason
+        ),
+        Offer::Exhausted(exhausted) => {
+            let posts = exhausted.posts.max(1);
+            give_up(
+                context,
+                std::slice::from_ref(&*exhausted),
+                reason,
+                Retry::Undelivered,
+                posts,
+            )
+            .await;
+        }
+        Offer::Closed => {}
+    }
+}
+
+/// Act on what a replayed key said the item had become.
+async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, state: InboxState) {
+    match state {
+        InboxState::Delivered => {
+            deliver(context, row).await;
+        }
+        InboxState::Withdrawn => {
+            // meka stamps the same state whether the item was cancelled unread or given up on after
+            // its own hour of retries, and the receipt does not say which, so the reason claims
+            // only what is known. Offering the message again is right for the first and
+            // harmless for the second, where a fresh item is a fresh hour and the
+            // offers are bounded either way.
+            offer_again(
+                context,
+                row,
+                "meka took it back before the agent read it",
+                Some(context.config.bridge.retry_base),
+            )
+            .await;
+        }
+        InboxState::Pending | InboxState::Appended => {
+            tracing::debug!(seq = row.seq, state = %state, "a message is still with meka");
+        }
+        InboxState::Other(name) => tracing::warn!(
+            seq = row.seq,
+            state = %name,
+            "meka reports an item state this build does not know; leaving the message as it is"
+        ),
+    }
+}
+
+/// Ask meka about anything it has had for longer than an outcome can take.
+///
+/// The feed's replay and a reconnect's reconciliation settle these in the ordinary way, and neither
+/// happens on a connection that stays up for days. What is left is the hand-over whose outcome
+/// reached this bridge and was not written down: a store error inside `apply` is logged and nothing
+/// re-drives it, the feed position moves past the event, and meka never sends it again. Its message
+/// would sit with meka for as long as the connection lasts, counting against the queue depth and
+/// reaching nobody.
+///
+/// meka gives up on an item within the hour, so one older than that has an outcome that has been
+/// and gone -- or is one meka is holding for the next turn, which asking will not hurry.
+/// Rate-limited by `[bridge].straggler_sweep` for that second case, and normally over an empty
+/// list.
+async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
+    let posted = match context.store.rows_in(QueueState::Posted).await {
+        Ok(posted) => posted,
+        Err(error) => {
+            tracing::error!("could not read what meka has: {}", error);
+            return;
+        }
+    };
+    let stale = Utc::now()
+        - chrono::Duration::from_std(context.config.bridge.hand_over_within).unwrap_or_default();
+    for row in posted {
+        if row.posted_at.is_none_or(|posted| posted > stale) {
+            continue;
+        }
+        tracing::warn!(
+            seq = row.seq,
+            "meka has had a message longer than an outcome can take; asking what became of it"
+        );
+        ask_about(context, session_id, &row).await;
+    }
+}
+
+/// Ask meka what became of everything it has, for the events that may have been missed.
+///
+/// Run on every reconnect, not only on a notice saying the replay had a hole: the notice is matched
+/// on prose, and a post under a key meka already holds costs one request and changes nothing on its
+/// side.
+async fn reconcile(context: &SessionContext, session_id: Uuid, before: DateTime<Utc>) {
+    let posted = match context.store.rows_in(QueueState::Posted).await {
+        Ok(posted) => posted,
+        Err(error) => {
+            tracing::error!("could not read what meka has: {}", error);
+            return;
+        }
+    };
+    for row in posted {
+        // Handed over since the connection opened, so its outcome is on that connection and asking
+        // would only spend a request to be told what is already on the way.
+        if row.posted_at.is_some_and(|posted| posted > before) {
+            continue;
+        }
+        ask_about(context, session_id, &row).await;
+    }
+}
+
+/// Ask meka what became of one hand-over, under the key it was made with.
+async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessage) {
+    if row.session_id != Some(session_id) {
+        // Nothing will ever report on it: its outcome would arrive on a feed for a session this
+        // bridge no longer follows. A rebind closes these as it goes, so reaching one here means a
+        // rebind could not read them, and leaving it would strand its message with meka for good.
+        tracing::warn!(
+            seq = row.seq,
+            "a message was handed to a session this bridge no longer follows"
+        );
+        fail(
+            context,
+            row,
+            "the session it was handed to is no longer this bridge's",
+            Retry::Never,
+        )
+        .await;
+        return;
+    }
+    let (Some(key), Some(body)) = (row.key.as_deref(), row.body.as_deref()) else {
+        tracing::error!(
+            seq = row.seq,
+            "meka has an item this bridge kept no request for, so it cannot be asked about"
+        );
+        return;
+    };
+    match context.meka.post_inbox(session_id, body, key).await {
+        Ok(receipt) if !receipt.replayed => {
+            // meka has no record of the key, so the post just made is the hand-over now.
+            //
+            // One thing reaches here in practice: `[meka].token` was rotated, since meka scopes a
+            // key to the token that used it. A meka whose store was replaced has no session either
+            // and answers 404, which rebinds rather than arriving here.
+            //
+            // The item made under the old token is still meka's to deliver, so the agent reads this
+            // message twice. Taken rather than prevented: withdrawing the copy just made would
+            // leave the old one's fate unknowable and its message owed back, which trades one kind
+            // of repetition for another, and this way it is delivered.
+            tracing::warn!(
+                seq = row.seq,
+                item = %receipt.item_id,
+                "meka had no record of a message it had accepted; it is handed over afresh"
+            );
+            if let Err(error) = context
+                .store
+                .posted(row.seq, session_id, &receipt.item_id, Utc::now())
+                .await
+            {
+                tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
+            }
+        }
+        Ok(receipt) => settle_replayed(context, row, receipt.state).await,
+        Err(error) => tracing::warn!(
+            seq = row.seq,
+            "could not ask meka about a message ({}); it is asked about again later",
+            error
+        ),
+    }
+}
+
+/// The row meka knows as `item_id`, or `None` with the reason logged.
+async fn row_for(context: &SessionContext, item_id: &str) -> Option<QueuedMessage> {
+    match context.store.row_by_item(item_id).await {
+        Ok(Some(row)) => Some(row),
+        Ok(None) => {
+            // Another client of the same session, or a message `queue clear` took out from under
+            // the hand-over. Nothing here to settle either way.
+            tracing::debug!(item = %item_id, "the feed named an item this bridge did not hand over");
+            None
+        }
+        Err(error) => {
+            tracing::error!(item = %item_id, "could not look up an item's message: {}", error);
+            None
+        }
+    }
+}
+
+/// The conversations `rows` came from.
+fn conversations_of(rows: &[QueuedMessage]) -> BTreeSet<ConversationId> {
+    rows.iter()
+        .filter_map(|row| ConversationId::parse(&row.conversation))
+        .collect()
+}
+
+/// Drop a feed event belonging to a session this bridge has already replaced.
+///
+/// Its id is a number in that session's own sequence, so letting it reach the feed position would
+/// have the reader reopen the replacement's feed from a `Last-Event-ID` that means nothing there,
+/// and meka would replay nothing until the new session's own ids overtook it. Nothing else is lost
+/// by dropping them: whatever the old session was told to do is settled by the rebind, which closes
+/// every hand-over it held.
+fn superseded(event: Uuid, current: Uuid) -> bool {
+    tracing::debug!("dropping a feed event for session {event}, already replaced by {current}");
+    false
+}
+
+/// Act on one thing the feed reader handed over.
+///
+/// Returns whether the queue may have changed, so the caller works it before waiting again.
+async fn handle_feed(
+    context: &SessionContext,
+    session_id: &mut Uuid,
+    turns: &mut HashMap<String, TurnTally>,
+    typist: &mut TurnTypist,
+    event: FeedEvent,
+    shutdown: &CancellationToken,
+) -> bool {
+    match event {
+        FeedEvent::Connected { session, at } => {
+            if session != *session_id {
+                return superseded(session, *session_id);
+            }
+            tracing::info!(session_id = %session_id, "following the session feed");
+            reconcile(context, *session_id, at).await;
+            true
+        }
+        FeedEvent::SessionGone { session } => {
+            // Only for the session the reader was actually following. A post that hit the same 404
+            // has already bound a replacement by now, and rebinding again would throw that one
+            // away unread and tell the owner its messages were lost.
+            if session != *session_id {
+                tracing::debug!(
+                    "the feed lost session {session}, which has already been replaced by \
+                     {session_id}"
+                );
+                return false;
+            }
+            if context.config.session.recreate_on_missing {
+                // The result is deliberately not consulted: whether or not a replacement was bound,
+                // the hand-overs the old session held were closed on the way past, so the queue has
+                // changed and is worth working either way.
+                rebind(context, session_id, shutdown).await;
+            } else {
+                tracing::error!(
+                    "meka no longer knows session {session_id}, and [session].recreate_on_missing \
+                     is off; nothing can be handed over until one is bound"
+                );
+            }
+            true
+        }
+        FeedEvent::Item {
+            session,
+            item: StreamItem { id, turn_id, event },
+        } => {
+            if session != *session_id {
+                return superseded(session, *session_id);
+            }
+            // Bounded by dropping what is held, the same rule the typist uses: a tally matters
+            // only between a turn's start and its terminal, and losing one costs that turn's log
+            // line its counters.
+            if turns.len() >= crate::bridge::turn::MAX_TRACKED_TURNS {
+                tracing::warn!(
+                    "tallying {} turns, so terminals are going missing; forgetting what is held",
+                    turns.len()
+                );
+                turns.clear();
+            }
+            let queue_changed = apply(
+                context,
+                *session_id,
+                turns,
+                typist,
+                turn_id.as_deref(),
+                &event,
+            )
+            .await;
+            if let Some(id) = id {
+                context.position.fetch_max(id, Ordering::SeqCst);
+                // Written down for the events that decide something, and not per text delta. A
+                // position behind a delta is replayed into a tally at worst; one behind an inbox
+                // outcome is replayed into a write that changes nothing the second time.
+                let worth_keeping = matches!(
+                    event,
+                    TurnEvent::InboxDelivered { .. }
+                        | TurnEvent::InboxFailed { .. }
+                        | TurnEvent::InboxWithdrawn { .. }
+                        | TurnEvent::Finished { .. }
+                        | TurnEvent::Failed { .. }
+                        | TurnEvent::Cancelled { .. }
+                );
+                if worth_keeping
+                    && let Err(error) = context.store.set_feed_position(*session_id, id).await
+                {
+                    tracing::error!("failed to record the feed position: {}", error);
+                }
+            }
+            queue_changed
+        }
+    }
+}
+
+/// How a turn ended, off its terminal event.
+enum Ending {
+    Finished(String),
+    Failed(ProblemDetail),
+    Cancelled(String),
+}
+
+/// Act on one feed event. Returns whether the queue may have changed.
+async fn apply(
+    context: &SessionContext,
+    session_id: Uuid,
+    turns: &mut HashMap<String, TurnTally>,
+    typist: &mut TurnTypist,
+    turn: Option<&str>,
+    event: &TurnEvent,
+) -> bool {
+    match event {
+        TurnEvent::Started {
+            source, resumed, ..
+        } => {
+            let Some(turn) = turn else {
+                return false;
+            };
+            typist.begin(turn);
+            turns.entry(turn.to_string()).or_default();
+            match source {
+                TurnSource::Inbox { item_ids } => {
+                    let mut conversations = BTreeSet::new();
+                    let mut messages = 0;
+                    for item_id in item_ids {
+                        let Some(row) = row_for(context, item_id).await else {
+                            continue;
+                        };
+                        messages += 1;
+                        if let Some(conversation) = ConversationId::parse(&row.conversation) {
+                            conversations.insert(conversation);
+                        }
+                    }
+                    tracing::info!(
+                        turn,
+                        messages,
+                        conversations = conversations.len(),
+                        "the agent was woken for this bridge's messages"
+                    );
+                    typist.expect(turn, conversations);
+                }
+                TurnSource::Client => {
+                    tracing::debug!(turn, "a turn somebody else submitted began");
+                }
+                TurnSource::Schedule { job_id } => {
+                    tracing::debug!(turn, job = %job_id, "a scheduled job fired");
+                }
+                TurnSource::Background => {
+                    tracing::debug!(turn, "a background outcome opened a turn");
+                }
+                TurnSource::Unknown(_) if *resumed => {
+                    tracing::debug!(turn, "joined a turn already running");
+                }
+                TurnSource::Unknown(name) => {
+                    tracing::debug!(turn, source = %name, "a turn began");
+                }
+            }
+            false
+        }
+        TurnEvent::AssistantText { .. } => {
+            if let Some(turn) = turn {
+                turns.entry(turn.to_string()).or_default().note(event);
+            }
+            false
+        }
+        TurnEvent::ToolCallComposing { .. }
+        | TurnEvent::ToolCallStarted { .. }
+        | TurnEvent::ToolCallCompleted { .. } => {
+            if let Some(turn) = turn {
+                turns.entry(turn.to_string()).or_default().note(event);
+                typist.observe(turn, event);
+            }
+            if let TurnEvent::ToolCallStarted { name, .. } = event {
+                tracing::debug!(tool = %name, "agent tool call");
+            }
+            false
+        }
+        TurnEvent::InboxDelivered { item_ids } => {
+            for item_id in item_ids {
+                let Some(row) = row_for(context, item_id).await else {
+                    continue;
+                };
+                deliver(context, &row).await;
+                let Some(turn) = turn else {
+                    continue;
+                };
+                // Recorded whether or not this was the call that closed the hand-over. A
+                // reconciliation settles one a moment before its event is read on every reconnect
+                // that spans a delivery, and the turn read it either way: the notice its failure
+                // owes, and the second offer its silence owes, both hang on this association and
+                // nothing else carries it.
+                {
+                    let tally = turns.entry(turn.to_string()).or_default();
+                    if !tally.read.contains(&row.seq) {
+                        tally.read.push(row.seq);
+                    }
+                }
+                if let Some(conversation) = ConversationId::parse(&row.conversation) {
+                    typist.expect(turn, BTreeSet::from([conversation]));
+                }
+            }
+            false
+        }
+        TurnEvent::InboxFailed { item_id, reason } => {
+            if let Some(row) = row_for(context, item_id).await {
+                tracing::error!(seq = row.seq, "meka gave up on a message: {}", reason);
+                fail(context, &row, reason, Retry::Undelivered).await;
+            }
+            false
+        }
+        TurnEvent::InboxWithdrawn { item_id } => {
+            if let Some(row) = row_for(context, item_id).await {
+                offer_again(
+                    context,
+                    &row,
+                    "the turn that had opened on it was cancelled",
+                    Some(context.config.bridge.retry_base),
+                )
+                .await;
+            }
+            true
+        }
+        TurnEvent::Finished { stop_reason, .. } => {
+            let Some(turn) = turn else {
+                return false;
+            };
+            let tally = turns.remove(turn);
+            finish(
+                context,
+                turn,
+                tally,
+                typist,
+                Ending::Finished(stop_reason.clone()),
+            )
+            .await
+        }
+        TurnEvent::Failed { error } => {
+            let Some(turn) = turn else {
+                return false;
+            };
+            let tally = turns.remove(turn);
+            let problem: ProblemDetail = serde_json::from_value(error.clone()).unwrap_or_default();
+            finish(context, turn, tally, typist, Ending::Failed(problem)).await
+        }
+        TurnEvent::Cancelled { reason } => {
+            let Some(turn) = turn else {
+                return false;
+            };
+            let tally = turns.remove(turn);
+            finish(
+                context,
+                turn,
+                tally,
+                typist,
+                Ending::Cancelled(reason.clone()),
+            )
+            .await
+        }
+        TurnEvent::Notice { level, text } => {
+            tracing::warn!(level = %level, "meka notice: {}", text);
+            if notice_reports_lost_events(text) {
+                // Everything meka has, however recently: the notice says events were dropped, and
+                // nothing here can say which.
+                reconcile(context, session_id, Utc::now()).await;
+                return true;
+            }
+            false
+        }
+        TurnEvent::ContextCompacted {
+            source,
+            replaced_count,
+            generation,
+        } => {
+            // Worth a line at warn because of what this session is. One permanent context holds
+            // everyone the agent has ever spoken to, on every platform, so a compaction is the
+            // moment its memory of conversations nobody is currently having becomes a summary.
+            // Nothing here can prevent it; an operator wondering why the agent forgot somebody
+            // should be able to find when.
+            tracing::warn!(
+                source = %source,
+                replaced = replaced_count,
+                generation,
+                "meka compacted the session; earlier conversations are now a summary"
+            );
+            false
+        }
+        TurnEvent::PermissionRequired { tool_name, .. } => {
+            // Sessions declare `supports_permission_prompts: false`, so meka denies a gated tool
+            // immediately rather than emitting this. Reaching here means the turn is about to
+            // stall for the full timeout with nothing able to answer.
+            tracing::error!(
+                tool = %tool_name,
+                "meka asked for permission, but this bridge has no approval channel; the turn will \
+                 stall and deny. meka only asks when its [permissions].approvals is on for the \
+                 session, so turn that off and raise [session].permission if the tool is one the \
+                 agent should reach."
+            );
+            false
+        }
+        TurnEvent::Thinking { .. } | TurnEvent::Unknown { .. } => false,
+    }
+}
+
+/// Close out a turn that ended. Returns whether the queue may have changed.
+async fn finish(
+    context: &SessionContext,
+    turn: &str,
+    tally: Option<TurnTally>,
+    typist: &mut TurnTypist,
+    ending: Ending,
+) -> bool {
+    typist.close(turn);
+    let tally = tally.unwrap_or_default();
+    match ending {
+        Ending::Finished(stop_reason) => {
+            tracing::info!(
+                turn,
+                stop_reason = %stop_reason,
+                sends = tally.sends,
+                tool_calls = tally.tool_calls,
+                text_chars = tally.text_length,
+                messages = tally.read.len(),
+                "turn finished"
+            );
+            if tally.read.is_empty() {
+                return false;
+            }
+            if let Err(error) = context.store.mark_turn_completed(Utc::now()).await {
+                tracing::error!("failed to record the turn timestamp: {}", error);
+            }
+            // A turn that produced meka's empty-response stand-in and called nothing did no work
+            // at all: no message was sent, no tool ran. Offering the messages again is therefore
+            // free of side effects, and far better than leaving somebody who just messaged the bot
+            // in silence. No wait before the next claim: the agent is idle, and the only cost of
+            // one would be the silence going on longer.
+            if tally.produced_nothing(&stop_reason) {
+                tracing::warn!(
+                    text = %tally.text_preview.trim(),
+                    "the model returned an empty response and called no tools; offering its \
+                     messages again"
+                );
+                for row in read_by(context, &tally).await {
+                    offer_again(context, &row, "the model returned an empty response", None).await;
+                }
+                return true;
+            }
+            if tally.is_silent() {
+                // Not an error: the agent is allowed to read something and say nothing. Logged at
+                // warn with what it produced instead, because from the other end this looks
+                // exactly like a broken bridge, and the text is usually what explains which one it
+                // was.
+                tracing::warn!(
+                    messages = tally.read.len(),
+                    tool_calls = tally.tool_calls,
+                    text = %tally.text_preview.trim(),
+                    "the agent sent no messages this turn"
+                );
+            }
+            false
+        }
+        Ending::Failed(problem) => {
+            let error = MekaError::Problem(problem);
+            // Worth saying differently because it is the one failure here that is not about the
+            // message that hit it. One permanent session carries every conversation, so a window
+            // it has outgrown refuses the next message too. meka retries an item it has accepted
+            // for an hour, so this is logged on each of those attempts, and the item is given up
+            // on with `inbox.failed` at the end of them.
+            if error.is_context_overflow() {
+                tracing::error!(
+                    "the agent's session no longer fits the model's context window, so every \
+                     message will fail until it is shortened: compact or rewind it on meka's side, \
+                     or `mekabridge session reset --yes` to start a new one and lose what it \
+                     remembers ({})",
+                    error
+                );
+            } else {
+                tracing::error!(
+                    turn,
+                    sends = tally.sends,
+                    tool_calls = tally.tool_calls,
+                    "turn failed: {}",
+                    error
+                );
+            }
+            after_reading(context, &tally, &error.to_string()).await;
+            false
+        }
+        Ending::Cancelled(reason) => {
+            tracing::warn!(
+                turn,
+                sends = tally.sends,
+                tool_calls = tally.tool_calls,
+                reason = %reason,
+                "turn cancelled"
+            );
+            after_reading(
+                context,
+                &tally,
+                &format!("the turn was cancelled: {reason}"),
+            )
+            .await;
+            false
+        }
+    }
+}
+
+/// A turn ended badly after the model had read this bridge's messages.
+///
+/// They are accounted for, since they were read, and are not offered again: a second run would
+/// repeat whatever the first did, with the agent unable to remember doing it. What the agent was
+/// in the middle of is half done, which is what the owner is told, and the chats only where the
+/// agent had not got a word in.
+async fn after_reading(context: &SessionContext, tally: &TurnTally, reason: &str) {
+    if tally.read.is_empty() {
+        return;
+    }
+    let rows = read_by(context, tally).await;
+    let affected = conversations_of(&rows);
+    let count = rows.len();
+    tracing::error!(
+        sends = tally.sends,
+        tool_calls = tally.tool_calls,
+        messages = count,
+        "the turn ended after the agent had read this bridge's messages, so they are not offered \
+         again: {}",
+        reason
+    );
+    announce(
+        context,
+        &affected,
+        &Failure {
+            reason,
+            retry: Retry::Never,
+            answered: tally.sends > 0,
+            delivered: true,
+        },
+        Lost {
+            count,
+            attempts: 1,
+            recoverable: false,
+        },
+    )
+    .await;
+}
+
+/// The rows a turn read, as the store has them now.
+async fn read_by(context: &SessionContext, tally: &TurnTally) -> Vec<QueuedMessage> {
+    match context.store.rows(&tally.read).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!("could not read what a turn was handed: {}", error);
+            Vec::new()
+        }
+    }
+}
+
+/// How long a hand-over waits before it is posted again.
+///
+/// `attempts` is how many it has already had, so the first failure waits `base` and each one after
+/// that twice as long. Exponential rather than fixed because the failure this exists for is meka
+/// out of reach, where the right wait is unknowable and the cost of guessing short is a request
+/// spent for nothing.
+///
+/// A `Retry-After` raises the wait but never lowers it. Letting it ask for *shorter* would undo the
+/// point: meka's concurrency-limit 429 carries a flat one second, which taken literally puts every
+/// attempt inside a few seconds.
+fn retry_delay(base: Duration, attempts: u32, retry_after: Option<Duration>) -> Duration {
+    // Capped exponent as well as capped result: `Duration * u32` panics on overflow, and this is
+    // reached with whatever attempt count a database row happens to hold.
+    let scheduled = base * 2_u32.saturating_pow(attempts.min(8));
+    retry_after
+        .map_or(scheduled, |asked| asked.max(scheduled))
+        .min(RETRY_DELAY_MAX)
+}
+
+/// What should happen to a batch that did not reach the model.
+struct Failure<'a> {
+    /// Recorded against the rows and quoted to the owner verbatim.
+    reason: &'a str,
+    /// Why it is not being offered again.
+    retry: Retry,
+    /// Whether the agent got a word in anywhere before this went wrong.
+    ///
+    /// A chat that was answered is not owed an apology, and one sent anyway would contradict what
+    /// the agent had just said in it. Whether *this* chat was answered would be the sharper
+    /// question, and the answer is deliberately not asked for: the only record of it is the
+    /// presence state, which is meaningful solely after a turn actually ran, and half the callers
+    /// here are failures where none did. Erring toward silence costs a chat in a
+    /// multi-conversation batch its apology; erring the other way apologises to somebody who was
+    /// just answered.
+    answered: bool,
+    /// Whether the messages reached the agent despite this.
+    ///
+    /// Changes the whole of what the owner is looking at. Messages that never arrived are lost and
+    /// somebody has to decide what to do about them; messages the agent read before the turn died
+    /// are not lost, but whatever it was in the middle of is half done.
+    delivered: bool,
+}
+
+/// Why a batch is not being offered again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// A failure that needs an operator, where further attempts only delay the notice saying so.
+    Never,
+    /// meka never accepted it: every post over the hour failed.
+    Unaccepted,
+    /// meka accepted it and could not deliver it.
+    Undelivered,
+}
+
+/// What the session task should do with the queue this round.
 struct Readiness {
     /// Conversations whose waiting messages may be claimed now.
     ready: Vec<String>,
@@ -844,7 +2131,7 @@ struct Readiness {
 /// replayed after a restart releases immediately instead of being debounced as though it had just
 /// arrived. The cost is a dependence on the two clocks roughly agreeing, and both directions of
 /// skew degrade into either no debounce or one full quiet period.
-async fn readiness(context: &DrainContext) -> Readiness {
+async fn readiness(context: &SessionContext) -> Readiness {
     let windows = match context.store.pending_windows().await {
         Ok(windows) => windows,
         Err(error) => {
@@ -903,7 +2190,7 @@ async fn readiness(context: &DrainContext) -> Readiness {
         // The cost is that a conversation whose oldest message is already past the ceiling skips
         // the floor, so a split post arriving with timestamps that old is not held together. That
         // needs a clock skewed by more than the ceiling or a delivery delayed by as much, and the
-        // parts still all reach the agent, the later ones flagged `late:`.
+        // parts still all reach the agent, the later ones under a header saying when they arrived.
         if waited >= settle_max {
             ready.push(window.conversation);
             continue;
@@ -946,686 +2233,16 @@ async fn readiness(context: &DrainContext) -> Readiness {
 /// A conversation whose channel cannot be resolved is treated as not reporting it, which releases
 /// sooner. That is the safe direction: the alternative holds messages for a channel nobody can ask
 /// about, and the id came out of the queue rather than from a user, so it should always resolve.
-fn reports_typing(context: &DrainContext, conversation_id: &str) -> bool {
+fn reports_typing(context: &SessionContext, conversation_id: &str) -> bool {
     ConversationId::parse(conversation_id)
         .and_then(|conversation| context.channels.get(conversation.channel()).cloned())
         .is_some_and(|channel| channel.capabilities().typing_status)
 }
 
-/// Hand one batch to the agent and record what happened to it.
-async fn deliver(
-    context: &DrainContext,
-    batch: Vec<QueuedMessage>,
-    last_turn: Option<TurnWindow>,
-    shutdown: &CancellationToken,
-) -> Option<TurnWindow> {
-    let started_at = chrono::Utc::now();
-    // How many attempts the most-tried message here has already had, which is what the wait before
-    // the next one is scaled from. Read now because the batch is consumed below.
-    let attempts = batch
-        .iter()
-        .map(|message| message.attempts)
-        .max()
-        .unwrap_or(0);
-
-    let mut events: Vec<InboundEvent> = Vec::with_capacity(batch.len());
-    // Only the rows that survive decoding. Taking the whole batch here meant a row discarded just
-    // below was still handed to `fail_batch` and `release_batch` later, and neither filters on
-    // state, so the row it had just marked `done` was resurrected to `pending` to be discarded
-    // again on the next round. It also inflated the count in the notice sent to the owner.
-    let mut sequences: Vec<i64> = Vec::with_capacity(batch.len());
-    let mut undecodable = Vec::new();
-    for message in &batch {
-        match serde_json::from_str::<InboundEvent>(&message.payload) {
-            Ok(event) => {
-                events.push(event);
-                sequences.push(message.seq);
-            }
-            Err(error) => {
-                // A payload this build cannot read will never become readable, so retrying it would
-                // wedge the queue behind it forever.
-                tracing::error!(
-                    seq = message.seq,
-                    "dropping an undecodable queue payload: {}",
-                    error
-                );
-                undecodable.push(message.seq);
-            }
-        }
-    }
-    if !undecodable.is_empty()
-        && let Err(error) = context.store.complete_batch(&undecodable).await
-    {
-        tracing::error!("failed to discard undecodable payloads: {}", error);
-    }
-    if events.is_empty() {
-        return last_turn;
-    }
-    let delivered_count = events.len();
-
-    // A message whose own timestamp falls inside the previous turn arrived while the agent was
-    // working. Compared against platform time, so clock skew can only cause an under-report, which
-    // reads as an ordinary message rather than a wrong claim.
-    if let Some(window) = last_turn {
-        for event in &mut events {
-            let InboundEvent::Message(message) = event else {
-                continue;
-            };
-            message.arrived_mid_turn =
-                message.timestamp >= window.started_at && message.timestamp <= window.ended_at;
-        }
-    }
-
-    let conversations: BTreeSet<ConversationId> = events
-        .iter()
-        .map(|event| event.conversation().clone())
-        .collect();
-
-    let dropped = context.store.take_dropped().await.unwrap_or_else(|error| {
-        tracing::error!("failed to read the dropped-message counter: {}", error);
-        0
-    });
-
-    let session_id = match ensure_session(context).await {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            // Nothing was submitted, so nothing ran and the batch is intact. Backed off all the
-            // same: meka being unreachable now is the best evidence available about whether it will
-            // be a moment from now.
-            let retry = if error.is_retryable() {
-                Retry::After(retry_delay(
-                    context.config.bridge.retry_base,
-                    attempts,
-                    error.retry_after(),
-                ))
-            } else {
-                Retry::Never
-            };
-            record_failure(context, &sequences, &Failure {
-                reason: &error.to_string(),
-                retry,
-                answered: false,
-                delivered: false,
-            })
-            .await;
-            // The counter was taken above and the envelope carrying it is now discarded unbuilt, so
-            // put it back or the agent is never told its view is incomplete. Only the paths that
-            // give up *before* submitting need this: past that point the envelope reached meka and
-            // the count was reported, and restoring it there would report the same overflow twice.
-            if dropped > 0
-                && let Err(error) = context.store.note_dropped(dropped).await
-            {
-                tracing::error!("failed to restore the dropped-message counter: {}", error);
-            }
-            return last_turn;
-        }
-    };
-
-    let identities = context.accounts.identities();
-
-    let (missed, withheld) = missed_context(context, &events).await;
-
-    let nonce = nonce();
-    // Any row in the batch having been recovered makes the whole envelope uncertain, since the
-    // agent cannot tell which of the messages in front of it was the interrupted one.
-    let recovered = batch.iter().any(|message| message.recovered);
-    let message = Envelope {
-        events: &events,
-        dropped,
-        identities,
-        missed: &missed,
-        nonce: &nonce,
-        recovered,
-    }
-    .render();
-
-    tracing::info!(
-        messages = events.len(),
-        conversations = conversations.len(),
-        session_id = %session_id,
-        "submitting a turn"
-    );
-
-    let mut report = submit(context, session_id, &message, &conversations, shutdown).await;
-
-    // meka forgetting the session (its row was deleted, or the database was replaced) is
-    // recoverable exactly once: bind a fresh session and replay the same batch into it. Safe to
-    // replay because the rejection happens before anything runs, so the first submission cannot
-    // have left work behind.
-    //
-    // `had_side_effects` is what holds that up, rather than the reasoning alone. This runs ahead of
-    // every other arm, so anything that arrives here as a missing session is replayed without the
-    // usual question being asked. Today only a refused submission can, and refusals happen before
-    // the turn starts. Should meka ever report it from further in -- a rejoin answering that the
-    // session went away mid-turn is the obvious candidate -- replaying would hand a second copy to
-    // an agent that has no memory of sending the first, and nothing here would have noticed.
-    if matches!(&report.outcome, Err(error) if error.is_session_missing())
-        && !report.had_side_effects()
-        && context.config.session.recreate_on_missing
-    {
-        tracing::warn!(
-            "meka no longer knows session {}; creating a replacement. The agent's memory of \
-             earlier conversations is gone. If this keeps happening, check meka's \
-             `[serve].delete_on_idle`: with it on, an idle session's row is deleted rather than \
-             merely evicted, which wipes the assistant every idle_timeout.",
-            session_id
-        );
-        if let Err(error) = context.store.clear_session_id().await {
-            tracing::error!("failed to clear the stale session binding: {}", error);
-        }
-        report = match ensure_session(context).await {
-            Ok(replacement) => {
-                let message = Envelope {
-                    events: &events,
-                    dropped,
-                    identities,
-                    // Reused rather than recomputed: taking it again would come back empty, because
-                    // the first call marked it seen.
-                    missed: &missed,
-                    nonce: &nonce,
-                    recovered,
-                }
-                .render();
-                submit(context, replacement, &message, &conversations, shutdown).await
-            }
-            Err(error) => TurnReport::failed(error),
-        };
-    }
-
-    // meka spent a whole turn budget refusing, having retried throughout `submit`, so this is a
-    // session that is wedged rather than merely occupied. Every submission was refused before it
-    // ran, so nothing reached the agent and nothing was lost: the batch goes back to the queue
-    // untouched and the next drain tick starts a fresh round of retries. Counting it as a failed
-    // delivery would let a busy session burn the retry budget and eventually declare a message
-    // undeliverable that meka never even saw.
-    if matches!(&report.outcome, Err(error) if error.is_turn_in_flight()) {
-        tracing::warn!(
-            "meka has been busy with a turn this bridge did not start for a full turn budget; \
-             requeueing the batch"
-        );
-        if let Err(error) = context.store.release_batch(&sequences).await {
-            tracing::error!("failed to requeue a deferred batch: {}", error);
-        }
-        // The envelope this counter was rendered into is being thrown away, so put it back or the
-        // notice that the queue overflowed is lost to a turn that never ran.
-        if dropped > 0
-            && let Err(error) = context.store.note_dropped(dropped).await
-        {
-            tracing::error!("failed to restore the dropped-message counter: {}", error);
-        }
-        // The backlog this envelope reported is deliberately *not* marked accounted for. It was
-        // never delivered, and spending it here would leave the retry telling a chat with thirty
-        // messages waiting that nothing had been said in it.
-        //
-        // No turn ran, so there is no window to report either. Inventing one would flag the next
-        // batch's messages as having arrived mid-turn against a turn that never happened, and those
-        // messages are in that very batch.
-        return last_turn;
-    }
-
-    // Spent only where the envelope that announced it is still in front of the agent. The backlog
-    // and the dropped-message count are each stated once, in that envelope, so an envelope meka
-    // took back never said them and they are owed again.
-    //
-    // Keyed on the envelope rather than on which error came back. A refusal is the obvious case: a
-    // meka restarting refuses the socket, its concurrency limit answers 429, a rotated token
-    // answers 401, and each of those once spent a backlog nobody was shown. Withdrawal is the
-    // subtler one, and it only exists because this bridge asks for it: turns are submitted
-    // `unanswered_message: "withdraw"` so a resubmission does not leave a duplicate behind, and the
-    // message that goes takes the announcements riding on it. Reading the old "the turn was taken"
-    // rule against a withdrawn envelope would trade a duplicate message for a lost backlog.
-    if !report.envelope_kept() {
-        // Restored on the same condition and for the same reason: the envelope it was rendered
-        // into is not in front of anybody.
-        if dropped > 0
-            && let Err(error) = context.store.note_dropped(dropped).await
-        {
-            tracing::error!("failed to restore the dropped-message counter: {}", error);
-        }
-    }
-    for spent in withheld.iter().filter(|_| report.envelope_kept()) {
-        if let Err(error) = context
-            .store
-            .mark_seen(spent.conversation.as_str(), spent.watermark, spent.through)
-            .await
-        {
-            tracing::error!(
-                conversation = %spent.conversation,
-                "failed to record what the agent was shown: {}",
-                error
-            );
-        }
-    }
-
-    // Why the turn stopped, when it was cancelled rather than finished or failed. Kept out of
-    // `failure` because it is not an error meka reported: nothing went wrong at the HTTP layer, the
-    // work simply did not run to the end.
-    let mut cancelled: Option<String> = None;
-    let failure = match &report.outcome {
-        Ok(TurnOutcome::Finished { stop_reason, .. }) => {
-            tracing::info!(
-                stop_reason = %stop_reason,
-                sends = report.sends,
-                tool_calls = report.tool_calls,
-                text_chars = report.text_length,
-                "turn finished"
-            );
-            None
-        }
-        // Not a success, and treating it as one is the same mistake as reading an idle session as a
-        // finished turn. meka cancels a turn whose stream has had no subscriber for
-        // `[serve].stream_reattach_grace`, reporting `client`, so this is what a rejoin that lands
-        // after the kill gets back: a turn stopped partway through work nobody has seen. At
-        // `stream_reattach_grace = "0s"`, which meka offers to restore its older behaviour, every
-        // dropped stream ends here.
-        //
-        // The batch is therefore treated as undelivered. `had_side_effects` still applies below and
-        // is what stops a cancellation that interrupted a half-finished send from being replayed.
-        Ok(TurnOutcome::Cancelled { reason }) => {
-            tracing::warn!(reason = %reason, "turn cancelled; its batch was not delivered");
-            cancelled = Some(reason.clone());
-            None
-        }
-        Err(error) => Some(error),
-    };
-
-    match failure {
-        // A turn that produced meka's empty-response stand-in and called nothing did no work at
-        // all: no message was sent, no tool ran. Handing the batch over again is therefore free of
-        // side effects, and far better than leaving somebody who just messaged the bot in silence.
-        // At once, too, rather than after a wait. Nothing upstream asked to be left alone here: an
-        // empty response is the model having produced nothing, not a service saying it is busy.
-        None if report.produced_nothing() => {
-            tracing::warn!(
-                text = %report.text_preview.trim(),
-                "the model returned an empty response and called no tools; retrying the batch"
-            );
-            record_failure(context, &sequences, &Failure {
-                reason: "the model returned an empty response",
-                retry: Retry::Now,
-                answered: false,
-                delivered: false,
-            })
-            .await;
-        }
-        // Stopped partway. The batch is spent if the agent had already acted, for the same reason a
-        // failure after side effects is, and owed back to the queue otherwise.
-        None if cancelled.is_some() => {
-            let reason = cancelled.unwrap_or_default();
-            if report.had_side_effects() {
-                tracing::error!(
-                    sends = report.sends,
-                    tool_calls = report.tool_calls,
-                    "the turn was cancelled ({reason}) after the agent had already acted, so its \
-                     batch will not be retried"
-                );
-                complete(context, &sequences).await;
-                announce(
-                    context,
-                    &conversations,
-                    &Failure {
-                        reason: &format!("the turn was cancelled: {reason}"),
-                        retry: Retry::Never,
-                        answered: report.sends > 0,
-                        delivered: true,
-                    },
-                    Lost {
-                        count: delivered_count,
-                        attempts: attempts + 1,
-                        recoverable: false,
-                    },
-                )
-                .await;
-            } else {
-                tracing::warn!("the turn was cancelled ({reason}) having done nothing; requeueing");
-                record_failure(context, &sequences, &Failure {
-                    reason: &format!("the turn was cancelled: {reason}"),
-                    retry: Retry::After(retry_delay(
-                        context.config.bridge.retry_base,
-                        attempts,
-                        None,
-                    )),
-                    answered: false,
-                    delivered: false,
-                })
-                .await;
-            }
-        }
-        None => {
-            if report.is_silent() {
-                // Not an error: the agent is allowed to read something and say nothing. Logged at
-                // warn with what it produced instead, because from the other end this looks exactly
-                // like a broken bridge, and the text is usually what explains which one it was.
-                tracing::warn!(
-                    conversations = conversations.len(),
-                    tool_calls = report.tool_calls,
-                    text = %report.text_preview.trim(),
-                    "the agent sent no messages this turn"
-                );
-            }
-            complete(context, &sequences).await;
-        }
-        // Must stay ahead of the lost-stream arm below: every dropped stream satisfies
-        // `turn_outcome_unknown`, so behind it this guard is unreachable and a turn that had
-        // already answered somebody gets handed back to be answered again. The counters are
-        // truncated by a drop, so whatever they do show is a floor on what the agent did.
-        //
-        // Reachable rather than theoretical because meka scopes `content_started` to a single
-        // provider call, so a rate limit partway through a tool loop arrives here with the earlier
-        // iterations' calls already made.
-        Some(error) if report.had_side_effects() => {
-            tracing::error!(
-                sends = report.sends,
-                tool_calls = report.tool_calls,
-                "the turn failed after the agent had already acted, so its batch will not be \
-                 retried: {}",
-                error
-            );
-            complete(context, &sequences).await;
-            announce(
-                context,
-                &conversations,
-                &Failure {
-                    reason: &error.to_string(),
-                    retry: Retry::Never,
-                    answered: report.sends > 0,
-                    delivered: true,
-                },
-                Lost {
-                    count: delivered_count,
-                    attempts: attempts + 1,
-                    // Nothing was un-seen: the messages reached the agent, so they are accounted
-                    // for rather than owed.
-                    recoverable: false,
-                },
-            )
-            .await;
-        }
-        // The turn was accepted, the stream died, and `run_turn` could not rejoin it. What the turn
-        // did is genuinely unknown, and there is no longer any way to find out: a session that has
-        // gone idle since proves nothing, because meka stops a turn whose stream has had no
-        // subscriber for `[serve].stream_reattach_grace`. Reading idle as "it finished" is how a
-        // message gets marked delivered that was never answered, so the batch is requeued instead.
-        //
-        // The session is not polled for idle first. That wait used to decide the outcome; now that
-        // it cannot, it is a stall of up to a whole turn budget before the retry, buying nothing.
-        // Should the old turn somehow still be going, the resubmission is refused with a 409 and
-        // `submit` holds the batch on a two-second timer, which is the same waiting done properly.
-        Some(error) if error.turn_outcome_unknown() => {
-            tracing::error!(
-                sends = report.sends,
-                tool_calls = report.tool_calls,
-                "lost the turn stream and could not rejoin it ({}); requeueing the batch, which \
-                 may deliver the same messages twice",
-                error
-            );
-            record_failure(context, &sequences, &Failure {
-                reason: &error.to_string(),
-                retry: Retry::After(retry_delay(
-                    context.config.bridge.retry_base,
-                    attempts,
-                    error.retry_after(),
-                )),
-                // Nothing was sent, or the arm above would have taken this. Saying otherwise
-                // would suppress the chat's notice while the owner's said the message was owed
-                // back, which cannot both be true.
-                answered: false,
-                delivered: false,
-            })
-            .await;
-        }
-        Some(error) => {
-            // Only the wording differs, deliberately: a context overflow is already non-retryable
-            // below, so an arm of its own would duplicate everything under it to change one line.
-            // Worth saying differently because it is the one failure here that is not about the
-            // message that hit it. One permanent session carries every conversation, so a window
-            // it has outgrown refuses the next message too.
-            if error.is_context_overflow() {
-                tracing::error!(
-                    "the agent's session no longer fits the model's context window, so every \
-                     message will fail until it is shortened: compact or rewind it on meka's \
-                     side, or `mekabridge session reset --yes` to start a new one and lose what \
-                     it remembers ({})",
-                    error
-                );
-            } else {
-                tracing::error!("turn failed: {}", error);
-            }
-            // A failure needing an operator will not stop happening on its own, so spending the
-            // whole budget on it only delays the notice that says so.
-            let retry = if error.is_retryable() {
-                Retry::After(retry_delay(
-                    context.config.bridge.retry_base,
-                    attempts,
-                    error.retry_after(),
-                ))
-            } else {
-                Retry::Never
-            };
-            record_failure(context, &sequences, &Failure {
-                reason: &error.to_string(),
-                retry,
-                answered: false,
-                delivered: false,
-            })
-            .await;
-        }
-    }
-
-    Some(TurnWindow {
-        started_at,
-        ended_at: chrono::Utc::now(),
-    })
-}
-
-/// Mark a batch delivered and note when the turn that carried it ended.
-async fn complete(context: &DrainContext, sequences: &[i64]) {
-    if let Err(error) = context.store.complete_batch(sequences).await {
-        tracing::error!("failed to mark a delivered batch: {}", error);
-    }
-    if let Err(error) = context.store.mark_turn_completed(chrono::Utc::now()).await {
-        tracing::error!("failed to record the turn timestamp: {}", error);
-    }
-}
-
-/// Submit a turn, retrying on a timer while meka is busy with a turn of its own.
-///
-/// A `turn-in-flight` rejection refuses the batch before it runs, so retrying delivers it exactly
-/// once, and it stays claimed throughout so the envelope is not rebuilt per attempt.
-///
-/// The 409 is the only trustworthy sign that the session is busy; meka's `turn_in_flight` is not,
-/// and asking it is worse than not asking. Its scheduled work locks the session's runtime before
-/// marking itself busy, so in the window between the two the session calls itself idle and refuses
-/// anyway, turning a wait-for-idle retry into a spin as tight as the two processes can trade
-/// requests.
-async fn submit(
-    context: &DrainContext,
-    session_id: Uuid,
-    message: &str,
-    conversations: &BTreeSet<ConversationId>,
-    shutdown: &CancellationToken,
-) -> TurnReport {
-    let deadline = tokio::time::Instant::now() + context.config.meka.turn_timeout;
-    let mut attempt = 0_u32;
-    loop {
-        let report = context.runner.run(session_id, message, conversations).await;
-        let refused = report
-            .outcome
-            .as_ref()
-            .err()
-            .is_some_and(MekaError::is_turn_in_flight);
-        // Belt and braces rather than load-bearing: the same budget bounds the turn itself, so a
-        // 409 can only ever be seen strictly before the deadline -- a refusal that took longer
-        // would have failed as a timeout and never reached this path. The guard costs one
-        // comparison and keeps the loop correct if those two budgets are ever separated.
-        if !refused || (attempt > 0 && tokio::time::Instant::now() >= deadline) {
-            return report;
-        }
-        if attempt == 0 {
-            // Once per episode, not once per attempt: at one line per attempt this buried whatever
-            // an operator opened the log to find.
-            //
-            // Nothing is shown in the chat while this runs. The indicator used to go up here, on
-            // the reasoning that meka refuses only because it is running some turn and the agent is
-            // therefore working. True, and beside the point now that the indicator means the model
-            // is writing a message to this chat specifically: somebody else's turn is the furthest
-            // thing from that, and a chat waiting on one is genuinely being left alone.
-            tracing::info!(
-                "meka is running a turn this bridge did not start; holding the batch and retrying \
-                 every {}s until it finishes",
-                DEFER_RETRY_INTERVAL.as_secs()
-            );
-        }
-        attempt += 1;
-
-        let interrupted = tokio::select! {
-            () = shutdown.cancelled() => true,
-            () = tokio::time::sleep(DEFER_RETRY_INTERVAL) => false,
-        };
-        if interrupted {
-            return report;
-        }
-    }
-}
-
-/// What should happen to a batch whose turn did not deliver it.
-struct Failure<'a> {
-    /// Recorded against the rows and quoted to the owner verbatim.
-    reason: &'a str,
-    /// Whether it is worth handing over again, and when.
-    retry: Retry,
-    /// Whether the agent got a word in anywhere before this went wrong.
-    ///
-    /// A chat that was answered is not owed an apology, and one sent anyway would contradict what
-    /// the agent had just said in it. Whether *this* chat was answered would be the sharper
-    /// question, and the answer is deliberately not asked for: the only record of it is the turn
-    /// runner's presence state, which is meaningful solely after a turn actually ran, and half the
-    /// callers here are failures where none did. Erring toward silence costs a chat in a
-    /// multi-conversation batch its apology; erring the other way apologises to somebody who was
-    /// just answered.
-    answered: bool,
-    /// Whether the messages reached the agent despite this.
-    ///
-    /// Changes the whole of what the owner is looking at. Messages that never arrived are lost and
-    /// somebody has to decide what to do about them; messages the agent read and acted on before
-    /// the turn died are not lost, but whatever it was in the middle of is half done.
-    delivered: bool,
-}
-
-/// Whether a failed batch is worth another attempt, and how long to leave it first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Retry {
-    /// Offer it again once this has passed.
-    After(Duration),
-    /// Offer it again on the next pass, for a failure that did nothing and says nothing about when
-    /// it might stop happening.
-    Now,
-    /// Do not offer it again. For a failure that needs an operator, where further attempts only
-    /// delay the notice saying so.
-    Never,
-}
-
-/// How long a batch waits before it is offered again.
-///
-/// `attempts` is how many it has already had, so the first failure waits `base` and each one after
-/// that twice as long. Exponential rather than fixed because the failure this exists for is an
-/// upstream out of quota, where the right wait is unknowable and the cost of guessing short is an
-/// attempt spent for nothing.
-///
-/// A `Retry-After` raises the wait but never lowers it. Letting it ask for *shorter* would undo the
-/// point: meka's concurrency-limit 429 carries a flat one second, which taken literally puts all
-/// four attempts inside four seconds.
-fn retry_delay(base: Duration, attempts: u32, retry_after: Option<Duration>) -> Duration {
-    // Capped exponent as well as capped result: `Duration * u32` panics on overflow, and this is
-    // reached with whatever attempt count a database row happens to hold.
-    let scheduled = base * 2_u32.saturating_pow(attempts.min(8));
-    retry_after
-        .map_or(scheduled, |asked| asked.max(scheduled))
-        .min(RETRY_DELAY_MAX)
-}
-
-/// Mark a batch failed, and tell whoever is waiting about anything that will never be delivered.
-async fn record_failure(context: &DrainContext, sequences: &[i64], failure: &Failure<'_>) {
-    let (max_attempts, retry_at) = match failure.retry {
-        Retry::After(delay) => (
-            context.config.bridge.turn_retries,
-            chrono::Duration::from_std(delay)
-                .ok()
-                .map(|delay| chrono::Utc::now() + delay),
-        ),
-        Retry::Now => (context.config.bridge.turn_retries, None),
-        Retry::Never => (0, None),
-    };
-    let outcome = context
-        .store
-        .fail_batch(sequences, failure.reason, max_attempts, retry_at)
-        .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            tracing::error!("failed to record a batch failure: {}", error);
-            return;
-        }
-    };
-    if !outcome.retrying.is_empty() {
-        tracing::warn!(
-            count = outcome.retrying.len(),
-            retry_in = ?retry_at.map(|at| at - chrono::Utc::now()),
-            "requeued messages after a failed turn"
-        );
-    }
-    if outcome.exhausted.is_empty() {
-        return;
-    }
-    // The row's own counter rather than `max_attempts`, which a permanent error forces to zero and
-    // which would then report a message that had already been tried four times as having had one.
-    let spent = outcome
-        .exhausted
-        .iter()
-        .map(|message| message.attempts)
-        .max()
-        .unwrap_or(1);
-    tracing::error!(
-        count = outcome.exhausted.len(),
-        "giving up on {} message(s) after {spent} attempt(s)",
-        outcome.exhausted.len()
-    );
-
-    // Owed to the agent again. A message is marked seen the moment it is queued, on the assumption
-    // that the agent is about to be handed it, and this is exactly where that assumption fails.
-    // Without this it is neither delivered nor owed, so nothing but `read_history` over the right
-    // window would ever turn it up again.
-    let mut affected: BTreeSet<ConversationId> = BTreeSet::new();
-    // Whether that actually worked, which it cannot when `[storage].history_retention` is zero:
-    // there is no history row to un-see, so the message really is gone. The owner is told which of
-    // the two happened rather than promised the recoverable one.
-    let mut recoverable = false;
-    for message in &outcome.exhausted {
-        match context.store.mark_unseen(message.key()).await {
-            Ok(marked) => recoverable |= marked,
-            Err(error) => tracing::error!(
-                conversation = %message.conversation,
-                "failed to mark an undeliverable message unseen: {}",
-                error
-            ),
-        }
-        if let Some(conversation) = ConversationId::parse(&message.conversation) {
-            affected.insert(conversation);
-        }
-    }
-    announce(context, &affected, failure, Lost {
-        count: outcome.exhausted.len(),
-        attempts: spent,
-        recoverable,
-    })
-    .await;
-}
-
 /// What became of the messages a notice is about.
 struct Lost {
     count: usize,
-    /// Attempts actually spent, which is not `turn_retries + 1` when a permanent error cut it
-    /// short.
+    /// Attempts actually spent, which a permanent refusal cuts short at one.
     attempts: u32,
     /// Whether they can still be reached, which needs a history to have been kept.
     recoverable: bool,
@@ -1637,7 +2254,7 @@ struct Lost {
 /// nothing wrong, cannot act on an upstream status code, and may not be somebody an operator would
 /// hand a stack trace to. The owner gets everything, because the owner is the one who can fix it.
 async fn announce(
-    context: &DrainContext,
+    context: &SessionContext,
     affected: &BTreeSet<ConversationId>,
     failure: &Failure<'_>,
     lost: Lost,
@@ -1689,10 +2306,10 @@ async fn announce(
     let count = lost.count;
     let mut text = if failure.delivered {
         format!(
-            "mekabridge: a turn carrying {count} message(s) failed after the agent had already \
-             acted, so whatever it was doing is half finished. The messages themselves are \
-             accounted for and were not sent again, since a second run would repeat what the first \
-             one did.\n\nError: {}",
+            "mekabridge: a turn ended badly after the agent had already read {count} message(s), \
+             so whatever it was doing with them is half finished. The messages themselves are \
+             accounted for and were not offered again, since a second run would repeat what the \
+             first one did.\n\nError: {}",
             failure.reason
         )
     } else if lost.recoverable {
@@ -1726,9 +2343,11 @@ async fn announce(
             Retry::Never => {
                 "\nGiven up on at once: this one needs you rather than another attempt.".to_string()
             }
-            Retry::Now | Retry::After(_) => {
-                format!("\nTried {} time(s) before giving up.", lost.attempts)
-            }
+            Retry::Unaccepted => format!(
+                "\nmeka did not accept it in {} attempt(s) over the last hour.",
+                lost.attempts
+            ),
+            Retry::Undelivered => "\nmeka accepted it and could not deliver it.".to_string(),
         });
     }
     if told.is_empty() {
@@ -1751,7 +2370,7 @@ async fn announce(
 /// the agent speaking and must not stamp the conversation as answered. It is still recorded, under
 /// no session, because the chat can see it and a record that omits it would leave the agent reading
 /// replies to something it has no trace of.
-async fn notify(context: &DrainContext, conversation: &ConversationId, text: &str) {
+async fn notify(context: &SessionContext, conversation: &ConversationId, text: &str) {
     let channel = match context.channels.resolve(conversation) {
         Ok(channel) => channel,
         Err(error) => {
@@ -1797,9 +2416,9 @@ async fn notify(context: &DrainContext, conversation: &ConversationId, text: &st
 /// When each conversation was last told that something failed.
 ///
 /// In memory only, because after a restart telling somebody again is the right answer rather than
-/// the wrong one. Owned outright by the drain loop rather than shared behind an `Arc` the way
+/// the wrong one. Owned outright by the session task rather than shared behind an `Arc` the way
 /// [`TypingState`] is, since nothing else here writes it; the mutex is for interior mutability
-/// through the `&DrainContext` every function in this file takes.
+/// through the `&SessionContext` every function in this file takes.
 ///
 /// Without it a provider out of quota for half an hour writes an apology into every affected chat
 /// every time a batch runs out of attempts, which is a worse experience than the silence it
@@ -1865,9 +2484,9 @@ impl NoticeLog {
 /// matter: one created at `ask` was migrated to `none` with approvals on, which denies every call
 /// including `send_message`, so it cannot reply to anyone until its level changes.
 ///
-/// Runs once per process, on the first turn rather than at startup, because the bridge comes up
-/// before meka does.
-async fn reconcile_permission(context: &DrainContext, session_id: Uuid) {
+/// Runs once per process, when the session is bound, which waits meka out because the bridge
+/// comes up before meka does.
+async fn reconcile_permission(context: &SessionContext, session_id: Uuid) {
     if context.permission_checked.get().is_some() {
         return;
     }
@@ -1908,8 +2527,8 @@ async fn reconcile_permission(context: &DrainContext, session_id: Uuid) {
     }
 }
 
-/// Return the bound meka session, creating one if this is the first turn.
-async fn ensure_session(context: &DrainContext) -> Result<Uuid, MekaError> {
+/// Return the bound meka session, creating one if this bridge has none yet.
+async fn ensure_session(context: &SessionContext) -> Result<Uuid, MekaError> {
     if let Some(session_id) = context
         .store
         .session_id()
@@ -1919,23 +2538,41 @@ async fn ensure_session(context: &DrainContext) -> Result<Uuid, MekaError> {
         reconcile_permission(context, session_id).await;
         return Ok(session_id);
     }
-    let session_id = context
-        .meka
-        .create_session(
-            context.config.session.cwd.as_deref(),
-            context.config.session.permission,
-        )
-        .await?;
-    tracing::info!(session_id = %session_id, "created the meka session for this bridge");
+    let remembered = *context
+        .pending_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let session_id = match remembered {
+        Some(session_id) => session_id,
+        None => {
+            let session_id = context
+                .meka
+                .create_session(
+                    context.config.session.cwd.as_deref(),
+                    context.config.session.permission,
+                )
+                .await?;
+            *context
+                .pending_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session_id);
+            tracing::info!(session_id = %session_id, "created the meka session for this bridge");
+            session_id
+        }
+    };
     context
         .store
         .set_session_id(session_id)
         .await
         .map_err(|error| MekaError::Decode(error.to_string()))?;
+    *context
+        .pending_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     Ok(session_id)
 }
 
-/// Random fence marker for one turn's envelope.
+/// Random fence marker for one envelope.
 fn nonce() -> String {
     use rand::RngExt as _;
     let bytes: [u8; NONCE_BYTES] = rand::rng().random();
@@ -1995,7 +2632,6 @@ mod tests {
             forwarded_from: None,
             group_id: None,
             notes: Vec::new(),
-            arrived_mid_turn: false,
             attachments,
             timestamp: Utc::now(),
         }
@@ -2189,10 +2825,11 @@ mod tests {
         assert_eq!(retry_delay(base, 1, None), Duration::from_secs(20));
         assert_eq!(retry_delay(base, 2, None), Duration::from_secs(40));
         assert_eq!(retry_delay(base, 3, None), Duration::from_secs(80));
+        assert_eq!(retry_delay(base, 4, None), Duration::from_secs(160));
         // Bounded rather than doubling forever, and bounded without panicking: this is reached with
         // whatever attempt count a row in the database happens to carry, and `Duration * u32`
         // panics on overflow rather than saturating.
-        assert_eq!(retry_delay(base, 4, None), RETRY_DELAY_MAX);
+        assert_eq!(retry_delay(base, 5, None), RETRY_DELAY_MAX);
         assert_eq!(retry_delay(base, u32::MAX, None), RETRY_DELAY_MAX);
     }
 
@@ -2206,8 +2843,8 @@ mod tests {
             Duration::from_secs(45)
         );
         // Shorter: ignored. meka attaches a flat one second to its concurrency-limit 429, and
-        // taking that literally on the fourth attempt would put the whole budget inside a few
-        // seconds, which is the failure this backoff exists to prevent arriving by another road.
+        // taking that literally on the fourth attempt would put every post inside a few seconds,
+        // which is the failure this backoff exists to prevent arriving by another road.
         assert_eq!(
             retry_delay(base, 3, Some(Duration::from_secs(1))),
             Duration::from_secs(80)

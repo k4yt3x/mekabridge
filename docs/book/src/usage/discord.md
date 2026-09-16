@@ -70,7 +70,7 @@ Everything withheld is still recorded, and the mention that wakes the agent arri
 
 Discord reports when a person is typing, so a conversation is held while they are still composing
 and for `[bridge].settle` after they stop, capped by `[bridge].settle_max`. Somebody typing a
-thought across three messages therefore gets one turn rather than three.
+thought across three messages is therefore handed over once rather than three times.
 
 This needs `GUILD_MESSAGE_TYPING` and `DIRECT_MESSAGE_TYPING`, which the bridge requests
 unconditionally. Both are unprivileged, so unlike Message Content they need no toggle in the
@@ -110,7 +110,7 @@ a19f4c>>>
 
 Discord sends raw content full of ids: `<@123>`, `<@&456>`, `<#789>`, `<:shrug:111>`, `<t:1712345678:R>`. Unresolved, the agent reads opaque numbers, so the bridge rewrites them into `@Alice`, `@Moderators`, `#general`, `:shrug:`, and an absolute UTC time.
 
-This does edit what the sender literally typed, inside text the envelope otherwise fences as verbatim. It is the one place the bridge changes a message body, and the alternative is an agent that cannot tell who was named.
+This does edit what the sender literally typed, inside text the item otherwise fences as verbatim. It is the one place the bridge changes a message body, and the alternative is an agent that cannot tell who was named.
 
 The reverse is deliberately not done. The agent writing `@Alice` does not become a mention, because guessing wrong pings a stranger. Writing `<@245119312739729408>` literally does work: `<` is the one Markdown-significant character left unescaped, precisely so a deliberate mention survives. Whether it actually notifies is then decided by `mention_roles` and `mention_everyone`.
 
@@ -178,7 +178,7 @@ Somebody who has set themselves invisible is reported as offline. That is what t
 
 ## Attachments
 
-Announced in the envelope with a handle, fetched only when the agent asks, as everywhere else. Two Discord specifics are worth knowing:
+Announced on the item with a handle, fetched only when the agent asks, as everywhere else. Two Discord specifics are worth knowing:
 
 - **Handles die with their message.** Discord's CDN links are signed and expire, so the bridge stores a reference to the message and re-requests it to get a fresh link. That is always correct, and it means deleting the message makes the file unreachable. On Telegram the file id outlives the message.
 - **Videos have no still frame.** Discord exposes no thumbnail to a bot, so `view_attachment` on a video has nothing to show. On Telegram it falls back to the still frame the platform already made.

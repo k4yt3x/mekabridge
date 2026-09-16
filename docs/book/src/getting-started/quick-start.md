@@ -80,17 +80,19 @@ meka retries a failed MCP connect in the background with backoff, so starting th
 
 ## 5. Say something
 
-Message your bot. The log should show a turn being submitted:
+Message your bot. The log should show it being handed over and read:
 
 ```
-INFO mekabridge::bridge::inbound: submitting a turn messages=1 conversations=1 session_id=...
+INFO mekabridge::bridge::inbound: rendered messages for the agent messages=1 conversations=1
+INFO mekabridge::bridge::inbound: handed a message to the agent seq=1 item=... replayed=false
+INFO mekabridge::bridge::inbound: the agent read a message seq=1 conversation=telegram:123456789
 INFO mekabridge::bridge: the agent sent a message conversation=telegram:123456789 parts=1
 ```
 
 If the agent read the message and chose not to reply, you get this instead, which is a normal outcome rather than a fault:
 
 ```
-INFO mekabridge::bridge::inbound: the agent sent no messages this turn conversations=1
+WARN mekabridge::bridge::inbound: the agent sent no messages this turn messages=1
 ```
 
 ## Troubleshooting the first run

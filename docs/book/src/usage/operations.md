@@ -55,25 +55,33 @@ WantedBy=multi-user.target
 
 `Requires=` plus `After=` means meka starts after the bridge and is stopped if the bridge is. meka does recover on its own from a bridge that was missing at boot, retrying in the background with backoff, so this is about avoiding the window rather than avoiding a permanent break: while the server is disconnected, `required = true` makes meka refuse turns rather than run them with no way to reply.
 
+The bridge recovers from the opposite order on its own too, and waits rather than failing: it cannot bind a session or open a feed until meka answers, so it retries both with backoff and starts handing messages over the moment it can. Messages that arrive meanwhile wait in the queue.
+
 Restarting the bridge alone is safe at any point, but meka's reconnect is lazy: it is driven by the next tool call that finds the transport closed, not by the restart.
 
 ## Shutdown
 
-SIGTERM or SIGINT stops the channels and the drain loop, then waits up to 30 seconds for an in-flight turn to finish, then checkpoints the database.
+SIGTERM or SIGINT stops the channels, the feed reader and the session task, then waits up to 30 seconds for anything in flight, then checkpoints the database.
 
-A turn already running is allowed to complete. Cutting it off would leave its batch marked in flight with the provider tokens already spent. If the drain window expires anyway, the batch stays in flight and the next start returns it to the queue, so nothing is lost either way.
+Nothing here has to finish. A hand-over is durable on whichever side it reached: one meka has already accepted is meka's to run, and one it has not is posted again on the next start under the same key. A turn already running on meka's side is unaffected by the bridge stopping at all, since the bridge no longer holds it open.
 
 ## Crash recovery
 
-Every inbound message is written to SQLite before the agent is woken for it, so a crash mid-turn loses no work: on start, rows left in flight are returned to pending.
+Every inbound message is written to SQLite before the agent is woken for it, and the hand-over that carries it is written down too, so a crash at any point loses nothing and repeats nothing:
 
 ```
-WARN mekabridge::bridge: recovered messages that were in flight when the bridge last stopped count=3
+WARN mekabridge::bridge::inbound: recovered hand-overs the previous run left open orphaned=1 unposted=1 posted=2
 ```
 
-Delivered rows are kept for seven days rather than deleted immediately, because they are what makes duplicate detection work across a restart: Telegram resends any update whose offset was never confirmed, and without a record of having delivered one the bridge cannot tell it from a message it has never seen.
+- **`orphaned`**: rows claimed with nothing ever rendered for them. Nothing reached meka, so they go straight back to the queue.
+- **`unposted`**: an item was rendered and never posted. The same bytes go out under the same key, rather than a fresh item that would state a backlog already marked seen and so state nothing at all.
+- **`posted`**: meka has the item and its fate is unknown. The feed's replay usually says, and every one of them is asked about under its own key as soon as the feed is open, so nothing waits on an outcome that has been and gone.
 
-**There is one window a hard kill can still lose.** Telegram's client library confirms a batch's offset as soon as the batch arrives, before the bridge has stored any of it, so a small number of messages can be acknowledged to Telegram and not yet written. The buffer between the pollers and the writer bounds that number at eight, and blocking the poller when it is full is what stops the confirmation going out any earlier. In practice this only bites on `SIGKILL`, an OOM kill, or power loss: `SIGTERM` drains, and an idle bridge has nothing in flight. Those messages are lost outright rather than recorded as unseen, which makes it the one loss path here that leaves no trace. Closing it fully means the bridge driving `getUpdates` itself, from the highest id it has actually stored.
+`mekabridge queue list` shows the same states, per row, while the bridge runs.
+
+Delivered rows are kept for seven days rather than deleted immediately, because they are what makes duplicate detection work across a restart: Telegram resends any update whose offset was never confirmed, and without a record of having delivered one the bridge cannot tell it from a message it has never seen. Sweeping one takes the rendered item with it. A row that ends `failed` drops its rendered item there and then and is kept, since it is what an operator has to look at.
+
+**There is one window a hard kill can still lose.** Telegram's client library confirms an update batch's offset as soon as the batch arrives, before the bridge has stored any of it, so a small number of messages can be acknowledged to Telegram and not yet written. The buffer between the pollers and the writer bounds that number at eight, and blocking the poller when it is full is what stops the confirmation going out any earlier. In practice this only bites on `SIGKILL`, an OOM kill, or power loss: `SIGTERM` drains, and an idle bridge has nothing in flight. Those messages are lost outright rather than recorded as unseen, which makes it the one loss path here that leaves no trace. Closing it fully means the bridge driving `getUpdates` itself, from the highest id it has actually stored.
 
 Discord has no equivalent window, because its gateway replays from a sequence number on resume. It has the opposite gap: nothing backfills messages sent while the connection was down.
 
@@ -83,26 +91,35 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 
 | Line | Meaning |
 |------|---------|
-| `submitting a turn messages=N` | A batch went to the agent |
-| `the agent sent no messages this turn` | The agent read the batch and sent nothing. Legal, but logged at warn with the text it produced instead, because from the other end it is indistinguishable from a broken bridge |
-| `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the batch is retried at once |
-| `requeued messages after a failed turn` | The batch goes back for another attempt. `retry_in` says how long it waits first, and is absent only for the empty-response case, which is offered again at once |
-| `the turn failed after the agent had already acted` | Not retried, and the batch is marked delivered. meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
-| `the agent's session no longer fits the model's context window` | Not retried, and the next message will fail the same way. The one turn failure that is about the session rather than the message |
-| `giving up on messages after N attempt(s)` | The batch is `failed`. The chat is told something went wrong, the owner is told what, and the message goes back to being unseen |
-| `inbound queue is full` | Messages are being shed; the agent is told how many in the next envelope |
-| `recovered messages that were in flight` | The previous run died mid-turn |
+| `following the session feed` | The feed is open. Everything below that reports an outcome arrives on it |
+| `rendered messages for the agent` | A settled pass became one inbox item per message. None has left yet |
+| `handed a message to the agent` | meka accepted the item and now owns getting it read. `replayed=true` means meka already had it, which is how a restart settles rather than sends twice |
+| `the agent was woken for this bridge's messages` | meka opened a turn on one of this bridge's items |
+| `the agent read a message` | The provider accepted a request carrying it, so the model has seen it. This, and only this, is what marks a message delivered |
+| `turn finished sends=N tool_calls=N` | A turn that carried this bridge's messages ended. `messages` says how many it read |
+| `the agent sent no messages this turn` | The agent read them and sent nothing. Legal, but logged at warn with the text it produced instead, because from the other end it is indistinguishable from a broken bridge |
+| `the model returned an empty response` | The provider came back with no content and no tool calls. Nothing ran, so the messages are offered again |
+| `meka did not accept a message (...); trying again` | The post did not get through. `retry_in` says how long it waits, doubling from 10s to 5m |
+| `giving up on a message meka never accepted` | An hour of posts, none of which got through. The message goes back among what the agent has not seen and both the chat and the owner are told |
+| `meka refused a message` | A refusal no wait can clear: a rejected token, a malformed request, a context overflow. Given up on at once, so this arrives seconds after the message rather than an hour later |
+| `meka gave up on a message` | meka spent its own hour on the item. Same outcome as the line above, decided on the other side |
+| `a message did not reach the agent (...); it is offered again` | Its item was taken back unread, or the turn that read it produced nothing at all. It is handed over afresh under a new key |
+| `the turn ended after the agent had read this bridge's messages` | Not offered again, and the messages are marked delivered. meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
+| `the agent's session no longer fits the model's context window` | Not something a retry fixes, and the next message will fail the same way. The one failure that is about the session rather than the message |
+| `giving up on N message(s)` | The chat is told something went wrong, the owner is told what, and the messages go back to being unseen |
+| `recovered hand-overs the previous run left open` | The previous run stopped mid-hand-over. `orphaned`, `unposted` and `posted` say what state each was in; see [Crash recovery](#crash-recovery) |
+| `inbound queue is full` | Messages are being shed; the agent is told how many on the next item handed over |
+| `lost the session feed (...); reconnecting` | The connection to meka dropped. It is reopened from the last event acted on and meka replays what was missed; nothing is lost and nothing is delivered twice |
+| `could not open the session feed (...); trying again` | The reconnect itself failed. Retried with backoff up to 30s; only repeated lines are a concern |
+| `meka notice: the replay does not reach your Last-Event-ID ...` or `Fell behind ...` | Some events are gone. Every hand-over still out is asked about under its own key, so nothing is waiting on an outcome that has already passed |
+| `meka has had a message longer than an outcome can take; asking what became of it` | An outcome that arrived and could not be written down. meka gives up on an item within the hour, so anything older has an answer waiting; the bridge asks rather than leaving the message with meka |
+| `meka had no record of a message it had accepted` | meka's store was replaced, or `[meka].token` was rotated, which changes the scope of the key. It is handed over afresh, and on a rotation the agent may read it twice |
+| `skipping a feed frame this build cannot read` | One event this version does not understand. Skipped rather than reconnected over, since a reconnect would replay it and fail identically |
 | `logged in` | Which account a channel resolved to at startup, which is what every message it records is keyed on |
 | `this channel is logged in as a different account than last time` | The bot behind a channel was replaced. Nothing is lost, but messages recorded under the old account cannot be replied to, reacted to, edited, or deleted from the new one, and the history tools mark them |
 | `could not find out which account this channel is logged in as` | The platform did not answer the startup probe, so the channel is not started this run; the others are unaffected |
-| `meka no longer knows session ...` | The session was deleted in meka; a replacement is created and the agent's memory is gone |
+| `meka no longer knows session ...` | The session was deleted in meka; a replacement is bound and the agent's memory is gone |
 | `meka asked for permission` | Unexpected: sessions declare they cannot answer prompts, so meka should deny without asking |
-| `the turn was cancelled ... having done nothing` | meka stopped the turn before the agent had acted, most often because the stream went away for longer than `[serve].stream_reattach_grace`. The batch goes back to the queue |
-| `the turn was cancelled ... after the agent had already acted` | Stopped partway through work that had real effects. Not retried, for the same reason a failure after a send is not |
-| `lost the turn stream ...; rejoining it` | The connection to meka dropped and is being resumed from the last event seen. The turn keeps running and nothing is delivered twice |
-| `could not rejoin the turn stream ...; trying again` | The rejoin request itself failed. Retried while meka still holds the turn open; only repeated lines are a concern |
-| `lost the turn stream and could not rejoin it` | Resuming failed too, so what the turn did is unknown. The batch goes back to the queue, which may deliver the same messages twice |
-| `meka notice: the replay does not reach your Last-Event-ID ...` or `Fell behind ...` | The rejoin could not replay everything, so some events are gone. The batch is closed rather than retried; the owner is told only if the turn then failed as well |
 | `the agent viewed an attachment` | An image was fetched and passed to the model. `preview=true` means it was a still frame, not the file |
 | `the agent downloaded an attachment` | A file was written to `[storage].attachment_dir` |
 | `the agent turned a conversation down` | Muted or blocked. `mekabridge policy clear` undoes it |
@@ -133,7 +150,7 @@ Everything durable is in the SQLite database at `[storage].path`. Back it up wit
 
 The database holds the session binding, the account each channel has been logged in as, the conversation address book, the queue, and, since 0.3.0, a record of every message from every conversation the agent is not blocking. It does not hold the agent's side of the conversation or its reasoning; that lives inside meka's own session database.
 
-Upgrading to 0.13.0 rebuilds every table on the first start, which is one-way: an older build refuses to open the result rather than misread it. Take the backup first.
+Upgrading to 0.13.0 rebuilds every table on the first start, and 0.14.0 rebuilds the queue again. Both are one-way: an older build refuses to open the result rather than misread it. Take the backup first.
 
 That last part is what `read_history` and `search_history` read, and it makes the file as sensitive as the chats in it. `[storage].history_retention` bounds how far back it goes, and `"0s"` turns it off. See [Security](./security.md).
 
@@ -143,21 +160,22 @@ That last part is what `read_history` and `search_history` read, and it makes th
 
 **One message went unanswered while others worked.** Look for `the model returned an empty response`
 or `the agent sent no messages this turn` around that timestamp. The first means the provider
-returned nothing at all; the bridge hands the batch straight back and reports a failure if it keeps
+returned nothing at all; the messages are offered again, and reported as undeliverable if it keeps
 happening. The second carries the text the agent produced instead, which is usually enough to tell
 "it decided not to reply" from "it wrote an answer and never sent it". Neither is a delivery fault:
-the queue will show the batch as `done`.
+the queue will show the rows as `done`.
 
-**A chat was told the bridge had a problem.** Three things produce that notice, and the owner's
-copy says which:
+**A chat was told the bridge had a problem.** Four things produce that notice, and the owner's copy
+says which:
 
-- The retry budget ran out: `[bridge].turn_retries` attempts spaced 10s, 20s and 40s apart, so about
-  a minute. A rate limit or an overloaded provider is the usual cause, and meka's own three retries
-  happen inside the first attempt, so the upstream has been unavailable for a while by then.
-- The error was one no retry could fix, such as a rejected token. Given up on immediately, so this
-  one arrives seconds after the message rather than a minute.
-- The turn failed *after* the agent had already sent or run something. Not retried, and the chat is
-  told it may not have finished rather than that its message never arrived.
+- meka could not be reached for an hour from when the item was rendered. The posts are spaced 10s, 20s
+  and so on up to 5m apart, so this arrives long after the message rather than straight away.
+- meka had the item and spent its own hour on it, then gave up. Same wait, decided on the other side.
+- The error was one no wait could fix, such as a rejected token or a context overflow. Given up on
+  immediately, so this one arrives seconds after the message.
+- The turn failed *after* the model had read the messages. Not handed over again, and the chat is
+  told it may not have finished rather than that its message never arrived. A chat the agent had
+  already answered is told nothing at all, since an apology would contradict what it just said.
 
 `owner_conversation` has meka's error verbatim, and after a provider failure the upstream's own
 response alongside it, as `The provider said: ...`. That is what names a revoked credential or a
@@ -169,7 +187,9 @@ since the same text names it. `mekabridge queue list` shows the rows as `failed`
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
 
-**Every message suddenly fails, in every chat at once.** Look for `the agent's session no longer fits the model's context window`. One permanent session carries every conversation, so a window it has outgrown refuses the next message too, and no number of retries changes that. Shorten the conversation on meka's side, with `POST /v1/sessions/{id}/compact` or `/rewind` in its REPL. `mekabridge session reset --yes` also clears it, at the price of the agent's memory of every conversation.
+**Every message suddenly fails, in every chat at once.** Look for `the agent's session no longer fits the model's context window`. One permanent session carries every conversation, so a window it has outgrown refuses the next message too, and no number of attempts changes that. Shorten the conversation on meka's side, with `POST /v1/sessions/{id}/compact` or `/rewind` in its REPL. `mekabridge session reset --yes` also clears it, at the price of the agent's memory of every conversation; anything handed over is closed and put back among what the agent has not seen, so the new session meets it as a backlog.
+
+**Messages are piling up and nothing is being handed over.** `mekabridge queue list` shows the hand-overs as well as the rows. A hand-over `waiting on meka` with a rising post count and a `last error` is meka being unreachable or refusing; one `with meka` that never settles means the feed is not open, which the log says with `could not open the session feed`. One waiting hand-over holds the queue behind it deliberately: nothing overtakes it, since whatever is refusing the first will refuse the second, and releasing the later one would hand the agent the second half of a morning before the first.
 
 **A chat was told the bridge had a problem, but the owner's copy never came.** Most likely `[bridge].owner_conversation` names a chat the bridge cannot post to, which `mekabridge doctor` reports under `channels`. The cause to check first is a Discord user id where a channel id belongs: the two are both snowflakes, so startup validation accepts it and Discord answers `Unknown Channel` on every send. `discord:@<user id>` is the form that reaches a person. Failing that, the owner's notice is rate limited like the chat's, to one every fifteen minutes.
 
@@ -219,12 +239,12 @@ The other two causes are the agent having muted or blocked the chat itself (same
 
 **A moderation call fails.** The bot needs to be an administrator of that specific chat with the matching right. Have the agent call `member` with no `user_id` to see what it actually holds there. Telegram also refuses any action against another administrator.
 
-**The agent replies to the wrong person.** Check the conversation ids in `mekabridge conversations list`. The agent routes by the id in the envelope header, so this usually means it reused a stale id rather than the one in front of it.
+**The agent replies to the wrong person.** Check the conversation ids in `mekabridge conversations list`. The agent routes by the `conversation:` header, so this usually means it reused a stale id rather than the one in front of it.
 
-**Messages arrive in one lump after a delay.** That is batching working as intended: everything that arrived during a turn is delivered together in the next one.
+**Messages arrive in one lump after a delay.** That is batching working as intended: everything that settles together is handed over together, and meka reads the lot into one turn.
 
 **Every reply feels a couple of seconds slow.** That is `[bridge].settle`, which waits for a chat to go quiet so a burst becomes one turn instead of being answered after the first fragment. Lower it if you would rather have the latency back, but expect the agent to reply mid-thought more often.
 
-**Replies in a busy group are consistently delayed by the same amount.** The chat never goes quiet for a full `settle`, so `settle_max` is releasing every batch rather than acting as an occasional fallback. Lower `settle_max`, or accept it as the price of one turn per burst instead of one per message.
+**Replies in a busy group are consistently delayed by the same amount.** The chat never goes quiet for a full `settle`, so `settle_max` is releasing every pass rather than acting as an occasional fallback. Lower `settle_max`, or accept it as the price of one turn per burst instead of one per message.
 
-**A file was not downloaded.** It exceeded `attachment_max_bytes`. The envelope says so, and the agent can tell the user.
+**A file was not downloaded.** It exceeded `attachment_max_bytes`. The `attachment:` line says so, and the agent can tell the user.

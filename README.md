@@ -8,7 +8,7 @@ People message a bot, the agent reads what they wrote, and the agent decides wha
 
 mekabridge treats the agent as a person with a phone.
 
-- **Inbound** messages from every configured channel are queued and handed to the agent in batches. One meka session runs one turn at a time, so anything arriving mid-turn waits, the way messages wait while somebody is in a meeting.
+- **Inbound** messages from every configured channel are queued and handed to the agent through meka's session inbox, one item per message. meka reads them all into one turn, so a burst costs one turn rather than one each, and something arriving while the agent is working reaches it inside that same turn, the way a person glances at a message mid-task.
 - **Outbound** messages happen only because the agent called an MCP tool. The bridge never writes chat content of its own. Replying, staying quiet, replying to somebody else, replying on a different platform, or messaging first tomorrow are all the agent's decisions.
 
 One instance owns exactly one meka session, permanently. That session is the agent's memory: everyone it has talked to, on every platform, in one continuous context.

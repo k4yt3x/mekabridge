@@ -1,4 +1,4 @@
-//! Running one turn against meka, and the presence signalling that goes with it.
+//! What a turn on the feed is doing, and the presence signalling that goes with it.
 //!
 //! The typing window is closed by the next `tool_call.executing` or `tool_call.composing`, not by
 //! one carrying the id that opened it. meka emits `composing` without marking the attempt as having
@@ -6,21 +6,24 @@
 //! fresh tool ids while the `composing` already on the wire cannot be taken back. Matching on the
 //! id waits for one that never arrives, leaving the indicator up until the turn ends.
 //!
-//! A turn that dies mid-call emits no closing event either, which is why the token is cancelled
-//! when the turn ends rather than only by an event.
+//! A turn that dies mid-call emits no closing event either, which is why the window is closed when
+//! the turn ends rather than only by an event.
 //!
 //! Cancelling has to abandon a request already in flight, not merely stop starting new ones: both
 //! platforms queue rate-limited calls rather than refusing them, so one allowed to finish keeps the
 //! indicator drawn for as long as the backlog takes to drain.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::{
     channel::{ChannelRegistry, ConversationId},
-    meka::{MekaClient, MekaError, TurnOutcome, sse::TurnEvent},
+    meka::sse::TurnEvent,
 };
 
 /// Which conversations the agent has sent to since the current composing window opened.
@@ -46,7 +49,7 @@ impl Presence {
             .insert(conversation.clone());
     }
 
-    /// Whether the agent has already sent to `conversation` this turn.
+    /// Whether the agent has already sent to `conversation` this window.
     pub fn has_replied(&self, conversation: &ConversationId) -> bool {
         self.replied
             .lock()
@@ -54,7 +57,7 @@ impl Presence {
             .contains(conversation)
     }
 
-    /// Forget everything, so the next turn starts from silence.
+    /// Forget everything, so the next window starts from silence.
     pub fn reset(&self) {
         self.replied
             .lock()
@@ -67,15 +70,14 @@ impl Presence {
 ///
 /// Two situations mean it: the replay ring no longer reaching the position asked for, and the
 /// re-attached subscription falling behind afterwards. Matched on prose because the event carries
-/// no code, which is fragile in the safe direction: a rewording means the counters are believed
-/// again, which is where they stood before any of this existed, rather than a batch being wrongly
-/// discarded. Worth asking meka for a flag on the event.
+/// no code, which is fragile only in the cheap direction: a rewording means one reconciliation is
+/// not run on the notice, and every reconnect runs one anyway.
 ///
 /// The gap notice is matched on the clause it has kept across rewordings rather than on its
 /// opening, which is what went stale: meka 0.46 replaced "Replay buffer does not reach" with "the
 /// replay does not reach", so a match on the first two words stopped firing a release before this
 /// bridge's own floor and nothing failed to say so.
-fn notice_reports_lost_events(text: &str) -> bool {
+pub fn notice_reports_lost_events(text: &str) -> bool {
     text.contains("does not reach your Last-Event-ID") || text.contains("Fell behind")
 }
 
@@ -83,33 +85,26 @@ fn notice_reports_lost_events(text: &str) -> bool {
 /// replied" apart from "the agent stayed quiet". meka namespaces MCP tools as
 /// `mcp__<server>__<tool>`, and the server segment is whatever the operator named this bridge in
 /// meka's config, so the match is on the suffix.
-const SEND_TOOL_SUFFIX: &str = "__send_message";
+pub const SEND_TOOL_SUFFIX: &str = "__send_message";
 
 /// How much assistant text to keep for diagnostics. Enough to hold any of meka's empty-turn
 /// stand-ins whole, and to show the opening of a real answer that never got delivered.
 const TEXT_PREVIEW_CHARS: usize = 240;
 
-/// What a turn did, for logging, for deciding whether to warn about a silent turn, and for deciding
-/// whether a failed one may be handed over again.
+/// Ceiling on how many turns are tracked at once, past which what is held is dropped.
 ///
-/// Reported for a failed turn as much as a finished one, which is why the outcome is a `Result` in
-/// here rather than the return type. meka's own retries are scoped to a single provider call, so a
-/// failure reaching the bridge may already have several calls behind it, and whether anything
-/// happened is the difference between a batch safe to offer again and one whose retry would repeat
-/// work the agent cannot remember doing.
-#[derive(Debug)]
-pub struct TurnReport {
-    pub outcome: Result<TurnOutcome, MekaError>,
-    /// Whether meka took the turn at all.
-    ///
-    /// A refused submission and a turn that ran and failed are both an `Err` but mean opposite
-    /// things: one reached the agent, the other reached nobody. Read off the events rather than
-    /// the error, which cannot tell them apart, since meka's `internal` covers both. Any
-    /// accepted turn opens with `turn.started` and a refusal produces no events at all.
-    ///
-    /// A stream that dies before its first event therefore reads as not accepted when it was,
-    /// erring toward showing the agent a backlog twice rather than losing it.
-    pub accepted: bool,
+/// A turn is forgotten when its terminal arrives, and a terminal lost to a replay hole would
+/// otherwise leave its entry behind for the life of the process. Far above the one turn a session
+/// runs at a time, so reaching it means terminals are going missing rather than that a session is
+/// busy.
+pub const MAX_TRACKED_TURNS: usize = 1024;
+
+/// What one turn has done so far, tallied off the feed.
+///
+/// For logging, for deciding whether to warn about a silent turn, and for the one case where a
+/// delivered message is offered again: the model came back with nothing at all.
+#[derive(Debug, Default)]
+pub struct TurnTally {
     /// Times the agent called a send tool during the turn.
     pub sends: usize,
     /// Total tool calls, including sends.
@@ -121,60 +116,31 @@ pub struct TurnReport {
     /// produced instead. Without it an operator has to query meka's message API to find out why a
     /// message went unanswered, which is a poor thing to need at 3am.
     pub text_preview: String,
-    /// Whether the counters above are known to be missing events.
-    ///
-    /// Set when a rejoin reports a replay hole: meka retains a bounded ring, so a stream resumed
-    /// after a long enough gap comes back with a `notice` saying some events are gone rather than
-    /// a transcript that silently skips. Those events can include a send, which makes
-    /// [`Self::had_side_effects`] answer "no" for a turn that did act.
-    pub counters_incomplete: bool,
-    /// What meka said it did with the envelope this turn carried, off the terminal event.
-    ///
-    /// `None` where it said nothing: a turn that never began, a turn that finished (there is
-    /// nothing to withdraw from one that worked), and the `sse-lag` failure, which is the stream's
-    /// own event rather than the turn's. Read through [`Self::envelope_kept`] rather than
-    /// directly, since what a caller wants to know is whether the envelope is still in front
-    /// of the agent.
-    pub message_withdrawn: Option<bool>,
+    /// This bridge's messages the model read in this turn, by queue sequence. Filled from
+    /// `inbox.delivered`, not from the turn's opening: a turn opened on an item and failed before
+    /// the provider accepted the request never showed the model anything.
+    pub read: Vec<i64>,
 }
 
-impl TurnReport {
-    /// A turn that never got as far as running, so nothing was produced and nothing was done.
-    pub fn failed(error: MekaError) -> Self {
-        Self {
-            outcome: Err(error),
-            accepted: false,
-            sends: 0,
-            tool_calls: 0,
-            text_length: 0,
-            text_preview: String::new(),
-            counters_incomplete: false,
-            message_withdrawn: None,
+impl TurnTally {
+    /// Count what `event` says the agent did.
+    pub fn note(&mut self, event: &TurnEvent) {
+        match event {
+            TurnEvent::AssistantText { text } => {
+                self.text_length += text.chars().count();
+                // Bounded: a long answer would otherwise be held in memory for a log line.
+                if self.text_preview.chars().count() < TEXT_PREVIEW_CHARS {
+                    self.text_preview.push_str(text);
+                }
+            }
+            TurnEvent::ToolCallStarted { name, .. } => {
+                self.tool_calls += 1;
+                if name.ends_with(SEND_TOOL_SUFFIX) {
+                    self.sends += 1;
+                }
+            }
+            _ => {}
         }
-    }
-
-    /// Whether the envelope this turn carried is still in front of the agent.
-    ///
-    /// What decides whether the announcements riding on it (the backlog a conversation is owed, the
-    /// count of messages that could not be queued) have been delivered. They are stated once, in
-    /// the envelope, so if meka took the envelope back they were never said and must be said again.
-    ///
-    /// Answered from what meka reports rather than from the stream. meka is explicit that the
-    /// stream cannot be read for this: thinking and a half-composed tool call both look like output
-    /// and neither reaches the conversation, while a reply of nothing but thinking does.
-    ///
-    /// Silence is read as "gone", which is the safe direction. Repeating a backlog costs the agent
-    /// a line it has already seen; dropping one loses messages from every path that would have
-    /// found them again. A turn that finished is the exception and is not silence at all: meka
-    /// withdraws only from a turn that ended badly, so there is nothing for it to report.
-    pub fn envelope_kept(&self) -> bool {
-        if !self.accepted {
-            return false;
-        }
-        if matches!(self.outcome, Ok(TurnOutcome::Finished { .. })) {
-            return true;
-        }
-        self.message_withdrawn == Some(false)
     }
 
     /// A turn that produced text but sent nothing.
@@ -185,42 +151,16 @@ impl TurnReport {
         self.sends == 0
     }
 
-    /// Whether anything happened that a second attempt would repeat.
-    ///
-    /// Sends and tool calls, not text. Text costs tokens and nothing else, so a turn that wrote a
-    /// paragraph and then died can be handed over again without anybody noticing; a turn that ran a
-    /// shell command cannot, and the agent would have no memory of the first run to tell it apart
-    /// from the second.
-    pub const fn had_side_effects(&self) -> bool {
-        // A hole in the accounting counts as "it acted". The two readings are not symmetric: a
-        // turn wrongly held to have acted costs one unanswered message that is still owed to the
-        // agent and reported to whoever is waiting, while one wrongly held to have done nothing is
-        // replayed, and the agent repeats work it cannot remember doing.
-        self.counters_incomplete || self.sends > 0 || self.tool_calls > 0
-    }
-
     /// Whether the turn did nothing at all because the model came back empty.
     ///
     /// meka streams a bracketed stand-in as the assistant text when a turn yields no content, and
-    /// paired with zero tool calls that is provably inert, so the batch can be handed over again.
+    /// paired with zero tool calls that is provably inert, so what it read can be offered again.
     /// Refusals are excluded, being a real answer.
     ///
     /// Matching meka's wording is brittle but degrades safely: a rewording leaves the turn treated
-    /// as silent and logged rather than retried.
-    pub fn produced_nothing(&self) -> bool {
-        // Only a turn that ran to its own end can be called inert. One that was stopped partway
-        // produced the stand-in for the round it managed rather than for the turn, and what to do
-        // with its batch is the cancellation's decision, not this one's.
-        let Ok(TurnOutcome::Finished { stop_reason, .. }) = &self.outcome else {
-            return false;
-        };
-        // Provably is the operative word, and a hole in the accounting is exactly the case where
-        // nothing is provable: the counters are a floor, so zero tool calls is not evidence that
-        // none ran, and the stand-in describes only the part of the stream that came back. Read
-        // without this the turn looks inert, the batch is handed over at once, and the agent
-        // repeats a send it cannot remember making. This is the same guard `had_side_effects` makes
-        // on the failure path, which is worth nothing if the success path answers first.
-        if self.counters_incomplete || self.tool_calls > 0 || stop_reason == "refusal" {
+    /// as silent and logged rather than offered again.
+    pub fn produced_nothing(&self, stop_reason: &str) -> bool {
+        if self.tool_calls > 0 || stop_reason == "refusal" {
             return false;
         }
         let text = self.text_preview.trim();
@@ -228,205 +168,132 @@ impl TurnReport {
     }
 }
 
-/// Runs turns and keeps the originating conversations looking alive while they run.
-pub struct TurnRunner {
-    meka: MekaClient,
+/// Draws the typing indicator in the chats a turn is answering, while the model writes a message.
+///
+/// Keyed by turn because the feed carries every turn on the session, and a window opened by one
+/// must not be closed by the events of the next. The conversations a turn is answering are those
+/// of the items it opened on or read, which is the best guess available: `tool_call.composing`
+/// carries the tool name and nothing else, so the message's actual target is not knowable until
+/// the call runs.
+pub struct TurnTypist {
     channels: Arc<ChannelRegistry>,
-    typing_enabled: bool,
+    enabled: bool,
     /// How often the indicator is renewed, from
     /// [`crate::config::BridgeConfig::typing_refresh`].
-    typing_refresh: Duration,
+    refresh: Duration,
     /// Ceiling on how long the indicator is held, from
     /// [`crate::config::BridgeConfig::typing_max`].
-    typing_max: Duration,
+    max: Duration,
     /// Shared with the outbound sink so the indicator can stop once a reply has actually landed.
     presence: Arc<Presence>,
+    /// The open composing window of each turn.
+    windows: HashMap<String, CancellationToken>,
+    /// Which conversations each turn is answering.
+    targets: HashMap<String, BTreeSet<ConversationId>>,
 }
 
-impl TurnRunner {
-    pub const fn new(
-        meka: MekaClient,
+impl TurnTypist {
+    pub fn new(
         channels: Arc<ChannelRegistry>,
-        typing_enabled: bool,
-        typing_refresh: Duration,
-        typing_max: Duration,
+        enabled: bool,
+        refresh: Duration,
+        max: Duration,
         presence: Arc<Presence>,
     ) -> Self {
         Self {
-            meka,
             channels,
-            typing_enabled,
-            typing_refresh,
-            typing_max,
+            enabled,
+            refresh,
+            max,
             presence,
+            windows: HashMap::new(),
+            targets: HashMap::new(),
         }
     }
 
-    /// Submit `message` and drive the turn to completion.
-    ///
-    /// `conversations` are the ones the batch came from; each gets a typing indicator until the
-    /// agent replies there or the window lapses.
-    pub async fn run(
-        &self,
-        session_id: Uuid,
-        message: &str,
-        conversations: &BTreeSet<ConversationId>,
-    ) -> TurnReport {
-        // Sends from an earlier turn must not suppress this turn's indicator.
+    /// A turn began. Sends from an earlier turn must not suppress this one's indicator.
+    pub fn begin(&mut self, turn: &str) {
         self.presence.reset();
-        // Nothing is raised until the model starts writing a send call. Opening it any earlier,
-        // on submission or on `Started`, is a claim that a reply is being written when the agent
-        // may be about to spend two minutes reading files.
-        let mut typing: Option<CancellationToken> = None;
-
-        let mut sends = 0_usize;
-        let mut tool_calls = 0_usize;
-        let mut text_length = 0_usize;
-        let mut text_preview = String::new();
-        let mut counters_incomplete = false;
-        let mut message_withdrawn: Option<bool> = None;
-
-        let mut accepted = false;
-        let result = self
-            .meka
-            .run_turn(session_id, message, |event| {
-                // Any event at all means meka took the turn: a refused submission never opens a
-                // stream, so nothing reaches here. `turn.started` is always the first, but this
-                // deliberately does not name it -- the point is "something arrived", and tying it to
-                // one variant would go quiet the day meka reorders its opening events.
-                accepted = true;
-                match event {
-                TurnEvent::AssistantText { text } => {
-                    text_length += text.chars().count();
-                    // Bounded: a long answer would otherwise be held in memory for a log line.
-                    if text_preview.chars().count() < TEXT_PREVIEW_CHARS {
-                        text_preview.push_str(text);
-                    }
-                }
-                TurnEvent::ToolCallComposing { name, .. } => {
-                    // Closes first, unconditionally. A second `composing` means the previous call
-                    // is over one way or another: either its arguments finished, or meka retried
-                    // the round and the call being announced now is its replacement. Clearing the
-                    // presence record belongs to `start_typing`, which owns the window it opens.
-                    if let Some(previous) = typing.take() {
-                        previous.cancel();
-                    }
-                    if !name.ends_with(SEND_TOOL_SUFFIX) {
-                        return;
-                    }
-                    typing = Some(self.start_typing(conversations));
-                }
-                TurnEvent::ToolCallStarted { name, .. } => {
-                    tool_calls += 1;
-                    if name.ends_with(SEND_TOOL_SUFFIX) {
-                        sends += 1;
-                    }
-                    // The arguments are written, so whatever was being composed is composed. Closed
-                    // here rather than left to the send landing, because a send that fails never
-                    // lands and would leave the indicator up until the turn ended.
-                    if let Some(typing) = typing.take() {
-                        typing.cancel();
-                    }
-                    tracing::debug!(tool = %name, "agent tool call");
-                }
-                TurnEvent::Notice { level, text } => {
-                    if notice_reports_lost_events(text) {
-                        counters_incomplete = true;
-                    }
-                    tracing::warn!(level = %level, "meka notice: {}", text);
-                }
-                TurnEvent::ContextCompacted {
-                    source,
-                    replaced_count,
-                    generation,
-                } => {
-                    // Worth a line at warn because of what this session is. One permanent context
-                    // holds everyone the agent has ever spoken to, on every platform, so a
-                    // compaction is the moment its memory of conversations nobody is currently
-                    // having becomes a summary. Nothing here can prevent it; an operator wondering
-                    // why the agent forgot somebody should be able to find when.
-                    tracing::warn!(
-                        source = %source,
-                        replaced = replaced_count,
-                        generation,
-                        "meka compacted the session; earlier conversations are now a summary"
-                    );
-                }
-                TurnEvent::PermissionRequired { tool_name, .. } => {
-                    // Sessions declare `supports_permission_prompts: false`, so meka denies a gated
-                    // tool immediately rather than emitting this. Reaching here means the turn is
-                    // about to stall for the full timeout with nothing able to answer.
-                    tracing::error!(
-                        tool = %tool_name,
-                        "meka asked for permission, but this bridge has no approval channel; the \
-                         turn will stall and deny. meka only asks when its [permissions].approvals \
-                         is on for the session, so turn that off and raise [session].permission if \
-                         the tool is one the agent should reach."
-                    );
-                }
-                // Both terminals carry it, and only the terminal does. Recorded here rather than
-                // read off the outcome because a failure arrives as a Problem Detail, which this
-                // field deliberately sits beside rather than inside.
-                TurnEvent::Failed {
-                    message_withdrawn: withdrawn,
-                    ..
-                }
-                | TurnEvent::Cancelled {
-                    message_withdrawn: withdrawn,
-                    ..
-                } => {
-                    message_withdrawn = *withdrawn;
-                }
-                _ => {}
-                }
-            })
-            .await;
-
-        if let Some(typing) = typing {
-            typing.cancel();
+        // Bounded by dropping what is held, the same rule the notice log uses. Every window is
+        // cancelled on the way out, so nothing is left drawing in a chat; what is lost is the
+        // record of which chats a turn already under way is answering, and the worst of that is an
+        // indicator that does not appear.
+        if self.targets.len() >= MAX_TRACKED_TURNS {
+            tracing::warn!(
+                "tracking {} turns, so terminals are going missing; forgetting what is held",
+                self.targets.len()
+            );
+            for (_, window) in self.windows.drain() {
+                window.cancel();
+            }
+            self.targets.clear();
         }
+        self.targets.entry(turn.to_string()).or_default();
+    }
 
-        // The counters are kept on the error path too. They used to be dropped with the `Ok`, which
-        // left the caller unable to tell a turn that failed before the agent did anything from one
-        // that failed after it had already answered somebody.
-        //
-        // A turn that ended in `sse-lag` is the case those counters cannot describe: meka dropped
-        // events from this client's view before cancelling, so a send may have happened and left no
-        // trace here. Counting that as "did nothing" is what hands the batch back for a second
-        // delivery.
-        let counters_incomplete =
-            counters_incomplete || result.as_ref().is_err_and(MekaError::dropped_events);
-        TurnReport {
-            outcome: result,
-            accepted,
-            sends,
-            tool_calls,
-            text_length,
-            text_preview,
-            counters_incomplete,
-            message_withdrawn,
+    /// Note that `turn` is answering `conversations`, on top of any it already was.
+    pub fn expect(&mut self, turn: &str, conversations: impl IntoIterator<Item = ConversationId>) {
+        self.targets
+            .entry(turn.to_string())
+            .or_default()
+            .extend(conversations);
+    }
+
+    /// Open or close a window on a tool-call event of `turn`.
+    pub fn observe(&mut self, turn: &str, event: &TurnEvent) {
+        match event {
+            TurnEvent::ToolCallComposing { name, .. } => {
+                // Closes first, unconditionally. A second `composing` means the previous call
+                // is over one way or another: either its arguments finished, or meka retried
+                // the round and the call being announced now is its replacement. Clearing the
+                // presence record belongs to `start_typing`, which owns the window it opens.
+                if let Some(previous) = self.windows.remove(turn) {
+                    previous.cancel();
+                }
+                if !name.ends_with(SEND_TOOL_SUFFIX) {
+                    return;
+                }
+                let Some(conversations) = self.targets.get(turn) else {
+                    // A turn this bridge handed nothing to has nobody waiting on it.
+                    return;
+                };
+                let token = self.start_typing(conversations);
+                self.windows.insert(turn.to_string(), token);
+            }
+            TurnEvent::ToolCallStarted { .. } => {
+                // The arguments are written, so whatever was being composed is composed. Closed
+                // here rather than left to the send landing, because a send that fails never
+                // lands and would leave the indicator up until the turn ended.
+                if let Some(window) = self.windows.remove(turn) {
+                    window.cancel();
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// The turn ended; nothing it was composing is coming.
+    pub fn close(&mut self, turn: &str) {
+        if let Some(window) = self.windows.remove(turn) {
+            window.cancel();
+        }
+        self.targets.remove(turn);
     }
 
     /// Open the indicator in each conversation until the returned token is cancelled, the agent
     /// replies there, or the ceiling is reached.
     ///
-    /// Called only while the model is writing a send call's arguments. `conversations` is the batch
-    /// the turn was submitted for rather than the message's actual target, which is not knowable
-    /// yet: `tool_call.composing` carries the tool name and nothing else, because no argument has
-    /// streamed. For the single-conversation batch that per-conversation readiness makes the common
-    /// case, the two are the same; for a batch spanning several chats it briefly shows the
-    /// indicator in one that is not being answered.
+    /// Called only while the model is writing a send call's arguments.
     fn start_typing(&self, conversations: &BTreeSet<ConversationId>) -> CancellationToken {
         let token = CancellationToken::new();
-        if !self.typing_enabled {
+        if !self.enabled {
             return token;
         }
         // Whatever a previous window recorded is stale the moment a new one opens. `Presence` stops
         // the refresh loop re-arming after a reply has landed, which was right when one indicator
         // covered a whole turn; per message it reads backwards, because a fresh composing event on
         // a send tool is exactly the evidence that another message is coming. Left standing, the
-        // record would silence every send after the first: the token is now dropped at
+        // record would silence every send after the first: the token is dropped at
         // `tool_call.executing`, before the send tool runs and records itself, so it can only ever
         // suppress a later window rather than the one it was written for.
         self.presence.reset();
@@ -440,8 +307,8 @@ impl TurnRunner {
             let channel = Arc::clone(channel);
             let conversation = conversation.clone();
             let presence = Arc::clone(&self.presence);
-            let typing_max = self.typing_max;
-            let typing_refresh = self.typing_refresh;
+            let typing_max = self.max;
+            let typing_refresh = self.refresh;
             let token = token.child_token();
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + typing_max;
@@ -454,16 +321,15 @@ impl TurnRunner {
                     if tokio::time::Instant::now() >= deadline {
                         tracing::debug!(
                             conversation = %conversation,
-                            "the turn has run past the typing window; letting the indicator lapse"
+                            "the window has run past the typing ceiling; letting the indicator lapse"
                         );
                         return;
                     }
                     // Raced against the token rather than simply awaited. A rate-limited platform
                     // parks the request instead of refusing it -- twilight queues typing calls
-                    // behind the channel's bucket -- so a request that outlives its turn has to be
-                    // abandoned, not merely followed by no more. Otherwise a burst of indicators
-                    // goes on arriving long after the agent stopped, which is exactly how a spin on
-                    // a refused submission turned into minutes of phantom typing.
+                    // behind the channel's bucket -- so a request that outlives its window has to
+                    // be abandoned, not merely followed by no more. Otherwise a burst of indicators
+                    // goes on arriving long after the agent stopped.
                     let sent = tokio::select! {
                         biased;
                         () = token.cancelled() => return,
@@ -498,17 +364,14 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{
-        channel::{
-            Activity, Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity,
-            FetchedFile, InboundEvent, Platform, SendOptions,
-        },
-        meka::sse::Usage,
+    use crate::channel::{
+        Activity, Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity,
+        FetchedFile, InboundEvent, Platform, SendOptions,
     };
 
     /// Every wording meka has emitted, copied from the emitting sites rather than paraphrased.
-    /// They are the only signal that a rejoin lost events, so a drift in any of them silently
-    /// restores the bug where a turn that had already sent gets handed back to send again.
+    /// A drift in any of them means one reconciliation is not run on the notice; the reconnect
+    /// runs one regardless, which is why this is cheap to get wrong and still worth pinning.
     ///
     /// Both spellings of the gap notice are here because pinning only the one this bridge was
     /// written against is what hid the drift: meka reworded it in 0.46, the assertion and the
@@ -529,15 +392,13 @@ mod tests {
         assert!(notice_reports_lost_events(
             "Fell behind; 12 event(s) were dropped from this replay."
         ));
-        // An ordinary notice must not make the counters look untrustworthy: that would mark every
-        // batch spent and stop anything ever being retried.
+        // An ordinary notice must not trigger a reconciliation per notice.
         assert!(!notice_reports_lost_events(
             "Session was compacted before this turn."
         ));
     }
 
-    /// A short ceiling, so the test that proves the indicator lapses does not take half an hour.
-    /// Production follows `[meka].turn_timeout` unless the operator pins it.
+    /// A short ceiling, so the test that proves the indicator lapses does not take two minutes.
     const TEST_TYPING_MAX: Duration = Duration::from_secs(30);
 
     /// What the shipped default is; these tests assert against the interval they configure.
@@ -698,32 +559,58 @@ mod tests {
         }
     }
 
-    fn runner_with(channel: Arc<SpyChannel>, presence: Arc<Presence>) -> TurnRunner {
-        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
-            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
-            token: crate::config::secret::Secret::new("test", "test"),
-            connect_timeout: Duration::from_secs(1),
-            turn_timeout: Duration::from_secs(1),
-            max_retries: 0,
-        })
-        .expect("client builds");
+    fn typist_with(channel: Arc<SpyChannel>, presence: Arc<Presence>, enabled: bool) -> TurnTypist {
         let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
             channel as Arc<dyn Channel>
         ]));
-        TurnRunner::new(
-            meka,
-            channels,
-            true,
-            TYPING_REFRESH,
-            TEST_TYPING_MAX,
-            presence,
-        )
+        TurnTypist::new(channels, enabled, TYPING_REFRESH, TEST_TYPING_MAX, presence)
     }
 
     fn conversations() -> BTreeSet<ConversationId> {
         let mut set = BTreeSet::new();
         set.insert(ConversationId::parse("spy:1").expect("valid"));
         set
+    }
+
+    fn composing(name: &str) -> TurnEvent {
+        TurnEvent::ToolCallComposing {
+            id: "c1".to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn executing(name: &str) -> TurnEvent {
+        TurnEvent::ToolCallStarted {
+            id: "c1".to_string(),
+            name: name.to_string(),
+            display_summary: None,
+        }
+    }
+
+    /// A turn is forgotten on its terminal, and a terminal lost to a replay hole would otherwise
+    /// leave its entry behind for good. Bounded by dropping the lot, with every window cancelled
+    /// so nothing is left claiming somebody is being written to.
+    #[tokio::test(start_paused = true)]
+    async fn tracking_is_bounded_when_terminals_go_missing() {
+        let channel = Arc::new(SpyChannel::new());
+        let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
+        typist.begin("t0");
+        typist.expect("t0", conversations());
+        typist.observe("t0", &composing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let drawn = channel.activity_count();
+        assert!(drawn >= 1, "the window has to be open to begin with");
+
+        for index in 0..MAX_TRACKED_TURNS {
+            typist.begin(&format!("spare{index}"));
+        }
+        assert!(typist.targets.len() <= MAX_TRACKED_TURNS, "unbounded");
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            drawn,
+            "a window dropped with its turn went on drawing"
+        );
     }
 
     #[test]
@@ -736,7 +623,7 @@ mod tests {
         presence.reset();
         assert!(
             !presence.has_replied(&conversation),
-            "a new turn must start from silence, not inherit the last one's sends"
+            "a new window must start from silence, not inherit the last one's sends"
         );
     }
 
@@ -746,9 +633,9 @@ mod tests {
         // re-arming afterwards tells a user who was just answered that a second message is coming.
         let channel = Arc::new(SpyChannel::new());
         let presence = Arc::new(Presence::default());
-        let runner = runner_with(Arc::clone(&channel), Arc::clone(&presence));
+        let typist = typist_with(Arc::clone(&channel), Arc::clone(&presence), true);
 
-        let token = runner.start_typing(&conversations());
+        let token = typist.start_typing(&conversations());
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
             channel.activity_count(),
@@ -768,21 +655,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_new_window_draws_even_in_a_chat_just_answered() {
-        // The regression the per-message rework introduced. The gate stops a *live* loop re-arming
-        // after a reply; it must not stop the next message being announced, and under the new
-        // scheme every window after the first would otherwise draw nothing, because the indicator
-        // is dropped before the send tool runs and records itself.
+        // The gate stops a *live* loop re-arming after a reply; it must not stop the next message
+        // being announced, since the indicator is dropped before the send tool runs and records
+        // itself, so every window after the first would otherwise draw nothing.
         let channel = Arc::new(SpyChannel::new());
         let presence = Arc::new(Presence::default());
-        let runner = runner_with(Arc::clone(&channel), Arc::clone(&presence));
+        let typist = typist_with(Arc::clone(&channel), Arc::clone(&presence), true);
 
-        let first = runner.start_typing(&conversations());
+        let first = typist.start_typing(&conversations());
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(channel.activity_count(), 1);
         presence.note_sent(&ConversationId::parse("spy:1").expect("valid"));
         first.cancel();
 
-        let second = runner.start_typing(&conversations());
+        let second = typist.start_typing(&conversations());
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
             channel.activity_count(),
@@ -794,13 +680,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_stops_the_indicator_promptly() {
-        // What actually ends the indicator on a normal turn. Nothing covered it, and the ceiling
-        // used to be 30s, so a leak here would have looked like a brief tail rather than the
-        // half-hour one the turn budget now allows.
         let channel = Arc::new(SpyChannel::new());
-        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+        let typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
 
-        let token = runner.start_typing(&conversations());
+        let token = typist.start_typing(&conversations());
         tokio::time::sleep(TYPING_REFRESH * 3).await;
         assert!(
             channel.activity_count() > 1,
@@ -816,7 +699,7 @@ mod tests {
         assert_eq!(
             channel.activity_count(),
             after_cancel,
-            "the indicator kept refreshing after the turn ended"
+            "the indicator kept refreshing after the window closed"
         );
     }
 
@@ -824,12 +707,12 @@ mod tests {
     async fn cancelling_abandons_a_typing_request_that_has_not_gone_out_yet() {
         // Discord queues typing calls behind the channel's rate limit bucket, so one can sit for
         // seconds before it is sent. Cancelling has to drop the request, not just decline to make
-        // the next one: a bridge that spun on a refused submission left thousands of them queued,
-        // and the platform went on drawing the indicator for minutes after meka had gone idle.
+        // the next one, or the platform goes on drawing the indicator for minutes after the agent
+        // has gone quiet.
         let channel = Arc::new(SpyChannel::slow(Duration::from_secs(10)));
-        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+        let typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
 
-        let token = runner.start_typing(&conversations());
+        let token = typist.start_typing(&conversations());
         tokio::time::sleep(Duration::from_secs(1)).await;
         token.cancel();
 
@@ -842,13 +725,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn typing_lapses_once_the_turn_outlives_the_window() {
+    async fn typing_lapses_once_the_window_outlives_the_ceiling() {
         // A turn grinding through tool calls is working, not composing. Holding the indicator for
         // its whole duration claims something no person would.
         let channel = Arc::new(SpyChannel::new());
-        let runner = runner_with(Arc::clone(&channel), Arc::new(Presence::default()));
+        let typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
 
-        let token = runner.start_typing(&conversations());
+        let token = typist.start_typing(&conversations());
         tokio::time::sleep(TEST_TYPING_MAX * 4).await;
 
         let sent = channel.activity_count();
@@ -861,274 +744,163 @@ mod tests {
         token.cancel();
     }
 
-    #[tokio::test]
-    async fn a_refused_submission_does_not_announce_typing() {
-        // The indicator claims the agent is composing. A submission meka refuses never reached the
-        // agent at all, so announcing it is a plain falsehood -- and since a refused batch is now
-        // retried rather than dropped, one flash per attempt reads as a permanently typing bot.
-        let channel = Arc::new(SpyChannel::new());
-        // Nothing listens on this port, so the submission fails before meka ever sees it.
-        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
-            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
-            token: crate::config::secret::Secret::new("test", "test"),
-            connect_timeout: Duration::from_millis(50),
-            turn_timeout: Duration::from_secs(1),
-            max_retries: 0,
-        })
-        .expect("client builds");
-        let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
-            Arc::clone(&channel) as Arc<dyn Channel>,
-        ]));
-        let runner = TurnRunner::new(
-            meka,
-            channels,
-            true,
-            TYPING_REFRESH,
-            TEST_TYPING_MAX,
-            Arc::new(Presence::default()),
-        );
-
-        let report = runner
-            .run(uuid::Uuid::new_v4(), "hello", &conversations())
-            .await;
-        assert!(report.outcome.is_err(), "nothing is listening on that port");
-        assert_eq!(
-            channel.activity_count(),
-            0,
-            "typing was announced for a turn that was never accepted"
-        );
-    }
-
     #[tokio::test(start_paused = true)]
     async fn typing_is_not_emitted_at_all_when_disabled() {
         let channel = Arc::new(SpyChannel::new());
-        let meka = crate::meka::MekaClient::new(&crate::config::MekaConfig {
-            base_url: "http://127.0.0.1:1".parse().expect("literal parses"),
-            token: crate::config::secret::Secret::new("test", "test"),
-            connect_timeout: Duration::from_secs(1),
-            turn_timeout: Duration::from_secs(1),
-            max_retries: 0,
-        })
-        .expect("client builds");
-        let channels = Arc::new(crate::channel::ChannelRegistry::from_channels([
-            Arc::clone(&channel) as Arc<dyn Channel>,
-        ]));
-        let runner = TurnRunner::new(
-            meka,
-            channels,
-            false,
-            TYPING_REFRESH,
-            TEST_TYPING_MAX,
-            Arc::new(Presence::default()),
-        );
+        let typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), false);
 
-        let token = runner.start_typing(&conversations());
+        let token = typist.start_typing(&conversations());
         tokio::time::sleep(TYPING_REFRESH * 2).await;
         assert_eq!(channel.activity_count(), 0);
         token.cancel();
     }
 
-    fn report(sends: usize) -> TurnReport {
-        TurnReport {
-            accepted: true,
-            outcome: Ok(TurnOutcome::Finished {
-                stop_reason: "end_turn".to_string(),
-                refusal_text: None,
-                usage: Usage::default(),
-            }),
-            sends,
-            tool_calls: sends,
-            text_length: 10,
-            text_preview: "hello".to_string(),
-            counters_incomplete: false,
-            message_withdrawn: None,
+    /// The window is opened by a send tool composing and closed by the next call announced,
+    /// whichever it is, and only for a turn that is answering somebody.
+    #[tokio::test(start_paused = true)]
+    async fn a_composing_send_opens_a_window_the_next_call_closes() {
+        let channel = Arc::new(SpyChannel::new());
+        let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
+
+        // A turn nobody here is waiting on draws nothing, whatever it composes.
+        typist.begin("t0");
+        typist.observe("t0", &composing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(TYPING_REFRESH * 2).await;
+        assert_eq!(channel.activity_count(), 0, "no target, no indicator");
+        typist.close("t0");
+
+        typist.begin("t1");
+        typist.expect("t1", conversations());
+        // Reading files is not writing a message.
+        typist.observe("t1", &composing("read_file"));
+        typist.observe("t1", &executing("read_file"));
+        tokio::time::sleep(TYPING_REFRESH * 2).await;
+        assert_eq!(channel.activity_count(), 0, "a non-send call draws nothing");
+
+        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(TYPING_REFRESH * 2 + Duration::from_millis(10)).await;
+        let while_composing = channel.activity_count();
+        assert!(
+            while_composing >= 2,
+            "the window was not drawn: {while_composing}"
+        );
+
+        // The arguments are finished: the next event on the turn closes the window, and a
+        // different turn's events leave it alone.
+        typist.observe("t2", &executing("mcp__mekabridge__send_message"));
+        typist.observe("t1", &executing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            while_composing,
+            "the window stayed open past the call that closed it"
+        );
+        typist.close("t1");
+    }
+
+    /// A composing call meka abandoned and replaced, which is what its provider retry looks like:
+    /// no closing event for the first id ever arrives, so the replacement has to close it.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_composing_call_is_closed_by_its_replacement() {
+        let channel = Arc::new(SpyChannel::new());
+        let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
+        typist.begin("t1");
+        typist.expect("t1", conversations());
+        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(TYPING_REFRESH + Duration::from_millis(10)).await;
+        let drawn = channel.activity_count();
+        assert!(drawn >= 1);
+
+        typist.observe("t1", &composing("read_file"));
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            drawn,
+            "the abandoned window kept drawing"
+        );
+
+        // And a turn ending closes whatever was left open.
+        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let reopened = channel.activity_count();
+        typist.close("t1");
+        tokio::time::sleep(TYPING_REFRESH * 3).await;
+        assert_eq!(
+            channel.activity_count(),
+            reopened,
+            "the turn ended with a window open"
+        );
+    }
+
+    fn tally(sends: usize, tool_calls: usize, text: &str) -> TurnTally {
+        let mut tally = TurnTally::default();
+        for _ in 0..sends {
+            tally.note(&executing("mcp__mekabridge__send_message"));
         }
+        for _ in sends..tool_calls {
+            tally.note(&executing("read_file"));
+        }
+        tally.note(&TurnEvent::AssistantText {
+            text: text.to_string(),
+        });
+        tally
     }
 
     #[test]
     fn a_turn_without_sends_is_reported_as_silent() {
-        assert!(report(0).is_silent());
-        assert!(!report(1).is_silent());
-    }
-
-    /// What decides whether the backlog and the dropped-message count have been delivered. Both are
-    /// stated once, in the envelope, so the question is only ever whether the envelope survived.
-    #[test]
-    fn the_envelope_is_kept_only_where_meka_says_it_still_holds_it() {
-        let ended = |outcome, accepted, message_withdrawn| TurnReport {
-            outcome,
-            accepted,
-            sends: 0,
-            tool_calls: 0,
-            text_length: 0,
-            text_preview: String::new(),
-            counters_incomplete: false,
-            message_withdrawn,
-        };
-        let finished = || {
-            Ok(TurnOutcome::Finished {
-                stop_reason: "end_turn".to_string(),
-                refusal_text: None,
-                usage: Usage::default(),
-            })
-        };
-        let failed = || Err(MekaError::Timeout(Duration::from_secs(1)));
-
-        // A turn that worked keeps its message, and meka says nothing about a terminal it never
-        // withdraws from, so the absent field here must not read as a withdrawal.
-        assert!(ended(finished(), true, None).envelope_kept());
-        // The reason this exists: withdrawn means the announcements went with it.
-        assert!(!ended(failed(), true, Some(true)).envelope_kept());
-        // Withdrawn only happens for a turn that produced nothing, so a failure meka kept the
-        // message for still showed it.
-        assert!(ended(failed(), true, Some(false)).envelope_kept());
-        // Silence on a turn that ended badly is not a promise. `sse-lag` is the real case: the
-        // failure is the stream's own event and carries no answer.
-        assert!(
-            !ended(failed(), true, None).envelope_kept(),
-            "an unanswered withdrawal must not be read as a keep"
-        );
-        // A submission meka refused never rendered anything to anybody, and says nothing about a
-        // message it never took.
-        assert!(!ended(failed(), false, None).envelope_kept());
-        // Belt to that brace. The runner cannot build this one, since the terminal carrying the
-        // flag is itself an event and any event marks the turn accepted, so the guard is here to
-        // keep a later reading of the flag from answering for a turn that never ran.
-        assert!(!ended(failed(), false, Some(false)).envelope_kept());
-    }
-
-    #[test]
-    fn a_failed_turn_still_says_whether_the_agent_had_acted() {
-        // The distinction the whole retry decision rests on. meka only retries a provider failure
-        // while nothing has reached the frontend, so a failure that gets this far may well have a
-        // sent message and a shell command behind it, and handing that batch over again would
-        // repeat both with the agent none the wiser.
-        let failed = |sends, tool_calls| TurnReport {
-            accepted: true,
-            outcome: Err(MekaError::Timeout(Duration::from_secs(1))),
-            sends,
-            tool_calls,
-            text_length: 400,
-            text_preview: "I'll take a look".to_string(),
-            counters_incomplete: false,
-            message_withdrawn: None,
-        };
-        assert!(failed(1, 1).had_side_effects());
-        assert!(
-            failed(0, 3).had_side_effects(),
-            "tool calls count even when nothing was sent"
-        );
-        assert!(
-            !failed(0, 0).had_side_effects(),
-            "text alone costs tokens and nothing else"
-        );
-    }
-
-    fn empty_turn(stop_reason: &str, tool_calls: usize, text: &str) -> TurnReport {
-        TurnReport {
-            accepted: true,
-            outcome: Ok(TurnOutcome::Finished {
-                stop_reason: stop_reason.to_string(),
-                refusal_text: None,
-                usage: Usage::default(),
-            }),
-            sends: 0,
-            tool_calls,
-            text_length: text.chars().count(),
-            text_preview: text.to_string(),
-            counters_incomplete: false,
-            message_withdrawn: None,
-        }
-    }
-
-    #[test]
-    fn a_turn_with_a_hole_in_its_accounting_is_never_called_inert() {
-        // The two predicates have to agree, and here they did not. `had_side_effects` treats a
-        // reported replay hole as "it acted"; `produced_nothing` looked only at the counters, so
-        // both answered yes for the same report and the caller's first arm -- the one that hands
-        // the batch straight back -- won. The path is ordinary: the agent answers through
-        // send_message and writes no text, so meka's final round emits the empty-response
-        // stand-in, and a rejoin that outran the replay ring leaves `tool_calls` at zero
-        // for a turn that had already sent.
-        let mut report = empty_turn("end_turn", 0, "[The model returned an empty response.]");
-        assert!(report.produced_nothing());
-        report.counters_incomplete = true;
-        assert!(
-            !report.produced_nothing(),
-            "a turn whose events are known to be missing cannot be called provably inert"
-        );
-        assert!(report.had_side_effects(), "and the two must not disagree");
-    }
-
-    #[test]
-    fn a_cancelled_turn_is_not_diagnosed_as_an_empty_response() {
-        // Stopped partway, so the stand-in describes the round it managed rather than the turn.
-        // Taken for an empty response the batch is requeued with no backoff and the log, the stored
-        // reason and the owner's notice all name the wrong cause.
-        let report = TurnReport {
-            accepted: true,
-            outcome: Ok(TurnOutcome::Cancelled {
-                reason: "client".to_string(),
-            }),
-            sends: 0,
-            tool_calls: 0,
-            text_length: 0,
-            text_preview: "[The model returned an empty response.]".to_string(),
-            counters_incomplete: false,
-            message_withdrawn: None,
-        };
-        assert!(!report.produced_nothing());
+        assert!(tally(0, 0, "hello").is_silent());
+        assert!(tally(0, 3, "hello").is_silent());
+        assert!(!tally(1, 1, "hello").is_silent());
     }
 
     #[test]
     fn a_model_that_returned_nothing_is_recognised() {
-        // meka's stand-in for a turn with no content. Nothing ran, so the batch can be retried.
+        // meka's stand-in for a turn with no content. Nothing ran, so what it read can be offered
+        // again.
         assert!(
-            empty_turn("end_turn", 0, "[The model returned an empty response.]").produced_nothing()
+            tally(0, 0, "[The model returned an empty response.]").produced_nothing("end_turn")
         );
         assert!(
-            empty_turn(
-                "end_turn",
+            tally(
+                0,
                 0,
                 "[The model returned an empty response (stop reason: length).]"
             )
-            .produced_nothing()
+            .produced_nothing("end_turn")
         );
         assert!(
-            empty_turn(
-                "max_tokens",
+            tally(
+                0,
                 0,
                 "[The model reached its output limit before producing a response.]"
             )
-            .produced_nothing()
+            .produced_nothing("max_tokens")
         );
-    }
-
-    #[test]
-    fn a_turn_whose_accounting_has_a_hole_counts_as_having_acted() {
-        // A rejoin that outran meka's replay ring comes back saying some events are gone. Those can
-        // include a send, so the counters understate what happened, and the two readings are not
-        // symmetric: held to have acted, the batch is one unanswered message still owed to the
-        // agent; held to have done nothing, it is replayed and the agent repeats work it cannot
-        // remember doing.
-        let mut report = report(0);
-        report.tool_calls = 0;
-        assert!(!report.had_side_effects());
-        report.counters_incomplete = true;
-        assert!(report.had_side_effects());
     }
 
     #[test]
     fn a_turn_that_actually_did_something_is_not_treated_as_empty() {
-        // A real answer that simply was not sent must not be replayed: the agent may have acted.
-        assert!(!empty_turn("end_turn", 0, "Sure, here is what I found.").produced_nothing());
-        // Tool calls mean side effects may have happened, so replaying is not safe.
+        // A real answer that simply was not sent must not be offered again: the agent may have
+        // acted on it in ways the tally cannot see.
+        assert!(!tally(0, 0, "Sure, here is what I found.").produced_nothing("end_turn"));
+        // Tool calls mean side effects may have happened, so offering again is not safe.
         assert!(
-            !empty_turn("end_turn", 2, "[The model returned an empty response.]")
-                .produced_nothing()
+            !tally(0, 2, "[The model returned an empty response.]").produced_nothing("end_turn")
         );
         // A refusal is a real answer, not a failure to produce one.
-        assert!(!empty_turn("refusal", 0, "[The model declined to respond.]").produced_nothing());
+        assert!(!tally(0, 0, "[The model declined to respond.]").produced_nothing("refusal"));
+    }
+
+    #[test]
+    fn the_text_preview_is_bounded() {
+        let mut tally = TurnTally::default();
+        for _ in 0..100 {
+            tally.note(&TurnEvent::AssistantText {
+                text: "0123456789".to_string(),
+            });
+        }
+        assert_eq!(tally.text_length, 1000);
+        assert!(tally.text_preview.chars().count() <= TEXT_PREVIEW_CHARS + 10);
     }
 
     #[test]

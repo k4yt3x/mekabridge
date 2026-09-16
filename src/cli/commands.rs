@@ -14,7 +14,7 @@ use crate::{
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::MekaClient,
-    store::{Policy, Store},
+    store::{Policy, QueueState, Store},
 };
 
 /// Starter config written by `mekabridge config init`.
@@ -22,10 +22,12 @@ const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
 /// The oldest meka this bridge can drive, as `(major, minor)`.
 ///
-/// A floor rather than a recommendation. Turns carry `options.unanswered_message`, and meka refuses
-/// an unknown member of `options` rather than ignoring it, so against an older one every turn is a
-/// 422 that no retry clears and no message is ever answered.
-const MEKA_MINIMUM: (u64, u64) = (0, 48);
+/// A floor rather than a recommendation, and this one is total in both directions. Messages are
+/// handed over through the session inbox, which an older meka answers with a 404, so nothing ever
+/// reaches the agent. And `GET /v1/sessions/{id}/stream` was a view of one turn that closed at its
+/// terminal before 0.55, where it is now the session's feed and does not end, so a bridge that
+/// followed it on an older meka would hear about one turn and then nothing.
+const MEKA_MINIMUM: (u64, u64) = (0, 55);
 
 /// Whether `version` is older than [`MEKA_MINIMUM`], or `None` when it cannot be read as one.
 ///
@@ -204,8 +206,8 @@ pub async fn doctor(config: &Config) -> Result<()> {
             println!("  ok     database at {}", config.storage.path.display());
             match store.queue_stats().await {
                 Ok(stats) => println!(
-                    "  ok     queue: {} pending, {} in flight, {} failed",
-                    stats.pending, stats.in_flight, stats.failed
+                    "  ok     queue: {} pending, {} rendered for meka, {} with meka, {} failed",
+                    stats.pending, stats.in_flight, stats.posted, stats.failed
                 ),
                 Err(error) => {
                     println!("  fail   could not read queue stats: {error}");
@@ -268,9 +270,10 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 // Ahead of everything else this block reports: on a meka this old none of it
                 // matters, because no turn will run at all.
                 println!(
-                    "  fail   this bridge needs meka {}.{} or later. Every turn against an older \
-                     one is refused as an invalid body, because turns carry \
-                     `options.unanswered_message` and meka refuses an option it does not know",
+                    "  fail   this bridge needs meka {}.{} or later. Messages are handed over \
+                     through the session inbox, which an older one has no route for, and their \
+                     outcome is read from the session feed, which an older one ends after a \
+                     single turn",
                     MEKA_MINIMUM.0, MEKA_MINIMUM.1
                 );
                 failures += 1;
@@ -654,8 +657,8 @@ pub async fn status(config: &Config) -> Result<()> {
         None => println!("last turn:     never"),
     }
     println!(
-        "queue:         {} pending, {} in flight, {} delivered, {} failed",
-        stats.pending, stats.in_flight, stats.done, stats.failed
+        "queue:         {} pending, {} rendered for meka, {} with meka, {} delivered, {} failed",
+        stats.pending, stats.in_flight, stats.posted, stats.done, stats.failed
     );
     println!("conversations: {}", conversations.len());
     println!("channels:      {}", config.channels.len());
@@ -676,25 +679,41 @@ pub async fn queue_list(config: &Config, limit: usize) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
     let stats = store.queue_stats().await?;
     println!(
-        "{} pending, {} in flight, {} delivered, {} failed",
-        stats.pending, stats.in_flight, stats.done, stats.failed
+        "{} pending, {} rendered for meka, {} with meka, {} delivered, {} failed",
+        stats.pending, stats.in_flight, stats.posted, stats.done, stats.failed
     );
     // Claiming would mark rows in flight, which is exactly what an inspection command must not do,
     // so this peeks at pending rows without touching their state.
-    let pending = store.peek_pending(limit).await?;
-    if pending.is_empty() {
+    let mut rows = store.peek_pending(limit).await?;
+    // What meka has, and what is rendered and waiting on it. An operator watching a stuck queue
+    // needs the reason, and the reason is on the row.
+    rows.extend(store.rows_in(QueueState::InFlight).await?);
+    rows.extend(store.rows_in(QueueState::Posted).await?);
+    rows.sort_by_key(|row| row.seq);
+    if rows.is_empty() {
         println!("nothing waiting");
         return Ok(());
     }
     println!();
-    for message in pending {
+    for row in rows.iter().take(limit) {
+        let state = match row.state {
+            QueueState::Pending => "waiting to be claimed".to_string(),
+            QueueState::InFlight => "rendered, waiting on meka".to_string(),
+            QueueState::Posted => format!("with meka as {}", row.item_id.as_deref().unwrap_or("?")),
+            other => other.as_str().to_string(),
+        };
         println!(
-            "  #{:<6} {:<28} attempts {}  received {}",
-            message.seq,
-            message.conversation,
-            message.attempts,
-            message.received_at.to_rfc3339()
+            "  #{:<6} {:<28} {:<34} offers {}  posts {}  received {}",
+            row.seq,
+            row.conversation,
+            state,
+            row.attempts,
+            row.posts,
+            row.received_at.to_rfc3339()
         );
+        if let Some(error) = &row.last_error {
+            println!("         last error: {error}");
+        }
     }
     Ok(())
 }
@@ -1027,6 +1046,12 @@ pub async fn session_show(config: &Config) -> Result<()> {
                     "idle"
                 }
             );
+            // What meka still holds for the agent, which is not the same as what this bridge is
+            // waiting on: another client of the same session can put something here too.
+            match info.inbox_pending {
+                Some(pending) => println!("inbox:      {pending} waiting to be read"),
+                None => println!("inbox:      not reported (the session is not loaded)"),
+            }
         }
         Err(error) => println!("meka:       could not read it ({error})"),
     }
@@ -1042,10 +1067,34 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
         ));
     }
     let store = Store::open(&config.storage.path).await?;
+    // Every hand-over out belongs to the session being unbound: one meka has will be read by a
+    // session nothing will ever ask about again, and one it has not is addressed to a session that
+    // is about to stop existing. Both are closed here, and their messages go back among what the
+    // agent has not seen, so the replacement meets them as a backlog rather than not at all.
+    let mut open = store.rows_in(QueueState::InFlight).await?;
+    open.extend(store.rows_in(QueueState::Posted).await?);
+    let mut owed = 0_usize;
+    for row in &open {
+        let Some(closed) = store
+            .failed(row.seq, "the session it belonged to was reset", Utc::now())
+            .await?
+        else {
+            continue;
+        };
+        store.mark_unseen(closed.key()).await?;
+        owed += 1;
+    }
     match store.session_id().await? {
         Some(session_id) => {
             store.clear_session_id().await?;
             println!("unbound session {session_id}; the next message starts a new one");
+            if owed > 0 {
+                println!(
+                    "{} message(s) that had been handed over are back among what the agent has \
+                     not seen",
+                    owed
+                );
+            }
             println!(
                 "note: the session still exists in meka. Delete it there if you want the history \
                  gone."
@@ -1064,7 +1113,7 @@ pub async fn cancel(config: &Config) -> Result<()> {
         return Ok(());
     };
     let meka = MekaClient::new(&config.meka)?;
-    meka.cancel_turn(session_id).await?;
+    meka.cancel_turn(session_id, None).await?;
     // meka's cancel is idempotent and returns 204 whether or not a turn was in flight, so there is
     // nothing more definite to report.
     println!("cancellation sent for session {session_id}");
@@ -1522,15 +1571,15 @@ mod tests {
 
     #[test]
     fn a_meka_below_the_floor_is_caught_before_the_first_message() {
-        // The failure it prevents is total: an older meka refuses every turn as an invalid body,
-        // so without this the deployment looks healthy and answers nobody.
-        assert_eq!(meka_is_too_old("0.47.1"), Some(true));
-        assert_eq!(meka_is_too_old("0.46.0"), Some(true));
-        assert_eq!(meka_is_too_old("0.48.0"), Some(false));
-        assert_eq!(meka_is_too_old("0.49.0"), Some(false));
+        // The failure it prevents is total: an older meka has no inbox to hand a message to, so
+        // without this the deployment looks healthy and answers nobody.
+        assert_eq!(meka_is_too_old("0.54.1"), Some(true));
+        assert_eq!(meka_is_too_old("0.48.0"), Some(true));
+        assert_eq!(meka_is_too_old("0.55.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.56.0"), Some(false));
         assert_eq!(meka_is_too_old("1.0.0"), Some(false));
         // The patch component is never compared, so a pre-release riding it is read as its minor.
-        assert_eq!(meka_is_too_old("0.48.0-rc1"), Some(false));
+        assert_eq!(meka_is_too_old("0.55.0-rc1"), Some(false));
         // No opinion beats a wrong one: a build that does not report a version this can read must
         // not fail an otherwise healthy deployment.
         for unreadable in ["", "dev", "0", "nightly.1", "0.x.0"] {

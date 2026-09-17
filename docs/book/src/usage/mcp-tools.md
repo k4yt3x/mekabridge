@@ -354,4 +354,4 @@ transport = "stdio"
 
 ## Version skew
 
-mekabridge builds against rmcp 3.x while meka pins 2.x. The two negotiate a mutually supported protocol version at `initialize`. That path is covered by an integration test that runs a real 2.x client against the real server on every `cargo test`, asserting that the handshake, the tool list, the annotations, and the input schemas all survive the gap.
+The bridge and meka are separate processes, each linking whatever rmcp it likes, and the two negotiate a mutually supported protocol version at `initialize`. meka has moved its own pin through 1.3, 1.5, 1.7, 2.1 and 3.1, so what the bridge owes is a surface that survives the negotiation rather than one that matches a crate version. That path is covered by an integration test that runs a real rmcp 2.x client, one major version behind the server's own, against the real server on every `cargo test`, asserting that the handshake, the tool list, the annotations, and the input schemas all survive the gap.

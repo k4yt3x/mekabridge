@@ -353,6 +353,14 @@ pub struct ServerInfo {
     /// opinion" and the check is skipped instead of taking `doctor` down.
     #[serde(default)]
     pub enabled_permissions: Vec<String>,
+    /// The scopes `[meka].token` holds, which meka reports from 0.57.
+    ///
+    /// The one thing about the token nothing else here could check. Every call `doctor` makes
+    /// needs a read scope only, so a token that cannot hand a message over answers all of them and
+    /// the gap surfaces at the first message instead. Empty on an older meka, which reads as "no
+    /// opinion" the same way [`Self::enabled_permissions`] does.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// One configured profile, as returned by `GET /v1/profiles`.
@@ -1224,6 +1232,16 @@ mod tests {
             !info.vision,
             "the fields it dropped must not shadow the ones it kept"
         );
+        assert!(
+            info.scopes.is_empty(),
+            "a meka that reports no scopes has said nothing, not that the token holds nothing"
+        );
+
+        let scoped = r#"{"version":"0.57.0","default_permission":"read",
+                         "enabled_permissions":["read"],"vision":true,
+                         "scopes":["sessions:r","sessions:w"]}"#;
+        let info: ServerInfo = serde_json::from_str(scoped).expect("0.57 must deserialize");
+        assert_eq!(info.scopes, ["sessions:r", "sessions:w"]);
     }
 
     /// The rename that reads as a healthy deployment being unservable. Every field on

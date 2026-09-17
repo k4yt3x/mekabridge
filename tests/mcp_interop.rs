@@ -1,10 +1,16 @@
-//! Interop between mekabridge's MCP server and the MCP client version meka actually links against.
+//! Interop between mekabridge's MCP server and an MCP client that is not the one it was built
+//! against.
 //!
-//! mekabridge builds against rmcp 3.x while meka pins 2.x. The two are separate processes and the
-//! protocol negotiates a mutually supported version at `initialize`, but that negotiation is
-//! exactly the kind of thing that quietly breaks on an upgrade. These tests drive the real server
-//! over a real socket with a real 2.x client, so the skew is checked on every `cargo test` rather
-//! than discovered in production.
+//! The two are separate processes, each free to link whatever rmcp it likes, and the protocol
+//! negotiates a mutually supported version at `initialize`. What this bridge owes is a surface that
+//! survives that negotiation rather than one that happens to match a crate version: meka has moved
+//! its own pin through 1.3, 1.5, 1.7, 2.1 and 3.1, and each move is the kind of thing that breaks
+//! quietly. So these tests drive the real server over a real socket with a real rmcp 2.x client,
+//! one major behind the server's own, on every `cargo test`.
+//!
+//! The client is deliberately not the version meka pins today, which since meka 0.42 is the same
+//! major as the server's. Pinning the test to whatever meka currently links would make it agree
+//! with the server by construction, which is the one thing it must not do.
 
 // Integration tests live in their own crate, so the `allow-*-in-tests` clippy settings that cover
 // `#[cfg(test)]` modules do not apply here. Assertions read better with `expect` than with matches.
@@ -405,7 +411,7 @@ async fn connect(
     ClientInfo::default()
         .serve(transport)
         .await
-        .expect("meka's rmcp version must complete the initialize handshake")
+        .expect("a client a major version behind must complete the initialize handshake")
 }
 
 #[tokio::test]
@@ -683,8 +689,8 @@ async fn input_schemas_survive_negotiation() {
 #[tokio::test]
 async fn the_history_cursor_survives_the_version_gap() {
     // `before` is a number, and every other tool argument this bridge takes is a string. Serde and
-    // schemars agree locally, but meka's client is a major version behind and it is the one that
-    // validates arguments in production, so the numeric form is exercised over a real socket.
+    // schemars agree locally, but the client that validates arguments in production is somebody
+    // else's build, so the numeric form is exercised over a real socket against one.
     let harness = start().await;
     let client = connect(&harness).await;
 

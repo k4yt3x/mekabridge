@@ -21,8 +21,8 @@ pub enum TurnSource {
     Schedule { job_id: String },
     /// A background task reported back and earned a turn of its own.
     Background,
-    /// A name this build does not know, or none at all: the `turn.started` meka synthesises when a
-    /// feed attaches mid-turn carries no source.
+    /// A name this build does not know, or none at all: before meka 0.57 the `turn.started`
+    /// synthesised when a feed attaches mid-turn carried no source.
     Unknown(String),
 }
 
@@ -33,8 +33,9 @@ pub enum TurnEvent {
         started_at: String,
         source: TurnSource,
         /// Whether this is the announcement meka synthesises for a turn already running when the
-        /// feed attached, rather than a turn beginning. It carries no id, no source and no time,
-        /// and everything after it is the real thing.
+        /// feed attached, rather than a turn beginning. It carries no id and no time, and since
+        /// meka 0.57 it names the turn's source as a real one does; everything after it is the
+        /// real thing.
         resumed: bool,
     },
     AssistantText {
@@ -441,7 +442,9 @@ mod tests {
     }
 
     /// What a feed attaching mid-turn opens with: the id of the turn in flight and `resumed`, with
-    /// no source and no time, because it is synthesised rather than replayed.
+    /// no time, because it is synthesised rather than replayed. Both shapes are pinned because both
+    /// are in the field: meka names the source on it from 0.57 and named none before, and the
+    /// bridge reads `resumed` rather than the absent source to tell the two apart.
     #[test]
     fn a_resumed_turn_is_told_apart_from_one_beginning() {
         let parsed = parse(
@@ -454,6 +457,15 @@ mod tests {
         assert_eq!(parsed.event, TurnEvent::Started {
             started_at: String::new(),
             source: TurnSource::Unknown(String::new()),
+            resumed: true,
+        });
+        let named = r#"{"turn_id":"t1","session_id":"s","resumed":true,
+                        "source":"inbox","item_ids":["i1","i2"]}"#;
+        assert_eq!(event("turn.started", named), TurnEvent::Started {
+            started_at: String::new(),
+            source: TurnSource::Inbox {
+                item_ids: vec!["i1".to_string(), "i2".to_string()]
+            },
             resumed: true,
         });
     }
@@ -520,6 +532,27 @@ mod tests {
                 event: "some.future.event".to_string()
             }
         );
+    }
+
+    /// The two meka 0.57 added, which this bridge ignores on purpose rather than by oversight. They
+    /// are progress on a tool call the agent is running, for a client drawing it; nothing here
+    /// draws a tool call, and meka sends them with no `id:` and keeps them out of its replay ring,
+    /// so reading them changes neither the feed position nor what a reconnect is handed.
+    #[test]
+    fn a_running_tool_call_s_progress_is_read_and_ignored() {
+        for (name, data) in [
+            ("tool_call.output_delta", r#"{"id":"tu_1","chunk":"one\n"}"#),
+            (
+                "subagent.activity",
+                r#"{"id":"tu_1","summary":"read_file"}"#,
+            ),
+        ] {
+            let parsed = event(name, data);
+            assert_eq!(parsed, TurnEvent::Unknown {
+                event: name.to_string()
+            });
+            assert!(!parsed.is_terminal());
+        }
     }
 
     #[test]

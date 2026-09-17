@@ -107,6 +107,11 @@ across turns. Two things follow for an operator:
 - **A hole is not a loss.** meka says so with a `notice`, and the bridge answers it by asking about
   every hand-over it has out, under each one's own key. It does the same on every reconnect, so an
   outcome reported while nothing was listening is never waited on for ever.
+- **A turn in flight is rejoined, not restarted.** meka opens the reattached feed with a
+  `turn.started` marked `resumed` for the turn it joined, and from meka 0.57 that names the items
+  the turn was opened on. It is how a bridge that restarted mid-turn knows whom that turn is
+  answering, which is what the typing indicator is drawn from; nothing is handed over twice on the
+  strength of it.
 
 ## What meka needs from you
 
@@ -120,6 +125,8 @@ scopes = ["sessions:r", "sessions:w"]
 ```
 
 `sessions:w` covers creating a session, posting to its inbox, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **the session feed**. Both are required, and neither is optional in practice: without `sessions:w` nothing can be handed over, and without `sessions:r` the bridge hands messages over and never learns what became of any of them.
+
+`mekabridge doctor` says whether the token holds both, on meka 0.57 and later, which is the first release to report the calling token's scopes. It is the one thing about the token nothing else can check: every other question `doctor` asks needs a read scope only, so a token that cannot hand a message over answers all of them and the gap surfaces as a message that is never answered. Against an older meka the line is absent rather than guessed at.
 
 ### An MCP server entry
 

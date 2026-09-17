@@ -315,13 +315,16 @@ struct MekaRecorder {
     readiness: Mutex<Option<(u16, String)>>,
     /// What `GET /v1/sessions/{id}` reports for `turn_in_flight`.
     turn_in_flight: Mutex<bool>,
-    /// The turn running right now, if any.
+    /// The turn running right now, if any: its id and the items it opened on.
     ///
     /// meka runs one turn at a time per session and reads every item waiting for it into that
     /// turn. Whichever item's driver gets here first takes the lot; one that arrives while the
     /// turn runs is appended to it at the next round boundary rather than opening a turn of
     /// its own.
-    in_turn: Mutex<Option<String>>,
+    ///
+    /// The items are held because a feed attaching mid-turn is told them: see [`open_feed`]. Only
+    /// the ones it opened on, which is the source meka records once and never revises.
+    in_turn: Mutex<Option<(String, Vec<String>)>>,
     /// Each item as `(id, body)`, in the order meka accepted them, which is the order a turn reads
     /// them in.
     by_item: Mutex<Vec<(String, String)>>,
@@ -609,12 +612,12 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match in_turn.clone() {
-            Some(turn) => Err(turn),
+            Some((turn, _)) => Err(turn),
             None => {
                 let waiting = recorder.take_waiting("delivered");
                 let turn = (!waiting.is_empty()).then(|| feed.next_turn());
                 if let Some(turn) = &turn {
-                    *in_turn = Some(turn.clone());
+                    *in_turn = Some((turn.clone(), waiting.clone()));
                 }
                 Ok(turn.map(|turn| (turn, waiting)))
             }
@@ -629,6 +632,9 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
             let appended = recorder.take_waiting("delivered");
             if !appended.is_empty() {
                 recorder.read_in(&turn, &appended);
+                // Not added to what the turn names on a reattach. meka records the source once,
+                // when the turn opens, so an item appended at a round boundary is never in it; a
+                // client that reattaches after one learns of it from its `inbox.delivered`.
                 feed.push(
                     "inbox.delivered",
                     Some(&turn),
@@ -876,6 +882,27 @@ async fn open_feed(
         .map_or(last_event_id.unwrap_or(0), |frame| frame.id);
 
     let mut opening = vec!["retry: 3000\n\n".to_string()];
+    // What meka opens a feed with when a turn is already running: the turn it joined, `resumed` to
+    // tell it from one beginning, and since 0.57 the source that turn was opened on. Synthesised
+    // rather than replayed, so it carries no `id:` and no `started_at`, and it comes before the
+    // gap notice and the backlog.
+    if let Some((turn, items)) = recorder
+        .in_turn
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        opening.push(format!(
+            "event: turn.started\ndata: {}\n\n",
+            serde_json::json!({
+                "turn_id": turn,
+                "session_id": "s",
+                "resumed": true,
+                "source": "inbox",
+                "item_ids": items,
+            })
+        ));
+    }
     if *recorder
         .feed_gap
         .lock()
@@ -3016,6 +3043,9 @@ async fn a_hand_over_posted_before_a_restart_is_settled_by_the_replay() {
 struct Running {
     store: Store,
     wake: Arc<Notify>,
+    /// This run's own channel. A restart gets a fresh one, which is what makes it possible to ask
+    /// what the *new* process drew rather than what its predecessor had already drawn.
+    channel: Arc<MockChannel>,
     shutdown: CancellationToken,
 }
 
@@ -3028,8 +3058,9 @@ impl Drop for Running {
 async fn run_bridge(config: &Arc<Config>) -> Running {
     let store = Store::open(&config.storage.path).await.expect("opens");
     let accounts = mock_accounts(&store).await;
+    let channel = Arc::new(MockChannel::new("mock"));
     let channels = Arc::new(ChannelRegistry::from_channels([
-        Arc::new(MockChannel::new("mock")) as Arc<dyn Channel>,
+        Arc::clone(&channel) as Arc<dyn Channel>
     ]));
     let meka = MekaClient::new(&config.meka).expect("client");
     let shutdown = CancellationToken::new();
@@ -3048,6 +3079,7 @@ async fn run_bridge(config: &Arc<Config>) -> Running {
     Running {
         store,
         wake,
+        channel,
         shutdown,
     }
 }
@@ -5370,6 +5402,140 @@ async fn a_dropped_feed_is_reopened_from_where_it_left_off() {
     harness
         .wait_for_queue("the second batch", |stats| stats.done == 2)
         .await;
+}
+
+#[tokio::test]
+async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
+    // meka opens a feed that attached mid-turn with a `turn.started` for the turn it joined, marked
+    // `resumed`, and since 0.57 that announcement names the source too: for this bridge, the inbox
+    // items the turn was opened on. So the arm that handles a turn beginning is now entered twice
+    // for one turn, and everything it is trusted not to disturb has to survive being entered again
+    // -- the message is read once, the turn is one turn, and what the turn is known to be answering
+    // is still known, which is what lets the indicator go up for the message it writes afterwards.
+    let harness =
+        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(1500))
+            .await;
+    harness
+        .sender
+        .send(message("what did the log say?", "1"))
+        .await
+        .expect("queued");
+
+    // The turn has read the message and has not begun writing anything yet, which is the window the
+    // stub holds open and the only moment a reattach is interesting.
+    harness
+        .wait_for("the message to be read", |harness| {
+            !harness.turns().is_empty()
+        })
+        .await;
+    harness.recorder.feed.cut();
+    harness
+        .wait_for("the feed to be reopened", |harness| {
+            harness
+                .recorder
+                .attaches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                >= 2
+        })
+        .await;
+
+    harness
+        .wait_for("the indicator during composition", |harness| {
+            harness.channel.activity_count() > 0
+        })
+        .await;
+    harness
+        .wait_for_queue("the message to be settled", |stats| stats.done == 1)
+        .await;
+    assert_eq!(
+        harness.turns().len(),
+        1,
+        "the rejoined turn was counted as a second one: {:?}",
+        harness.turns()
+    );
+    assert_eq!(
+        harness.items().len(),
+        1,
+        "the message was handed over again after the reattach: {:?}",
+        harness.items()
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_write() {
+    // Why the resumed announcement is worth reading rather than merely tolerating. Whom the turn
+    // is answering was known to a typist that died with the process, and the turn is still running:
+    // meka 0.57 names that turn's items on the feed the new process attaches to, and there is
+    // nowhere else for it to learn them. Without it the send this turn composes next raises no
+    // indicator, because a turn this bridge was handed nothing for has nobody waiting on it.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("state.db");
+    let recorder = Arc::new(MekaRecorder::default());
+    recorder.set(&recorder.script, TurnScript::Compose);
+    // Long enough that a restart fits between the turn reading the message and the turn writing
+    // one, which is the whole window this test needs.
+    recorder.set(&recorder.compose_for, Duration::from_millis(2000));
+    recorder.set(
+        &recorder.compose_tool,
+        "mcp__mekabridge__send_message".to_string(),
+    );
+    let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
+    let config = Arc::new(config_for(meka_address, &database, true));
+
+    let first = run_bridge(&config).await;
+    let payload = serde_json::to_string(&message("what did the log say?", "1")).expect("encodes");
+    first
+        .store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    let account = mock_account(&first.store).await;
+    first
+        .store
+        .enqueue(
+            MessageKey {
+                conversation: "mock:1",
+                account,
+                message_id: "1",
+                revision: 0,
+            },
+            &payload,
+            Utc::now(),
+            64,
+        )
+        .await
+        .expect("enqueued");
+    first.wake.notify_one();
+
+    // Stopped once the turn has read the message and before it has written anything.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let stats = first.store.queue_stats().await.expect("stats");
+        if stats.done == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first run never got the message read; stats {stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    first.shutdown.cancel();
+    drop(first);
+
+    let second = run_bridge(&config).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while second.channel.activity_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restarted bridge drew nothing while the turn it rejoined wrote the reply"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    second.shutdown.cancel();
+    meka_shutdown.cancel();
 }
 
 #[tokio::test]

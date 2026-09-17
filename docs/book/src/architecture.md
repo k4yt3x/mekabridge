@@ -179,4 +179,4 @@ Unit tests cover config resolution, the queue state machine, item rendering and 
 Two integration suites:
 
 - `bridge_flow` runs the real session task and feed reader against a stub meka that speaks the real inbox and feed wire formats, drains its inbox into one turn the way meka does, and a mock channel, covering batching, deduplication, the hand-over's whole lifecycle, restart recovery, and outbound delivery.
-- `mcp_interop` runs a real rmcp 2.x client, the version meka links against, against the real MCP server, so the protocol version skew is checked on every test run.
+- `mcp_interop` runs a real rmcp 2.x client, one major version behind the server's own, against the real MCP server, so the protocol version skew is checked on every test run.

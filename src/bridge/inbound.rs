@@ -1734,13 +1734,35 @@ async fn apply(
                             conversations.insert(conversation);
                         }
                     }
-                    tracing::info!(
-                        turn,
-                        messages,
-                        conversations = conversations.len(),
-                        "the agent was woken for this bridge's messages"
-                    );
+                    if *resumed {
+                        tracing::debug!(
+                            turn,
+                            messages,
+                            "rejoined a turn running on this bridge's messages"
+                        );
+                    } else {
+                        tracing::info!(
+                            turn,
+                            messages,
+                            conversations = conversations.len(),
+                            "the agent was woken for this bridge's messages"
+                        );
+                    }
+                    // Taken from a resumed announcement too, which is the whole worth of meka 0.57
+                    // naming the source on one: a bridge that restarted mid-turn learns here whom
+                    // the turn is answering, and without it a send composed after the reattach
+                    // raises no indicator, since the typist has no target for a turn it was handed
+                    // nothing for. Only the items the turn *opened* on, which is what meka records
+                    // as its source; one appended at a later round boundary is learnt from its own
+                    // `inbox.delivered` if that is still in the replay.
                     typist.expect(turn, conversations);
+                }
+                // A turn already running when the feed attached, and already counted. meka names
+                // the source on that announcement since 0.57, so a resumed one no longer arrives
+                // as `Unknown`: the inbox arm above takes its own, and everything else says only
+                // that this is a rejoin.
+                _ if *resumed => {
+                    tracing::debug!(turn, "joined a turn already running");
                 }
                 TurnSource::Client => {
                     tracing::debug!(turn, "a turn somebody else submitted began");
@@ -1750,9 +1772,6 @@ async fn apply(
                 }
                 TurnSource::Background => {
                     tracing::debug!(turn, "a background outcome opened a turn");
-                }
-                TurnSource::Unknown(_) if *resumed => {
-                    tracing::debug!(turn, "joined a turn already running");
                 }
                 TurnSource::Unknown(name) => {
                     tracing::debug!(turn, source = %name, "a turn began");

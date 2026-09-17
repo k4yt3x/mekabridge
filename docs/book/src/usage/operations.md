@@ -94,7 +94,7 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `following the session feed` | The feed is open. Everything below that reports an outcome arrives on it |
 | `rendered messages for the agent` | A settled pass became one inbox item per message. None has left yet |
 | `handed a message to the agent` | meka accepted the item and now owns getting it read. `replayed=true` means meka already had it, which is how a restart settles rather than sends twice |
-| `the agent was woken for this bridge's messages` | meka opened a turn on one of this bridge's items |
+| `the agent was woken for this bridge's messages` | meka opened a turn on one of this bridge's items. Once per turn: a feed rejoining a turn already running says so at debug instead, so counting these counts turns |
 | `the agent read a message` | The provider accepted a request carrying it, so the model has seen it. This, and only this, is what marks a message delivered |
 | `turn finished sends=N tool_calls=N` | A turn that carried this bridge's messages ended. `messages` says how many it read |
 | `the agent sent no messages this turn` | The agent read them and sent nothing. Legal, but logged at warn with the text it produced instead, because from the other end it is indistinguishable from a broken bridge |

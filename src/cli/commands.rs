@@ -110,6 +110,51 @@ pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
     checks
 }
 
+/// Print a set of checks under `doctor`'s gutter and say what they cost the run.
+fn report(checks: &[Check]) -> (usize, usize) {
+    for check in checks {
+        match check {
+            Check::Ok(line) => println!("  ok     {line}"),
+            Check::Warn(line) => println!("  warn   {line}"),
+            Check::Fail(line) => println!("  fail   {line}"),
+        }
+    }
+    verdict(checks)
+}
+
+/// Decide what the scopes meka reports for `[meka].token` mean.
+///
+/// `None` when meka said nothing: every build before 0.57 reports no scopes, and so would one this
+/// bridge could not reach. Neither is a token with nothing.
+///
+/// Worth a round trip because it is the one thing about the token nothing else here can check.
+/// Reading the version, the profiles and the readiness all take a read scope, so a token that
+/// cannot hand a message over answers every question `doctor` asks and the gap shows up at the
+/// first message instead, as a message that is never answered.
+pub fn assess_scopes(scopes: &[String]) -> Option<Check> {
+    if scopes.is_empty() {
+        return None;
+    }
+    let missing: Vec<&str> = ["sessions:r", "sessions:w"]
+        .into_iter()
+        .filter(|needed| !scopes.iter().any(|held| held == needed))
+        .collect();
+    if missing.is_empty() {
+        return Some(Check::Ok(
+            "the token holds sessions:r and sessions:w".to_string(),
+        ));
+    }
+    // Both halves are named because losing either is a different silence: without `sessions:w`
+    // nothing is handed over at all, and without `sessions:r` everything is handed over and none
+    // of it is ever settled, which looks like the agent reading messages and never replying.
+    Some(Check::Fail(format!(
+        "the token is missing {}. `sessions:w` creates the session and puts a message in its \
+         inbox; `sessions:r` opens the session feed, the only thing that says what became of one. \
+         Add both to this token's `scopes` under [[serve.tokens]] in meka's config",
+        missing.join(" and ")
+    )))
+}
+
 /// Ask the platform whether the conversation operator notices go to is one it can reach.
 ///
 /// Startup validation can only judge the shape of the id, and on Discord the shape says nothing:
@@ -278,6 +323,11 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 );
                 failures += 1;
             }
+            if let Some(check) = assess_scopes(&info.scopes) {
+                let (failed, warned) = report(std::slice::from_ref(&check));
+                failures += failed;
+                warnings += warned;
+            }
             // A separate call since meka 0.44, which took `model` off `/v1/info` because the word
             // there named a backend while the same word on `POST /v1/sessions` names a profile.
             match meka.profiles().await {
@@ -341,15 +391,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
     }
     match meka.ready().await {
         Ok(ready) => {
-            let checks = assess_readiness(&ready);
-            for check in &checks {
-                match check {
-                    Check::Ok(line) => println!("  ok     {line}"),
-                    Check::Warn(line) => println!("  warn   {line}"),
-                    Check::Fail(line) => println!("  fail   {line}"),
-                }
-            }
-            let (failed, warned) = verdict(&checks);
+            let (failed, warned) = report(&assess_readiness(&ready));
             failures += failed;
             warnings += warned;
         }
@@ -511,14 +553,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             }
             if let Some(owner) = &config.bridge.owner_conversation {
                 let checks = assess_owner_conversation(&registry, owner, &authenticated).await;
-                for check in &checks {
-                    match check {
-                        Check::Ok(line) => println!("  ok     {line}"),
-                        Check::Warn(line) => println!("  warn   {line}"),
-                        Check::Fail(line) => println!("  fail   {line}"),
-                    }
-                }
-                let (failed, warned) = verdict(&checks);
+                let (failed, warned) = report(&checks);
                 failures += failed;
                 warnings += warned;
             }
@@ -1539,6 +1574,50 @@ mod tests {
             verdict(&assess_readiness(&readiness("ok", true, true, true))),
             (0, 0)
         );
+    }
+
+    /// Both scopes are required, and a token short of either answers everything else `doctor` asks,
+    /// so this is the only check that can catch one. Failing rather than warning is the point: the
+    /// gate has to go red on a token that cannot work, not print a line above a zero exit.
+    #[test]
+    fn a_token_that_cannot_do_the_work_fails_the_run() {
+        let held = |scopes: &[&str]| -> Vec<String> {
+            scopes.iter().map(|scope| (*scope).to_string()).collect()
+        };
+        assert_eq!(
+            assess_scopes(&held(&["sessions:r", "sessions:w"])),
+            Some(Check::Ok(
+                "the token holds sessions:r and sessions:w".to_string()
+            ))
+        );
+        // Scopes it holds beyond the two are meka's business, not this bridge's.
+        assert!(matches!(
+            assess_scopes(&held(&["sessions:r", "sessions:w", "memory:r"])),
+            Some(Check::Ok(_))
+        ));
+        // The two shapes that reach here: the classic one that hands nothing over, and a token
+        // scoped to some other part of meka entirely. A token holding `sessions:w` alone never gets
+        // this far, since `/v1/info` itself takes a read scope, but it must not read as ok either.
+        for short in [
+            held(&["sessions:r"]),
+            held(&["memory:r"]),
+            held(&["sessions:w"]),
+        ] {
+            let check = assess_scopes(&short).expect("meka named the scopes");
+            assert!(
+                matches!(check, Check::Fail(_)),
+                "a token holding only {short:?} passed"
+            );
+            assert_eq!(
+                verdict(std::slice::from_ref(&check)),
+                (1, 0),
+                "the failure must count against the exit code"
+            );
+        }
+        // No scopes at all is a meka too old to report them, or one that could not be reached.
+        // Reading it as a token holding nothing would fail every deployment on meka 0.55 and 0.56,
+        // which work.
+        assert_eq!(assess_scopes(&[]), None);
     }
 
     #[test]

@@ -954,15 +954,15 @@ mod tests {
     #[test]
     fn problem_kinds_route_on_the_type_uri() {
         assert_eq!(
-            problem("https://meka.so/errors/session-not-found").kind(),
+            problem("https://meka.run/errors/session-not-found").kind(),
             ProblemKind::SessionNotFound
         );
         assert_eq!(
-            problem("https://meka.so/errors/turn-in-flight").kind(),
+            problem("https://meka.run/errors/turn-in-flight").kind(),
             ProblemKind::TurnInFlight
         );
         assert_eq!(
-            problem("https://meka.so/errors/provider").kind(),
+            problem("https://meka.run/errors/provider").kind(),
             ProblemKind::Provider
         );
         assert_eq!(
@@ -971,20 +971,35 @@ mod tests {
         );
     }
 
+    /// meka 0.59 moved every `type` URI from `meka.so` to `meka.run`, keeping the segment after the
+    /// last slash. Both hosts are in support at once, since the floor is 0.55, and routing on that
+    /// last segment is what makes the move invisible here rather than a table to keep in step.
+    #[test]
+    fn the_host_a_type_uri_sits_under_decides_nothing() {
+        for host in ["https://meka.so", "https://meka.run"] {
+            assert_eq!(
+                problem(&format!("{host}/errors/context-overflow")).kind(),
+                ProblemKind::ContextOverflow,
+                "{host} must route like the other, or one of the two mekas this build supports \
+                 has every error fall to `Other`"
+            );
+        }
+    }
+
     #[test]
     fn session_missing_is_detected() {
-        let error = MekaError::Problem(problem("https://meka.so/errors/session-not-found"));
+        let error = MekaError::Problem(problem("https://meka.run/errors/session-not-found"));
         assert!(error.is_session_missing());
-        let other = MekaError::Problem(problem("https://meka.so/errors/auth"));
+        let other = MekaError::Problem(problem("https://meka.run/errors/auth"));
         assert!(!other.is_session_missing());
     }
 
     #[test]
     fn retryable_classification_covers_transient_failures() {
         assert!(
-            MekaError::Problem(problem("https://meka.so/errors/concurrency-limit")).is_retryable()
+            MekaError::Problem(problem("https://meka.run/errors/concurrency-limit")).is_retryable()
         );
-        assert!(MekaError::Problem(problem("https://meka.so/errors/internal")).is_retryable());
+        assert!(MekaError::Problem(problem("https://meka.run/errors/internal")).is_retryable());
     }
 
     /// Where a provider rate limit or an overload lands once meka's own retries are spent.
@@ -995,7 +1010,7 @@ mod tests {
     /// message given up on at the first attempt.
     #[test]
     fn a_provider_failure_is_worth_another_attempt() {
-        assert!(MekaError::Problem(problem("https://meka.so/errors/provider")).is_retryable());
+        assert!(MekaError::Problem(problem("https://meka.run/errors/provider")).is_retryable());
     }
 
     /// The type meka minted so a transient upstream failure stops arriving byte-identical to a dead
@@ -1004,7 +1019,7 @@ mod tests {
     /// meka gave one of these a 4xx.
     #[test]
     fn an_upstream_meka_calls_transient_is_worth_another_attempt() {
-        let detail = problem("https://meka.so/errors/provider-unavailable");
+        let detail = problem("https://meka.run/errors/provider-unavailable");
         assert_eq!(detail.kind(), ProblemKind::ProviderUnavailable);
         assert!(MekaError::Problem(detail).is_retryable());
     }
@@ -1014,16 +1029,16 @@ mod tests {
     /// the whole retry budget is spent proving it.
     #[test]
     fn a_context_overflow_is_never_worth_another_attempt() {
-        let error = MekaError::Problem(problem("https://meka.so/errors/context-overflow"));
+        let error = MekaError::Problem(problem("https://meka.run/errors/context-overflow"));
         assert_eq!(
-            problem("https://meka.so/errors/context-overflow").kind(),
+            problem("https://meka.run/errors/context-overflow").kind(),
             ProblemKind::ContextOverflow,
             "an unrecognised type would fall to `Other`, whose 5xx rule retries it"
         );
         assert!(!error.is_retryable());
         assert!(error.is_context_overflow());
         assert!(
-            !MekaError::Problem(problem("https://meka.so/errors/provider")).is_context_overflow(),
+            !MekaError::Problem(problem("https://meka.run/errors/provider")).is_context_overflow(),
             "the two share a status and must not share a remedy"
         );
     }
@@ -1033,7 +1048,7 @@ mod tests {
     /// status alone.
     #[test]
     fn a_context_overflow_is_not_retried_at_the_status_it_really_carries() {
-        let mut detail = problem("https://meka.so/errors/context-overflow");
+        let mut detail = problem("https://meka.run/errors/context-overflow");
         detail.status = 502;
         assert!(!MekaError::Problem(detail).is_retryable());
     }
@@ -1061,7 +1076,7 @@ mod tests {
         // would turn every rate limit into a message abandoned on the first attempt the day that
         // improvement shipped.
         let retryable = |status| {
-            let mut detail = problem("https://meka.so/errors/retryable-provider");
+            let mut detail = problem("https://meka.run/errors/retryable-provider");
             detail.status = status;
             MekaError::Problem(detail).is_retryable()
         };
@@ -1099,21 +1114,21 @@ mod tests {
 
     #[test]
     fn a_retry_after_hint_is_read_when_meka_sends_one() {
-        let mut detail = problem("https://meka.so/errors/internal");
+        let mut detail = problem("https://meka.run/errors/internal");
         detail.retry_after = Some(45.0);
         assert_eq!(
             MekaError::Problem(detail).retry_after(),
             Some(Duration::from_secs(45))
         );
         assert_eq!(
-            MekaError::Problem(problem("https://meka.so/errors/internal")).retry_after(),
+            MekaError::Problem(problem("https://meka.run/errors/internal")).retry_after(),
             None
         );
         // Nonsense rather than an instruction to wait forever. The last two matter more than they
         // look: `Duration::from_secs_f64` *panics* on a value it cannot represent, and this reads
         // whatever number the other side put in a JSON body.
         for nonsense in [-1.0, f64::NAN, f64::INFINITY, 1e300] {
-            let mut detail = problem("https://meka.so/errors/internal");
+            let mut detail = problem("https://meka.run/errors/internal");
             detail.retry_after = Some(nonsense);
             assert_eq!(
                 MekaError::Problem(detail).retry_after(),
@@ -1129,7 +1144,7 @@ mod tests {
         // answers its 429 with `with_retry_after(1)`, which sets both the header and a
         // `retry_after` body extension that flattens to the top level. The value is an
         // integer there, so the field has to tolerate one.
-        let body = r#"{"type":"https://meka.so/errors/concurrency-limit",
+        let body = r#"{"type":"https://meka.run/errors/concurrency-limit",
                        "title":"Too many concurrent turns","status":429,
                        "detail":"retry shortly","retry_after":1}"#;
         let detail: ProblemDetail = serde_json::from_str(body).expect("parses");
@@ -1142,14 +1157,17 @@ mod tests {
     #[test]
     fn permanent_failures_are_not_retried() {
         // Retrying an auth or validation failure just burns time; both need operator action.
-        assert!(!MekaError::Problem(problem("https://meka.so/errors/auth")).is_retryable());
-        assert!(!MekaError::Problem(problem("https://meka.so/errors/invalid-body")).is_retryable());
+        assert!(!MekaError::Problem(problem("https://meka.run/errors/auth")).is_retryable());
+        assert!(
+            !MekaError::Problem(problem("https://meka.run/errors/invalid-body")).is_retryable()
+        );
         // `provider` used to be asserted here, on the grounds that meka's `Provider` and
         // `InvalidRequest` both mapped onto it and the agent loop had already tried to repair
         // them. meka 0.44 pointed `RetryableProvider` at the same URI, so the bucket now holds
         // transient failures too and is retried; see `a_provider_failure_is_worth_another_attempt`.
         assert!(
-            !MekaError::Problem(problem("https://meka.so/errors/session-not-found")).is_retryable()
+            !MekaError::Problem(problem("https://meka.run/errors/session-not-found"))
+                .is_retryable()
         );
     }
 
@@ -1157,11 +1175,11 @@ mod tests {
     /// and an inbox post is refused on it before anything is written.
     #[test]
     fn a_locked_session_is_a_wait_rather_than_a_failure() {
-        let locked = MekaError::Problem(problem("https://meka.so/errors/session-locked"));
+        let locked = MekaError::Problem(problem("https://meka.run/errors/session-locked"));
         assert!(locked.is_session_locked());
         assert!(locked.is_retryable());
         assert!(
-            !MekaError::Problem(problem("https://meka.so/errors/session-not-found"))
+            !MekaError::Problem(problem("https://meka.run/errors/session-not-found"))
                 .is_session_locked()
         );
     }
@@ -1315,7 +1333,7 @@ mod tests {
 
     #[test]
     fn problem_detail_displays_title_status_and_detail() {
-        let rendered = problem("https://meka.so/errors/auth").to_string();
+        let rendered = problem("https://meka.run/errors/auth").to_string();
         assert_eq!(rendered, "t (409): d");
     }
 
@@ -1323,7 +1341,7 @@ mod tests {
     /// reading if the relayed upstream text rides along with it.
     #[test]
     fn the_upstream_response_reaches_whoever_reads_the_failure() {
-        let mut detail = problem("https://meka.so/errors/provider");
+        let mut detail = problem("https://meka.run/errors/provider");
         detail.provider_response = Some("401 invalid_api_key".to_string());
         assert_eq!(
             detail.to_string(),
@@ -1331,7 +1349,7 @@ mod tests {
         );
         // Absent where the operator turned relaying off, or on a meka predating the key.
         assert_eq!(
-            problem("https://meka.so/errors/provider").to_string(),
+            problem("https://meka.run/errors/provider").to_string(),
             "t (409): d"
         );
     }
@@ -1341,7 +1359,7 @@ mod tests {
     /// Telegram's 4096 characters and into a second message the operator may never read.
     #[test]
     fn a_vast_upstream_response_does_not_displace_the_rest_of_the_notice() {
-        let mut detail = problem("https://meka.so/errors/provider");
+        let mut detail = problem("https://meka.run/errors/provider");
         // A multi-byte character throughout, so a byte-wise cut would land mid-character and panic.
         detail.provider_response = Some("é".repeat(4 * 1024));
         let rendered = detail.to_string();
@@ -1359,7 +1377,7 @@ mod tests {
     /// caught here instead of by an operator reading a notice that stopped naming the cause.
     #[test]
     fn a_real_502_body_parses_into_both_new_fields() {
-        let body = r#"{"type":"https://meka.so/errors/provider-unavailable",
+        let body = r#"{"type":"https://meka.run/errors/provider-unavailable",
                        "title":"Provider temporarily unavailable","status":502,
                        "detail":"its response is in the server log",
                        "provider_response":"529 overloaded_error","retry_after":30}"#;

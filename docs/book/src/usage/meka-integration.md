@@ -149,13 +149,15 @@ The `name` becomes the namespace prefix, so the agent sees `mcp__mekabridge__sen
 
 ## Eager loading
 
-meka ships MCP tools **deferred** by default: the agent has to call `load_tool` before it can use one. For a bridge that is exactly backwards, because `send_message` is used on almost every turn.
+meka ships MCP tools **deferred** by default: the agent has to call `tool_load` before it can use one. For a bridge that is exactly backwards, because `send_message` is used on almost every turn.
 
 ```toml
 eager_load_tools = ["send_message", "list_conversations"]
 ```
 
 Leave the rest deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip. `read_history` is the one worth reconsidering if the agent lives in busy groups, since a muted conversation waking on a mention often needs it immediately.
+
+From meka 0.60 an eager tool buys more than that round trip. A deferred tool appears in the agent's `[Tool discovery]` index as a name and a one-line summary, and the whole index is capped at 8 KB across every MCP server at once. This bridge's own entries are roughly 6 KB of that, so the bridge and meka's seven built-in MCP-resource tools together sit just inside the cap: attach a second server of almost any size and the index drops a tier, keeping every name and dropping every summary. Nothing becomes unreachable and `tool_search` still finds a tool by keyword, but the summaries are what tell the agent when to reach for `unseen` rather than `read_history`, and they stop arriving. An eager tool is not in that index at all, so it keeps its full schema whatever else is attached.
 
 ## Permissions
 
@@ -192,7 +194,7 @@ property of the transport rather than a difference in kind. Gating it would make
 agent may run commands, fetch URLs and read every file, but may not say hello", which is not a
 posture anyone would pick deliberately, and its failure is silent from both ends.
 
-It also would not contain anything. meka grants `fetch_url` at `read`, so an agent at that level can
+It also would not contain anything. meka grants `web_fetch` at `read`, so an agent at that level can
 already push arbitrary bytes to any host on the internet. These tools reach only conversations on your
 allowlist, so they are strictly more constrained than a tool meka already treats as read-only.
 

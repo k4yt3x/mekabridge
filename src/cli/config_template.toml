@@ -85,7 +85,9 @@ channel = "mute"
 #   eager_load_tools = ["send_message", "list_conversations"]
 #
 # Without `eager_load_tools`, meka defers MCP tools and the agent pays an extra round trip before
-# every single reply.
+# every single reply. From meka 0.60 a deferred tool is also described to the agent out of an index
+# bounded across every MCP server at once, and this bridge alone fills most of it, so a second
+# server attached later costs every tool here its description.
 transport = "http"
 bind = "127.0.0.1:9100"
 path = "/mcp"

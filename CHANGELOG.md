@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-09-18
+
+### Added
+
+- The meka integration docs cover meka 0.60's bounded tool index and what eager loading now buys.
+
+### Fixed
+
+- The docs named meka's `load_tool` and `fetch_url`; 0.60 renamed them `tool_load` and `web_fetch`.
+
 ## [0.15.0] - 2026-09-17
 
 ### Added
@@ -416,7 +426,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.15.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.15.1...HEAD
+[0.15.1]: https://github.com/k4yt3x/mekabridge/compare/0.15.0...0.15.1
 [0.15.0]: https://github.com/k4yt3x/mekabridge/compare/0.14.0...0.15.0
 [0.14.0]: https://github.com/k4yt3x/mekabridge/compare/0.13.1...0.14.0
 [0.13.1]: https://github.com/k4yt3x/mekabridge/compare/0.13.0...0.13.1

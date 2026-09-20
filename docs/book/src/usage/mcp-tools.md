@@ -2,17 +2,17 @@
 
 These are the only way a message reaches a person. The bridge never authors chat content of its own.
 
-meka namespaces them by the server name from its config, so with `name = "mekabridge"` the agent sees `mcp__mekabridge__send_message`.
+meka namespaces them by the server name from its config, so with `name = "mekabridge"` the agent sees `mcp__mekabridge__message_send`.
 
 ## Why routing is explicit
 
 meka's MCP client sends a progress token and a tool-use id in `_meta` on a `tools/call`, and nothing else. There is no session identity on the wire, so an MCP server cannot work out which conversation a call belongs to.
 
-Every send therefore takes a `conversation` id. The agent reads it off the header attached to each inbound message, looks it up with `list_conversations`, or is simply told one in its own instructions. That constraint is also what makes the interesting behaviour possible: because the target is always explicit, replying to somebody else, replying on a different platform, or messaging first are all the same operation.
+Every send therefore takes a `conversation` id. The agent reads it off the header attached to each inbound message, looks it up with `conversation_list`, or is simply told one in its own instructions. That constraint is also what makes the interesting behaviour possible: because the target is always explicit, replying to somebody else, replying on a different platform, or messaging first are all the same operation.
 
 Any well-formed id naming a configured channel is accepted, whether or not the bridge has seen that conversation before. Whether the chat can actually be written to is the platform's judgement, not the bridge's.
 
-## `send_message`
+## `message_send`
 
 Send a message to a person or group.
 
@@ -32,7 +32,7 @@ Returns the platform message ids produced. Long text is split, so there may be s
 
 Text too long for one platform message is split, and each part previews its own first link, so a long answer carrying several links produces several cards. Suppressing all but one would mean guessing which part holds the link the agent meant, and guessing wrong drops a card that was explicitly asked for. Send the link on its own to get exactly one.
 
-## `send_file`
+## `file_send`
 
 Send local files.
 
@@ -54,7 +54,7 @@ Relative paths and missing files are rejected before the platform is contacted, 
 
 `link_preview` does nothing on Telegram, and is accepted rather than refused there. `sendPhoto` and `sendDocument` carry no `link_preview_options` at all, so a caption's links never expand into a card; refusing the call would make the agent handle a platform difference it cannot see from the schema, for a request that is harmless.
 
-## `react`
+## `message_react`
 
 Attach an emoji reaction to a message.
 
@@ -70,14 +70,14 @@ The bridge never reacts on its own. Like sending, this happens only because the 
 
 Telegram accepts a fixed set of emoji and allows bots one reaction per message. The set changes, so the bridge does not keep its own copy: it sends what the agent chose and passes Telegram's rejection back verbatim.
 
-## `edit_message`
+## `message_edit`
 
 Replace the text of a message the agent sent.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
 | `conversation` | string | Conversation the message is in |
-| `message_id` | string | Id returned by `send_message` |
+| `message_id` | string | Id returned by `message_send` |
 | `text` | string | Replacement body, as Markdown |
 | `link_preview` | bool, optional | Expand the first link in the revision. Off unless asked for |
 
@@ -87,7 +87,7 @@ The new text replaces the old entirely. Correcting a reply in place is what a pe
 
 An edit is one message, so replacement text long enough to need splitting is refused rather than truncated. Telegram also declines to edit messages older than 48 hours, and passes that back verbatim.
 
-## `delete_message`
+## `message_delete`
 
 Remove a message.
 
@@ -98,7 +98,7 @@ Remove a message.
 
 The agent's own messages anywhere, and anyone's in a group where it is an administrator with the delete right. This cannot be undone and the message disappears for everyone, so it is logged at warn: that log line is the only remaining record.
 
-## `mute`, `unmute`, `block`, and `unblock`
+## `conversation_mute`, `conversation_unmute`, `conversation_block`, and `conversation_unblock`
 
 How much of a conversation reaches the agent. All four take the same arguments.
 
@@ -108,17 +108,17 @@ How much of a conversation reaches the agent. All four take the same arguments.
 | `duration` | string, optional | `30m`, `2h`, `7d`. Omit to leave it until changed |
 | `reason` | string, optional | Recorded alongside, shown when listing |
 
-**`mute`** turns a conversation down to mentions only. The agent is woken when somebody names it, or uses their client's reply button on something it said, and for nothing else: somebody answering it in ordinary prose, without either, does not reach it. Everything else is received and **recorded**, so `read_history` and `search_history` reach it, and the next thing that does wake the conversation says how much accumulated.
+**`conversation_mute`** turns a conversation down to mentions only. The agent is woken when somebody names it, or uses their client's reply button on something it said, and for nothing else: somebody answering it in ordinary prose, without either, does not reach it. Everything else is received and **recorded**, so `history_read` and `history_search` reach it, and the next thing that does wake the conversation says how much accumulated.
 
-**`block`** stops a conversation reaching the agent at all. Nothing is delivered and nothing is kept, so unlike a mute there is no way to read afterwards what was said; the agent is only told how many messages went. It is the heavier of the two and belongs on a chat there is no reason to read later.
+**`conversation_block`** stops a conversation reaching the agent at all. Nothing is delivered and nothing is kept, so unlike a mute there is no way to read afterwards what was said; the agent is only told how many messages went. It is the heavier of the two and belongs on a chat there is no reason to read later.
 
 Both are attention management, not access control. An allowlist decides who may speak to the agent; these decide what it is worth being woken for. Neither consumes queue depth or a provider turn.
 
 Muting a one-to-one chat is refused: every message there is addressed to the agent, so it would change nothing, and reporting success for a no-op is worse than saying so.
 
-`unmute` and `unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `mekabridge policy clear`.
+`conversation_unmute` and `conversation_unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `mekabridge policy clear`.
 
-`duration` on `unmute` is how the agent joins a discussion it has been pulled into without having to remember to mute the room afterwards. When it lapses the conversation falls back to the configured default for its kind rather than to whatever preceded it, and the agent is told: the message that discovers the expiry is delivered even if nothing in it addresses the agent, because a notice nobody is woken for is a notice nobody reads. See [Group attention](./group-attention.md).
+`duration` on `conversation_unmute` is how the agent joins a discussion it has been pulled into without having to remember to mute the room afterwards. When it lapses the conversation falls back to the configured default for its kind rather than to whatever preceded it, and the agent is told: the message that discovers the expiry is delivered even if nothing in it addresses the agent, because a notice nobody is woken for is a notice nobody reads. See [Group attention](./group-attention.md).
 
 A decision the agent made can only be undone by the agent or by an operator. That matters if it silences the conversation you would use to ask it to stop:
 
@@ -127,7 +127,40 @@ $ mekabridge policy list
 $ mekabridge policy clear telegram:-1001234567890
 ```
 
-## `unseen`
+## `watch_create`, `watch_delete`, and `watch_list`
+
+Patterns that wake the agent in a conversation it has otherwise muted. The third reason a muted chat
+reaches it, after a mention and a reply, and the only one the agent sets itself.
+
+| Argument | Type | Meaning |
+|----------|------|---------|
+| `pattern` | string | Regular expression. Case-insensitive unless it says `(?-i)` |
+| `field` | string, optional | `text` (default), `sender`, or `sender_id` |
+| `conversation` | string, optional | Confine it to one chat. Omit to watch every muted chat |
+| `duration` | string, optional | `2h`, `7d`. Omit to keep it until removed |
+| `reason` | string, optional | Shown back when it fires, and when listing |
+
+`watch_delete` takes an `id`, from `watch_list` or from the `woke you:` line that said a watch
+fired. `watch_list` takes nothing and returns every watch standing.
+
+One watch reads one field, and the wake line names which matched. Setting the same
+`(conversation, field, pattern)` twice returns the watch already there rather than a second copy, so
+an agent syncing a rule list it keeps elsewhere can call `watch_create` for every rule every time.
+
+A match decides only that a message is **worth a turn**. What it means is judged in the turn it
+wakes, with the surrounding conversation already printed alongside it. That division is what lets
+the pattern be tuned for recall: too broad costs turns and is visible in the wake line, too narrow
+misses silently.
+
+At most 500 watches, each at most 256 characters, matched with a linear-time engine so a badly
+written rule cannot hang the bridge. A pattern that will not compile is refused when it is set, with
+the error explaining why. Watches are consulted only under `mute`: a chat heard in full delivers the
+message anyway, and a blocked one keeps nothing to match.
+
+`mekabridge watch list`, `mekabridge watch create` and `mekabridge watch delete` are the operator's
+side of the same controls. See [Group attention](./group-attention.md#watches).
+
+## `backlog_check`
 
 How much is recorded that the agent has not been shown, and when the most recent of it arrived.
 
@@ -135,31 +168,51 @@ How much is recorded that the agent has not been shown, and when the most recent
 |----------|------|---------|
 | `conversation` | string, optional | Chat to ask about. Omit for every chat at once |
 
-Asking does not count as having seen anything, so `read_history` still returns the same messages
+Asking does not count as having seen anything, so `history_read` still returns the same messages
 afterwards.
 
-The tool answers with the backlog, which is what the agent wants to read. It is deliberately **not**
-the value a watcher should compare: a backlog falls to zero every time an ordinary turn sweeps the
-conversation, so a watcher gating on it would fire on the sweep and announce news the agent had just
-been handed. `mekabridge unseen` prints a separate watcher-facing marker for that, which moves only
-when something new is said. See [Group attention](./group-attention.md).
+The answer is JSON, because the useful reader is a scheduled job:
 
-## `read_history` and `search_history`
+```json
+{ "conversation": "telegram:-1001234567890", "unseen": 3,
+  "newest": "2026-08-14T10:22:31+00:00", "latest": "2026-08-14T10:22:31+00:00" }
+```
+
+The two counts are separate fields because only one of them can be gated on. `unseen` is the
+backlog, which is what the agent wants to **read**, and it falls to zero every time an ordinary turn
+sweeps the conversation, so a gate on it fires on the sweep. `latest` moves when, and only when,
+somebody else says something that still stands, which makes it the field to **watch**:
+
+```
+gate: {
+  check: { tool: "mcp__mekabridge__backlog_check", arguments: { conversation: "..." } },
+  when: { at: "/latest", is: "changed" }
+}
+```
+
+`newest` and `latest` are absent rather than null when there is nothing to report, and
+`conversation` is absent when the question was about every chat. See
+[Group attention](./group-attention.md).
+
+## `history_read` and `history_search`
 
 Read back what was said, including messages the agent was never woken for.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `conversation` | string | Chat to read. Optional for `search_history`, which spans all of them without it |
-| `query` | string | `search_history` only. `a OR b`, `a NOT b`, and `"quoted phrases"` work |
+| `conversation` | string | Chat to read. Optional for `history_search`, which spans all of them without it |
+| `query` | string | `history_search` only. `a OR b`, `a NOT b`, and `"quoted phrases"` work |
 | `limit` | number, optional | Default 20, capped at 100 |
-| `before` | number, optional | `read_history` only. The `cursor` of the oldest message you were given, to page further back |
+| `before` | number, optional | `history_read` only. The `cursor` of the oldest message you were given, to page further back |
+| `after` | number, optional | `history_read` only. The `cursor` of the newest message you were given, to read only what has been said since |
 
-This is what makes `mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
+This is what makes `conversation_mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
+
+The two cursors read opposite ways and at most one may be set. `before` pages backwards through what is already there. `after` follows a conversation forwards: it returns the **oldest** messages above the cursor, so a job sweeping a busy chat gets the next page in order rather than the latest page with a hole behind it. Keep the newest `cursor` you were handed, pass it back next time, and nothing is read twice or missed in between. A forward read that finds nothing says the chat has not moved, rather than offering the retention as a possible cause.
 
 Both read what the bridge recorded: nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
 
-A long reply becomes several real messages, and the platform can refuse one after the earlier ones have gone out. The tool reports the failure and names the part, and the parts that landed are recorded, so `read_history` matches what the person can actually see rather than showing nothing at all.
+A long reply becomes several real messages, and the platform can refuse one after the earlier ones have gone out. The tool reports the failure and names the part, and the parts that landed are recorded, so `history_read` matches what the person can actually see rather than showing nothing at all.
 
 ### Both sides, and what became of each message
 
@@ -176,23 +229,27 @@ Four fields say what has happened to a message since:
 | `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id` |
 | `previous_account` | It went through a bot account this channel no longer uses, because the bot was deleted and recreated. Its `message_id` belongs to that account, so replying to it, reacting to it, editing it, or deleting it from the current one fails |
 
-A message the agent was woken for is in its context permanently, so the record is the only thing able to tell it afterwards that what it acted on has been withdrawn or rewritten. That is why neither is erased. Both are excluded from `unseen` and from the missed-context lookback, though: a retracted message must never be offered as news.
+A message the agent was woken for is in its context permanently, so the record is the only thing able to tell it afterwards that what it acted on has been withdrawn or rewritten. That is why neither is erased. Both are excluded from `backlog_check` and from the missed-context lookback, though: a retracted message must never be offered as news.
 
-Long text is split into several real messages with several ids, and each gets its own row. `send_message`'s receipt numbers them (`part 2/3: 502`), so a later `edit_message` or `react` addresses the part meant rather than the first one.
+Long text is split into several real messages with several ids, and each gets its own row. `message_send`'s receipt numbers them (`part 2/3: 502`), so a later `message_edit` or `message_react` addresses the part meant rather than the first one.
 
 A file the agent sent carries an attachment handle like any other, so a session that did not send it can still open it.
 
 Deletions are reported by Discord only. The Telegram Bot API never tells a bot that somebody deleted a message, so deleted Telegram messages are never marked and simply age out under `history_retention`.
 
-On Discord, `search_history` also asks Discord's own guild search when the search names one conversation, and merges what comes back. That reaches messages from before the bot joined, which the bridge cannot have recorded. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord has indexed it; each of those falls back to the local results rather than failing the search. A result that came from Discord rather than the archive has no attachment handles and a `cursor` of `0`, since there is no local row to page from.
+On Discord, `history_search` also asks Discord's own guild search when the search names one conversation, and merges what comes back. That reaches messages from before the bot joined, which the bridge cannot have recorded. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord has indexed it; each of those falls back to the local results rather than failing the search. A result that came from Discord rather than the archive has no attachment handles and a `cursor` of `0`, since there is no local row to page from.
 
-Attachment handles come back with each message, so a picture found in history can go straight to `view_attachment` while it is still within `attachment_retention`.
+Attachment handles come back with each message, so a picture found in history can go straight to `attachment_view` while it is still within `attachment_retention`.
 
 Each message also carries a `cursor`, which is what `before` takes. It is deliberately not a timestamp: Telegram stamps to the second, so a burst shares one, and paging on a timestamp would drop the siblings of the message paged from without anything saying so.
 
-## `moderate_member`
+## `member_moderate`
 
 Restrict, ban, or reinstate somebody in a group. Present only when `admin_tools` is on.
+
+It is the one tool that keeps an `action` enum rather than splitting into a tool per verb. The other
+arguments mean the same thing whichever action is chosen, which is what makes a family acceptable
+rather than five tools that would each cost a line of the agent's bounded tool index.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
@@ -210,26 +267,26 @@ Restrict, ban, or reinstate somebody in a group. Present only when `admin_tools`
 
 Anonymous admins and channel posts have no user id and cannot be moderated this way.
 
-## `set_member_rights` and `set_member_roles`
+## `member_set_rights` and `member_set_roles`
 
-Promote, adjust, or demote somebody. Which of the two you get depends on the platform, because the two moderation models do not overlap: Telegram grants privileges to a person directly, Discord puts them on roles and grants the role. Only the tool that would work on a reachable chat is offered, so a Discord-only deployment never sees `set_member_rights` and vice versa. A deployment with both platforms sees both.
+Promote, adjust, or demote somebody. Which of the two you get depends on the platform, because the two moderation models do not overlap: Telegram grants privileges to a person directly, Discord puts them on roles and grants the role. Only the tool that would work on a reachable chat is offered, so a Discord-only deployment never sees `member_set_rights` and vice versa. A deployment with both platforms sees both.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
 | `conversation` | string | Group to act in |
 | `user_id` | string | Numeric id |
-| `rights` | array | `set_member_rights`: the complete set of privileges they should end up with |
-| `roles` | array | `set_member_roles`: the complete set of role **names**, as shown on a header's `roles:` line |
+| `rights` | array | `member_set_rights`: the complete set of privileges they should end up with |
+| `roles` | array | `member_set_roles`: the complete set of role **names**, as shown on a header's `roles:` line |
 
-Both replace rather than add, so an empty list demotes. Telegram lets a bot grant only privileges it holds itself; Discord lets it grant only roles below its own. `set_member_roles` takes names rather than ids because a name is what the agent was shown, and a role name it does not recognise comes back with the list of ones that exist.
+Both replace rather than add, so an empty list demotes. Telegram lets a bot grant only privileges it holds itself; Discord lets it grant only roles below its own. `member_set_roles` takes names rather than ids because a name is what the agent was shown, and a role name it does not recognise comes back with the list of ones that exist.
 
-## `pin_message` and `set_chat`
+## `message_pin` and `chat_set`
 
-`pin_message` takes `conversation`, `message_id`, `pin` (false to unpin), and optional `silent`. On Discord it needs the `PIN_MESSAGES` permission, which was split out of `MANAGE_MESSAGES`, and Discord always announces a pin with no way not to, so `silent` is refused there rather than accepted and ignored.
+`message_pin` takes `conversation`, `message_id`, `pin` (false to unpin), and optional `silent`. On Discord it needs the `PIN_MESSAGES` permission, which was split out of `MANAGE_MESSAGES`, and Discord always announces a pin with no way not to, so `silent` is refused there rather than accepted and ignored.
 
-`set_chat` takes `conversation` and an optional `title`, `description`, and `slowmode`; omitted fields are left alone. `slowmode` is the shortest gap allowed between one person's messages, as a duration like `30s`, with `0s` turning it off. It is Discord-only, capped at 6 hours, and the lever for quieting a room rather than a person.
+`chat_set` takes `conversation` and an optional `title`, `description`, and `slowmode`; omitted fields are left alone. `slowmode` is the shortest gap allowed between one person's messages, as a duration like `30s`, with `0s` turning it off. It is Discord-only, capped at 6 hours, and the lever for quieting a room rather than a person.
 
-## `member`
+## `member_get`
 
 Somebody's standing in a chat and the privileges they hold.
 
@@ -242,7 +299,7 @@ Omitting `user_id` is the useful case: it lets the agent find out what it is all
 
 The answer also carries the roles somebody holds and, for anyone currently restricted, when that lifts. On Discord permissions are computed for the specific channel asked about, including its overwrites, because holding a permission in a server says nothing about holding it in a given room.
 
-## `list_members`
+## `member_list`
 
 Who is in a chat, or who matches a name.
 
@@ -276,9 +333,9 @@ Filtering is applied to the page, so `coverage` comes back as `present` rather t
 
 `as_of` is when the bridge last heard anything about that chat's presence. Presence cannot be fetched on demand, only accumulated from a live connection, so an answer is only ever as fresh as the last update that reached it. **Telegram reports no presence at all**, so the field is absent there rather than `unknown`.
 
-Both `member` and `list_members` are withheld when a channel sets `admin_tools = false`, since they read about people rather than messages.
+Both `member_get` and `member_list` are withheld when a channel sets `admin_tools = false`, since they read about people rather than messages.
 
-## `view_attachment`
+## `attachment_view`
 
 Look at a picture, without writing anything to disk.
 
@@ -290,9 +347,9 @@ Returns the image itself, which meka forwards to the provider as a multimodal bl
 
 Prefer triaging from the `attachment:` line first. It carries the media type, pixel size, running time and byte count, which is usually enough to decide whether a file is worth looking at, and what an agent looks at stays in its context for the life of the session.
 
-Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `download_attachment` instead. So does everything when the active profile has no vision.
+Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `attachment_download` instead. So does everything when the active profile has no vision.
 
-## `download_attachment`
+## `attachment_download`
 
 Write a file to disk and get its path back.
 
@@ -302,7 +359,7 @@ Write a file to disk and get its path back.
 
 For the cases where the agent needs the file rather than a look at it: reading a document, running a tool over an archive. Files land in `[storage].attachment_dir` and are bounded by `attachment_max_bytes`. Calling it twice returns the same path without fetching again.
 
-## `list_conversations`
+## `conversation_list`
 
 Known conversations, most recently active first.
 
@@ -311,11 +368,11 @@ Known conversations, most recently active first.
 | `channel` | string, optional | Restrict to one configured channel |
 | `limit` | integer, optional | Default 50, capped at 200 |
 
-This is not garnish. In a session that runs for months, compaction eventually summarises away the older parts of the context. `list_conversations` is how the agent re-derives its address book instead of scrolling back through history that may no longer be there.
+This is not garnish. In a session that runs for months, compaction eventually summarises away the older parts of the context. `conversation_list` is how the agent re-derives its address book instead of scrolling back through history that may no longer be there.
 
 Each entry carries `policy` (the one actually in force, whether from an explicit decision or the configured default), `policy_until` when somebody ruled on it explicitly, and `unseen` for how much a muted conversation is holding.
 
-## `get_conversation`
+## `conversation_get`
 
 One conversation by id, with its title, kind, and last activity.
 
@@ -333,11 +390,11 @@ Only two things are refused here: an id that is not well formed, and one naming 
 
 Most tools are annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, and gating replying behind a higher level would leave a bridge running at `read` understanding every message and unable to answer any of them.
 
-Five are the exception and need `unrestricted`: `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `mute` and `block` modify plenty, but only this bridge's own record of what it forwards.
+Five are the exception and need `unrestricted`: `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` and `chat_set`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `conversation_mute` and `conversation_block` modify plenty, but only this bridge's own record of what it forwards.
 
 `workspace` is not enough for those five, which surprises people: meka refuses an unsandboxed MCP tool at the one level whose promise is confinement. [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) has the reasoning and the `tool_permissions` escape hatch.
 
-`download_attachment` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
+`attachment_download` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
 
 Everything that reaches the platform also carries `openWorldHint: true`, which is the accurate caveat: those change nothing locally, but they do act on the outside world. The policy and history tools do not, since they only change or read what this bridge itself holds.
 

@@ -367,11 +367,11 @@ mod tests {
         assert_eq!(
             event(
                 "tool_call.composing",
-                r#"{"id":"tu_1","name":"mcp__mekabridge__send_message"}"#,
+                r#"{"id":"tu_1","name":"mcp__mekabridge__message_send"}"#,
             ),
             TurnEvent::ToolCallComposing {
                 id: "tu_1".to_string(),
-                name: "mcp__mekabridge__send_message".to_string()
+                name: "mcp__mekabridge__message_send".to_string()
             }
         );
     }

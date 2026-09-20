@@ -62,13 +62,14 @@ mute_context = 5
 # What reaches the agent from a conversation nobody has ruled on, by kind of chat:
 #
 #   active  every message wakes the agent
-#   mute    everything is recorded, but only a mention or a reply wakes the agent
+#   mute    everything is recorded, but only a mention, a reply, or a pattern the agent is
+#           watching for wakes it (see `mekabridge watch`)
 #   block   nothing is delivered and nothing is kept
 #
 # Groups default to mentions only, which is how a person configures a busy room on their own phone.
 # A one-to-one chat has nobody else in it, so mute there would silence the agent against the only
-# person talking to it. The agent can override any single conversation with the mute and block tools,
-# and an operator with `mekabridge policy set`.
+# person talking to it. The agent can override any single conversation with the conversation_mute
+# and conversation_block tools, and an operator with `mekabridge policy set`.
 [bridge.default_policy]
 direct = "active"
 group = "mute"
@@ -82,7 +83,7 @@ channel = "mute"
 #   transport = "http"
 #   url = "http://127.0.0.1:9100/mcp"
 #   required = true
-#   eager_load_tools = ["send_message", "list_conversations"]
+#   eager_load_tools = ["message_send", "conversation_list"]
 #
 # Without `eager_load_tools`, meka defers MCP tools and the agent pays an extra round trip before
 # every single reply. From meka 0.60 a deferred tool is also described to the agent out of an index
@@ -95,7 +96,7 @@ path = "/mcp"
 # token = "${MEKABRIDGE_MCP_TOKEN}"
 
 [storage]
-# How long a recorded message stays readable through read_history and search_history. Set to "0s" to
+# How long a recorded message stays readable through history_read and history_search. Set to "0s" to
 # record nothing at all, which is the switch for a deployment that does not want a chat log on disk;
 # delivery is unaffected either way. Matches the attachment retention, so a message and the picture
 # attached to it fall out of reach together.
@@ -122,7 +123,7 @@ allowed_users = [123456789]
 # admin_tools = false
 # Turn Telegram's privacy mode off (/setprivacy in @BotFather, then re-add the bot to each group).
 # With it on, Telegram withholds every group message that does not mention the bot, so a muted
-# conversation has nothing to record and read_history comes back empty exactly when the agent needs
+# conversation has nothing to record and history_read comes back empty exactly when the agent needs
 # it. The `mute` policy above is the better way to limit what wakes the agent, because it keeps
 # what it withholds.
 
@@ -156,7 +157,7 @@ allowed_users = [123456789]
 # # Ask for the privileged MESSAGE_CONTENT intent. On by default. It must be enabled first on the Bot
 # # page of the Developer Portal, or the gateway closes with a 4014 at startup rather than degrading.
 # # Without it Discord blanks the text of every server message except those mentioning the bot, so
-# # mentions still wake the agent but read_history has nothing to show it.
+# # mentions still wake the agent but history_read has nothing to show it.
 # # message_content = false
 # # Track who is online, for deciding who is around to be given work. Off by default: unlike the
 # # other intents this one cannot be reached over HTTP, so it goes into the connection handshake, and

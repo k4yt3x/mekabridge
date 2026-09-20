@@ -14,7 +14,8 @@ use crate::{
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::MekaClient,
-    store::{Policy, QueueState, Store},
+    store::{NewWatch, Policy, QueueState, Store, WatchOutcome},
+    watch::WatchField,
 };
 
 /// Starter config written by `mekabridge config init`.
@@ -276,7 +277,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             if config.storage.history_retention.is_zero() {
                 // Not a failure: some deployments deliberately keep no chat log. It does change
                 // what a muted conversation can offer the agent, so it is stated
-                // rather than left to be discovered when read_history comes back
+                // rather than left to be discovered when history_read comes back
                 // empty.
                 println!(
                     "  warn   history is off, so nothing a muted conversation withholds can be \
@@ -372,13 +373,13 @@ pub async fn doctor(config: &Config) -> Result<()> {
             }
             if info.vision {
                 println!(
-                    "  ok     vision is on, so view_attachment hands the agent the picture itself"
+                    "  ok     vision is on, so attachment_view hands the agent the picture itself"
                 );
             } else {
                 println!(
-                    "  warn   the active profile has vision off, so view_attachment returns a \
+                    "  warn   the active profile has vision off, so attachment_view returns a \
                      description rather than the image and the agent can only reach a file through \
-                     download_attachment. Set `vision = true` under [profiles.<name>]."
+                     attachment_download. Set `vision = true` under [profiles.<name>]."
                 );
                 warnings += 1;
             }
@@ -490,7 +491,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                                     "  warn   {} has privacy mode on, so Telegram withholds group \
                                      messages that do not mention it. The `mute` policy already \
                                      limits what wakes the agent, and privacy mode on top of it \
-                                     means read_history has nothing to show. Turn it off with \
+                                     means history_read has nothing to show. Turn it off with \
                                      /setprivacy in @BotFather, then remove and re-add the bot to \
                                      each group.",
                                     channel.id()
@@ -499,7 +500,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                                     "  warn   {} runs with `message_content = false`, so Discord \
                                      blanks the text of every server message except those \
                                      mentioning the bot. Mentions still wake the agent, but \
-                                     read_history and search_history will have nothing to show it \
+                                     history_read and history_search will have nothing to show it \
                                      about what led up to one.",
                                     channel.id()
                                 ),
@@ -621,7 +622,7 @@ fn permission_problem(level: &str) -> Option<&'static str> {
         "ask" => Some(
             "meka 0.46 retired `ask` for an `approvals` switch beside the level, so a session \
              cannot run at it any more; upgrading meka moves this one to `none`, where every call \
-             is denied including send_message. Set [session].permission to \"read\" and restart: \
+             is denied including message_send. Set [session].permission to \"read\" and restart: \
              the bridge reconciles the level before its next turn, so no session reset is needed.",
         ),
         "write" => Some(
@@ -918,6 +919,135 @@ pub async fn policy_clear(config: &Config, conversation: &str) -> Result<()> {
     Ok(())
 }
 
+/// List the watches in force.
+pub async fn watch_list(config: &Config) -> Result<()> {
+    let store = Store::open(&config.storage.path).await?;
+    let watches = store.list_watches(Utc::now()).await?;
+    if watches.is_empty() {
+        println!("no watches; a muted conversation wakes the agent on a mention or a reply only");
+        return Ok(());
+    }
+    for watch in watches {
+        let until = match watch.until {
+            Some(until) => format!("until {}", short_time(until)),
+            None => "indefinite".to_string(),
+        };
+        println!(
+            "  {:<5} {:<10} {:<28} {:<22} {:<30} {}",
+            watch.id,
+            watch.field.as_str(),
+            watch.conversation.as_deref().unwrap_or("(every chat)"),
+            until,
+            watch.pattern,
+            watch.reason.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+/// Add a watch from the command line.
+pub async fn watch_create(
+    config: &Config,
+    pattern: &str,
+    field: WatchField,
+    conversation: Option<&str>,
+    duration: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    // Compiled before anything is stored, so a pattern that could never match is refused while the
+    // operator is still looking at it rather than sitting in the table matching nothing.
+    crate::watch::compile_pattern(pattern).map_err(|error| {
+        BridgeError::config(format!("{pattern:?} is not a usable pattern: {error}"))
+    })?;
+    let until = duration
+        .map(|duration| {
+            let parsed = humantime::parse_duration(duration).map_err(|error| {
+                BridgeError::config(format!("{duration:?} is not a duration: {error}"))
+            })?;
+            chrono::Duration::from_std(parsed)
+                .map_err(|_| BridgeError::config(format!("{duration:?} is too long")))
+        })
+        .transpose()?
+        .map(|duration| Utc::now() + duration);
+
+    // Same validation as `policy_set`, and for the same reason: a watch scoped to a mistyped id
+    // would be stored, consulted for a conversation that does not exist, and report success.
+    let scope = conversation
+        .map(|conversation| {
+            let parsed = crate::channel::ConversationId::parse(conversation).ok_or_else(|| {
+                BridgeError::config(format!(
+                    "{conversation:?} is not a conversation id; the form is <channel>:<chat>, as \
+                     printed by `mekabridge conversations list`"
+                ))
+            })?;
+            let platform = config
+                .channels
+                .iter()
+                .find(|channel| channel.id == parsed.channel())
+                .map(platform_name)
+                .ok_or_else(|| {
+                    BridgeError::config(format!(
+                        "{parsed} names channel {:?}, which is not configured",
+                        parsed.channel()
+                    ))
+                })?;
+            Ok::<_, BridgeError>((parsed, platform))
+        })
+        .transpose()?;
+
+    let store = Store::open(&config.storage.path).await?;
+    let outcome = store
+        .add_watch(
+            NewWatch {
+                conversation: scope.as_ref().map(|(parsed, _)| parsed.as_str()),
+                platform: scope.as_ref().map(|(_, platform)| *platform),
+                field,
+                pattern,
+                until,
+                reason,
+            },
+            Utc::now(),
+        )
+        .await?;
+    let scope = scope.as_ref().map_or_else(
+        || "every muted conversation".to_string(),
+        |(parsed, _)| parsed.to_string(),
+    );
+    match outcome {
+        WatchOutcome::Added(watch) => println!(
+            "watch {} added: {} in the {} of {scope}",
+            watch.id,
+            watch.pattern,
+            watch.field.as_str()
+        ),
+        WatchOutcome::Existing(watch) => println!(
+            "watch {} already covers {} in the {} of {scope}",
+            watch.id,
+            watch.pattern,
+            watch.field.as_str()
+        ),
+        // An error rather than a printed note: the watch was not added and retrying will not add
+        // it, so a script that chained onto this must not read the refusal as success.
+        WatchOutcome::AtCapacity(held) => {
+            return Err(BridgeError::command(format!(
+                "not added: there are already {held} watches, which is the most this bridge holds; \
+                 remove one with `mekabridge watch delete`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove a watch, including one the agent set on itself and cannot be asked to undo.
+pub async fn watch_delete(config: &Config, id: i64) -> Result<()> {
+    let store = Store::open(&config.storage.path).await?;
+    match store.remove_watch(id).await? {
+        Some(watch) => println!("watch {} removed: {}", watch.id, watch.pattern),
+        None => println!("there is no watch {id}"),
+    }
+    Ok(())
+}
+
 /// Report what the agent has not been shown, as an exit code and one line.
 ///
 /// Built to be a scheduled job's gate, which is why it owns its exit code rather than reporting
@@ -949,7 +1079,8 @@ pub fn unseen(config_path: Option<&Path>, conversation: Option<&str>) -> std::pr
         };
         let config = Config::load(config_path)?;
         // The other half of the same mistake, and the one that survives a well-formed id: a channel
-        // segment naming nothing configured can never match a row. The `unseen` tool refuses this
+        // segment naming nothing configured can never match a row. The `backlog_check` tool
+        // refuses this
         // through the channel registry, and a gate reading the exit code deserves the same answer
         // from out here.
         if let Some(parsed) = &parsed
@@ -1018,7 +1149,7 @@ pub async fn history_show(
                 .search_messages(query, Some(conversation), limit)
                 .await?
         }
-        None => store.history(conversation, limit, None).await?,
+        None => store.history(conversation, limit, None, None).await?,
     };
     if messages.is_empty() {
         println!("nothing recorded");

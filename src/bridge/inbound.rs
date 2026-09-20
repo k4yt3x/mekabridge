@@ -40,8 +40,9 @@ use crate::{
     },
     store::{
         AccountId, Backlog, ConversationRecord, EnqueueOutcome, HandOver, MessageKey, Offer,
-        Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store,
+        Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store, WatchRecord,
     },
+    watch::Watchlist,
 };
 
 /// Safety-net poll interval. The writer notifies the session task directly, so this only covers
@@ -177,6 +178,48 @@ impl TypingState {
     }
 }
 
+/// The watches in force, compiled, and the rows they were compiled from.
+///
+/// Held across messages because compiling is the expensive half and the rows almost never change:
+/// [`Store::watches`] hands back the same allocation while its cache holds and while a refetch
+/// finds nothing different, so the pointer comparison here is what turns "re-read the watches on
+/// every message" into "recompile them when the agent actually changes one".
+#[derive(Default)]
+struct Watches {
+    held: Option<(Arc<Vec<WatchRecord>>, Watchlist)>,
+}
+
+impl Watches {
+    /// The current watchlist, or `None` when nothing is being watched.
+    ///
+    /// A store that cannot answer yields `None`, which withholds the message rather than
+    /// delivering it. That is the opposite of how [`gate`] fails on a policy it cannot read, and
+    /// deliberately: failing open on a policy costs an unwanted turn, while failing open here is
+    /// not available at all, since without the rules there is nothing to decide with.
+    async fn current(&mut self, store: &Store, now: DateTime<Utc>) -> Option<&Watchlist> {
+        let rows = match store.watches(now).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(
+                    "could not read the watches, so nothing will wake a muted chat but a mention: \
+                     {}",
+                    error
+                );
+                return None;
+            }
+        };
+        let stale = !matches!(&self.held, Some((held, _)) if Arc::ptr_eq(held, &rows));
+        if stale {
+            let list = Watchlist::new(rows.as_ref().clone());
+            self.held = Some((rows, list));
+        }
+        self.held
+            .as_ref()
+            .map(|(_, list)| list)
+            .filter(|list| !list.is_empty())
+    }
+}
+
 /// Persist events from every channel into the queue.
 ///
 /// Runs until the sender side closes, which happens when all channels have stopped.
@@ -193,6 +236,7 @@ pub async fn writer(
     typing: Arc<TypingState>,
     accounts: Arc<ChannelAccounts>,
 ) {
+    let mut watches = Watches::default();
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
         // Only a message is ever queued. The other two are handled here and go no further, so this
@@ -256,7 +300,7 @@ pub async fn writer(
             );
             continue;
         };
-        let disposition = match gate(&store, &config, message).await {
+        let disposition = match gate(&store, &config, &mut watches, message).await {
             Ok(disposition) => disposition,
             Err(error) => {
                 // Failing open. A store that cannot answer should not also cost people their
@@ -394,9 +438,14 @@ enum Disposition {
 /// A lapsed record is cleared here rather than swept on a timer, and what it did is handed to the
 /// message that lifted it, since a policy whose effect is invisible gives the agent nothing to
 /// judge a renewal on.
+///
+/// Watches are the third way through a mute, after a mention and a reply. They are consulted only
+/// there, because that is the only policy where they decide anything: `active` delivers the message
+/// whatever they say, and `block` keeps nothing for them to read.
 async fn gate(
     store: &Store,
     config: &Config,
+    watches: &mut Watches,
     message: &mut InboundMessage,
 ) -> Result<Disposition, crate::store::StoreError> {
     let conversation = message.conversation.clone();
@@ -430,6 +479,17 @@ async fn gate(
         None => config.bridge.default_policy.for_kind(message.chat_kind),
     };
 
+    // Recorded on the message before the arms below rather than inside the one that needs it, so
+    // that a message which was also addressed still carries what it matched. The agent is told why
+    // it was woken, and "you were named" alone would hide a rule that is firing on every mention.
+    if policy == Policy::Mute {
+        let matched = match watches.current(store, now).await {
+            Some(list) => list.matches(message),
+            None => Vec::new(),
+        };
+        message.matches = matched;
+    }
+
     match policy {
         Policy::Active => Ok(Disposition::Deliver),
         Policy::Block => {
@@ -447,6 +507,9 @@ async fn gate(
         // confusion the notice exists to prevent, so it is worth the one turn. Expiries are rare
         // by construction: only an explicitly timed decision has one at all.
         Policy::Mute if announced => Ok(Disposition::Deliver),
+        // A rule the agent set itself, which is the whole point of one: it asked to hear about
+        // this, in a room it had otherwise turned down.
+        Policy::Mute if !message.matches.is_empty() => Ok(Disposition::Deliver),
         // Mention-only means mention-only. There was once a window here that went on delivering
         // everything for a few minutes after the agent spoke, on the theory that an exchange
         // already under way should carry on without a second mention. In a busy room it delivered
@@ -501,7 +564,7 @@ fn announce_expiry(
         }
         Policy::Mute => message.notes.push(format!(
             "you had muted this chat until {until}; anything said meanwhile was recorded, and \
-             read_history will show it"
+             history_read will show it"
         )),
         // Nothing observable changed, so there is nothing to report.
         Policy::Active if fallback == Policy::Active => {}
@@ -662,7 +725,7 @@ async fn record_message(
         .await?;
     // An edit is recorded as a row of its own, since the queue needs a distinct key to deliver it
     // as an event rather than discard it as a redelivery. Marking what it replaced is what stops
-    // `read_history` returning the old and the new wording as two messages that both look current.
+    // `history_read` returning the old and the new wording as two messages that both look current.
     if let Some(edited_at) = message.edited_at {
         store
             .supersede_message(key_of(message, account), edited_at)
@@ -1297,7 +1360,7 @@ async fn give_up(
     tracing::error!(count = rows.len(), "giving up on {} message(s)", rows.len());
     // Owed to the agent again. A message is marked seen the moment it is queued, on the assumption
     // that the agent is about to be handed it, and this is exactly where that assumption fails.
-    // Without this it is neither delivered nor owed, so nothing but `read_history` over the right
+    // Without this it is neither delivered nor owed, so nothing but `history_read` over the right
     // window would ever turn it up again. What each hand-over reported as a *backlog* is given back
     // by the store, against the row that reported it.
     let mut affected: BTreeSet<ConversationId> = BTreeSet::new();
@@ -2501,7 +2564,7 @@ impl NoticeLog {
 /// A session's level is fixed when it is created, so without this an operator who edits the config
 /// sees no effect and no explanation. A session carried across meka 0.46 is the case that makes it
 /// matter: one created at `ask` was migrated to `none` with approvals on, which denies every call
-/// including `send_message`, so it cannot reply to anyone until its level changes.
+/// including `message_send`, so it cannot reply to anyone until its level changes.
 ///
 /// Runs once per process, when the session is bound, which waits meka out because the bridge
 /// comes up before meka does.
@@ -2644,6 +2707,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            matches: Vec::new(),
             sender_roles: Vec::new(),
             text: "look".to_string(),
             reply_to: None,
@@ -2809,7 +2873,7 @@ mod tests {
         let mut message = event_with(Vec::new());
         announce_expiry(&mut message, &lapsed(Policy::Mute, 0), Policy::Mute);
         assert!(
-            message.notes[0].contains("read_history"),
+            message.notes[0].contains("history_read"),
             "got {:?}",
             message.notes
         );
@@ -2936,5 +3000,242 @@ mod tests {
         // would let a user close the fence and forge a header.
         let samples: BTreeSet<String> = (0..32).map(|_| nonce()).collect();
         assert!(samples.len() > 1, "nonce must vary between turns");
+    }
+
+    /// A config carrying the shipped defaults, which is all the gate reads from one.
+    fn gate_config() -> Config {
+        Config::from_toml(
+            r#"
+[meka]
+base_url = "http://127.0.0.1:8080"
+token = "test-token"
+[storage]
+path = "/tmp/mekabridge-gate-tests.db"
+[[channels.telegram]]
+id = "telegram"
+token = "123:fake"
+allowed_users = [1]
+"#,
+            std::path::Path::new("/tmp/config.toml"),
+        )
+        .expect("valid config")
+    }
+
+    async fn gated(
+        store: &Store,
+        watches: &mut Watches,
+        conversation: &str,
+        text: &str,
+        addressed: bool,
+    ) -> (Disposition, Vec<crate::watch::WatchMatch>) {
+        let mut message = event_with(Vec::new());
+        message.conversation = ConversationId::parse(conversation).expect("valid");
+        message.chat_kind = ChatKind::Group;
+        message.text = text.to_string();
+        message.addressed = addressed;
+        let disposition = gate(store, &gate_config(), watches, &mut message)
+            .await
+            .expect("gate");
+        (disposition, message.matches)
+    }
+
+    async fn muted_store(conversation: &str) -> Store {
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .set_policy(
+                conversation,
+                "telegram",
+                Policy::Mute,
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .expect("mute");
+        store
+    }
+
+    #[tokio::test]
+    async fn a_watch_wakes_a_muted_conversation_and_says_which_one_did() {
+        // The feature in one test: a room turned down to mentions only, a message nothing
+        // addressed, and a rule the agent set that makes it worth a turn anyway.
+        let store = muted_store("telegram:-100").await;
+        store
+            .add_watch(
+                crate::store::NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: crate::watch::WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: Some("releases"),
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("add");
+        let mut watches = Watches::default();
+
+        let (disposition, matched) = gated(
+            &store,
+            &mut watches,
+            "telegram:-100",
+            "the deploy is stuck",
+            false,
+        )
+        .await;
+        assert_eq!(disposition, Disposition::Deliver);
+        assert_eq!(matched.len(), 1, "got {matched:?}");
+        assert_eq!(matched[0].reason.as_deref(), Some("releases"));
+
+        let (disposition, matched) = gated(
+            &store,
+            &mut watches,
+            "telegram:-100",
+            "unrelated chatter",
+            false,
+        )
+        .await;
+        assert_eq!(
+            disposition,
+            Disposition::Withhold,
+            "a message matching nothing must still be withheld"
+        );
+        assert!(matched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_that_was_addressed_still_reports_what_it_matched() {
+        // Computed before the arm that delivers on `addressed`, so a rule firing on every mention
+        // is visible rather than hidden behind the mention that would have woken the agent anyway.
+        let store = muted_store("telegram:-100").await;
+        store
+            .add_watch(
+                crate::store::NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: crate::watch::WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("add");
+        let mut watches = Watches::default();
+        let (disposition, matched) = gated(
+            &store,
+            &mut watches,
+            "telegram:-100",
+            "@bot deploy now",
+            true,
+        )
+        .await;
+        assert_eq!(disposition, Disposition::Deliver);
+        assert_eq!(matched.len(), 1, "got {matched:?}");
+    }
+
+    #[tokio::test]
+    async fn watches_decide_nothing_where_the_policy_already_has() {
+        // Consulted only under `mute`. A chat heard in full delivers the message whatever they
+        // say, and a blocked one keeps nothing to match against, so running them there would be
+        // work with no decision attached and a `matches` line that explained nothing.
+        let store = Store::open_in_memory().await.expect("opens");
+        store
+            .add_watch(
+                crate::store::NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: crate::watch::WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("add");
+        let mut watches = Watches::default();
+
+        store
+            .set_policy(
+                "telegram:-100",
+                "telegram",
+                Policy::Active,
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .expect("active");
+        let (disposition, matched) = gated(
+            &store,
+            &mut watches,
+            "telegram:-100",
+            "the deploy is stuck",
+            false,
+        )
+        .await;
+        assert_eq!(disposition, Disposition::Deliver);
+        assert!(matched.is_empty(), "nothing was decided by a watch here");
+
+        store
+            .set_policy(
+                "telegram:-200",
+                "telegram",
+                Policy::Block,
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .expect("block");
+        let (disposition, matched) = gated(
+            &store,
+            &mut watches,
+            "telegram:-200",
+            "the deploy is stuck",
+            false,
+        )
+        .await;
+        assert_eq!(
+            disposition,
+            Disposition::Discard,
+            "a watch must not reach into a conversation the agent blocked"
+        );
+        assert!(matched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_watch_removed_stops_waking_the_agent_within_the_cache_window() {
+        // The operator's way back. `mekabridge watch delete` runs in another process, so the gate
+        // has to notice it without being restarted.
+        let store = muted_store("telegram:-100").await;
+        let outcome = store
+            .add_watch(
+                crate::store::NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: crate::watch::WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("add");
+        let crate::store::WatchOutcome::Added(record) = outcome else {
+            panic!("must add");
+        };
+        let mut watches = Watches::default();
+        let (disposition, _) = gated(&store, &mut watches, "telegram:-100", "deploy", false).await;
+        assert_eq!(disposition, Disposition::Deliver);
+
+        store.remove_watch(record.id).await.expect("remove");
+        let (disposition, matched) =
+            gated(&store, &mut watches, "telegram:-100", "deploy", false).await;
+        assert_eq!(disposition, Disposition::Withhold, "got {matched:?}");
     }
 }

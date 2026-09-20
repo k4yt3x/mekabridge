@@ -27,6 +27,9 @@ With no subcommand, mekabridge runs the daemon.
 | `policy list` | The configured defaults, plus every conversation with a policy of its own |
 | `policy set <id> <active\|mute\|block> [--duration 30m] [--reason X]` | Override the default for one conversation |
 | `policy clear <id>` | Drop a conversation's own policy so it follows the default again |
+| `watch list` | Every pattern that wakes the agent in a muted conversation |
+| `watch create <pattern> [--field text\|sender\|sender_id] [--conversation id] [--duration 7d] [--reason X]` | Add one |
+| `watch delete <id>` | Remove one |
 | `history <id> [--limit N] [--search WORDS]` | What a conversation said, including what the agent was never woken for |
 | `unseen [<id>]` | What the agent has not been shown, as a line and an exit code. Built to gate a scheduled job |
 | `session show` | The bound session and what meka says about it |
@@ -46,6 +49,12 @@ mekabridge queue list --limit 5
 ```
 
 The `policy` commands exist because the agent rules on conversations itself. One it muted or blocked indefinitely is unreachable from inside the bridge, including the one you would use to ask it to undo them, so this is the way back.
+
+The `watch` commands are the same kind of way back. A watch is a pattern the agent set that wakes it
+in a conversation it has otherwise muted, and one written too broadly wakes it on everything in a
+busy room, which is expensive to leave standing while you ask it nicely to stop. A running bridge
+picks up a change from here within a couple of seconds. See
+[Group attention](../usage/group-attention.md#watches).
 
 `policy clear` and `policy set <id> active` are different. Clearing returns the conversation to `[bridge.default_policy]`, which for a group is normally `mute`; setting it active overrides that default so the agent is woken for everything there.
 

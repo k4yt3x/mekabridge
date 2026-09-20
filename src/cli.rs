@@ -16,6 +16,7 @@ use crate::{
     config::{Config, LogFormat, default_config_path},
     error::Result,
     store::Policy,
+    watch::WatchField,
 };
 
 /// Default row cap for the listing commands.
@@ -90,6 +91,12 @@ pub enum Command {
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
+    },
+
+    /// Inspect or override the patterns that wake the agent in a muted conversation.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
     },
 
     /// Read back what a conversation has said, including what the agent was never woken for.
@@ -183,6 +190,68 @@ impl From<PolicyArg> for Policy {
             PolicyArg::Active => Self::Active,
             PolicyArg::Mute => Self::Mute,
             PolicyArg::Block => Self::Block,
+        }
+    }
+}
+
+/// Operator control over the agent's watches.
+///
+/// The way back, as the `policy` commands are: the agent sets these itself, and a rule it wrote
+/// badly can wake it on every message in a busy room, which is an expensive thing to have to ask
+/// it nicely to stop doing.
+#[derive(Debug, Subcommand)]
+pub enum WatchCommand {
+    /// List every watch currently standing.
+    List,
+
+    /// Add a watch.
+    Create {
+        /// Regular expression to look for. Case-insensitive unless it says `(?-i)`.
+        pattern: String,
+
+        /// Which part of a message to match against.
+        #[arg(long, default_value = "text")]
+        field: WatchFieldArg,
+
+        /// Confine it to one conversation. Omit to watch every muted chat.
+        #[arg(long)]
+        conversation: Option<String>,
+
+        /// How long, as a duration like `2h` or `7d`. Omit to leave it until it is removed.
+        #[arg(long)]
+        duration: Option<String>,
+
+        /// Note recorded alongside, shown when the watch fires and when listing.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Remove a watch by id.
+    Delete {
+        /// Watch id, as printed by `mekabridge watch list`.
+        id: i64,
+    },
+}
+
+/// Mirrors `watch::WatchField` rather than deriving `ValueEnum` on it, so the matcher stays free of
+/// a clap dependency. Same arrangement as [`PolicyArg`].
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum WatchFieldArg {
+    /// The message body.
+    Text,
+    /// The sender's display name and username.
+    Sender,
+    /// The sender's platform id.
+    SenderId,
+}
+
+impl From<WatchFieldArg> for WatchField {
+    fn from(value: WatchFieldArg) -> Self {
+        match value {
+            WatchFieldArg::Text => Self::Text,
+            WatchFieldArg::Sender => Self::Sender,
+            WatchFieldArg::SenderId => Self::SenderId,
         }
     }
 }
@@ -347,6 +416,27 @@ async fn dispatch(command: Command, config: Config) -> Result<()> {
             PolicyCommand::Clear { conversation } => {
                 commands::policy_clear(&config, &conversation).await
             }
+        },
+        Command::Watch { command } => match command {
+            WatchCommand::List => commands::watch_list(&config).await,
+            WatchCommand::Create {
+                pattern,
+                field,
+                conversation,
+                duration,
+                reason,
+            } => {
+                commands::watch_create(
+                    &config,
+                    &pattern,
+                    field.into(),
+                    conversation.as_deref(),
+                    duration.as_deref(),
+                    reason.as_deref(),
+                )
+                .await
+            }
+            WatchCommand::Delete { id } => commands::watch_delete(&config, id).await,
         },
         Command::History {
             conversation,

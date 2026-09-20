@@ -81,11 +81,11 @@ pub fn notice_reports_lost_events(text: &str) -> bool {
     text.contains("does not reach your Last-Event-ID") || text.contains("Fell behind")
 }
 
-/// The MCP tool name meka exposes for this bridge's `send_message`, used to tell "the agent
+/// The MCP tool name meka exposes for this bridge's `message_send`, used to tell "the agent
 /// replied" apart from "the agent stayed quiet". meka namespaces MCP tools as
 /// `mcp__<server>__<tool>`, and the server segment is whatever the operator named this bridge in
 /// meka's config, so the match is on the suffix.
-pub const SEND_TOOL_SUFFIX: &str = "__send_message";
+pub const SEND_TOOL_SUFFIX: &str = "__message_send";
 
 /// How much assistant text to keep for diagnostics. Enough to hold any of meka's empty-turn
 /// stand-ins whole, and to show the opening of a real answer that never got delivered.
@@ -596,7 +596,7 @@ mod tests {
         let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
         typist.begin("t0");
         typist.expect("t0", conversations());
-        typist.observe("t0", &composing("mcp__mekabridge__send_message"));
+        typist.observe("t0", &composing("mcp__mekabridge__message_send"));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let drawn = channel.activity_count();
         assert!(drawn >= 1, "the window has to be open to begin with");
@@ -764,7 +764,7 @@ mod tests {
 
         // A turn nobody here is waiting on draws nothing, whatever it composes.
         typist.begin("t0");
-        typist.observe("t0", &composing("mcp__mekabridge__send_message"));
+        typist.observe("t0", &composing("mcp__mekabridge__message_send"));
         tokio::time::sleep(TYPING_REFRESH * 2).await;
         assert_eq!(channel.activity_count(), 0, "no target, no indicator");
         typist.close("t0");
@@ -777,7 +777,7 @@ mod tests {
         tokio::time::sleep(TYPING_REFRESH * 2).await;
         assert_eq!(channel.activity_count(), 0, "a non-send call draws nothing");
 
-        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        typist.observe("t1", &composing("mcp__mekabridge__message_send"));
         tokio::time::sleep(TYPING_REFRESH * 2 + Duration::from_millis(10)).await;
         let while_composing = channel.activity_count();
         assert!(
@@ -787,8 +787,8 @@ mod tests {
 
         // The arguments are finished: the next event on the turn closes the window, and a
         // different turn's events leave it alone.
-        typist.observe("t2", &executing("mcp__mekabridge__send_message"));
-        typist.observe("t1", &executing("mcp__mekabridge__send_message"));
+        typist.observe("t2", &executing("mcp__mekabridge__message_send"));
+        typist.observe("t1", &executing("mcp__mekabridge__message_send"));
         tokio::time::sleep(TYPING_REFRESH * 3).await;
         assert_eq!(
             channel.activity_count(),
@@ -806,7 +806,7 @@ mod tests {
         let mut typist = typist_with(Arc::clone(&channel), Arc::new(Presence::default()), true);
         typist.begin("t1");
         typist.expect("t1", conversations());
-        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        typist.observe("t1", &composing("mcp__mekabridge__message_send"));
         tokio::time::sleep(TYPING_REFRESH + Duration::from_millis(10)).await;
         let drawn = channel.activity_count();
         assert!(drawn >= 1);
@@ -820,7 +820,7 @@ mod tests {
         );
 
         // And a turn ending closes whatever was left open.
-        typist.observe("t1", &composing("mcp__mekabridge__send_message"));
+        typist.observe("t1", &composing("mcp__mekabridge__message_send"));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let reopened = channel.activity_count();
         typist.close("t1");
@@ -835,7 +835,7 @@ mod tests {
     fn tally(sends: usize, tool_calls: usize, text: &str) -> TurnTally {
         let mut tally = TurnTally::default();
         for _ in 0..sends {
-            tally.note(&executing("mcp__mekabridge__send_message"));
+            tally.note(&executing("mcp__mekabridge__message_send"));
         }
         for _ in sends..tool_calls {
             tally.note(&executing("read_file"));
@@ -907,10 +907,10 @@ mod tests {
     fn send_tool_detection_matches_mekas_namespacing() {
         // meka rewrites MCP tools as `mcp__<server>__<tool>`, and the server segment is whatever
         // the operator called this bridge, so only the suffix is stable.
-        assert!("mcp__mekabridge__send_message".ends_with(SEND_TOOL_SUFFIX));
-        assert!("mcp__my_bridge__send_message".ends_with(SEND_TOOL_SUFFIX));
-        assert!(!"mcp__mekabridge__send_file".ends_with(SEND_TOOL_SUFFIX));
-        assert!(!"mcp__mekabridge__list_conversations".ends_with(SEND_TOOL_SUFFIX));
+        assert!("mcp__mekabridge__message_send".ends_with(SEND_TOOL_SUFFIX));
+        assert!("mcp__my_bridge__message_send".ends_with(SEND_TOOL_SUFFIX));
+        assert!(!"mcp__mekabridge__file_send".ends_with(SEND_TOOL_SUFFIX));
+        assert!(!"mcp__mekabridge__conversation_list".ends_with(SEND_TOOL_SUFFIX));
         assert!(!"read_file".ends_with(SEND_TOOL_SUFFIX));
     }
 }

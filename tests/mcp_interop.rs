@@ -25,8 +25,9 @@ use mekabridge::{
     mcp::{
         ChatSettings, ConversationSummary, DownloadedAttachment, HistoryEntry, MemberAction,
         MemberCoverage, MemberInfo, MemberListing, MemberRight, OutboundSink, Policy, SendOptions,
-        SinkError, ToolSurface, UnseenSummary, ViewedAttachment, serve,
+        SinkError, ToolSurface, UnseenSummary, ViewedAttachment, WatchOutcome, WatchRecord, serve,
     },
+    watch::WatchField,
 };
 use rmcp2::{
     ServiceExt,
@@ -49,6 +50,7 @@ struct RecordingSink {
     #[allow(clippy::type_complexity)]
     policies: Mutex<Vec<(String, Policy, Option<chrono::DateTime<chrono::Utc>>)>>,
     roles: Mutex<Vec<Vec<String>>>,
+    watches: Mutex<Vec<WatchRecord>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -86,7 +88,7 @@ impl OutboundSink for RecordingSink {
         Ok(vec!["1001".to_string()])
     }
 
-    async fn send_file(
+    async fn file_send(
         &self,
         _conversation: &str,
         _paths: &[std::path::PathBuf],
@@ -97,7 +99,7 @@ impl OutboundSink for RecordingSink {
         Ok(vec!["2001".to_string()])
     }
 
-    async fn react(
+    async fn message_react(
         &self,
         conversation: &str,
         message_id: &str,
@@ -114,7 +116,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn view_attachment(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
+    async fn attachment_view(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
         match handle {
             // A one-pixel PNG, so the assertion is against real image bytes rather than a stub.
             "417" => Ok(ViewedAttachment::Image {
@@ -132,14 +134,14 @@ impl OutboundSink for RecordingSink {
             }),
             "418" => Ok(ViewedAttachment::Description(
                 "This is a document (\"q3.pdf\", application/pdf) and has no image preview. Use \
-                 download_attachment to get the file itself."
+                 attachment_download to get the file itself."
                     .to_string(),
             )),
             other => Err(SinkError::UnknownAttachment(other.to_string())),
         }
     }
 
-    async fn download_attachment(&self, handle: &str) -> Result<DownloadedAttachment, SinkError> {
+    async fn attachment_download(&self, handle: &str) -> Result<DownloadedAttachment, SinkError> {
         if handle != "418" {
             return Err(SinkError::UnknownAttachment(handle.to_string()));
         }
@@ -162,7 +164,7 @@ impl OutboundSink for RecordingSink {
         Ok((id == "telegram:1").then(|| summary(id)))
     }
 
-    async fn edit_message(
+    async fn message_edit(
         &self,
         conversation: &str,
         message_id: &str,
@@ -182,7 +184,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn delete_message(&self, _conversation: &str, message_id: &str) -> Result<(), SinkError> {
+    async fn message_delete(&self, _conversation: &str, message_id: &str) -> Result<(), SinkError> {
         let mut deletes = self
             .deletes
             .lock()
@@ -191,7 +193,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn moderate_member(
+    async fn member_moderate(
         &self,
         _conversation: &str,
         user_id: &str,
@@ -207,7 +209,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn set_member_rights(
+    async fn member_set_rights(
         &self,
         _conversation: &str,
         _user_id: &str,
@@ -216,7 +218,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn set_member_roles(
+    async fn member_set_roles(
         &self,
         _conversation: &str,
         _user_id: &str,
@@ -229,7 +231,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn pin_message(
+    async fn message_pin(
         &self,
         _conversation: &str,
         _message_id: &str,
@@ -239,7 +241,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn set_chat(
+    async fn chat_set(
         &self,
         _conversation: &str,
         _settings: ChatSettings,
@@ -247,7 +249,7 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn member(
+    async fn member_get(
         &self,
         _conversation: &str,
         user_id: Option<&str>,
@@ -263,7 +265,7 @@ impl OutboundSink for RecordingSink {
         })
     }
 
-    async fn list_members(
+    async fn member_list(
         &self,
         _conversation: &str,
         _query: Option<&str>,
@@ -298,7 +300,7 @@ impl OutboundSink for RecordingSink {
         Ok(previous)
     }
 
-    async fn unseen(&self, _conversation: Option<&str>) -> Result<UnseenSummary, SinkError> {
+    async fn backlog_check(&self, _conversation: Option<&str>) -> Result<UnseenSummary, SinkError> {
         Ok(UnseenSummary {
             count: 0,
             newest: None,
@@ -306,11 +308,54 @@ impl OutboundSink for RecordingSink {
         })
     }
 
-    async fn read_history(
+    async fn watch_create(
+        &self,
+        pattern: &str,
+        field: WatchField,
+        conversation: Option<&str>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> Result<WatchOutcome, SinkError> {
+        let mut watches = self
+            .watches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = WatchRecord {
+            id: watches.len() as i64 + 1,
+            conversation: conversation.map(str::to_string),
+            field,
+            pattern: pattern.to_string(),
+            reason: reason.map(str::to_string),
+            until,
+            created_at: chrono::Utc::now(),
+        };
+        watches.push(record.clone());
+        Ok(WatchOutcome::Added(record))
+    }
+
+    async fn watch_delete(&self, id: i64) -> Result<Option<WatchRecord>, SinkError> {
+        let mut watches = self
+            .watches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let position = watches.iter().position(|watch| watch.id == id);
+        Ok(position.map(|position| watches.remove(position)))
+    }
+
+    async fn watch_list(&self) -> Result<Vec<WatchRecord>, SinkError> {
+        Ok(self
+            .watches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
+    }
+
+    async fn history_read(
         &self,
         conversation: &str,
         _limit: usize,
         _before: Option<i64>,
+        _after: Option<i64>,
     ) -> Result<Vec<HistoryEntry>, SinkError> {
         Ok(vec![HistoryEntry {
             conversation: conversation.to_string(),
@@ -331,7 +376,7 @@ impl OutboundSink for RecordingSink {
         }])
     }
 
-    async fn search_history(
+    async fn history_search(
         &self,
         _query: &str,
         _conversation: Option<&str>,
@@ -350,7 +395,7 @@ fn tool_params(name: &'static str, arguments: serde_json::Value) -> CallToolRequ
 }
 
 fn send_message_params(arguments: serde_json::Value) -> CallToolRequestParams {
-    tool_params("send_message", arguments)
+    tool_params("message_send", arguments)
 }
 
 struct Harness {
@@ -450,9 +495,9 @@ async fn each_moderation_model_is_offered_only_where_it_would_work() {
 
     let tools = client.list_all_tools().await.expect("tools/list works");
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-    assert!(names.contains(&"set_member_roles"), "got {names:?}");
-    assert!(!names.contains(&"set_member_rights"), "got {names:?}");
-    assert!(names.contains(&"moderate_member"), "got {names:?}");
+    assert!(names.contains(&"member_set_roles"), "got {names:?}");
+    assert!(!names.contains(&"member_set_rights"), "got {names:?}");
+    assert!(names.contains(&"member_moderate"), "got {names:?}");
 
     client.cancel().await.expect("clean shutdown");
 }
@@ -464,7 +509,7 @@ async fn setting_roles_round_trips_across_the_version_gap() {
 
     let result = client
         .call_tool(tool_params(
-            "set_member_roles",
+            "member_set_roles",
             serde_json::json!({
                 "conversation": "discord:123",
                 "user_id": "456",
@@ -500,22 +545,25 @@ async fn turning_off_admin_tools_removes_exactly_those() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
-        "block",
-        "delete_message",
-        "download_attachment",
-        "edit_message",
-        "get_conversation",
-        "list_conversations",
-        "mute",
-        "react",
-        "read_history",
-        "search_history",
-        "send_file",
-        "send_message",
-        "unblock",
-        "unmute",
-        "unseen",
-        "view_attachment",
+        "attachment_download",
+        "attachment_view",
+        "backlog_check",
+        "conversation_block",
+        "conversation_get",
+        "conversation_list",
+        "conversation_mute",
+        "conversation_unblock",
+        "conversation_unmute",
+        "file_send",
+        "history_read",
+        "history_search",
+        "message_delete",
+        "message_edit",
+        "message_react",
+        "message_send",
+        "watch_create",
+        "watch_delete",
+        "watch_list",
     ]);
 
     client.cancel().await.expect("clean shutdown");
@@ -530,29 +578,32 @@ async fn all_tools_are_visible_to_an_older_client() {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(names, vec![
-        "block",
-        "delete_message",
-        "download_attachment",
-        "edit_message",
-        "get_conversation",
-        "list_conversations",
-        "list_members",
-        "member",
-        "moderate_member",
-        "mute",
-        "pin_message",
-        "react",
-        "read_history",
-        "search_history",
-        "send_file",
-        "send_message",
-        "set_chat",
-        "set_member_rights",
-        "set_member_roles",
-        "unblock",
-        "unmute",
-        "unseen",
-        "view_attachment",
+        "attachment_download",
+        "attachment_view",
+        "backlog_check",
+        "chat_set",
+        "conversation_block",
+        "conversation_get",
+        "conversation_list",
+        "conversation_mute",
+        "conversation_unblock",
+        "conversation_unmute",
+        "file_send",
+        "history_read",
+        "history_search",
+        "member_get",
+        "member_list",
+        "member_moderate",
+        "member_set_rights",
+        "member_set_roles",
+        "message_delete",
+        "message_edit",
+        "message_pin",
+        "message_react",
+        "message_send",
+        "watch_create",
+        "watch_delete",
+        "watch_list",
     ]);
 
     for tool in &tools {
@@ -569,11 +620,11 @@ async fn all_tools_are_visible_to_an_older_client() {
         // the send tools as writes would leave a bridge at `read` unable to answer anybody -- while
         // the five that take irreversible action on somebody else's account ask for `write`.
         const NEEDS_WRITE: &[&str] = &[
-            "delete_message",
-            "moderate_member",
-            "set_member_rights",
-            "set_member_roles",
-            "set_chat",
+            "message_delete",
+            "member_moderate",
+            "member_set_rights",
+            "member_set_roles",
+            "chat_set",
         ];
         let read_only = tool
             .annotations
@@ -598,13 +649,13 @@ async fn input_schemas_survive_negotiation() {
     let tools = client.list_all_tools().await.expect("tools/list works");
     let send = tools
         .iter()
-        .find(|tool| tool.name.as_ref() == "send_message")
-        .expect("send_message is advertised");
+        .find(|tool| tool.name.as_ref() == "message_send")
+        .expect("message_send is advertised");
     let schema = serde_json::to_value(&*send.input_schema).expect("schema serializes");
     let properties = schema
         .get("properties")
         .and_then(serde_json::Value::as_object)
-        .expect("send_message has an object schema");
+        .expect("message_send has an object schema");
     assert!(properties.contains_key("conversation"));
     assert!(properties.contains_key("text"));
 
@@ -626,9 +677,9 @@ async fn input_schemas_survive_negotiation() {
     // would force every existing caller to start passing it. Neither shows up in a unit test of the
     // handler, because both are decided by the derive on the way out.
     for (tool_name, field) in [
-        ("send_message", "link_preview"),
-        ("edit_message", "link_preview"),
-        ("send_file", "link_preview"),
+        ("message_send", "link_preview"),
+        ("message_edit", "link_preview"),
+        ("file_send", "link_preview"),
     ] {
         let tool = tools
             .iter()
@@ -662,14 +713,14 @@ async fn input_schemas_survive_negotiation() {
     // `paths` has to arrive as a required *array*. Nothing in a handler test can see this: the
     // shape is decided by the derive on the way out, and a schema advertising a bare string
     // would have the agent send one path as a scalar and be refused by serde on every call.
-    let send_file = tools
+    let file_send = tools
         .iter()
-        .find(|tool| tool.name.as_ref() == "send_file")
-        .expect("send_file is advertised");
-    let schema = serde_json::to_value(&*send_file.input_schema).expect("schema serializes");
+        .find(|tool| tool.name.as_ref() == "file_send")
+        .expect("file_send is advertised");
+    let schema = serde_json::to_value(&*file_send.input_schema).expect("schema serializes");
     assert_eq!(
         schema["properties"]["paths"]["type"], "array",
-        "send_file must take a list of paths: {schema}"
+        "file_send must take a list of paths: {schema}"
     );
     let required: Vec<&str> = schema
         .get("required")
@@ -697,8 +748,8 @@ async fn the_history_cursor_survives_the_version_gap() {
     let tools = client.list_all_tools().await.expect("tools/list works");
     let read = tools
         .iter()
-        .find(|tool| tool.name.as_ref() == "read_history")
-        .expect("read_history is advertised");
+        .find(|tool| tool.name.as_ref() == "history_read")
+        .expect("history_read is advertised");
     let schema = serde_json::to_value(&*read.input_schema).expect("schema serializes");
     assert_eq!(
         schema["properties"]["before"]["type"],
@@ -708,7 +759,7 @@ async fn the_history_cursor_survives_the_version_gap() {
 
     let result = client
         .call_tool(tool_params(
-            "read_history",
+            "history_read",
             serde_json::json!({"conversation": "telegram:1", "before": 8212, "limit": 5}),
         ))
         .await
@@ -728,11 +779,85 @@ async fn the_history_cursor_survives_the_version_gap() {
 }
 
 #[tokio::test]
+async fn the_watch_tools_round_trip_across_the_version_gap() {
+    // The enum argument is the part worth proving on the wire: `field` is a schema-typed string,
+    // and a client that serialized it differently from the way the server reads it would fail only
+    // here, not in the unit tests either side of the boundary.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "watch_create",
+            serde_json::json!({
+                "pattern": "^432688118$",
+                "field": "sender_id",
+                "conversation": "telegram:1",
+                "reason": "the owner"
+            }),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+
+    let listed = client
+        .call_tool(tool_params("watch_list", serde_json::json!({})))
+        .await
+        .expect("the call must succeed");
+    let text = listed
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect::<String>();
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(parsed[0]["field"], "sender_id", "got: {text}");
+    assert_eq!(parsed[0]["conversation"], "telegram:1", "got: {text}");
+
+    let removed = client
+        .call_tool(tool_params(
+            "watch_delete",
+            serde_json::json!({"id": parsed[0]["id"]}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(removed.is_error, Some(false), "{removed:?}");
+}
+
+#[tokio::test]
+async fn the_backlog_result_is_a_document_a_gate_can_point_into() {
+    // meka's scheduler parses a tool result's text as JSON when there is no structured content and
+    // then resolves a JSON pointer into it. If this came back as prose, every gate built on it
+    // would be declined as "the probe did not return JSON" rather than simply not firing.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let result = client
+        .call_tool(tool_params(
+            "backlog_check",
+            serde_json::json!({"conversation": "telegram:1"}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect::<String>();
+    let parsed: serde_json::Value =
+        serde_json::from_str(text.trim()).expect("a gate has to be able to parse this");
+    assert!(parsed.get("unseen").is_some(), "got: {text}");
+}
+
+#[tokio::test]
 async fn the_policy_tools_round_trip_across_the_version_gap() {
     let harness = start().await;
     let client = connect(&harness).await;
 
-    for (tool, expected) in [("mute", Policy::Mute), ("block", Policy::Block)] {
+    for (tool, expected) in [
+        ("conversation_mute", Policy::Mute),
+        ("conversation_block", Policy::Block),
+    ] {
         let result = client
             .call_tool(tool_params(
                 tool,
@@ -757,7 +882,7 @@ async fn the_policy_tools_round_trip_across_the_version_gap() {
 
     let result = client
         .call_tool(tool_params(
-            "unblock",
+            "conversation_unblock",
             serde_json::json!({"conversation": "telegram:1"}),
         ))
         .await
@@ -823,7 +948,7 @@ async fn tool_level_errors_arrive_as_results_not_protocol_failures() {
         .iter()
         .filter_map(|block| block.as_text().map(|text| text.text.clone()))
         .collect();
-    assert!(text.contains("list_conversations"), "got: {text}");
+    assert!(text.contains("conversation_list"), "got: {text}");
 
     client.cancel().await.expect("clean shutdown");
 }
@@ -835,7 +960,7 @@ async fn react_round_trips_across_the_version_gap() {
 
     let result = client
         .call_tool(tool_params(
-            "react",
+            "message_react",
             serde_json::json!({
                 "conversation": "telegram:1",
                 "message_id": "4471",
@@ -873,7 +998,7 @@ async fn view_attachment_returns_a_real_image_block_to_an_older_client() {
 
     let result = client
         .call_tool(tool_params(
-            "view_attachment",
+            "attachment_view",
             serde_json::json!({ "attachment": "417" }),
         ))
         .await
@@ -900,7 +1025,7 @@ async fn a_preview_frame_arrives_with_its_caveat_attached() {
 
     let result = client
         .call_tool(tool_params(
-            "view_attachment",
+            "attachment_view",
             serde_json::json!({ "attachment": "419" }),
         ))
         .await
@@ -934,7 +1059,7 @@ async fn an_unviewable_attachment_comes_back_as_a_description() {
 
     let result = client
         .call_tool(tool_params(
-            "view_attachment",
+            "attachment_view",
             serde_json::json!({ "attachment": "418" }),
         ))
         .await
@@ -959,7 +1084,7 @@ async fn an_unknown_attachment_handle_tells_the_agent_where_to_look() {
 
     let result = client
         .call_tool(tool_params(
-            "download_attachment",
+            "attachment_download",
             serde_json::json!({ "attachment": "9999" }),
         ))
         .await

@@ -17,12 +17,16 @@ In a conversation on `mute`, which is the default for groups and server channels
 - Somebody uses their client's **reply** button on one of its messages. This counts even with the
   ping turned off on Discord, because answering the agent is addressing it however the client
   renders it.
+- The message matches a **watch** the agent set. See [Watches](#watches).
 
 That is the whole list. Somebody answering the agent in ordinary prose, without naming it and
 without using reply, does not reach it, and neither does a follow-up typed straight after it has
 spoken. `@everyone`, `@here`, and role pings deliberately do not count either.
 
-Everything withheld is still **recorded**. `read_history` and `search_history` reach it, and the
+The first two are somebody else's decision about the agent. The third is the agent's own, which is
+why it is the only one that can be set and unset at runtime.
+
+Everything withheld is still **recorded**. `history_read` and `history_search` reach it, and the
 next thing that does wake the conversation arrives with a count of what accumulated and the last
 `mute_context` messages inline.
 
@@ -34,6 +38,8 @@ Every message from a chat that is not one-to-one carries a `woke you:` line:
 woke you: you were named
 woke you: you were named, or this replies to something you said
 woke you: nothing here named you; this chat was being heard in full when it arrived
+woke you: this matched your watch #12 (`看我简介`, spam signature) in the text
+woke you: you were named, and this matched your watch #12 (`看我简介`)
 ```
 
 The third is written in the past tense on purpose. It reports why the message was delivered, which
@@ -51,7 +57,7 @@ the theory that an exchange already under way should carry on without a second m
 room it delivered the room, in items indistinguishable from a message addressed to the agent,
 and each reply the agent was nudged into making pushed the window out again. It is gone.
 
-What replaces it is three things the agent asks for, none of which involves the bridge guessing.
+What replaces it is four things the agent asks for, none of which involves the bridge guessing.
 
 ### Look back once
 
@@ -62,7 +68,7 @@ landed. meka's own scheduler does this, and needs nothing from the bridge:
 schedule_create(
   at: "5m",
   prompt: "You argued for rolling back in the deploy group (telegram:-1001234567890).
-           read_history it and see whether anyone pushed back or asked a follow-up
+           history_read it and see whether anyone pushed back or asked a follow-up
            without naming you. Reply only if something is actually owed."
 )
 ```
@@ -70,35 +76,65 @@ schedule_create(
 One turn, at a time the agent picked, framed by the agent as a look-back rather than a summons. The
 prompt is delivered with no human present, so it has to carry its own context.
 
-### Stand watch
+### Listen for a word
 
-For a room worth following for a while, a recurring job with a gate costs nothing while the room is
-quiet. `mekabridge unseen` is the gate:
+A look-back is for one conversation the agent is already in the middle of. A watch is standing: it
+wakes the agent in a room it has otherwise turned down, whenever a message matches a pattern it set.
+
+```
+watch_create(pattern: "rolling back|rollback", reason: "I own this deploy")
+```
+
+See [Watches](#watches) below.
+
+### Gate a scheduled job
+
+For a room worth sweeping on a timer, a recurring job with a gate costs nothing while the room is
+quiet. `backlog_check` is the gate, and a tool gate runs at `read`:
 
 ```
 schedule_create(
   every: "2m",
-  gate: { command: "mekabridge unseen telegram:-1001234567890", fire: "on-change" },
+  gate: {
+    check: { tool: "mcp__mekabridge__backlog_check",
+             arguments: { conversation: "telegram:-1001234567890" } },
+    when: { at: "/latest", is: "changed" }
+  },
   prompt: "Something new was said in the deploy group since you last looked. ..."
 )
 ```
 
-`on-change` fires when the command's output differs from the previous run, so a turn is spent only
-once the chat has actually moved. Gates run a shell command unattended and meka requires
-`permission = "unrestricted"` to create one, as of 0.42: `workspace` used to authorise a gate and no
-longer does. An ungated `at:` job works at `read`.
+The pointer matters. `latest` moves when, and only when, somebody else says something that still
+stands; `unseen` is the backlog and falls to zero every time an ordinary turn sweeps the
+conversation, so a gate on that would fire on the sweep and announce news the agent had just been
+handed. Gating on the whole result has the same fault, since it contains both.
 
-The `unseen` MCP tool answers the same question, for the agent to read directly. It returns the
-backlog rather than the marker, because that is what is useful to read and the wrong thing to gate
-on.
+`mekabridge unseen` is the shell form of the same question, for a gate outside meka or a job that
+predates the tool:
+
+```
+schedule_create(
+  every: "2m",
+  gate: { check: { command: "mekabridge unseen telegram:-1001234567890" }, when: "changed" },
+  prompt: "..."
+)
+```
+
+Prefer the tool gate. A shell gate runs unattended with no sandbox, so meka requires
+`permission = "unrestricted"` to create one; a tool gate needs only `read`, and so does an ungated
+`at:` job.
+
+Pair it with `history_read(after: <cursor>)` in the prompt and the sweep reads exactly what it has
+not seen: keep the newest `cursor` you were handed, pass it back next time, and nothing is read
+twice or missed in between.
 
 ### Join the discussion
 
 When the agent really has been pulled in as a participant, mentions-only is the wrong shape and
-asking three people to `@` it on every message is obnoxious. `unmute` takes a duration:
+asking three people to `@` it on every message is obnoxious. `conversation_unmute` takes a duration:
 
 ```
-unmute(conversation: "telegram:-1001234567890", duration: "20m")
+conversation_unmute(conversation: "telegram:-1001234567890", duration: "20m")
 ```
 
 The room is heard in full for twenty minutes and then falls back to the configured default for its
@@ -109,6 +145,79 @@ When the window closes the agent is told, so it does not read the silence as the
 quiet. The message that discovers the expiry is delivered even if nothing in it addresses the agent,
 which costs one turn: a notice attached to a message nobody is woken for is a notice nobody reads,
 and it is the exact confusion the notice exists to prevent.
+
+## Watches
+
+A watch is a pattern that wakes the agent in a conversation it has otherwise turned down. It is the
+keyword notification every chat client has, and it exists for the same reason: mentions-only is the
+right default for a busy room and the wrong one for the two or three things in that room you would
+always want to know about.
+
+```
+watch_create(pattern: "看我简介", reason: "spam signature")
+watch_create(pattern: "^432688118$", field: "sender_id", conversation: "telegram:-1001234567890")
+```
+
+| Argument | Meaning |
+|----------|---------|
+| `pattern` | Regular expression. Case-insensitive unless it says `(?-i)` |
+| `field` | What it reads: `text` (default), `sender`, or `sender_id` |
+| `conversation` | Confine it to one chat. Omit to watch every muted chat |
+| `duration` | `2h`, `7d`. Omit to keep it until it is removed |
+| `reason` | Shown back when it fires, and when listing |
+
+`watch_list` shows what is standing, and `watch_delete` takes the id off it, or off the line that
+said a watch fired.
+
+### One watch reads one field
+
+`text` is the message body, captions included. `sender` is the display name and the username, either
+of which counts, because which of the two a person is known by differs by platform. `sender_id` is
+the platform id, which is how you follow one person rather than a turn of phrase.
+
+A rule inspects one of them, and the `woke you:` line says which matched. A watch that read
+everything would fire on a message whose body has nothing in it and leave the agent hunting for
+words that are only in somebody's display name. Two fields means two watches, each reporting for
+itself.
+
+### What a watch is not
+
+It decides that a message is **worth a turn**. It decides nothing about what the message means. The
+bridge has no opinion about whether `看我简介` is spam, a quotation, or somebody discussing spam; it
+wakes the agent, prints the surrounding conversation, and leaves the judgement where the judgement
+can be made.
+
+That division is what makes the feature safe to tune for **recall**. A pattern that is too broad
+costs turns and is visible in the wake line, so the agent can see which rule is firing and narrow
+it. A pattern that is too narrow costs nothing and misses silently, which is the failure you cannot
+see. Prefer the first, and keep whatever taxonomy you use to judge a match in the agent's own
+workspace rather than here.
+
+### Limits
+
+At most 500 watches, each pattern at most 256 characters. Patterns are matched with the `regex`
+crate, which is linear in the length of the message whatever the pattern does, so a rule the agent
+wrote badly cannot hang the bridge. One that will not compile is refused when it is set, with the
+error that explains why.
+
+Watches are consulted **only** where a conversation is on `mute`. In a chat heard in full every
+message already arrives, and a blocked chat keeps nothing to match against, so in both a watch would
+be work with no decision attached.
+
+### Undoing a watch from outside
+
+The same way back as for policies, and for the same reason: the agent sets these itself, and a rule
+that fires on everything is expensive to leave standing.
+
+```console
+$ mekabridge watch list
+$ mekabridge watch create '看我简介' --reason 'spam signature'
+$ mekabridge watch create 'deploy' --field sender --conversation telegram:-1001234567890
+$ mekabridge watch delete 3
+```
+
+A change from either side is picked up by a running bridge within a couple of seconds, without a
+restart.
 
 ## `mekabridge unseen`
 
@@ -121,7 +230,9 @@ $ echo $?
 ```
 
 **stdout** carries one value and nothing else: when anything was last said there, or `never`. That
-is what an `on-change` gate compares. **stderr** carries the backlog, which is what a person wants
+is what a `when: "changed"` gate compares. It is the same instant `backlog_check` reports as
+`latest`, which omits the field entirely rather than writing `never`; either way a gate sees no
+change until somebody speaks. **stderr** carries the backlog, which is what a person wants
 and a gate ignores. They are split because they answer different questions and only one of them can
 be watched: a backlog falls to zero every time an ordinary turn sweeps the conversation, so a
 watcher gating on it would fire on the sweep and spend a turn announcing news the agent had just
@@ -143,7 +254,7 @@ noticed. A malformed conversation id is a `2` for the same reason.
 Omit the conversation to ask about every chat at once.
 
 Asking does **not** count as having seen anything, so the turn a watcher goes on to trigger still
-finds the backlog waiting for `read_history`.
+finds the backlog waiting for `history_read`.
 
 Nothing volatile appears on either stream. A relative time or a chat title would fire a watcher on
 its own.
@@ -175,7 +286,7 @@ The consequence on Telegram is worth stating plainly: two messages a few seconds
 over separately, and the agent may answer the first before reading the second. If the second lands
 while the agent is still working on the first, meka reads it into that same turn at its next round
 boundary, under a header saying it arrived while the agent was working, so the agent can account for
-it before finishing or correct itself with `edit_message`.
+it before finishing or correct itself with `message_edit`.
 
 Every conversation is held for one second regardless, on every platform, unless its oldest waiting
 message is already older than `settle_max`, which only happens after downtime or under a badly

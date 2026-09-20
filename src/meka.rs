@@ -335,7 +335,7 @@ pub struct ServerInfo {
     pub version: String,
     /// Whether the active provider profile can look at images at all.
     ///
-    /// The bridge attaches nothing to a turn, so this gates `view_attachment` instead. Worth being
+    /// The bridge attaches nothing to a turn, so this gates `attachment_view` instead. Worth being
     /// precise about why, because the obvious reason is wrong: meka checks `vision` only on the
     /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
     /// provider whatever the setting says. So this check is not belt and braces over one of

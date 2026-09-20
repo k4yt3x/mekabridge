@@ -128,29 +128,29 @@ Available when `admin_tools` is on, which is the default. Discord refuses each c
 
 | Tool | Discord | Note |
 |---|---|---|
-| `moderate_member` `restrict` | Timeout | Needs a duration, capped at 28 days. Discord has no indefinite timeout, so the bridge refuses rather than silently choosing a length |
-| `moderate_member` `unrestrict` | Clears the timeout | Returns them to exactly their roles |
-| `moderate_member` `ban` | Ban | **Permanent.** Discord has no ban expiry, so a duration is refused with a pointer at `restrict`. `revoke_messages` deletes the last 7 days, which is Discord's ceiling |
-| `moderate_member` `unban` | Unban | |
-| `moderate_member` `kick` | Kick | A real primitive, unlike Telegram's ban-then-unban |
-| `set_member_roles` | Replaces the roles somebody holds, by name | Discord has no per-member privileges, so this replaces `set_member_rights`, which is not offered on a Discord channel |
-| `pin_message` | Pin or unpin | Needs `PIN_MESSAGES`, which Discord split out from `MANAGE_MESSAGES`. Always announces a pin, so `silent` is refused rather than ignored. 50 pins per channel |
-| `set_chat` | Name, topic, and slowmode | Slowmode is Discord-only, 0 to 6 hours |
-| `member` | Standing, roles, and timeout state | Omit `user_id` to ask about the bot itself. Permissions are computed for the specific channel, including its overwrites |
+| `member_moderate` `restrict` | Timeout | Needs a duration, capped at 28 days. Discord has no indefinite timeout, so the bridge refuses rather than silently choosing a length |
+| `member_moderate` `unrestrict` | Clears the timeout | Returns them to exactly their roles |
+| `member_moderate` `ban` | Ban | **Permanent.** Discord has no ban expiry, so a duration is refused with a pointer at `restrict`. `revoke_messages` deletes the last 7 days, which is Discord's ceiling |
+| `member_moderate` `unban` | Unban | |
+| `member_moderate` `kick` | Kick | A real primitive, unlike Telegram's ban-then-unban |
+| `member_set_roles` | Replaces the roles somebody holds, by name | Discord has no per-member privileges, so this replaces `member_set_rights`, which is not offered on a Discord channel |
+| `message_pin` | Pin or unpin | Needs `PIN_MESSAGES`, which Discord split out from `MANAGE_MESSAGES`. Always announces a pin, so `silent` is refused rather than ignored. 50 pins per channel |
+| `chat_set` | Name, topic, and slowmode | Slowmode is Discord-only, 0 to 6 hours |
+| `member_get` | Standing, roles, and timeout state | Omit `user_id` to ask about the bot itself. Permissions are computed for the specific channel, including its overwrites |
 
 An operator can undo any of it from the Discord client, and `mekabridge policy` lifts a mute or a block the agent set on itself.
 
 ## History
 
-The bridge records what it sees, the same as on Telegram, and `read_history` and `search_history` reach it. Discord adds two things on top.
+The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds two things on top.
 
 **Deletions are honoured.** Discord tells the bridge when a message is deleted, so the recorded copy goes too. The agent cannot be handed back something its author removed. Telegram reports nothing, so its archive cannot do this.
 
-**`search_history` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
+**`history_search` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
 
 ## Listing who is in a server
 
-`list_members` answers two different questions with two different requirements, and only one of them needs anything switched on.
+`member_list` answers two different questions with two different requirements, and only one of them needs anything switched on.
 
 **Searching by name is not gated.** Passing `query` uses Discord's member search, which works with no privileged intent, so a bot can always answer "is there someone here called Dana".
 
@@ -174,18 +174,18 @@ The bridge keeps **only the status** — online, idle, do not disturb, offline. 
 
 Somebody who has set themselves invisible is reported as offline. That is what they chose to appear as, and undoing it for a bot's benefit is not the bridge's call.
 
-`member` and `list_members` both carry the result, and `online_only` on a listing narrows it to people at their machine. See [`list_members`](./mcp-tools.md#list_members) for what the statuses mean and why `unknown` is not offline.
+`member_get` and `member_list` both carry the result, and `online_only` on a listing narrows it to people at their machine. See [`member_list`](./mcp-tools.md#member_list) for what the statuses mean and why `unknown` is not offline.
 
 ## Attachments
 
 Announced on the item with a handle, fetched only when the agent asks, as everywhere else. Two Discord specifics are worth knowing:
 
 - **Handles die with their message.** Discord's CDN links are signed and expire, so the bridge stores a reference to the message and re-requests it to get a fresh link. That is always correct, and it means deleting the message makes the file unreachable. On Telegram the file id outlives the message.
-- **Videos have no still frame.** Discord exposes no thumbnail to a bot, so `view_attachment` on a video has nothing to show. On Telegram it falls back to the still frame the platform already made.
+- **Videos have no still frame.** Discord exposes no thumbnail to a bot, so `attachment_view` on a video has nothing to show. On Telegram it falls back to the still frame the platform already made.
 
 Stickers arrive as a note rather than a file. An animated one says so, since it is not viewable.
 
-Outbound, `send_file` takes up to ten paths and puts them on **one message**, which is Discord's equivalent of a Telegram album; the caption becomes that message's body. Discord does not distinguish photos from documents on the way out, so `as_photo` only picks the indicator shown while the upload runs, and an image is rendered inline either way.
+Outbound, `file_send` takes up to ten paths and puts them on **one message**, which is Discord's equivalent of a Telegram album; the caption becomes that message's body. Discord does not distinguish photos from documents on the way out, so `as_photo` only picks the indicator shown while the upload runs, and an image is rendered inline either way.
 
 Each file is read whole into memory to be uploaded, unlike Telegram's, which streams from the path, so ten large files are ten buffers held at once.
 
@@ -193,7 +193,7 @@ Each file is read whole into memory to be uploaded, unlike Telegram's, which str
 
 Setting `message_content = false` is supported and coherent, but narrower than it sounds. Discord blanks `content`, `embeds`, and `attachments` on every server message **except** those that mention the bot, replies to it, and direct messages.
 
-So the agent is still woken by name and still reads the message that woke it. What it loses is everything else: the muted-channel backlog is empty, `read_history` has nothing to show about what led up to a mention, and Discord's own search refuses to answer. `mekabridge doctor` warns while this is the case.
+So the agent is still woken by name and still reads the message that woke it. What it loses is everything else: the muted-channel backlog is empty, `history_read` has nothing to show about what led up to a mention, and Discord's own search refuses to answer. `mekabridge doctor` warns while this is the case.
 
 ## Limits worth knowing
 

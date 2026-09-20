@@ -37,6 +37,8 @@ use rusqlite::{
 };
 use uuid::Uuid;
 
+use crate::watch::{MAX_WATCHES, WatchField};
+
 /// Schema statements applied in order. The index of a statement is its schema version, tracked in
 /// SQLite's `user_version`, so adding a migration means appending to this array and never editing
 /// an existing entry.
@@ -51,6 +53,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_008.sql"),
     include_str!("store/schema_009.sql"),
     include_str!("store/schema_010.sql"),
+    include_str!("store/schema_011.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -332,6 +335,26 @@ impl UnseenSummary {
     }
 }
 
+/// One watch: a pattern the agent set, which wakes it in a muted conversation.
+///
+/// The counterpart to [`PolicyRecord`] on the other side of the gate. A policy says how much of a
+/// conversation reaches the agent by default; a watch is the exception it carved out of that by
+/// hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRecord {
+    /// Row id, which is what the agent unwatches by and what the wake line names.
+    pub id: i64,
+    /// The conversation this is confined to, or `None` for every conversation.
+    pub conversation: Option<String>,
+    /// Which part of a message the pattern reads.
+    pub field: WatchField,
+    pub pattern: String,
+    pub reason: Option<String>,
+    /// When it lapses, or `None` for indefinite.
+    pub until: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Absence is meaningful: a conversation with no record follows the configured default for its chat
 /// kind, so this type says "somebody ruled on this one" rather than "this one has a policy".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +388,15 @@ impl PolicyRecord {
 #[derive(Default)]
 struct PolicyCache {
     entries: HashMap<String, (Option<PolicyRecord>, Instant)>,
+}
+
+/// The watches as last read, held whole.
+///
+/// Not keyed by conversation, unlike [`PolicyCache`]: an unscoped watch applies everywhere, so
+/// there is no per-conversation answer to cache, and the gate wants the whole set anyway.
+struct WatchCache {
+    rows: Arc<Vec<WatchRecord>>,
+    fetched_at: Instant,
 }
 
 /// One message as the bridge recorded it, which is not the same as one it delivered.
@@ -497,6 +529,38 @@ pub enum EnqueueOutcome {
     Duplicate,
     /// The queue is at `max_depth`. The message is dropped and counted so the agent can be told.
     Dropped,
+}
+
+/// A watch to record, as [`Store::add_watch`] takes it.
+///
+/// Grouped rather than passed as six arguments, the way [`MessageKey`] groups the four fields that
+/// identify a message: every one of these is part of one rule, and half of them are `Option`s that
+/// would otherwise be told apart only by position.
+#[derive(Debug, Clone, Copy)]
+pub struct NewWatch<'a> {
+    /// The conversation to confine it to, or `None` for every conversation.
+    pub conversation: Option<&'a str>,
+    /// Needed only alongside `conversation`, to mint the conversation row if nothing has arrived
+    /// from it yet.
+    pub platform: Option<&'a str>,
+    pub field: WatchField,
+    pub pattern: &'a str,
+    pub until: Option<DateTime<Utc>>,
+    pub reason: Option<&'a str>,
+}
+
+/// What happened to a [`Store::add_watch`] call.
+///
+/// Three outcomes rather than a record and an error, following [`EnqueueOutcome`]: the two that
+/// are not a plain insert are both things the caller has to say out loud, and neither is a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    Added(WatchRecord),
+    /// The same rule was already standing. Handed back rather than duplicated, so an agent
+    /// syncing a list it keeps elsewhere can call this for every rule and be told what changed.
+    Existing(WatchRecord),
+    /// The deployment already holds [`crate::watch::MAX_WATCHES`], naming how many.
+    AtCapacity(usize),
 }
 
 /// Where a queue row is in its hand-over.
@@ -648,6 +712,9 @@ pub struct Store {
     connection: tokio_rusqlite::Connection,
     /// Shared across clones, so a policy written through any handle is seen by every other.
     policies: Arc<RwLock<PolicyCache>>,
+    /// The watches in force, with when they were read. Shared for the same reason, and held whole
+    /// rather than per conversation because the gate matches the entire set against every message.
+    watches: Arc<RwLock<Option<WatchCache>>>,
 }
 
 impl Store {
@@ -750,6 +817,7 @@ impl Store {
         Ok(Self {
             connection,
             policies: Arc::default(),
+            watches: Arc::default(),
         })
     }
 
@@ -1322,6 +1390,235 @@ impl Store {
             })
             .await?;
         Ok(records)
+    }
+
+    /// Record a watch, hand back the one already standing for the same rule, or refuse for want of
+    /// room.
+    ///
+    /// Identity is the whole rule, `(conversation, field, pattern)`: the same words pointed at a
+    /// different field are a different watch. Deliberately not a `UNIQUE` index, because SQLite
+    /// treats NULLs as distinct and one would constrain the scoped rows while letting duplicate
+    /// global ones through.
+    ///
+    /// `platform` is needed only when `conversation` is given, to mint the conversation row the
+    /// same way [`Store::set_policy`] does when ruling on a chat nothing has arrived from yet.
+    ///
+    /// Lapsed rows are deleted here rather than swept on a timer, which keeps the ceiling honest:
+    /// a watch that has expired is not one of the [`MAX_WATCHES`] a deployment is allowed.
+    pub async fn add_watch(&self, watch: NewWatch<'_>, at: DateTime<Utc>) -> Result<WatchOutcome> {
+        let NewWatch {
+            conversation,
+            platform,
+            field,
+            pattern,
+            until,
+            reason,
+        } = watch;
+        let conversation = conversation.map(str::to_string);
+        let platform = platform.map(str::to_string);
+        let pattern = pattern.to_string();
+        let reason = reason.map(str::to_string);
+        let outcome = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "DELETE FROM watches WHERE until IS NOT NULL AND until <= ?1",
+                    [to_rfc3339(at)],
+                )?;
+                if let Some(address) = &conversation {
+                    transaction.execute(
+                        "INSERT INTO conversations (address, channel, platform, kind, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(address) DO NOTHING",
+                        rusqlite::params![
+                            address,
+                            channel_of(address),
+                            platform.as_deref().unwrap_or(""),
+                            KIND_UNKNOWN,
+                            to_rfc3339(at)
+                        ],
+                    )?;
+                }
+                // `IS` rather than `=`, and the same subquery whether or not a conversation was
+                // given: looking up a NULL address matches no row, so the subquery is NULL and
+                // this finds the unscoped watches, which is exactly the case a `= ?` would miss.
+                let existing = transaction
+                    .query_row(
+                        &format!(
+                            "SELECT {WATCH_COLUMNS} FROM {WATCH_FROM}
+                             WHERE w.pattern = ?1 AND w.field = ?2
+                               AND w.conversation_id IS {CONVERSATION_ID_OF_3}"
+                        ),
+                        rusqlite::params![&pattern, field.as_str(), &conversation],
+                        row_to_watch,
+                    )
+                    .optional()?;
+                if let Some(record) = existing {
+                    transaction.commit()?;
+                    return Ok(WatchOutcome::Existing(record));
+                }
+                let live: i64 =
+                    transaction.query_row("SELECT COUNT(*) FROM watches", [], |row| row.get(0))?;
+                if live >= MAX_WATCHES as i64 {
+                    // Decided inside the transaction, so the count cannot move between the check
+                    // and the insert. The lapsed rows were deleted above, so this counts only
+                    // watches that are actually standing.
+                    transaction.commit()?;
+                    return Ok(WatchOutcome::AtCapacity(live.max(0) as usize));
+                }
+                transaction.execute(
+                    &format!(
+                        "INSERT INTO watches
+                             (conversation_id, field, pattern, reason, until, created_at)
+                         VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6)"
+                    ),
+                    rusqlite::params![
+                        &conversation,
+                        field.as_str(),
+                        &pattern,
+                        reason,
+                        until.map(to_rfc3339),
+                        to_rfc3339(at),
+                    ],
+                )?;
+                let id = transaction.last_insert_rowid();
+                let record = transaction.query_row(
+                    &format!("SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} WHERE w.id = ?1"),
+                    [id],
+                    row_to_watch,
+                )?;
+                transaction.commit()?;
+                Ok(WatchOutcome::Added(record))
+            })
+            .await?;
+        // Unconditional, including the refusal: that path still commits the prune of lapsed rows
+        // above, so "nothing was added" is not the same as "nothing changed".
+        self.forget_cached_watches();
+        Ok(outcome)
+    }
+
+    /// Remove one watch by id, reporting what it was so the caller can say what it stopped
+    /// watching for. `None` means there was no such watch.
+    pub async fn remove_watch(&self, id: i64) -> Result<Option<WatchRecord>> {
+        let record = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let record = transaction
+                    .query_row(
+                        &format!("SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} WHERE w.id = ?1"),
+                        [id],
+                        row_to_watch,
+                    )
+                    .optional()?;
+                if record.is_some() {
+                    transaction.execute("DELETE FROM watches WHERE id = ?1", [id])?;
+                }
+                transaction.commit()?;
+                Ok(record)
+            })
+            .await?;
+        if record.is_some() {
+            self.forget_cached_watches();
+        }
+        Ok(record)
+    }
+
+    /// Every watch still standing, oldest first, pruning any that have lapsed.
+    ///
+    /// The listing an agent or an operator reads. [`Store::watches`] is the gate's read of the same
+    /// rows and is cached; this one is exact and writes.
+    pub async fn list_watches(&self, at: DateTime<Utc>) -> Result<Vec<WatchRecord>> {
+        let records = self
+            .connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let pruned = transaction.execute(
+                    "DELETE FROM watches WHERE until IS NOT NULL AND until <= ?1",
+                    [to_rfc3339(at)],
+                )?;
+                let records = {
+                    let mut statement = transaction.prepare(&format!(
+                        "SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} ORDER BY w.id"
+                    ))?;
+                    let rows = statement.query_map([], row_to_watch)?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                transaction.commit()?;
+                Ok((records, pruned))
+            })
+            .await?;
+        let (records, pruned) = records;
+        if pruned > 0 {
+            self.forget_cached_watches();
+        }
+        Ok(records)
+    }
+
+    /// The watches the gate matches against, cached for the same window as a policy.
+    ///
+    /// Cached for the same reason the policy is: this runs on every message from a muted
+    /// conversation, and the answer is almost always the same one. The TTL is also how long an
+    /// operator running `mekabridge watch` against a live daemon waits to see it take effect.
+    ///
+    /// The `Arc` is deliberately reused when a refetch finds the rows unchanged, so a caller can
+    /// tell "these are the same watches" by pointer and skip recompiling a regex set it already
+    /// built. Lapsed rows are filtered rather than deleted, because a read on the hot path should
+    /// not take a write lock; [`Store::list_watches`] and [`Store::add_watch`] do the pruning.
+    pub async fn watches(&self, at: DateTime<Utc>) -> Result<Arc<Vec<WatchRecord>>> {
+        if let Some(cached) = self.cached_watches() {
+            return Ok(cached);
+        }
+        let at = to_rfc3339(at);
+        let rows = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {WATCH_COLUMNS} FROM {WATCH_FROM}
+                     WHERE w.until IS NULL OR w.until > ?1
+                     ORDER BY w.id"
+                ))?;
+                let rows = statement.query_map([at], row_to_watch)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(self.cache_watches(rows))
+    }
+
+    fn cached_watches(&self) -> Option<Arc<Vec<WatchRecord>>> {
+        let cache = self.watches.read().ok()?;
+        let held = cache.as_ref()?;
+        (held.fetched_at.elapsed() < POLICY_CACHE_TTL).then(|| Arc::clone(&held.rows))
+    }
+
+    /// Hold `rows`, keeping the previous allocation when nothing has changed.
+    ///
+    /// The identity of the `Arc` is load-bearing: the gate compares it against the one its compiled
+    /// watchlist was built from, so minting a new one on every refetch would recompile every
+    /// pattern twice a second for no reason.
+    fn cache_watches(&self, rows: Vec<WatchRecord>) -> Arc<Vec<WatchRecord>> {
+        let Ok(mut cache) = self.watches.write() else {
+            return Arc::new(rows);
+        };
+        let held = match cache.take() {
+            Some(held) if *held.rows == rows => held.rows,
+            _ => Arc::new(rows),
+        };
+        *cache = Some(WatchCache {
+            rows: Arc::clone(&held),
+            fetched_at: Instant::now(),
+        });
+        held
+    }
+
+    fn forget_cached_watches(&self) {
+        if let Ok(mut cache) = self.watches.write() {
+            *cache = None;
+        }
     }
 
     /// Count one message discarded because its conversation is blocked.
@@ -2119,36 +2416,52 @@ impl Store {
     /// Selected newest-first so `limit` takes the most recent, then reversed, which is what "the
     /// last twenty messages" means.
     ///
-    /// `before` is a [`MessageRecord::id`], not a time. Paging on the timestamp cannot be made
-    /// correct: a burst shares one second, so "older than this timestamp" either drops the siblings
-    /// of the message paged from or returns them twice, and the first loses messages silently.
+    /// `before` and `after` are [`MessageRecord::id`]s, not times. Paging on the timestamp cannot
+    /// be made correct: a burst shares one second, so "older than this timestamp" either drops
+    /// the siblings of the message paged from or returns them twice, and the first loses
+    /// messages silently.
     ///
     /// Ordered by id so the sequence agrees with the cursor. That is also arrival order, which the
     /// timestamp is not for an edit: it carries the time of the message it revises.
+    ///
+    /// The two cursors read opposite ways and the difference is which end the limit cuts from.
+    /// `before` walks backwards through what is already there, so it takes the newest rows under
+    /// the cursor. `after` follows a conversation forwards, so it takes the *oldest* rows above
+    /// the cursor: a caller sweeping a busy chat has to be handed the next page in order, not the
+    /// latest page with a hole behind it. Setting both is refused at the tool, not here.
     pub async fn history(
         &self,
         address: &str,
         limit: usize,
         before: Option<i64>,
+        after: Option<i64>,
     ) -> Result<Vec<MessageRecord>> {
         let address = address.to_string();
         let limit = limit.min(i64::MAX as usize) as i64;
         let mut records = self
             .connection
             .call(move |connection| {
+                let order = if after.is_some() { "ASC" } else { "DESC" };
                 let mut statement = connection.prepare(&format!(
                     "SELECT {MESSAGE_COLUMNS}
                      FROM {MESSAGE_FROM}
-                     WHERE c.address = ?1 AND (?2 IS NULL OR m.id < ?2)
-                     ORDER BY m.id DESC
-                     LIMIT ?3"
+                     WHERE c.address = ?1
+                       AND (?2 IS NULL OR m.id < ?2)
+                       AND (?3 IS NULL OR m.id > ?3)
+                     ORDER BY m.id {order}
+                     LIMIT ?4"
                 ))?;
-                let rows = statement
-                    .query_map(rusqlite::params![address, before, limit], row_to_message)?;
+                let rows = statement.query_map(
+                    rusqlite::params![address, before, after, limit],
+                    row_to_message,
+                )?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
             })
             .await?;
-        records.reverse();
+        // Oldest first either way, which is reading order. The forward query already is.
+        if after.is_none() {
+            records.reverse();
+        }
         Ok(records)
     }
 
@@ -2254,7 +2567,7 @@ impl Store {
     /// Keyed on one message rather than a watermark because a message is marked seen when it is
     /// queued, assuming the agent is about to be handed it, and that assumption fails exactly when
     /// its batch runs out of attempts. Without this the message is neither delivered nor owed, so
-    /// nothing short of `read_history` over the right window finds it again.
+    /// nothing short of `history_read` over the right window finds it again.
     ///
     /// A `false` return is legitimate: `[storage].history_retention` of zero writes no history, so
     /// there is nothing to un-see.
@@ -2654,6 +2967,17 @@ const POLICY_COLUMNS: &str = "c.address, p.mode, p.until, p.reason, p.dropped, p
 
 const POLICY_FROM: &str = "conversation_policy p JOIN conversations c ON c.id = p.conversation_id";
 
+/// The columns [`row_to_watch`] reads, in the order it reads them.
+const WATCH_COLUMNS: &str = "w.id, c.address, w.field, w.pattern, w.reason, w.until, w.created_at";
+
+/// A `LEFT` join, because a watch with no conversation is one that applies to every conversation,
+/// and an inner join would drop exactly those.
+const WATCH_FROM: &str = "watches w LEFT JOIN conversations c ON c.id = w.conversation_id";
+
+/// [`CONVERSATION_ID_OF`] against the third bound parameter, for statements that need the address
+/// somewhere other than first.
+const CONVERSATION_ID_OF_3: &str = "(SELECT id FROM conversations WHERE address = ?3)";
+
 /// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
 const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
      q.received_at, q.state, q.key, q.body, q.session_id, q.item_id, q.dropped, q.attempts,
@@ -2701,7 +3025,7 @@ const MESSAGE_FROM: &str = "messages m
 ///
 /// A retracted message must not be offered as context it missed, and neither must the older wording
 /// of one that has since been edited, because the revision is in the table too and is the version
-/// worth showing. Both still read back through `read_history` and `search_history`, which is where
+/// worth showing. Both still read back through `history_read` and `history_search`, which is where
 /// finding them is the point.
 const MESSAGE_CURRENT: &str = "m.deleted_at IS NULL AND m.superseded_at IS NULL";
 
@@ -2751,6 +3075,27 @@ fn row_to_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRecord> {
         until: until.as_deref().map(parse_rfc3339).transpose()?,
         reason: row.get(3)?,
         dropped: row.get::<_, i64>(4)?.max(0) as u64,
+        created_at: parse_rfc3339(&created_at)?,
+    })
+}
+
+fn row_to_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchRecord> {
+    let field: String = row.get(2)?;
+    let until: Option<String> = row.get(5)?;
+    let created_at: String = row.get(6)?;
+    Ok(WatchRecord {
+        id: row.get(0)?,
+        conversation: row.get(1)?,
+        field: WatchField::parse(&field).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("{field:?} is not a known watch field").into(),
+            )
+        })?,
+        pattern: row.get(3)?,
+        reason: row.get(4)?,
+        until: until.as_deref().map(parse_rfc3339).transpose()?,
         created_at: parse_rfc3339(&created_at)?,
     })
 }
@@ -3156,7 +3501,10 @@ mod tests {
             "and it has to reach the agent"
         );
 
-        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:123", 10, None, None)
+            .await
+            .expect("read");
         let texts: Vec<(&str, bool)> = history
             .iter()
             .map(|row| (row.text.as_str(), row.previous_account))
@@ -3451,7 +3799,10 @@ mod tests {
             store.record_message(record.clone()).await.expect("record"),
             "a first recording is a write"
         );
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         // The id is assigned on insert, so it is the one field the caller cannot predict.
         assert_eq!(history.len(), 1);
         assert!(history[0].id > 0, "a paging cursor must be handed back");
@@ -3488,7 +3839,10 @@ mod tests {
             .await
             .expect("record");
 
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         assert_eq!(
             history[0].attachments,
             handles
@@ -3512,7 +3866,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .history("telegram:1", 10, None)
+                .history("telegram:1", 10, None, None)
                 .await
                 .expect("read")
                 .len(),
@@ -3533,7 +3887,10 @@ mod tests {
             record.timestamp = now() + chrono::Duration::seconds(index);
             store.record_message(record).await.expect("record");
         }
-        let history = store.history("telegram:1", 3, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 3, None, None)
+            .await
+            .expect("read");
         let texts: Vec<&str> = history.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -3564,7 +3921,10 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor = None;
         loop {
-            let page = store.history("telegram:1", 2, cursor).await.expect("read");
+            let page = store
+                .history("telegram:1", 2, cursor, None)
+                .await
+                .expect("read");
             let Some(oldest) = page.first() else { break };
             cursor = Some(oldest.id);
             seen.extend(page.iter().map(|row| row.text.clone()));
@@ -3588,7 +3948,10 @@ mod tests {
             .record_message(message(account, "telegram:2", "1", "theirs"))
             .await
             .expect("record");
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text, "ours");
     }
@@ -3703,7 +4066,10 @@ mod tests {
             .expect("mark");
         assert!(marked, "the row was there to mark");
 
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         assert_eq!(history.len(), 1, "the row must survive the deletion");
         assert!(
             history.first().is_some_and(|row| row.deleted_at.is_some()),
@@ -3747,7 +4113,10 @@ mod tests {
                 .await
                 .expect("mark")
         );
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         let deleted: Vec<&str> = history
             .iter()
             .filter(|row| row.deleted_at.is_some())
@@ -3784,7 +4153,10 @@ mod tests {
                 .expect("mark"),
             "the second report changes nothing"
         );
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         assert_eq!(
             history.first().and_then(|row| row.deleted_at),
             Some(first),
@@ -3795,7 +4167,7 @@ mod tests {
     #[tokio::test]
     async fn an_edit_supersedes_the_wording_it_replaced() {
         // Both rows stay, because "what did they say before they changed it" is worth answering,
-        // but only one of them is current. Without the mark `read_history` returns the two wordings
+        // but only one of them is current. Without the mark `history_read` returns the two wordings
         // as separate messages that both look like the live one.
         let (store, account) = seeded(&["telegram:1"]).await;
         store
@@ -3817,7 +4189,10 @@ mod tests {
             .expect("supersede");
         assert_eq!(marked, 1, "only the older wording is marked");
 
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         assert_eq!(history.len(), 2, "both wordings are kept");
         let superseded: Vec<&str> = history
             .iter()
@@ -3845,7 +4220,7 @@ mod tests {
         let (store, account) = seeded(&["telegram:1"]).await;
         let current = async || {
             store
-                .history("telegram:1", 10, None)
+                .history("telegram:1", 10, None, None)
                 .await
                 .expect("read")
                 .into_iter()
@@ -3979,7 +4354,7 @@ mod tests {
         );
         assert!(
             store
-                .history("telegram:1", 10, None)
+                .history("telegram:1", 10, None, None)
                 .await
                 .expect("read")
                 .iter()
@@ -3999,7 +4374,10 @@ mod tests {
         record.seen = true;
         store.record_message(record).await.expect("record");
 
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         let row = history.first().expect("one row");
         assert!(row.own);
         assert_eq!(row.session_id.as_deref(), Some("scheduled-news"));
@@ -5242,7 +5620,7 @@ mod tests {
         // The first one dies. Exactly its two rows come back, and the count it reported with them.
         store.failed(stating, "gone", now()).await.expect("fail");
         let owed = store
-            .history("telegram:1", 10, None)
+            .history("telegram:1", 10, None, None)
             .await
             .expect("read")
             .into_iter()
@@ -5502,7 +5880,7 @@ mod tests {
         );
         assert!(
             store
-                .history("telegram:1", 10, None)
+                .history("telegram:1", 10, None, None)
                 .await
                 .expect("read")
                 .iter()
@@ -5636,7 +6014,7 @@ mod tests {
     #[tokio::test]
     async fn a_recreated_bot_does_not_inherit_the_old_bots_file_handles() {
         // The worst of the collisions. A file id on Telegram is bound to the bot that received it,
-        // so handing the new bot the old bot's handle for message 1 pointed `view_attachment` at a
+        // so handing the new bot the old bot's handle for message 1 pointed `attachment_view` at a
         // file the new bot cannot fetch, or at the wrong picture.
         let (store, old_bot) = seeded(&["telegram:1"]).await;
         let old = store
@@ -5776,6 +6154,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_database_from_before_watches_gains_them_with_everything_still_in_place() {
+        // The upgrade every existing deployment takes. Schema 11 only adds a table, so the risk is
+        // not the new rows but the old ones: a migration that rebuilt something on the way past
+        // would take somebody's history with it.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        legacy_database(&path, 10, |connection| {
+            connection.execute(
+                "INSERT INTO conversations (address, channel, platform, kind, created_at)
+                 VALUES ('telegram:1', 'telegram', 'telegram', 'direct', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO accounts
+                     (channel, platform, platform_id, first_seen_at, last_seen_at)
+                 VALUES ('telegram', 'telegram', '111', '2026-09-01T00:00:00Z',
+                         '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO messages
+                     (conversation_id, account_id, message_id, sender_name, text, timestamp)
+                 VALUES (1, 1, '7', 'Alice', 'still here', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await;
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(
+            history.len(),
+            1,
+            "the upgrade must not cost anybody their history"
+        );
+        assert_eq!(history[0].text, "still here");
+
+        // And the new table works, including the scoped form that needs the conversation row.
+        assert!(store.list_watches(now()).await.expect("list").is_empty());
+        let outcome = store
+            .add_watch(
+                NewWatch {
+                    conversation: Some("telegram:1"),
+                    platform: Some("telegram"),
+                    field: WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add");
+        assert!(matches!(outcome, WatchOutcome::Added(_)));
+    }
+
+    #[tokio::test]
     async fn two_openers_racing_the_same_upgrade_both_survive() {
         // What a real upgrade looks like: systemd starts the daemon while an operator runs
         // `doctor`. The version was read once before the loop, so both saw the old one; the
@@ -5908,7 +6347,10 @@ mod tests {
         .await;
 
         let store = Store::open(&path).await.expect("upgrades");
-        let history = store.history("telegram:1", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
         let row = history.first().expect("the old row survives");
         assert_eq!(row.text, "said before the upgrade");
         assert!(!row.own, "an unmarked row is not the bridge's own message");
@@ -6030,7 +6472,10 @@ mod tests {
             "a placeholder is not a current account"
         );
 
-        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:123", 10, None, None)
+            .await
+            .expect("read");
         let carried: Vec<(i64, &str, i64, bool, bool)> = history
             .iter()
             .map(|row| {
@@ -6114,7 +6559,10 @@ mod tests {
             .expect("register");
         assert_ne!(new_handle, "7", "and its photo is not the old bot's photo");
 
-        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:123", 10, None, None)
+            .await
+            .expect("read");
         assert!(
             history.iter().all(|row| !row.previous_account),
             "the placeholder is unknown rather than previous, so nothing is flagged yet"
@@ -6131,7 +6579,10 @@ mod tests {
             ))
             .await
             .expect("record");
-        let history = store.history("telegram:123", 10, None).await.expect("read");
+        let history = store
+            .history("telegram:123", 10, None, None)
+            .await
+            .expect("read");
         let flagged: Vec<(&str, bool)> = history
             .iter()
             .map(|row| (row.text.as_str(), row.previous_account))
@@ -6238,6 +6689,292 @@ mod tests {
             reopened.session_id().await.expect("read"),
             Some(Uuid::nil()),
             "reopening must not wipe state"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_forward_cursor_hands_back_the_next_page_rather_than_the_latest_one() {
+        // What makes a sweep correct. Reading forwards has to take the *oldest* rows above the
+        // cursor: taking the newest would hand a caller that had fallen behind the latest page
+        // with a hole behind it, and the cursor it saved would step over whatever was in the hole.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for index in 0..5 {
+            let mut record = message(
+                account,
+                "telegram:1",
+                &index.to_string(),
+                &format!("line {index}"),
+            );
+            record.timestamp = now() + chrono::Duration::seconds(index);
+            store.record_message(record).await.expect("record");
+        }
+        let all = store
+            .history("telegram:1", 10, None, None)
+            .await
+            .expect("read");
+        let first = all[0].id;
+
+        let page = store
+            .history("telegram:1", 2, None, Some(first))
+            .await
+            .expect("read");
+        let texts: Vec<&str> = page.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["line 1", "line 2"], "the two after the cursor");
+
+        // A sweep keeps the newest cursor it was given, and the next call continues from it with
+        // nothing read twice and nothing skipped.
+        let next = store
+            .history("telegram:1", 2, None, Some(page[1].id))
+            .await
+            .expect("read");
+        let texts: Vec<&str> = next.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["line 3", "line 4"]);
+
+        let caught_up = store
+            .history("telegram:1", 2, None, Some(all[4].id))
+            .await
+            .expect("read");
+        assert!(
+            caught_up.is_empty(),
+            "nothing has been said since the last one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_is_recorded_once_however_often_it_is_asked_for() {
+        // The agent keeps its rules somewhere of its own and syncs them, so it calls this for every
+        // rule every time. A second row per call would fill the table and report every message
+        // twice.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let rule = NewWatch {
+            conversation: None,
+            platform: None,
+            field: WatchField::Text,
+            pattern: "deploy",
+            until: None,
+            reason: Some("releases"),
+        };
+        let WatchOutcome::Added(first) = store.add_watch(rule, now()).await.expect("add") else {
+            panic!("the first call must add");
+        };
+        let WatchOutcome::Existing(again) = store.add_watch(rule, now()).await.expect("add") else {
+            panic!("the second call must find the first");
+        };
+        assert_eq!(first.id, again.id);
+        assert_eq!(store.list_watches(now()).await.expect("list").len(), 1);
+
+        // The same words pointed at another field are a different rule, because they read a
+        // different string and fire on different messages.
+        let other = NewWatch {
+            field: WatchField::Sender,
+            ..rule
+        };
+        let WatchOutcome::Added(_) = store.add_watch(other, now()).await.expect("add") else {
+            panic!("a different field must be a different watch");
+        };
+        assert_eq!(store.list_watches(now()).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_watch_and_an_unscoped_one_are_different_rules() {
+        // SQLite treats NULLs as distinct, so the duplicate check cannot be a unique index and is
+        // a query instead. This is the case that would slip through one.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let global = NewWatch {
+            conversation: None,
+            platform: None,
+            field: WatchField::Text,
+            pattern: "deploy",
+            until: None,
+            reason: None,
+        };
+        let scoped = NewWatch {
+            conversation: Some("telegram:1"),
+            platform: Some("telegram"),
+            ..global
+        };
+        assert!(matches!(
+            store.add_watch(global, now()).await.expect("add"),
+            WatchOutcome::Added(_)
+        ));
+        assert!(matches!(
+            store.add_watch(scoped, now()).await.expect("add"),
+            WatchOutcome::Added(_)
+        ));
+        // And the unscoped one is still found rather than added twice, which is the half a unique
+        // index over a nullable column would silently lose.
+        assert!(matches!(
+            store.add_watch(global, now()).await.expect("add"),
+            WatchOutcome::Existing(_)
+        ));
+        let watches = store.list_watches(now()).await.expect("list");
+        assert_eq!(watches.len(), 2);
+        assert_eq!(watches[0].conversation, None);
+        assert_eq!(watches[1].conversation.as_deref(), Some("telegram:1"));
+    }
+
+    #[tokio::test]
+    async fn a_watch_scoped_to_a_chat_nothing_has_arrived_from_still_records() {
+        // Ruling on a conversation before it has said anything is legitimate, and the row it needs
+        // is minted here exactly as `set_policy` mints one.
+        let (store, _account) = seeded(&[]).await;
+        let outcome = store
+            .add_watch(
+                NewWatch {
+                    conversation: Some("telegram:-100"),
+                    platform: Some("telegram"),
+                    field: WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add");
+        let WatchOutcome::Added(record) = outcome else {
+            panic!("must add");
+        };
+        assert_eq!(record.conversation.as_deref(), Some("telegram:-100"));
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_watch_stops_matching_and_is_swept() {
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let lapsed = NewWatch {
+            conversation: None,
+            platform: None,
+            field: WatchField::Text,
+            pattern: "deploy",
+            until: Some(now() - chrono::Duration::minutes(1)),
+            reason: None,
+        };
+        store.add_watch(lapsed, now()).await.expect("add");
+        // Gone from what the gate matches before anything has swept it, since the read filters
+        // rather than waiting for a write.
+        assert!(store.watches(now()).await.expect("read").is_empty());
+        assert!(store.list_watches(now()).await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_watch_reports_what_it_was() {
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let WatchOutcome::Added(record) = store
+            .add_watch(
+                NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add")
+        else {
+            panic!("must add");
+        };
+        let removed = store.remove_watch(record.id).await.expect("remove");
+        assert_eq!(removed.expect("the row").pattern, "deploy");
+        assert!(
+            store
+                .remove_watch(record.id)
+                .await
+                .expect("remove")
+                .is_none(),
+            "removing it twice is not an error, and says so"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watch_cache_answers_the_gate_without_rereading_and_notices_a_write() {
+        // The identity of the handed-back `Arc` is what lets the gate skip recompiling a regex set
+        // it already built, so a refetch that found nothing changed has to hand back the same
+        // allocation rather than an equal one.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        store
+            .add_watch(
+                NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    pattern: "deploy",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add");
+        let first = store.watches(now()).await.expect("read");
+        let again = store.watches(now()).await.expect("read");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a cached read must not recompile"
+        );
+
+        store
+            .add_watch(
+                NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Sender,
+                    pattern: "spammer",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add");
+        let after = store.watches(now()).await.expect("read");
+        assert_eq!(after.len(), 2, "a write has to be visible immediately");
+        assert!(!Arc::ptr_eq(&first, &after));
+    }
+
+    #[tokio::test]
+    async fn the_watch_table_has_a_ceiling() {
+        // Every pattern is matched against every message in a muted room, and the agent can add
+        // rules at runtime, so there has to be a limit that is not "until it gets slow".
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        for index in 0..MAX_WATCHES {
+            let pattern = format!("rule{index}");
+            let outcome = store
+                .add_watch(
+                    NewWatch {
+                        conversation: None,
+                        platform: None,
+                        field: WatchField::Text,
+                        pattern: &pattern,
+                        until: None,
+                        reason: None,
+                    },
+                    now(),
+                )
+                .await
+                .expect("add");
+            assert!(matches!(outcome, WatchOutcome::Added(_)), "at {index}");
+        }
+        let outcome = store
+            .add_watch(
+                NewWatch {
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    pattern: "one too many",
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("add");
+        assert_eq!(outcome, WatchOutcome::AtCapacity(MAX_WATCHES));
+        assert_eq!(
+            store.list_watches(now()).await.expect("list").len(),
+            MAX_WATCHES
         );
     }
 }

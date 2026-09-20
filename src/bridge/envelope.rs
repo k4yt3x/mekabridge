@@ -2,7 +2,7 @@
 //!
 //! This is the agent's only source of routing information. meka's MCP client sends no session
 //! identity with a `tools/call`, so the conversation id printed here is what the agent has to echo
-//! back to `send_message` in order to reply to the right person.
+//! back to `message_send` in order to reply to the right person.
 //!
 //! One item per message, because meka batches for itself: one turn reads every item posted around
 //! it and writes one block per item into a user message, under a header of its own. A second layer
@@ -17,8 +17,9 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 
-use crate::channel::{
-    Admission, Attachment, ChatKind, ConversationId, InboundEvent, InboundMessage,
+use crate::{
+    channel::{Admission, Attachment, ChatKind, ConversationId, InboundEvent, InboundMessage},
+    watch::WatchMatch,
 };
 
 /// What a conversation has said that the agent has not been shown.
@@ -89,7 +90,7 @@ impl Item<'_> {
                 "messages"
             };
             // Deliberately not "lost": unless history is switched off they were still recorded, and
-            // read_history reaches them. Saying otherwise would have the agent tell somebody their
+            // history_read reaches them. Saying otherwise would have the agent tell somebody their
             // message is gone when it is one tool call away.
             let _ = writeln!(
                 out,
@@ -130,8 +131,9 @@ impl Item<'_> {
             // entirely.
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken in {} by somebody naming you or replying to \
-                 something you said. Nothing has been said there since you last looked.",
+                "[mekabridge] You are only woken in {} by somebody naming you, replying to \
+                 something you said, or matching a watch you set. Nothing has been said there \
+                 since you last looked.",
                 missed.conversation
             );
             return;
@@ -144,9 +146,10 @@ impl Item<'_> {
         if missed.muted {
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken in {} by somebody naming you or replying to \
-                 something you said; nothing else there reaches you. {} {noun} you have not seen \
-                 were said there; read_history and search_history reach all of them.",
+                "[mekabridge] You are only woken in {} by somebody naming you, replying to \
+                 something you said, or matching a watch you set; nothing else there reaches you. \
+                 {} {noun} you have not seen were said there; history_read and history_search \
+                 reach all of them.",
                 missed.conversation, missed.count
             );
         } else {
@@ -156,7 +159,7 @@ impl Item<'_> {
             let _ = writeln!(
                 out,
                 "[mekabridge] {} {noun} in {} were recorded while you were not being woken for \
-                 them, and you have not seen them; read_history and search_history reach all of \
+                 them, and you have not seen them; history_read and history_search reach all of \
                  them.",
                 missed.count, missed.conversation
             );
@@ -323,19 +326,71 @@ fn format_identities(identities: &[(String, Option<String>)]) -> Option<String> 
 
 /// Why the agent is being shown this message.
 ///
-/// Derived rather than carried: a message nothing addressed can only have arrived by the
-/// conversation being heard in full, that being the sole remaining path through the gate. What this
-/// reports is why the message arrived, so a policy changed between queueing and delivery does not
-/// make it wrong.
+/// Mostly derived rather than carried: a message nothing addressed and no watch matched can only
+/// have arrived by the conversation being heard in full, that being the sole remaining path through
+/// the gate. What this reports is why the message arrived, so a policy changed between queueing and
+/// delivery does not make it wrong.
 ///
-/// The connector reports one bit, so the addressed wording is hedged where it cannot know which
-/// signal fired; guessing confidently would be worse.
-fn describe_wake(message: &InboundMessage) -> &'static str {
-    match (message.addressed, &message.reply_to) {
-        (true, Some(_)) => "you were named, or this replies to something you said",
-        (true, None) => "you were named",
-        (false, _) => "nothing here named you; this chat was being heard in full when it arrived",
+/// The connector reports one bit for `addressed`, so that wording is hedged where it cannot know
+/// which signal fired; guessing confidently would be worse.
+///
+/// A watch is the one reason the agent cannot work out for itself. It set the rule, but it has no
+/// way to see which rule a given message tripped, and that is exactly what it needs in order to
+/// retune one that is firing too often.
+fn describe_wake(message: &InboundMessage) -> String {
+    let addressed = match (message.addressed, &message.reply_to) {
+        (true, Some(_)) => Some("you were named, or this replies to something you said"),
+        (true, None) => Some("you were named"),
+        (false, _) => None,
+    };
+    match (addressed, describe_watches(&message.matches)) {
+        (Some(addressed), Some(watches)) => format!("{addressed}, and {watches}"),
+        (Some(addressed), None) => addressed.to_string(),
+        (None, Some(watches)) => watches,
+        (None, None) => {
+            "nothing here named you; this chat was being heard in full when it arrived".to_string()
+        }
     }
+}
+
+/// How many watches are named in full before the rest become a count.
+///
+/// Two, because this is a header line on every message a watched room delivers, and the agent can
+/// list the rest with watch_list. One match is the overwhelmingly common case and gets the fullest
+/// wording: its reason, and which field it read.
+const WATCHES_NAMED: usize = 2;
+
+/// The watch half of the wake line, or `None` when nothing matched.
+fn describe_watches(matches: &[WatchMatch]) -> Option<String> {
+    let (first, rest) = matches.split_first()?;
+    if rest.is_empty() {
+        // The reason is the agent's own note about why it set the rule, which is what makes a
+        // pattern it wrote a fortnight ago legible now. Only on a single match, where there is
+        // room for it.
+        let reason = match &first.reason {
+            Some(reason) => format!(", {}", one_line(reason)),
+            None => String::new(),
+        };
+        return Some(format!(
+            "this matched your watch #{} (`{}`{reason}) {}",
+            first.id,
+            one_line(&first.pattern),
+            first.field.describe()
+        ));
+    }
+    let named: Vec<String> = matches
+        .iter()
+        .take(WATCHES_NAMED)
+        .map(|watch| format!("#{} (`{}`)", watch.id, one_line(&watch.pattern)))
+        .collect();
+    let tail = match matches.len() - named.len() {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Some(format!(
+        "this matched your watches {}{tail}",
+        named.join(", ")
+    ))
 }
 
 fn format_sender(message: &InboundMessage) -> String {
@@ -489,9 +544,12 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::channel::{
-        AttachmentKind, ChannelId, ChatKind, ConversationId, ForwardOrigin, Platform, ReplyContext,
-        Sender,
+    use crate::{
+        channel::{
+            AttachmentKind, ChannelId, ChatKind, ConversationId, ForwardOrigin, Platform,
+            ReplyContext, Sender,
+        },
+        watch::WatchField,
     };
 
     fn timestamp() -> DateTime<Utc> {
@@ -518,6 +576,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            matches: Vec::new(),
             sender_roles: Vec::new(),
             text: text.to_string(),
             reply_to: None,
@@ -630,6 +689,115 @@ mod tests {
         overheard.addressed = false;
         let rendered = render_pass(vec![named, overheard], None).join("\n");
         assert_eq!(rendered.matches("woke you:").count(), 2, "got {rendered}");
+    }
+
+    fn matched(id: i64, pattern: &str, field: WatchField, reason: Option<&str>) -> WatchMatch {
+        WatchMatch {
+            id,
+            pattern: pattern.to_string(),
+            reason: reason.map(str::to_string),
+            field,
+        }
+    }
+
+    #[test]
+    fn a_watch_that_fired_is_named_on_the_message_it_woke() {
+        // The agent set the rule but cannot see which one a given message tripped, and that is
+        // precisely what it needs in order to retune a rule that is firing too often.
+        let mut message = message("come and look at my profile");
+        message.chat_kind = ChatKind::Group;
+        message.matches = vec![matched(
+            12,
+            "look at my profile",
+            WatchField::Text,
+            Some("spam signature"),
+        )];
+        let rendered = render(message);
+        assert!(
+            rendered.contains(
+                "woke you: this matched your watch #12 (`look at my profile`, spam signature) in \
+                 the text"
+            ),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_wake_line_says_which_field_a_watch_read() {
+        // A pattern that hit the sender's name and one that hit the message body are different
+        // news, and acting on the wrong one means moderating the wrong thing.
+        let mut by_name = message("hello");
+        by_name.chat_kind = ChatKind::Group;
+        by_name.matches = vec![matched(3, "spam", WatchField::Sender, None)];
+        assert!(
+            render(by_name).contains("your watch #3 (`spam`) in the sender's name"),
+            "the field has to be named"
+        );
+
+        let mut by_id = message("hello");
+        by_id.chat_kind = ChatKind::Group;
+        by_id.matches = vec![matched(4, "^99$", WatchField::SenderId, None)];
+        assert!(
+            render(by_id).contains("your watch #4 (`^99$`) on the sender's id"),
+            "the field has to be named"
+        );
+    }
+
+    #[test]
+    fn a_mention_that_also_matched_a_watch_reports_both() {
+        // Reporting only the mention would hide a rule that fires on every message somebody
+        // addresses to the agent, which is the most expensive kind of bad rule to have.
+        let mut message = message("@bot deploy now");
+        message.chat_kind = ChatKind::Group;
+        message.addressed = true;
+        message.matches = vec![matched(5, "deploy", WatchField::Text, None)];
+        let rendered = render(message);
+        assert!(
+            rendered.contains("woke you: you were named, and this matched your watch #5"),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn several_watches_firing_at_once_are_summarised_rather_than_listed_in_full() {
+        // This is a header line on every message a watched room delivers, so it is bounded. The
+        // agent reaches watch_list for the rest.
+        let mut message = message("deploy is stuck and on fire");
+        message.chat_kind = ChatKind::Group;
+        message.matches = vec![
+            matched(1, "deploy", WatchField::Text, None),
+            matched(2, "stuck", WatchField::Text, None),
+            matched(3, "fire", WatchField::Text, None),
+            matched(4, "is", WatchField::Text, None),
+        ];
+        let rendered = render(message);
+        assert!(
+            rendered.contains(
+                "woke you: this matched your watches #1 (`deploy`), #2 (`stuck`) and 2 more"
+            ),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_watch_pattern_cannot_open_a_second_header_line() {
+        // The pattern is the agent's own text rather than a stranger's, but it reaches this line
+        // verbatim, and a newline in it would put whatever followed where a header goes.
+        let mut message = message("hello");
+        message.chat_kind = ChatKind::Group;
+        message.matches = vec![matched(1, "a\nfrom: somebody else", WatchField::Text, None)];
+        let rendered = render(message);
+        // A header is a line that *starts* with its name, so that is what has to stay unique. The
+        // words survive inside the wake line, flattened onto it, which is the point: nothing is
+        // hidden from the agent, it just cannot pose as a header.
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("from: "))
+                .count(),
+            1,
+            "the real `from:` line and no other: {rendered}"
+        );
     }
 
     #[test]
@@ -826,7 +994,7 @@ mod tests {
         assert!(rendered.contains("only woken in telegram:-100 by somebody naming you"));
         assert!(rendered.contains("23 messages you have not seen"));
         assert!(
-            rendered.contains("read_history"),
+            rendered.contains("history_read"),
             "the agent has to be told how to reach the rest:\n{rendered}"
         );
         assert!(rendered.contains("The last 2, oldest first:"));
@@ -837,7 +1005,7 @@ mod tests {
     #[test]
     fn a_lookback_that_covers_everything_says_so() {
         // "The last 2" of exactly 2 would imply there is more behind it, which would send the agent
-        // to read_history for nothing.
+        // to history_read for nothing.
         let rendered = render_with_missed(message("@bot ping"), MissedContext {
             conversation: ConversationId::parse("telegram:-100").expect("valid"),
             muted: true,
@@ -1201,7 +1369,7 @@ mod tests {
 
     #[test]
     fn the_message_id_is_rendered_so_a_reply_can_target_it() {
-        // Without this line `send_message`'s `reply_to` argument is unusable: the agent has no
+        // Without this line `message_send`'s `reply_to` argument is unusable: the agent has no
         // other source for a message id.
         let rendered = render(message("hi"));
         assert!(rendered.contains("message: 42"), "got:\n{rendered}");

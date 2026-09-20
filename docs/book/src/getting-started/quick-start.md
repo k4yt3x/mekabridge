@@ -64,7 +64,7 @@ name = "mekabridge"
 transport = "http"
 url = "http://127.0.0.1:9100/mcp"
 required = true
-eager_load_tools = ["send_message", "list_conversations"]
+eager_load_tools = ["message_send", "conversation_list"]
 ```
 
 `eager_load_tools` matters. Without it meka ships MCP tools deferred, and the agent pays a `tool_load` round trip before every single reply.

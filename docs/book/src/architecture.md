@@ -113,7 +113,7 @@ pub trait Channel: Send + Sync + 'static {
         -> Result<(), ChannelError>;
     async fn send_text(&self, conversation: &ConversationId, markdown: &str, options: &SendOptions)
         -> Result<Vec<String>, ChannelError>;
-    async fn send_file(&self, conversation: &ConversationId, path: &Path, caption: Option<&str>,
+    async fn file_send(&self, conversation: &ConversationId, path: &Path, caption: Option<&str>,
         as_photo: bool) -> Result<Vec<String>, ChannelError>;
     async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError>;
     async fn react(&self, conversation: &ConversationId, message_id: &str, emoji: Option<&str>)
@@ -134,7 +134,7 @@ The parse is shared. `render.rs` turns Markdown into blocks and spans and does t
 
 `<channel>:<chat>` or `<channel>:<chat>:<thread>`, for example `telegram:-1001234567890:77`.
 
-This is a public contract, not an internal detail: the agent passes it to `send_message`, and it appears in logs and in `mekabridge conversations list`. Parsing uses `splitn(3, ':')`, so the thread segment may itself contain colons and a future platform with structured thread ids needs no new format.
+This is a public contract, not an internal detail: the agent passes it to `message_send`, and it appears in logs and in `mekabridge conversations list`. Parsing uses `splitn(3, ':')`, so the thread segment may itself contain colons and a future platform with structured thread ids needs no new format.
 
 The address is deliberately not the whole identity of what is stored under it. A platform message id is only unique within the bot account that issued it: a Telegram bot deleted and recreated under the same channel numbers its private chats from 1 again, at the same addresses. So the store records which account each channel is logged in as, asked of the platform at startup, and keys every message, queue row, and attachment on the account, the address, the platform message id, and the revision (the edit time, or zero for the original). The address itself stays stable across a bot swap, which is what keeps policies, `owner_conversation`, and the ids in the agent's memory working; what changes is that messages recorded under the previous account are marked `previous_account` when read back, since their ids cannot be acted on from the new one.
 
@@ -164,7 +164,7 @@ The line running through all of it: a hand-over is spent when the feed says the 
 | A turn fails or is cancelled after the model read the messages | Not handed over again: the work is done and a second run would repeat it with the agent unable to remember the first. The owner is told; the chats are told only where the agent had not got a word in |
 | The feed connection drops | Reopened from the last event acted on, and meka replays what was missed across turns. Every hand-over still out is then asked about, so an outcome reported while nothing was listening is not waited on for ever |
 | meka says a replay had a hole in it | The same question, for every hand-over out. The notice is the cue rather than the mechanism, so a rewording costs nothing |
-| An attachment is too large to view, or the profile has no vision | `view_attachment` returns a description naming the file and pointing at `download_attachment`, rather than failing |
+| An attachment is too large to view, or the profile has no vision | `attachment_view` returns a description naming the file and pointing at `attachment_download`, rather than failing |
 | meka reports the session is gone | A replacement is bound and anything not yet accepted posted into it. Anything the old session had is closed, and its messages come back as a backlog rather than being replayed blind |
 | The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the messages are offered again rather than silently dropped |
 | Queue full | The message is dropped and counted; the next item handed over tells the agent how many it did not see |

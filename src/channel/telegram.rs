@@ -565,6 +565,8 @@ impl TelegramChannel {
             admission,
             sender_allowlisted,
             addressed: self.addressed(message),
+            // Filled by the gate, which is the only thing that knows what is being watched.
+            matches: Vec::new(),
             sender_roles: Vec::new(),
             text,
             reply_to,
@@ -963,7 +965,7 @@ impl Channel for TelegramChannel {
                 channel: self.id.as_str().to_string(),
                 message: if bodies.is_empty() {
                     "the replacement text renders to nothing, so there is no message to leave \
-                     behind. Use delete_message to remove it instead."
+                     behind. Use message_delete to remove it instead."
                         .to_string()
                 } else {
                     format!(
@@ -2483,7 +2485,7 @@ mod tests {
             .await
             .expect_err("an empty revision must be refused");
         assert!(error.to_string().contains("renders to nothing"), "{error}");
-        assert!(error.to_string().contains("delete_message"), "{error}");
+        assert!(error.to_string().contains("message_delete"), "{error}");
     }
 
     #[test]

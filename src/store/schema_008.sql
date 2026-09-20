@@ -18,7 +18,7 @@
 --
 -- `superseded_at` goes on the older row when an edit of the same `message_id` is recorded. An edit
 -- already arrives as its own row, under its own `external_id`, and nothing used to connect the two,
--- so `read_history` returned the pre-edit and post-edit wordings as two messages that both looked
+-- so `history_read` returned the pre-edit and post-edit wordings as two messages that both looked
 -- current.
 --
 -- No FTS trigger comes with this. `text` is still written once and never revised: an edit appends and

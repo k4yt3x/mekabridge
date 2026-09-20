@@ -32,7 +32,8 @@ use crate::{
         turn::{Presence, TurnTypist},
     },
     channel::{
-        Channel, ChannelRegistry, ChatKind, ConversationId, FileOptions, InboundEvent, SendOptions,
+        Channel, ChannelRegistry, ChatKind, ConversationId, FileOptions, InboundEvent, Platform,
+        SendOptions,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
@@ -41,7 +42,11 @@ use crate::{
         ToolSurface, ViewedAttachment, serve,
     },
     meka::MekaClient,
-    store::{AccountId, AccountIdentity, MessageKey, Policy, Store, UnseenSummary},
+    store::{
+        AccountId, AccountIdentity, MessageKey, NewWatch, Policy, Store, UnseenSummary,
+        WatchOutcome, WatchRecord,
+    },
+    watch::WatchField,
 };
 
 /// Buffer between the channel pollers and the durable writer.
@@ -202,7 +207,7 @@ async fn register_accounts(store: &Store, channels: &ChannelRegistry) -> Channel
                 before = %previous.label(),
                 "this channel is logged in as a different account than last time; messages \
                  recorded under the old one cannot be replied to, reacted to, edited or deleted \
-                 from this one, and read_history marks them as from a previous account"
+                 from this one, and history_read marks them as from a previous account"
             );
         }
         tracing::info!(channel = %channel.id(), account = %label, "logged in");
@@ -953,7 +958,7 @@ impl OutboundSink for BridgeSink {
         Ok(ids)
     }
 
-    async fn send_file(
+    async fn file_send(
         &self,
         conversation: &str,
         paths: &[std::path::PathBuf],
@@ -1011,7 +1016,7 @@ impl OutboundSink for BridgeSink {
         Ok(ids)
     }
 
-    async fn react(
+    async fn message_react(
         &self,
         conversation: &str,
         message_id: &str,
@@ -1044,7 +1049,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn edit_message(
+    async fn message_edit(
         &self,
         conversation: &str,
         message_id: &str,
@@ -1093,7 +1098,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn delete_message(
+    async fn message_delete(
         &self,
         conversation: &str,
         message_id: &str,
@@ -1142,7 +1147,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn moderate_member(
+    async fn member_moderate(
         &self,
         conversation: &str,
         user_id: &str,
@@ -1169,7 +1174,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn set_member_rights(
+    async fn member_set_rights(
         &self,
         conversation: &str,
         user_id: &str,
@@ -1189,7 +1194,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn set_member_roles(
+    async fn member_set_roles(
         &self,
         conversation: &str,
         user_id: &str,
@@ -1209,7 +1214,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn pin_message(
+    async fn message_pin(
         &self,
         conversation: &str,
         message_id: &str,
@@ -1230,7 +1235,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn set_chat(
+    async fn chat_set(
         &self,
         conversation: &str,
         settings: crate::channel::ChatSettings,
@@ -1248,7 +1253,7 @@ impl OutboundSink for BridgeSink {
         Ok(())
     }
 
-    async fn member(
+    async fn member_get(
         &self,
         conversation: &str,
         user_id: Option<&str>,
@@ -1260,7 +1265,7 @@ impl OutboundSink for BridgeSink {
             .map_err(|error| SinkError::Delivery(error.to_string()))
     }
 
-    async fn list_members(
+    async fn member_list(
         &self,
         conversation: &str,
         query: Option<&str>,
@@ -1274,7 +1279,7 @@ impl OutboundSink for BridgeSink {
             .map_err(|error| SinkError::Delivery(error.to_string()))
     }
 
-    async fn view_attachment(
+    async fn attachment_view(
         &self,
         handle: &str,
     ) -> std::result::Result<ViewedAttachment, SinkError> {
@@ -1283,7 +1288,7 @@ impl OutboundSink for BridgeSink {
         if !self.vision_enabled().await {
             return Ok(ViewedAttachment::Description(format!(
                 "This is a {} ({}). The current model has no vision, so it cannot be shown. Use \
-                 download_attachment to get the file itself.",
+                 attachment_download to get the file itself.",
                 record.kind,
                 describe_file(&record)
             )));
@@ -1300,7 +1305,7 @@ impl OutboundSink for BridgeSink {
         };
         let Some(file_ref) = file_ref else {
             return Ok(ViewedAttachment::Description(format!(
-                "This is a {} ({}) and has no image preview. Use download_attachment to get the \
+                "This is a {} ({}) and has no image preview. Use attachment_download to get the \
                  file itself.",
                 record.kind,
                 describe_file(&record)
@@ -1309,7 +1314,7 @@ impl OutboundSink for BridgeSink {
 
         // Answered before fetching where the size is already known. A connector refusing an
         // oversize file returns its own wording, which names a byte ceiling no operator
-        // configured and says nothing about `download_attachment`; the branch below that
+        // configured and says nothing about `attachment_download`; the branch below that
         // *does* say it only fires on the base64 form, which is the looser of meka's two
         // limits and so never first.
         //
@@ -1318,7 +1323,7 @@ impl OutboundSink for BridgeSink {
         // oversized video on the strength of a number describing something else.
         if !preview && record.bytes.is_some_and(|bytes| bytes > MAX_VIEW_BYTES) {
             return Ok(ViewedAttachment::Description(format!(
-                "This {} is {}, too large to show inline. Use download_attachment to get the file \
+                "This {} is {}, too large to show inline. Use attachment_download to get the file \
                  itself.",
                 record.kind,
                 describe_file(&record)
@@ -1336,7 +1341,7 @@ impl OutboundSink for BridgeSink {
         if !VIEWABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
             return Ok(ViewedAttachment::Description(format!(
                 "This is a {} of type {media_type}, which cannot be shown as an image. Use \
-                 download_attachment to get the file itself.",
+                 attachment_download to get the file itself.",
                 record.kind
             )));
         }
@@ -1349,7 +1354,7 @@ impl OutboundSink for BridgeSink {
         // it.
         if data.len() > MAX_VIEW_BASE64_BYTES {
             return Ok(ViewedAttachment::Description(format!(
-                "This {} is {} bytes, too large to show inline. Use download_attachment to get the \
+                "This {} is {} bytes, too large to show inline. Use attachment_download to get the \
                  file itself.",
                 record.kind,
                 fetched.bytes.len()
@@ -1370,7 +1375,7 @@ impl OutboundSink for BridgeSink {
         })
     }
 
-    async fn download_attachment(
+    async fn attachment_download(
         &self,
         handle: &str,
     ) -> std::result::Result<DownloadedAttachment, SinkError> {
@@ -1519,7 +1524,7 @@ impl OutboundSink for BridgeSink {
         Ok(existing.map(|record| record.policy))
     }
 
-    async fn unseen(
+    async fn backlog_check(
         &self,
         conversation: Option<&str>,
     ) -> std::result::Result<UnseenSummary, SinkError> {
@@ -1534,22 +1539,77 @@ impl OutboundSink for BridgeSink {
             .map_err(|error| SinkError::Internal(error.to_string()))
     }
 
-    async fn read_history(
+    async fn watch_create(
+        &self,
+        pattern: &str,
+        field: WatchField,
+        conversation: Option<&str>,
+        until: Option<chrono::DateTime<Utc>>,
+        reason: Option<&str>,
+    ) -> std::result::Result<WatchOutcome, SinkError> {
+        // Validated here rather than left to the matcher, so a pattern that will never fire is
+        // refused while the agent is still looking at it instead of being stored and silently
+        // matching nothing.
+        crate::watch::compile_pattern(pattern).map_err(SinkError::Delivery)?;
+        // Resolved for the same reason `set_policy` resolves: a watch scoped to an id that names no
+        // configured channel would be stored and never consulted.
+        let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
+        let platform = conversation
+            .as_ref()
+            .map(|conversation| {
+                self.channels
+                    .resolve(conversation)
+                    .map(|channel| channel.platform())
+                    .map_err(|error| SinkError::Internal(error.to_string()))
+            })
+            .transpose()?;
+        self.store
+            .add_watch(
+                NewWatch {
+                    conversation: conversation.as_ref().map(ConversationId::as_str),
+                    platform: platform.map(Platform::as_str),
+                    field,
+                    pattern,
+                    until,
+                    reason,
+                },
+                Utc::now(),
+            )
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))
+    }
+
+    async fn watch_delete(&self, id: i64) -> std::result::Result<Option<WatchRecord>, SinkError> {
+        self.store
+            .remove_watch(id)
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))
+    }
+
+    async fn watch_list(&self) -> std::result::Result<Vec<WatchRecord>, SinkError> {
+        self.store
+            .list_watches(Utc::now())
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))
+    }
+
+    async fn history_read(
         &self,
         conversation: &str,
         limit: usize,
         before: Option<i64>,
+        after: Option<i64>,
     ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
         let conversation = self.resolve(conversation)?;
         let records = self
             .store
-            .history(conversation.as_str(), limit, before)
+            .history(conversation.as_str(), limit, before, after)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         Ok(records.into_iter().map(history_entry).collect())
     }
 
-    async fn search_history(
+    async fn history_search(
         &self,
         query: &str,
         conversation: Option<&str>,
@@ -1624,7 +1684,7 @@ impl OutboundSink for BridgeSink {
                             previous_account: false,
                             timestamp: message.timestamp.to_rfc3339(),
                             // Not a row in the bridge's history, so there is nothing to page back
-                            // from. Zero is the value `read_history` already treats as no cursor.
+                            // from. Zero is the value `history_read` already treats as no cursor.
                             cursor: 0,
                         });
                     }
@@ -1762,7 +1822,7 @@ fn sanitize_file_stem(file_ref: &str) -> String {
     // runs past 48 characters, and the part that differs between two attachments of the *same*
     // message is the attachment id at the end, which is exactly what the cut removes. Two images on
     // one post therefore produced the same stem and, with the same extension, the same path: the
-    // second overwrote the first, `download_attachment` handed back the wrong bytes with no error,
+    // second overwrote the first, `attachment_download` handed back the wrong bytes with no error,
     // and sweeping either deleted both. The suffix is derived from the whole ref, so it survives
     // whatever the prefix loses.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -1896,7 +1956,7 @@ mod tests {
         // keeps, and the part that differs between two attachments of the *same* message is the id
         // at the end -- exactly what the truncation removes. Two screenshots on one post therefore
         // produced the same stem, and with the same extension the same path: the second overwrote
-        // the first, `download_attachment` returned the wrong bytes with no error at all, and
+        // the first, `attachment_download` returned the wrong bytes with no error at all, and
         // sweeping either deleted both.
         let first =
             sanitize_file_stem("1183429847290374144/1183429847290374145/1183429847290374146");

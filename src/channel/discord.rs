@@ -626,6 +626,8 @@ impl DiscordChannel {
             admission,
             sender_allowlisted,
             addressed: self.addressed(message, channel_kind),
+            // Filled by the gate, which is the only thing that knows what is being watched.
+            matches: Vec::new(),
             sender_roles: message
                 .guild_id
                 .map(|guild_id| self.names.role_names(guild_id, &roles))

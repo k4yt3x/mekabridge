@@ -1322,7 +1322,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mekabridge"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1338,6 +1338,7 @@ dependencies = [
  "libc",
  "pulldown-cmark",
  "rand",
+ "regex",
  "reqwest 0.13.4",
  "rmcp 2.2.0",
  "rmcp 3.1.0",
@@ -1758,6 +1759,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

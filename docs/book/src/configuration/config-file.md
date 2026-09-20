@@ -56,7 +56,7 @@ nothing on your machine, so replying sits at meka's `read` level:
 > meka would otherwise reject the session on the first message rather than at launch.
 
 > **`permission = "none"` cannot reply**, and `doctor` reports it as a failure: no tool is
-> executable at that level, `send_message` included. It is also what meka's 0.46 store migration
+> executable at that level, `message_send` included. It is also what meka's 0.46 store migration
 > turns an existing `ask` session into, so that is where a bridge upgraded across it lands. Naming
 > a workable level and restarting is enough; the bridge reconciles a running session's level with
 > the config before its next turn.
@@ -70,7 +70,7 @@ If you would rather sends be gated too, invert it from meka's side:
 
 ```toml
 [mcp.servers.tool_permissions]
-send_message = "unrestricted"
+message_send = "unrestricted"
 ```
 
 When `recreate_on_missing` fires, the agent's memory of every past conversation is gone. It is logged at warn level.
@@ -117,13 +117,13 @@ Those two are the only places the bridge writes chat content of its own, and `no
 
 `owner_conversation` names a chat, not a person, and startup can only check the shape of the id, never whether anything answers to it. Discord makes that gap sharp, because a user id and a channel id are both snowflakes: the wrong one is accepted here and then answered with `Unknown Channel` on every send, and nothing says so. Write `discord:@<user id>` to be reached by direct message and the bridge opens the channel itself. `mekabridge doctor` asks the platform whether the configured id resolves, which is the only way to settle it short of sending.
 
-The message is also put back among what the agent has not seen, so `unseen` counts it and it comes back as missed context the next time that conversation wakes.
+The message is also put back among what the agent has not seen, so `backlog_check` counts it and it comes back as missed context the next time that conversation wakes.
 
 When the queue is full, further messages are dropped and counted, and the next item handed over tells the agent how many it did not see. Nothing is discarded silently.
 
 `mute_followup` was removed in 0.7.0, and a config still setting it is refused at startup by name. That is deliberate: a knob that silently stopped doing anything would leave an operator reading their own config as the explanation for behaviour it no longer controls. Delete the line. A muted conversation now wakes the agent only when somebody names it or replies to something it said, and following a conversation on is the agent's own call. See [Group attention](../usage/group-attention.md).
 
-`mute_context` trades a few lines of the item that wakes a chat against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `read_history` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
+`mute_context` trades a few lines of the item that wakes a chat against a tool call. A bare `@bot what do you think about that?` is meaningless without the antecedent, and `history_read` to recover it costs a whole model round trip. Capped at 50, because a generous lookback quietly turns mention-only back into every message.
 
 ## `[bridge.default_policy]`
 
@@ -138,12 +138,12 @@ What reaches the agent from a conversation nobody has ruled on, by kind of chat.
 The three policies:
 
 - **`active`**: every message wakes the agent and costs a provider turn.
-- **`mute`**: everything is received and recorded, but only a message addressed to the agent wakes it. The rest is readable with `read_history` and `search_history`, and the agent is told how much it missed.
+- **`mute`**: everything is received and recorded, but only a message addressed to the agent, or one matching a watch it set, wakes it. The rest is readable with `history_read` and `history_search`, and the agent is told how much it missed. See [Group attention](../usage/group-attention.md#watches).
 - **`block`**: nothing is delivered and nothing is kept.
 
-These are the same three states Telegram and Discord offer in their own notification settings, which is deliberate: an agent reading a tool called `mute` should already know what it does.
+These are the same three states Telegram and Discord offer in their own notification settings, which is deliberate: an agent reading a tool called `conversation_mute` should already know what it does.
 
-Groups default to `mute` because a bot with privacy mode off receives every message said in every group it is in, and in a busy one almost none of it concerns the agent. A one-to-one chat has nobody else in it, so `mute` there would be a no-op at best; the bridge refuses it and points at `block`.
+Groups default to `mute` because a bot with privacy mode off receives every message said in every group it is in, and in a busy one almost none of it concerns the agent. A one-to-one chat has nobody else in it, so `mute` there would be a no-op at best; the bridge refuses it and points at `conversation_block`.
 
 A conversation with an explicit decision keeps it, so changing these defaults moves only the conversations nobody has ruled on. `mekabridge policy list` shows both.
 
@@ -169,10 +169,10 @@ A non-loopback `bind` without a `token` is a `doctor` failure: anyone who can re
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `path` | `<data dir>/mekabridge/mekabridge.db` | SQLite database |
-| `attachment_dir` | `<data dir>/mekabridge/attachments` | Where `download_attachment` writes files |
-| `attachment_max_bytes` | `20971520` (20 MiB) | Ceiling on what `download_attachment` will fetch. Telegram's cloud API caps `getFile` at 20 MiB regardless, so raising this only helps against a local Bot API server |
+| `attachment_dir` | `<data dir>/mekabridge/attachments` | Where `attachment_download` writes files |
+| `attachment_max_bytes` | `20971520` (20 MiB) | Ceiling on what `attachment_download` will fetch. Telegram's cloud API caps `getFile` at 20 MiB regardless, so raising this only helps against a local Bot API server |
 | `attachment_retention` | `30d` | How long an attachment stays reachable. Governs both the handle and any file downloaded through it, so past this the agent can no longer fetch a file from an older message |
-| `history_retention` | `30d` | How long a recorded message stays readable through `read_history` and `search_history`. `0s` records nothing at all |
+| `history_retention` | `30d` | How long a recorded message stays readable through `history_read` and `history_search`. `0s` records nothing at all |
 
 Every message the bridge is not blocking is recorded, not only the ones from muted conversations. A history that works in some chats and not others is a worse tool than one that behaves the same everywhere, and an agent whose session has been compacted has as much use for scroll-back in a chat it was listening to as in one it was not.
 

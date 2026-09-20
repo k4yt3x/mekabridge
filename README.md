@@ -53,7 +53,7 @@ name = "mekabridge"
 transport = "http"
 url = "http://127.0.0.1:9100/mcp"
 required = true
-eager_load_tools = ["send_message", "list_conversations"]
+eager_load_tools = ["message_send", "conversation_list"]
 ```
 
 Then start them, bridge first where you can:
@@ -69,14 +69,15 @@ meka retries a failed MCP connect in the background, so the wrong order recovers
 
 | Group | Tools |
 |-------|-------|
-| Sending | `send_message`, `send_file`, `react`, `edit_message`, `delete_message` |
-| Attachments | `view_attachment`, `download_attachment` |
-| Address book | `list_conversations`, `get_conversation` |
-| Attention | `mute`, `unmute`, `block`, `unblock`, `unseen` |
-| History | `read_history`, `search_history` |
-| Moderation | `moderate_member`, `set_member_rights`, `set_member_roles`, `pin_message`, `set_chat`, `member`, `list_members` |
+| Sending | `message_send`, `file_send`, `message_react`, `message_edit`, `message_delete` |
+| Attachments | `attachment_view`, `attachment_download` |
+| Address book | `conversation_list`, `conversation_get` |
+| Attention | `conversation_mute`, `conversation_unmute`, `conversation_block`, `conversation_unblock`, `backlog_check` |
+| Watches | `watch_create`, `watch_delete`, `watch_list` |
+| History | `history_read`, `history_search` |
+| Moderation | `member_moderate`, `member_set_rights`, `member_set_roles`, `message_pin`, `chat_set`, `member_get`, `member_list` |
 
-All but five are annotated read-only, so the conversational surface works at meka's `read` permission level. `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` and `set_chat` act irreversibly on somebody else's account or on the room, and need `unrestricted`. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
+All but five are annotated read-only, so the conversational surface works at meka's `read` permission level. `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` and `chat_set` act irreversibly on somebody else's account or on the room, and need `unrestricted`. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
 
 Routing is explicit because it has to be: meka's MCP client sends no session identity with a tool call, so an MCP server cannot infer which conversation a call belongs to. Every send names its target, which is also what makes messaging somebody else, or messaging first, the same operation as replying.
 

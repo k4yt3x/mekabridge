@@ -40,9 +40,10 @@ use mekabridge::{
     mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
     store::{
-        AccountId, AccountIdentity, ConversationRecord, HandOver, MessageKey, Policy, QueueState,
-        QueueStats, Store,
+        AccountId, AccountIdentity, ConversationRecord, HandOver, MessageKey, NewWatch, Policy,
+        QueueState, QueueStats, Store, WatchOutcome,
     },
+    watch::WatchField,
 };
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -690,7 +691,7 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
         let _ = feed.sender.send(frame);
     }
 
-    let send_tool = "mcp__mekabridge__send_message";
+    let send_tool = "mcp__mekabridge__message_send";
     let sent = |id: &str| serde_json::json!({ "id": id, "name": send_tool, "input": {}, "display_summary": null });
     match script {
         TurnScript::Answer => {
@@ -1432,7 +1433,7 @@ async fn sink_with_storage(
     .await
 }
 
-/// The same, pointed at a meka that answers, so the vision probe succeeds and `view_attachment`
+/// The same, pointed at a meka that answers, so the vision probe succeeds and `attachment_view`
 /// reaches the code that decides between an image and a description.
 async fn sink_against_meka(
     store: Store,
@@ -1519,6 +1520,7 @@ fn message(text: &str, message_id: &str) -> InboundEvent {
         sender_allowlisted: true,
         sender_roles: Vec::new(),
         addressed: false,
+        matches: Vec::new(),
         text: text.to_string(),
         reply_to: None,
         edited_at: None,
@@ -3158,6 +3160,272 @@ fn group_message(text: &str, message_id: &str, addressed: bool) -> InboundEvent 
     event
 }
 
+/// The same group message, from somebody the tests can name.
+fn group_message_from(text: &str, message_id: &str, display_name: &str, id: &str) -> InboundEvent {
+    let mut event = group_message(text, message_id, false);
+    let InboundEvent::Message(inner) = &mut event else {
+        panic!("a message was built just above");
+    };
+    inner.sender.display_name = display_name.to_string();
+    inner.sender.username = None;
+    inner.sender.id = id.to_string();
+    event
+}
+
+#[tokio::test]
+async fn a_watch_wakes_a_muted_group_exactly_once_and_names_the_rule() {
+    // The whole feature, end to end, through the real queue: a room on mentions only, a message
+    // nothing addressed, and a rule the agent set that makes it worth a turn. Exactly-once is the
+    // queue's own invariant rather than anything the watch does, which is the point of putting the
+    // rule here instead of in a separate process polling the database.
+    let harness = Harness::start().await;
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            "telegram",
+            Policy::Mute,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    harness
+        .store
+        .add_watch(
+            NewWatch {
+                conversation: None,
+                platform: None,
+                field: WatchField::Text,
+                pattern: "看我简介",
+                until: None,
+                reason: Some("spam signature"),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+
+    // Ordinary talk in the room still costs nothing.
+    harness
+        .sender
+        .send(group_message("morning everyone", "1", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.items().is_empty(),
+        "a muted room must stay quiet for what no rule matched: {:?}",
+        harness.items()
+    );
+
+    harness
+        .sender
+        .send(group_message("看我简介 for free money", "2", false))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn the watch woke", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+
+    let items = harness.items();
+    assert_eq!(items.len(), 1, "one match, one turn: {items:?}");
+    let item = &items[0];
+    assert!(
+        item.contains(
+            "woke you: this matched your watch #1 (`看我简介`, spam signature) in the text"
+        ),
+        "the agent has to be told which rule woke it:\n{item}"
+    );
+    // And the surrounding conversation arrives with it, which is what makes the match judgeable
+    // without spending a second turn on a history read.
+    assert!(
+        item.contains("morning everyone"),
+        "the missed context is what a bare match needs to be judged:\n{item}"
+    );
+
+    // The message is not offered again. Nothing marked it seen from outside; the queue delivered
+    // it once, which is the invariant the old cron-and-probe arrangement could not hold.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        harness.items().len(),
+        1,
+        "a handled message must not come back: {:?}",
+        harness.items()
+    );
+}
+
+#[tokio::test]
+async fn a_watch_on_the_sender_reads_the_name_rather_than_the_message() {
+    // The field is part of the rule, and the wake line says which one read. A name-matching rule
+    // reported as a text match would send the agent looking for words that are not there.
+    let harness = Harness::start().await;
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            "telegram",
+            Policy::Mute,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    harness
+        .store
+        .add_watch(
+            NewWatch {
+                conversation: None,
+                platform: None,
+                field: WatchField::Sender,
+                pattern: "free ?money",
+                until: None,
+                reason: None,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+
+    harness
+        .sender
+        .send(group_message_from("hello", "1", "Free Money Now", "99"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn the name matched", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+    let items = harness.items();
+    assert!(
+        items[0].contains("in the sender's name"),
+        "the field that matched has to be named:\n{}",
+        items[0]
+    );
+}
+
+#[tokio::test]
+async fn a_watch_confined_to_one_chat_does_not_wake_the_agent_in_another() {
+    // Scope is half of what makes a rule usable: "tell me when this room mentions a deploy" is a
+    // different request from "tell me whenever anyone anywhere does", and a bridge that could only
+    // express the second would make the feature unusable in a deployment with more than one room.
+    let harness = Harness::start().await;
+    for conversation in ["mock:-100", "mock:-200"] {
+        harness
+            .store
+            .set_policy(
+                conversation,
+                "telegram",
+                Policy::Mute,
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .expect("mute");
+    }
+    harness
+        .store
+        .add_watch(
+            NewWatch {
+                conversation: Some("mock:-200"),
+                platform: Some("telegram"),
+                field: WatchField::Text,
+                pattern: "deploy",
+                until: None,
+                reason: None,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+
+    harness
+        .sender
+        .send(group_message("the deploy is stuck", "1", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        harness.items().is_empty(),
+        "a watch scoped elsewhere must not wake this room: {:?}",
+        harness.items()
+    );
+}
+
+#[tokio::test]
+async fn removing_a_watch_makes_the_room_quiet_again() {
+    // The operator's way back, and the agent's own: a rule that turned out to fire on everything
+    // has to be able to stop firing without restarting the bridge.
+    let harness = Harness::start().await;
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            "telegram",
+            Policy::Mute,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    let outcome = harness
+        .store
+        .add_watch(
+            NewWatch {
+                conversation: None,
+                platform: None,
+                field: WatchField::Text,
+                pattern: "deploy",
+                until: None,
+                reason: None,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+    let WatchOutcome::Added(record) = outcome else {
+        panic!("the watch must be added");
+    };
+
+    harness
+        .sender
+        .send(group_message("the deploy is stuck", "1", false))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn the watch woke", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+    assert_eq!(harness.items().len(), 1);
+
+    harness
+        .store
+        .remove_watch(record.id)
+        .await
+        .expect("remove")
+        .expect("the row");
+    harness
+        .sender
+        .send(group_message("the deploy is stuck again", "2", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        harness.items().len(),
+        1,
+        "the room has to go quiet again: {:?}",
+        harness.items()
+    );
+}
+
 #[tokio::test]
 async fn a_group_nobody_has_ruled_on_follows_the_configured_default() {
     // The behaviour every pre-existing group inherits on upgrade. There is no row for it in
@@ -3196,7 +3464,7 @@ async fn a_group_nobody_has_ruled_on_follows_the_configured_default() {
     assert_eq!(
         harness
             .store
-            .history("mock:-100", 10, None)
+            .history("mock:-100", 10, None, None)
             .await
             .expect("read")
             .len(),
@@ -3277,7 +3545,7 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     assert!(
         harness
             .store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -3294,7 +3562,7 @@ async fn the_indicator_is_up_only_while_the_model_writes_the_message() {
     // agent spent reading. It now tracks the one interval meka can actually vouch for: between
     // `tool_call.composing` and `tool_call.executing` on a send call.
     let harness =
-        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(900)).await;
+        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(900)).await;
     harness
         .sender
         .send(message("what did the log say?", "1"))
@@ -3408,7 +3676,7 @@ async fn a_retracted_message_is_marked_rather_than_erased() {
     loop {
         let history = harness
             .store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read");
         assert_eq!(history.len(), 1, "the row must not be removed");
@@ -3436,7 +3704,7 @@ async fn await_history(harness: &Harness, expected: usize, label: &str) {
     while tokio::time::Instant::now() < deadline {
         let count = harness
             .store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .len();
@@ -3568,7 +3836,7 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
     assert_eq!(
         harness
             .store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .len(),
@@ -3600,7 +3868,7 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
         "the lookback is what makes a bare mention answerable:\n{envelope}"
     );
     assert!(
-        envelope.contains("read_history"),
+        envelope.contains("history_read"),
         "the agent has to be told how to reach the rest:\n{envelope}"
     );
 }
@@ -3700,7 +3968,7 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
         .take_unseen("mock:1", Utc::now(), 10)
         .await
         .expect("read");
-    assert_eq!(owed, 1, "the message has to survive for read_history");
+    assert_eq!(owed, 1, "the message has to survive for history_read");
 }
 
 #[tokio::test]
@@ -3760,7 +4028,7 @@ async fn a_batch_that_never_reached_the_model_owes_its_backlog_back() {
 async fn unmuting_reports_the_backlog_once_and_then_stops() {
     // The trap: `unseen` is only ever cleared by the turn that reports it, so a conversation that
     // stops being muted with a backlog behind it would keep that count for the rest of its life and
-    // `list_conversations` would go on quoting it.
+    // `conversation_list` would go on quoting it.
     let harness = Harness::start().await;
     harness
         .store
@@ -3907,7 +4175,7 @@ async fn the_sink_delivers_to_a_conversation_it_has_never_seen() {
     )]);
 
     // And it joins the address book, or the agent could message somebody and then fail to find them
-    // in `list_conversations` afterwards.
+    // in `conversation_list` afterwards.
     let record = store
         .conversation("mock:999")
         .await
@@ -4176,7 +4444,7 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
         address,
     )
     .await;
-    let viewed = sink.view_attachment(&handle).await.expect("resolves");
+    let viewed = sink.attachment_view(&handle).await.expect("resolves");
     shutdown.cancel();
 
     match viewed {
@@ -4349,7 +4617,7 @@ async fn an_abandoned_composing_call_still_closes_the_indicator() {
     // `executing` matching the id that opened the window never arrives. Waiting for it left the
     // indicator refreshing until the turn ended, which is the behaviour this whole rework removed.
     let harness =
-        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(700)).await;
+        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(700)).await;
     harness.recorder.set(&harness.recorder.compose_retry, true);
     harness
         .sender
@@ -4476,14 +4744,14 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
 
     // meka is unreachable here, so the vision probe fails and the sink degrades to a description
     // rather than pretending the model can see.
-    let viewed = sink.view_attachment(&handle).await.expect("resolves");
+    let viewed = sink.attachment_view(&handle).await.expect("resolves");
     assert!(
         matches!(viewed, ViewedAttachment::Description(ref text) if text.contains("no vision")),
         "got: {viewed:?}"
     );
 
     // Downloading works regardless of vision, and lands inside the configured directory.
-    let downloaded = sink.download_attachment(&handle).await.expect("downloads");
+    let downloaded = sink.attachment_download(&handle).await.expect("downloads");
     assert!(downloaded.path.starts_with(directory.path()));
     assert_eq!(downloaded.bytes, ONE_PIXEL_PNG.len() as u64);
     assert_eq!(
@@ -4513,7 +4781,7 @@ async fn an_unknown_attachment_handle_is_a_clear_error() {
     let sink = sink_for(store, channels).await;
 
     let error = sink
-        .view_attachment("9999")
+        .attachment_view("9999")
         .await
         .expect_err("an invented handle must not resolve");
     assert!(error.to_string().contains("9999"), "got: {error}");
@@ -4538,7 +4806,7 @@ async fn a_file_send_with_no_files_is_refused_by_the_sink() {
     .await;
 
     let error = sink
-        .send_file("mock:1", &[], None, FileOptions::default(), None)
+        .file_send("mock:1", &[], None, FileOptions::default(), None)
         .await
         .expect_err("an empty file list must be refused");
     assert!(error.to_string().contains("no files"), "got: {error}");
@@ -4590,7 +4858,7 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
     std::fs::write(&second, b"png").expect("write");
     // Two files in one call, so this also covers the sink handing the whole group to the channel
     // rather than the first of it.
-    sink.send_file(
+    sink.file_send(
         "mock:1",
         &[first.clone(), second.clone()],
         Some("see https://example.com"),
@@ -4693,7 +4961,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
     )
     .await;
 
-    sink.send_file(
+    sink.file_send(
         "mock:1",
         std::slice::from_ref(&path),
         None,
@@ -4826,7 +5094,7 @@ async fn what_the_agent_sends_is_recorded_one_row_per_platform_message() {
         .expect("send succeeds");
     assert_eq!(ids, vec!["m1", "m2", "m3"], "the caller is told every id");
 
-    let history = store.history("mock:1", 10, None).await.expect("read");
+    let history = store.history("mock:1", 10, None, None).await.expect("read");
     assert_eq!(
         history.len(),
         3,
@@ -4884,7 +5152,7 @@ async fn a_file_the_agent_sent_can_be_opened_again() {
     // What the platform will hand back when the handle is redeemed.
     channel.put_file(&path.display().to_string(), ONE_PIXEL_PNG.to_vec());
 
-    sink.send_file(
+    sink.file_send(
         "mock:1",
         std::slice::from_ref(&path),
         Some("here it is"),
@@ -4894,7 +5162,7 @@ async fn a_file_the_agent_sent_can_be_opened_again() {
     .await
     .expect("send succeeds");
 
-    let history = store.history("mock:1", 10, None).await.expect("read");
+    let history = store.history("mock:1", 10, None, None).await.expect("read");
     let row = history.first().expect("one row");
     let handle = row
         .attachments
@@ -4903,7 +5171,7 @@ async fn a_file_the_agent_sent_can_be_opened_again() {
     // Downloaded rather than viewed, because viewing branches on whether the model has vision and
     // this is about the handle reaching the platform and coming back with the bytes.
     let downloaded = sink
-        .download_attachment(handle)
+        .attachment_download(handle)
         .await
         .expect("the handle resolves to the file");
     assert_eq!(
@@ -4920,11 +5188,11 @@ async fn the_agent_editing_its_own_message_supersedes_the_old_wording() {
         .await
         .expect("send succeeds");
 
-    sink.edit_message("mock:1", "m1", "meet at five", false, None)
+    sink.message_edit("mock:1", "m1", "meet at five", false, None)
         .await
         .expect("edit succeeds");
 
-    let history = store.history("mock:1", 10, None).await.expect("read");
+    let history = store.history("mock:1", 10, None, None).await.expect("read");
     assert_eq!(history.len(), 2, "both wordings are kept");
     let live: Vec<&str> = history
         .iter()
@@ -4947,11 +5215,11 @@ async fn the_agent_deleting_its_own_message_marks_the_row() {
         .await
         .expect("send succeeds");
 
-    sink.delete_message("mock:1", "m1")
+    sink.message_delete("mock:1", "m1")
         .await
         .expect("delete succeeds");
 
-    let history = store.history("mock:1", 10, None).await.expect("read");
+    let history = store.history("mock:1", 10, None, None).await.expect("read");
     let row = history.first().expect("the row survives");
     assert!(row.deleted_at.is_some(), "and says it was deleted");
     assert_eq!(row.text, "spoke too soon", "with the text still readable");
@@ -4974,7 +5242,7 @@ async fn history_switched_off_records_nothing_the_agent_sent() {
 
     assert!(
         store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -4986,7 +5254,7 @@ async fn history_switched_off_records_nothing_the_agent_sent() {
 async fn an_edit_from_the_platform_supersedes_the_wording_it_replaced() {
     // An edit arrives as a second row, under an id of its own, because the queue needs a distinct
     // key to deliver it as an event rather than discard it as a redelivery. Nothing used to connect
-    // the two, so `read_history` returned the pre-edit and post-edit wordings as two messages that
+    // the two, so `history_read` returned the pre-edit and post-edit wordings as two messages that
     // both looked current, and an agent reading back could act on the retracted one.
     let harness = Harness::start().await;
     harness
@@ -5009,7 +5277,7 @@ async fn an_edit_from_the_platform_supersedes_the_wording_it_replaced() {
 
     let history = harness
         .store
-        .history("mock:1", 10, None)
+        .history("mock:1", 10, None, None)
         .await
         .expect("read");
     let live: Vec<&str> = history
@@ -5061,7 +5329,7 @@ async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
         .expect("record");
 
     let entries = sink
-        .search_history("match", Some("mock:1"), 20)
+        .history_search("match", Some("mock:1"), 20)
         .await
         .expect("search runs");
     let from_platform = entries
@@ -5098,7 +5366,7 @@ async fn a_half_sent_reply_records_the_parts_that_landed() {
         .expect_err("the refused part has to fail the call");
     assert!(error.to_string().contains("refused"), "got: {error}");
 
-    let history = store.history("mock:1", 10, None).await.expect("read");
+    let history = store.history("mock:1", 10, None, None).await.expect("read");
     let texts: Vec<&str> = history.iter().map(|row| row.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -5120,7 +5388,7 @@ async fn a_reply_that_never_started_leaves_no_trace() {
 
     assert!(
         store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -5162,7 +5430,7 @@ async fn the_bridges_own_apology_is_recorded_like_anything_else_it_says() {
     loop {
         let recorded = harness
             .store
-            .history("mock:1", 10, None)
+            .history("mock:1", 10, None, None)
             .await
             .expect("read")
             .into_iter()
@@ -5413,7 +5681,7 @@ async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
     // -- the message is read once, the turn is one turn, and what the turn is known to be answering
     // is still known, which is what lets the indicator go up for the message it writes afterwards.
     let harness =
-        Harness::start_composing("mcp__mekabridge__send_message", Duration::from_millis(1500))
+        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(1500))
             .await;
     harness
         .sender
@@ -5479,7 +5747,7 @@ async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_writ
     recorder.set(&recorder.compose_for, Duration::from_millis(2000));
     recorder.set(
         &recorder.compose_tool,
-        "mcp__mekabridge__send_message".to_string(),
+        "mcp__mekabridge__message_send".to_string(),
     );
     let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
     let config = Arc::new(config_for(meka_address, &database, true));

@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_code_span_is_not_escaped_inside() {
-        assert_eq!(render("`send_message(a_b)`"), "`send_message(a_b)`");
+        assert_eq!(render("`message_send(a_b)`"), "`message_send(a_b)`");
     }
 
     #[test]

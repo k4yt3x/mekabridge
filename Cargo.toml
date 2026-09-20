@@ -1,6 +1,6 @@
 [package]
 name = "mekabridge"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -29,6 +29,7 @@ humantime = "2"
 humantime-serde = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 rand = "0.10"
+regex = "1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 rmcp = { version = "3", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.37", features = ["bundled"] }

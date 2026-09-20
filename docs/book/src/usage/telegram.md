@@ -47,7 +47,7 @@ Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` 
 
 - **`woke you`** appears on every message from a chat that is not one-to-one, including ones nothing addressed, saying what pulled it in. It is absent in a direct chat, where every message is addressed to it anyway.
 
-- **`message`** is that message's own id. It is what `reply_to` and `react` take. An edit reads `message: 4471 (edited, revised at ...)`.
+- **`message`** is that message's own id. It is what `reply_to` and `message_react` take. An edit reads `message: 4471 (edited, revised at ...)`.
 - **`admitted`** carries two facts. First the grant that let the message through: `user allowlist` (a direct message from somebody you named), `chat allowlist` (the room is allowed), or `open channel` (nothing was checked). Then, separately, whether the sender's own account is on `allowed_users` at all. Since that list reaches direct messages only, somebody you named writing in an allowlisted group is admitted *by the group*, and the second clause is what still identifies them. The bridge reports both; what to make of them belongs in the agent's instructions.
 - **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
 - **`album`** ties the parts of a multi-photo post together, so a run of pictures does not read as several unrelated ones.
@@ -59,7 +59,7 @@ A sender who is another bot is marked `[bot]`. An anonymous group admin, who pos
 
 Group messages work the same as direct ones. Forum topics get their own conversation id with a third segment (`telegram:-1001234567890:77`), so the agent replies into the right topic rather than the group's General.
 
-**Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `read_history` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `mekabridge doctor` warns while privacy mode is on.
+**Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `history_read` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `mekabridge doctor` warns while privacy mode is on.
 
 Being added to or removed from a group is logged. If the group is not allowlisted the log line is a warning, because from the outside that state looks identical to a broken bot.
 
@@ -67,17 +67,17 @@ Being added to or removed from a group is logged. If the group is not allowliste
 
 An edited message is delivered again, marked as an edit, rather than being mistaken for a repeat of the original. The agent sees the revised text and knows which message it revises. In the history the wording it replaced is kept and marked `superseded`, so reading a conversation back shows the current text without losing what it used to say.
 
-In the other direction the agent can revise its own messages with `edit_message` and retract them with `delete_message`, which is how a person corrects a typo rather than sending a second message about it. Telegram declines to edit a message older than 48 hours.
+In the other direction the agent can revise its own messages with `message_edit` and retract them with `message_delete`, which is how a person corrects a typo rather than sending a second message about it. Telegram declines to edit a message older than 48 hours.
 
 **Telegram never reports that somebody deleted a message.** The Bot API has no such update, so unlike on Discord a deleted Telegram message is never marked `deleted` in the history: the bridge's copy stays as it was until `history_retention` prunes it. A message the agent deleted itself is marked, because that one the bridge did.
 
-The agent can react to any message with `react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
+The agent can react to any message with `message_react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
 
 ## Moderation
 
 With `admin_tools` on (the default) and the bot made an administrator, the agent can moderate a group: restrict, ban, unban, or kick members, promote and demote administrators, pin messages, and set the title.
 
-Telegram enforces all of it. Every call needs the matching admin right in that specific chat, and no bot can act on another administrator, so a group's owner cannot be evicted by their own bot. Rights are per chat, so the bot may moderate one group and not another; `member` with no `user_id` reports what it holds where it is.
+Telegram enforces all of it. Every call needs the matching admin right in that specific chat, and no bot can act on another administrator, so a group's owner cannot be evicted by their own bot. Rights are per chat, so the bot may moderate one group and not another; `member_get` with no `user_id` reports what it holds where it is.
 
 Two Telegram behaviours worth knowing:
 
@@ -88,15 +88,15 @@ Anonymous admins post as the chat and carry no user id, so they cannot be modera
 
 ## Listing who is in a chat
 
-Telegram will not enumerate ordinary members. The Bot API has no method for it and none for searching them, and no permission or setting changes that, so `list_members` answers a narrower question than it is asked and says so:
+Telegram will not enumerate ordinary members. The Bot API has no method for it and none for searching them, and no permission or setting changes that, so `member_list` answers a narrower question than it is asked and says so:
 
 - It returns the chat's **administrators**, with `coverage: administrators`.
 - It carries `total`, the full headcount, which is the one thing Telegram will say about everybody.
 - A `query` is refused, with an error explaining that Telegram has no member search rather than quietly returning nothing.
 
-Telegram also reports **no presence of any kind**. There is no online status, no last-seen, and no last-online date anywhere in the Bot API, at any permission level, so `presence` is absent rather than `unknown` on every Telegram member. Recency is the only proxy: `get_conversation` and `read_history` carry timestamps, so "posted four minutes ago" is available where "is online" is not.
+Telegram also reports **no presence of any kind**. There is no online status, no last-seen, and no last-online date anywhere in the Bot API, at any permission level, so `presence` is absent rather than `unknown` on every Telegram member. Recency is the only proxy: `conversation_get` and `history_read` carry timestamps, so "posted four minutes ago" is available where "is online" is not.
 
-To reach an ordinary member, the agent needs their user id, which it gets from the `from:` line of something they said. `member` then works on them normally.
+To reach an ordinary member, the agent needs their user id, which it gets from the `from:` line of something they said. `member_get` then works on them normally.
 
 Discord differs here: it will list a whole server, given one intent. See [Discord](./discord.md#listing-who-is-in-a-server).
 
@@ -131,7 +131,7 @@ The trade is that two messages a few seconds apart are handed over separately, a
 answer the first before reading the second. If the second lands while the agent is still working on
 the first, meka reads it into that same turn at its next round boundary, under a header saying it
 arrived while the agent was working, so the agent can account for it before it finishes or revise
-with `edit_message`. The alternative was a fixed wait on every message, which is a long time to sit
+with `message_edit`. The alternative was a fixed wait on every message, which is a long time to sit
 still for somebody who only ever meant to send one. See [Group attention](./group-attention.md).
 
 Everything is still held for one second, which is not configurable and is not about typing: an
@@ -140,7 +140,7 @@ photo followed by a separate turn carrying the rest.
 
 ## Muting and blocking a chat
 
-`mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
+`conversation_mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `conversation_block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `conversation_unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
 
 ## Formatting
 
@@ -164,7 +164,7 @@ If rendering ever misbehaves on a particular message, `parse_mode = "none"` send
 
 ## Attachments
 
-**Nothing is downloaded on arrival.** The item announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `view_attachment` to look at a picture or `download_attachment` to get the file on disk.
+**Nothing is downloaded on arrival.** The item announces what came in and hands the agent a handle; the agent fetches only what it decides it needs, with `attachment_view` to look at a picture or `attachment_download` to get the file on disk.
 
 ```
 attachment: photo, image/jpeg, 1920x1080, 2.1 MiB [417]
@@ -186,13 +186,13 @@ The invariant is that an allowlisted message always produces something. An unrec
 
 ### Viewing video and GIFs
 
-Telegram generates a still frame for every video, animation, and animated sticker. `view_attachment` resolves to that frame, so "show me" works for them with no transcoding and no ffmpeg dependency.
+Telegram generates a still frame for every video, animation, and animated sticker. `attachment_view` resolves to that frame, so "show me" works for them with no transcoding and no ffmpeg dependency.
 
 This matters more than it sounds. Telegram's cloud Bot API caps `getFile` at 20 MiB regardless of what `attachment_max_bytes` says, so a phone video often cannot be downloaded at all, and the thumbnail is the only part of it the bridge can retrieve. Only a local Bot API server lifts that ceiling.
 
 ### Sending
 
-Outbound, the agent uses `send_file` with absolute paths, optionally `as_photo` for images it wants shown inline.
+Outbound, the agent uses `file_send` with absolute paths, optionally `as_photo` for images it wants shown inline.
 
 Two to ten paths become one album, through `sendMediaGroup`. A single path keeps the ordinary `sendPhoto` / `sendDocument` route, because the album endpoint requires at least two items and one is an API error.
 
@@ -202,13 +202,13 @@ The caption is carried by exactly one item of the album, which is not an impleme
 
 ## Link previews
 
-Telegram renders a preview card for the first link in a message. The agent decides per message, with `link_preview` on `send_message` and `edit_message`; it defaults off, because the agent cites links as references far more often than it makes one the subject of a message, and a card on each part of a split reply is noise.
+Telegram renders a preview card for the first link in a message. The agent decides per message, with `link_preview` on `message_send` and `message_edit`; it defaults off, because the agent cites links as references far more often than it makes one the subject of a message, and a card on each part of a split reply is noise.
 
 There is no config key. It used to be one, which meant one answer for every message a channel would ever send, and the choice is really per message: a link dropped in passing wants no card, a link that *is* the answer wants one.
 
 The choice is sent explicitly in both directions rather than left to Telegram's default, which matters on an edit: an absent field would leave "the default" and "what the message already had" indistinguishable, so an edit asking for a card on a message sent without one might silently do nothing.
 
-`send_file` takes the same argument and Telegram ignores it. `sendPhoto` and `sendDocument` carry no `link_preview_options`, so a link in a caption never expands into a card whatever is asked for. Discord honours it there.
+`file_send` takes the same argument and Telegram ignores it. `sendPhoto` and `sendDocument` carry no `link_preview_options`, so a link in a caption never expands into a card whatever is asked for. Discord honours it there.
 
 ## Rate limits
 

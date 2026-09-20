@@ -19,3 +19,4 @@ pub mod mcp;
 pub mod meka;
 pub mod render;
 pub mod store;
+pub mod watch;

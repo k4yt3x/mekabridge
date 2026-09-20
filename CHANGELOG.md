@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-09-20
+
+### Added
+
+- Watches: a pattern the agent sets that wakes it in a muted chat, beside a mention and a reply.
+- `watch_create`, `watch_delete` and `watch_list`, and `mekabridge watch` for the operator.
+- A watch reads one named field: the message text, the sender's name, or the sender's id.
+- Every message a watch woke says which watch fired, on its `woke you:` line.
+- `history_read` takes `after`, a forward cursor, so a sweep reads only what it has not seen.
+
+### Changed
+
+- **Breaking:** every tool is renamed `<noun>_<verb>`; update `eager_load_tools` in meka's config.
+- **Breaking:** `backlog_check` (was `unseen`) answers JSON, so a tool gate can watch `/latest`.
+- **Breaking:** the database moves to schema 11, so an older build will not open it afterwards.
+- Tool descriptions are shorter, keeping this bridge well inside meka's bounded tool index.
+
+### Fixed
+
+- The group attention docs showed a scheduled-job gate in a syntax meka retired in 0.43.
+
 ## [0.15.1] - 2026-09-18
 
 ### Added
@@ -426,7 +447,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.15.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.16.0...HEAD
+[0.16.0]: https://github.com/k4yt3x/mekabridge/compare/0.15.1...0.16.0
 [0.15.1]: https://github.com/k4yt3x/mekabridge/compare/0.15.0...0.15.1
 [0.15.0]: https://github.com/k4yt3x/mekabridge/compare/0.14.0...0.15.0
 [0.14.0]: https://github.com/k4yt3x/mekabridge/compare/0.13.1...0.14.0

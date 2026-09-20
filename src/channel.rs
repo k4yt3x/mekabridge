@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ChannelConfig, PlatformConfig};
+use crate::{
+    config::{ChannelConfig, PlatformConfig},
+    watch::WatchMatch,
+};
 
 /// Supported platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +64,7 @@ impl std::fmt::Display for ChannelId {
 
 /// A conversation address, in the form `<channel>:<chat>` or `<channel>:<chat>:<thread>`.
 ///
-/// This is the string the agent passes to `send_message`, so it is a stable public contract rather
+/// This is the string the agent passes to `message_send`, so it is a stable public contract rather
 /// than an internal detail. It is deliberately readable: an operator reading a log, or a person
 /// telling the agent "message the group again", can both work with `telegram:-1001234567890`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -467,6 +470,18 @@ pub struct InboundMessage {
     /// they are decoded after an upgrade.
     #[serde(default)]
     pub addressed: bool,
+    /// Watches the agent set that this message matched, in the order they were created.
+    ///
+    /// Empty on every message from a conversation that is not muted, since a watch decides nothing
+    /// where everything is delivered anyway, and on every message that matched none. Carried
+    /// through the queue so the item the agent reads can name the rule that woke it: without that
+    /// it is handed a message from a room it muted with no way to tell which of its own rules is
+    /// responsible, which is the one thing it needs in order to retune them.
+    ///
+    /// `#[serde(default)]` because messages queued by an earlier release have no such field, and
+    /// they are decoded after an upgrade.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<WatchMatch>,
     /// Roles the sender holds in this chat, named rather than identified.
     ///
     /// Empty on a platform without roles, and on one that has them but did not say. Worth the
@@ -1386,6 +1401,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            matches: Vec::new(),
             sender_roles: Vec::new(),
             text: "hello".to_string(),
             reply_to: None,

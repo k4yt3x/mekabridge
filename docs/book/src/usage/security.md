@@ -29,7 +29,7 @@ The line ends with a second, separate fact: whether the sender's own account is 
 
 It grants nothing inside a server. Naming somebody so they can message the bot privately should not also make the bot answer them in every channel of every server it can see, which is a much wider grant than one line of config looks like. To be heard in a server, name the channel, the role, or the server itself.
 
-**`allow_all` admits individuals, not just groups.** On Telegram a private chat id *is* the user's id, so opening a channel opens direct messages too. Every turn costs provider tokens, so an open bot is also an open invitation to spend your budget. `[bridge.default_policy]` is the preventive lever, since it applies before anybody has said anything; the agent's own `mute` and `block` are reactive.
+**`allow_all` admits individuals, not just groups.** On Telegram a private chat id *is* the user's id, so opening a channel opens direct messages too. Every turn costs provider tokens, so an open bot is also an open invitation to spend your budget. `[bridge.default_policy]` is the preventive lever, since it applies before anybody has said anything; the agent's own `conversation_mute` and `conversation_block` are reactive.
 
 ### What the allowlist does not do
 
@@ -51,9 +51,9 @@ Anyone who can message the bot can put words in front of the model, and forwarde
 
 What neither prevents is an admitted sender persuading the agent to do something. The tools that matter here are the ones with effects you cannot undo from the chat:
 
-- **`mute`** and **`block`** can be aimed at any chat, including yours. A conversation blocked indefinitely is unreachable from inside the bridge, and a blocked one keeps nothing, so what was said while it was blocked cannot be recovered afterwards.
-- **`moderate_member`** and **`set_member_rights`** change somebody's standing in a group.
-- **`delete_message`** removes a message for everyone.
+- **`conversation_mute`** and **`conversation_block`** can be aimed at any chat, including yours. A conversation blocked indefinitely is unreachable from inside the bridge, and a blocked one keeps nothing, so what was said while it was blocked cannot be recovered afterwards.
+- **`member_moderate`** and **`member_set_rights`** change somebody's standing in a group.
+- **`message_delete`** removes a message for everyone.
 
 Each of these logs at warn, which is often the only surviving record. Recovery is out of band:
 
@@ -81,7 +81,7 @@ For a finer grain, meka can raise the required permission on individual tools:
 
 ```toml
 [mcp.servers.tool_permissions]
-moderate_member = "unrestricted"
+member_moderate = "unrestricted"
 ```
 
 Note that this only helps if the session is *not* already at `unrestricted`, and running there unlocks unconfined file modification and shell access too. Config is usually the better lever.
@@ -92,11 +92,11 @@ It works in the other direction as well, and that is the more useful one here: `
 
 A Telegram bot in a group sees only messages that mention it or reply to it, unless privacy mode is off (`/setprivacy` in @BotFather) or the bot is an administrator. It is on by default and looks exactly like a broken allowlist from the outside. `mekabridge doctor` reports it.
 
-Since 0.3.0 the recommended setting is **off**. Privacy mode and the `mute` policy limit what wakes the agent in the same way, but privacy mode does it by never delivering the message at all, so nothing is recorded and `read_history` comes back empty exactly when the agent is trying to work out what a mention referred to. `mute` withholds the turn and keeps the message.
+Since 0.3.0 the recommended setting is **off**. Privacy mode and the `mute` policy limit what wakes the agent in the same way, but privacy mode does it by never delivering the message at all, so nothing is recorded and `history_read` comes back empty exactly when the agent is trying to work out what a mention referred to. `mute` withholds the turn and keeps the message.
 
 ## What the bridge stores
 
-Since 0.3.0 the database holds a record of every message from every conversation the agent is not blocking, including the ones it was never woken for. That is what `read_history` and `search_history` read, and what makes a mention in a muted group answerable.
+Since 0.3.0 the database holds a record of every message from every conversation the agent is not blocking, including the ones it was never woken for. That is what `history_read` and `history_search` read, and what makes a mention in a muted group answerable.
 
 It is a real change in what sits on disk. Before, the database held the queue, the address book, and attachment metadata; delivered queue payloads were already kept for seven days, so a partial log existed, but it is now a chat log by design.
 
@@ -105,16 +105,16 @@ It is a real change in what sits on disk. Before, the database held the queue, t
 history_retention = "0s"   # record nothing
 ```
 
-Delivery is unaffected either way. What changes is that a muted conversation has nothing to show the agent when it wakes, so `mute` becomes closer to a quieter `block`. The database also carries no separate protection: it is as sensitive as the conversations in it, and `send_file` can read it (see below).
+Delivery is unaffected either way. What changes is that a muted conversation has nothing to show the agent when it wakes, so `mute` becomes closer to a quieter `block`. The database also carries no separate protection: it is as sensitive as the conversations in it, and `file_send` can read it (see below).
 
 ## What the agent can reach on your machine
 
-The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `moderate_member`, `delete_message`, `set_member_rights`, `set_member_roles` or `set_chat`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.
+The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` or `chat_set`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.
 
 Weigh that trade before raising the level. `unrestricted` is the whole machine, not just the moderation tools, so a deployment that wants the agent banning people and nothing more is better served by the `tool_permissions` override above than by moving the session. Three things to know either way:
 
-- **`send_file` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config and its database. Anyone who can talk the agent into a `send_file` call can exfiltrate those.
-- **`download_attachment` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.
+- **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those.
+- **`attachment_download` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.
 
 Confine the bridge with the systemd hardening in [Operations](./operations.md), and keep `[session].cwd` pointed at a directory that holds nothing you would mind the agent reading aloud.
 

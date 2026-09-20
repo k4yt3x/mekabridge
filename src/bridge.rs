@@ -1101,47 +1101,54 @@ impl OutboundSink for BridgeSink {
     async fn message_delete(
         &self,
         conversation: &str,
-        message_id: &str,
+        message_ids: &[String],
     ) -> std::result::Result<(), SinkError> {
         let conversation = self.resolve(conversation)?;
         let channel = self
             .channels
             .resolve(&conversation)
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        channel
-            .delete_message(&conversation, message_id)
-            .await
-            .map_err(|error| SinkError::Delivery(error.to_string()))?;
-        // Warn, not info: a deletion leaves no trace on the platform, so the chat itself no longer
-        // shows it happened.
+        let outcome = channel.delete_messages(&conversation, message_ids).await;
+        // Warn, not info, and written whether or not the call succeeded. A deletion leaves no trace
+        // on the platform, so this line is the only record of what was removed, and a batch that
+        // fails partway is exactly when that record matters: some of those messages are gone. The
+        // ids are in it because a count could not answer "which ones".
         tracing::warn!(
             conversation = %conversation,
-            message_id = %message_id,
-            "the agent deleted a message"
+            message_ids = %message_ids.join(", "),
+            count = message_ids.len(),
+            outcome = match &outcome {
+                Ok(()) => "deleted".to_string(),
+                Err(error) => format!("attempted, and failed: {error}"),
+            },
+            "the agent deleted messages"
         );
+        outcome.map_err(|error| SinkError::Delivery(error.to_string()))?;
         // Marked in the history the same way a deletion reported by the platform is, so a message
         // the agent removed reads back as removed rather than as one that was never there. Failing
         // here would report a deletion that did happen as an error, so it is logged instead.
         let conversation = self.canonical(&conversation).await;
         match self.accounts.get(channel.id().as_str()) {
             Some(account) => {
-                if let Err(error) = self
-                    .store
-                    .mark_deleted(conversation.as_str(), account, message_id, Utc::now())
-                    .await
-                {
-                    tracing::warn!(
-                        conversation = %conversation,
-                        message_id = %message_id,
-                        "could not mark a deleted message in the history: {}",
-                        error
-                    );
+                for message_id in message_ids {
+                    if let Err(error) = self
+                        .store
+                        .mark_deleted(conversation.as_str(), account, message_id, Utc::now())
+                        .await
+                    {
+                        tracing::warn!(
+                            conversation = %conversation,
+                            message_id = %message_id,
+                            "could not mark a deleted message in the history: {}",
+                            error
+                        );
+                    }
                 }
             }
             None => tracing::warn!(
                 conversation = %conversation,
-                message_id = %message_id,
-                "could not mark a deleted message in the history: the channel's account is unknown"
+                count = message_ids.len(),
+                "could not mark deleted messages in the history: the channel's account is unknown"
             ),
         }
         Ok(())
@@ -1153,11 +1160,10 @@ impl OutboundSink for BridgeSink {
         user_id: &str,
         action: crate::channel::MemberAction,
         until: Option<chrono::DateTime<Utc>>,
-        revoke_messages: bool,
     ) -> std::result::Result<(), SinkError> {
         let (conversation, channel) = self.admin_target(conversation)?;
         channel
-            .moderate_member(&conversation, user_id, action, until, revoke_messages)
+            .moderate_member(&conversation, user_id, action, until)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
         // Warn for every one of these. They change somebody's standing in a chat, an operator has
@@ -1168,7 +1174,6 @@ impl OutboundSink for BridgeSink {
             user_id = %user_id,
             action = action.as_str(),
             until = ?until,
-            revoke_messages,
             "the agent moderated a member"
         );
         Ok(())
@@ -1615,6 +1620,7 @@ impl OutboundSink for BridgeSink {
     async fn history_read(
         &self,
         conversation: &str,
+        sender_ids: &[String],
         limit: usize,
         before: Option<i64>,
         after: Option<i64>,
@@ -1622,7 +1628,7 @@ impl OutboundSink for BridgeSink {
         let conversation = self.resolve(conversation)?;
         let records = self
             .store
-            .history(conversation.as_str(), limit, before, after)
+            .history(conversation.as_str(), sender_ids, limit, before, after)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
         Ok(records.into_iter().map(history_entry).collect())
@@ -1632,6 +1638,7 @@ impl OutboundSink for BridgeSink {
         &self,
         query: &str,
         conversation: Option<&str>,
+        sender_ids: &[String],
         limit: usize,
     ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
         let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
@@ -1640,6 +1647,7 @@ impl OutboundSink for BridgeSink {
             .search_messages(
                 query,
                 conversation.as_ref().map(ConversationId::as_str),
+                sender_ids,
                 limit,
             )
             .await
@@ -1670,7 +1678,7 @@ impl OutboundSink for BridgeSink {
             && let Ok(channel) = self.channels.resolve(conversation)
         {
             match channel
-                .search_messages(conversation, query, limit - entries.len())
+                .search_messages(conversation, query, sender_ids, limit - entries.len())
                 .await
             {
                 Ok(found) => {

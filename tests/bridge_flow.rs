@@ -1095,6 +1095,9 @@ struct MockChannel {
     activities: Mutex<Vec<Activity>>,
     /// Files this channel will hand back from `fetch`, keyed by reference.
     files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// Each `delete_messages` call, as the batch it was given. One entry per call rather than per
+    /// id, so a test can tell one batch from several single deletes.
+    deletes: Mutex<Vec<Vec<String>>>,
 }
 
 impl MockChannel {
@@ -1121,6 +1124,7 @@ impl MockChannel {
             reactions: Mutex::new(Vec::new()),
             activities: Mutex::new(Vec::new()),
             files: Mutex::new(std::collections::HashMap::new()),
+            deletes: Mutex::new(Vec::new()),
         }
     }
 
@@ -1347,6 +1351,7 @@ impl Channel for MockChannel {
         &self,
         _conversation: &ConversationId,
         _query: &str,
+        _sender_ids: &[String],
         _limit: usize,
     ) -> Result<Vec<FoundMessage>, ChannelError> {
         // Stands in for Discord's guild search, which reaches back past anything the bridge
@@ -1375,8 +1380,26 @@ impl Channel for MockChannel {
     async fn delete_message(
         &self,
         _conversation: &ConversationId,
-        _message_id: &str,
+        message_id: &str,
     ) -> Result<(), ChannelError> {
+        self.deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(vec![message_id.to_string()]);
+        Ok(())
+    }
+
+    async fn delete_messages(
+        &self,
+        _conversation: &ConversationId,
+        message_ids: &[String],
+    ) -> Result<(), ChannelError> {
+        // Overridden so a test can see the batch. The trait's default would loop through
+        // `delete_message` and the two would be indistinguishable afterwards.
+        self.deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(message_ids.to_vec());
         Ok(())
     }
 
@@ -3614,7 +3637,7 @@ async fn a_group_nobody_has_ruled_on_follows_the_configured_default() {
     assert_eq!(
         harness
             .store
-            .history("mock:-100", 10, None, None)
+            .history("mock:-100", &[], 10, None, None)
             .await
             .expect("read")
             .len(),
@@ -3695,7 +3718,7 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
     assert!(
         harness
             .store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -3826,7 +3849,7 @@ async fn a_retracted_message_is_marked_rather_than_erased() {
     loop {
         let history = harness
             .store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(history.len(), 1, "the row must not be removed");
@@ -3854,7 +3877,7 @@ async fn await_history(harness: &Harness, expected: usize, label: &str) {
     while tokio::time::Instant::now() < deadline {
         let count = harness
             .store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .len();
@@ -3986,7 +4009,7 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
     assert_eq!(
         harness
             .store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .len(),
@@ -5244,7 +5267,10 @@ async fn what_the_agent_sends_is_recorded_one_row_per_platform_message() {
         .expect("send succeeds");
     assert_eq!(ids, vec!["m1", "m2", "m3"], "the caller is told every id");
 
-    let history = store.history("mock:1", 10, None, None).await.expect("read");
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
     assert_eq!(
         history.len(),
         3,
@@ -5312,7 +5338,10 @@ async fn a_file_the_agent_sent_can_be_opened_again() {
     .await
     .expect("send succeeds");
 
-    let history = store.history("mock:1", 10, None, None).await.expect("read");
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
     let row = history.first().expect("one row");
     let handle = row
         .attachments
@@ -5342,7 +5371,10 @@ async fn the_agent_editing_its_own_message_supersedes_the_old_wording() {
         .await
         .expect("edit succeeds");
 
-    let history = store.history("mock:1", 10, None, None).await.expect("read");
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
     assert_eq!(history.len(), 2, "both wordings are kept");
     let live: Vec<&str> = history
         .iter()
@@ -5365,14 +5397,123 @@ async fn the_agent_deleting_its_own_message_marks_the_row() {
         .await
         .expect("send succeeds");
 
-    sink.message_delete("mock:1", "m1")
+    sink.message_delete("mock:1", &["m1".to_string()])
         .await
         .expect("delete succeeds");
 
-    let history = store.history("mock:1", 10, None, None).await.expect("read");
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
     let row = history.first().expect("the row survives");
     assert!(row.deleted_at.is_some(), "and says it was deleted");
     assert_eq!(row.text, "spoke too soon", "with the text still readable");
+}
+
+#[tokio::test]
+async fn a_batch_deletion_goes_in_one_call_and_marks_every_row() {
+    // The purge path end to end: several ids reach the channel as one call, and every one of them
+    // reads back from the history as deleted rather than only the first.
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    for message_id in ["s1", "s2", "s3"] {
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: "mock:1".to_string(),
+                account,
+                message_id: message_id.to_string(),
+                revision: 0,
+                sender_id: Some("99".to_string()),
+                sender_name: "Spammer".to_string(),
+                text: format!("buy my course {message_id}"),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: true,
+                own: false,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now(),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+
+    let ids: Vec<String> = ["s1", "s2", "s3"].iter().map(|id| id.to_string()).collect();
+    sink.message_delete("mock:1", &ids)
+        .await
+        .expect("delete succeeds");
+
+    let calls = channel.deletes.lock().expect("lock").clone();
+    assert_eq!(calls.len(), 1, "one call, not three");
+    assert_eq!(calls[0], ids, "carrying every id, in order");
+
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
+    assert_eq!(history.len(), 3, "the rows survive the deletion");
+    assert!(
+        history.iter().all(|row| row.deleted_at.is_some()),
+        "every one of them has to be marked, not just the first"
+    );
+}
+
+#[tokio::test]
+async fn the_sender_filter_reaches_the_store_through_the_sink() {
+    // The read an agent does before a purge, through the sink the tool calls rather than the store
+    // directly, so the filter is proven to survive the layer in between.
+    let (sink, _channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    for (message_id, sender_id) in [("a", "42"), ("b", "99"), ("c", "99")] {
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: "mock:1".to_string(),
+                account,
+                message_id: message_id.to_string(),
+                revision: 0,
+                sender_id: Some(sender_id.to_string()),
+                sender_name: "Someone".to_string(),
+                text: "hello".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: true,
+                own: false,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now(),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+
+    let entries = sink
+        .history_read("mock:1", &["99".to_string()], 20, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "c"],
+        "only the one sender's messages come back"
+    );
 }
 
 #[tokio::test]
@@ -5392,7 +5533,7 @@ async fn history_switched_off_records_nothing_the_agent_sent() {
 
     assert!(
         store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -5427,7 +5568,7 @@ async fn an_edit_from_the_platform_supersedes_the_wording_it_replaced() {
 
     let history = harness
         .store
-        .history("mock:1", 10, None, None)
+        .history("mock:1", &[], 10, None, None)
         .await
         .expect("read");
     let live: Vec<&str> = history
@@ -5479,7 +5620,7 @@ async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
         .expect("record");
 
     let entries = sink
-        .history_search("match", Some("mock:1"), 20)
+        .history_search("match", Some("mock:1"), &[], 20)
         .await
         .expect("search runs");
     let from_platform = entries
@@ -5516,7 +5657,10 @@ async fn a_half_sent_reply_records_the_parts_that_landed() {
         .expect_err("the refused part has to fail the call");
     assert!(error.to_string().contains("refused"), "got: {error}");
 
-    let history = store.history("mock:1", 10, None, None).await.expect("read");
+    let history = store
+        .history("mock:1", &[], 10, None, None)
+        .await
+        .expect("read");
     let texts: Vec<&str> = history.iter().map(|row| row.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -5538,7 +5682,7 @@ async fn a_reply_that_never_started_leaves_no_trace() {
 
     assert!(
         store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .is_empty(),
@@ -5580,7 +5724,7 @@ async fn the_bridges_own_apology_is_recorded_like_anything_else_it_says() {
     loop {
         let recorded = harness
             .store
-            .history("mock:1", 10, None, None)
+            .history("mock:1", &[], 10, None, None)
             .await
             .expect("read")
             .into_iter()

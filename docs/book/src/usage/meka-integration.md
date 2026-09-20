@@ -179,6 +179,28 @@ The agent's own history is the other half. A session that has been running acros
 old names in its transcript and may reach for one; meka answers with a "did you mean" hint that
 catches reordered words, so `send_message` points at `message_send`. Nothing needs to be reset.
 
+### Upgrading to 0.18.0, which changed three arguments
+
+No tool was renamed. Three arguments changed, all in `tools/call` payloads rather than in any
+stored state, so nothing needs migrating:
+
+| Tool | 0.17.0 | 0.18.0 |
+|---|---|---|
+| `message_delete` | `message_id`, one string | `message_ids`, a list of up to 100 |
+| `member_moderate` | `revoke_messages`, a bool | gone |
+| `history_read`, `history_search` | | `sender_ids`, an optional list |
+
+`revoke_messages` was documented as deleting everything a person had posted. It never did that on
+Telegram: the flag of that name clears the chat from the removed person's own view, and Telegram
+forces it on in supergroups and channels anyway. It is now set on every Telegram ban and kick rather
+than offered. A Discord ban used to delete the person's last seven days as well, which was the one
+place the two platforms genuinely disagreed; it no longer does. Deleting somebody's messages is
+`message_delete`, and `history_read` with `sender_ids` is how to find them.
+
+An agent whose transcript predates the upgrade may send `message_id` to `message_delete`. The call
+is refused with a schema error naming the missing `message_ids`, rather than deleting the wrong
+thing.
+
 ## Eager loading
 
 meka ships MCP tools **deferred** by default: the agent has to call `tool_load` before it can use one. For a bridge that is exactly backwards, because `message_send` is used on almost every turn.
@@ -237,8 +259,8 @@ allowlist, so they are strictly more constrained than a tool meka already treats
 
 **Five tools are the exception and need `unrestricted`:** `member_moderate`, `message_delete`,
 `member_set_rights`, `member_set_roles` and `chat_set`. Each takes irreversible action on somebody
-else's account or on the room itself: a ban with `revoke_messages` erases everything a person ever
-posted, `message_delete` removes other people's messages where the bot moderates, the two rights
+else's account or on the room itself: `message_delete` removes up to a hundred of other people's
+messages at a time where the bot moderates, `member_moderate` bans people, the two rights
 tools change privileges, and `chat_set` rewrites the group's name and description. A `read` session
 can talk; it cannot ban.
 

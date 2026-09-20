@@ -2530,11 +2530,13 @@ impl Store {
     pub async fn history(
         &self,
         address: &str,
+        sender_ids: &[String],
         limit: usize,
         before: Option<i64>,
         after: Option<i64>,
     ) -> Result<Vec<MessageRecord>> {
         let address = address.to_string();
+        let senders = senders_json(sender_ids);
         let limit = limit.min(i64::MAX as usize) as i64;
         let mut records = self
             .connection
@@ -2546,11 +2548,12 @@ impl Store {
                      WHERE c.address = ?1
                        AND (?2 IS NULL OR m.id < ?2)
                        AND (?3 IS NULL OR m.id > ?3)
+                       AND {SENDER_FILTER_OF_5}
                      ORDER BY m.id {order}
                      LIMIT ?4"
                 ))?;
                 let rows = statement.query_map(
-                    rusqlite::params![address, before, after, limit],
+                    rusqlite::params![address, before, after, limit, senders],
                     row_to_message,
                 )?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2571,10 +2574,12 @@ impl Store {
         &self,
         query: &str,
         conversation: Option<&str>,
+        sender_ids: &[String],
         limit: usize,
     ) -> Result<Vec<MessageRecord>> {
         let query = query.to_string();
         let conversation = conversation.map(str::to_string);
+        let senders = senders_json(sender_ids);
         let limit = limit.min(i64::MAX as usize) as i64;
         let records = self
             .connection
@@ -2589,11 +2594,12 @@ impl Store {
                      JOIN accounts a ON a.id = m.account_id
                      WHERE messages_fts MATCH ?1
                        AND (?2 IS NULL OR c.address = ?2)
+                       AND {SENDER_FILTER_OF_4}
                      ORDER BY f.rank
                      LIMIT ?3"
                 ))?;
                 let rows = statement.query_map(
-                    rusqlite::params![query, conversation, limit],
+                    rusqlite::params![query, conversation, limit, senders],
                     row_to_message,
                 )?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3123,6 +3129,42 @@ const MESSAGE_COLUMNS: &str = "m.id, c.address, m.account_id, m.message_id, m.re
 const MESSAGE_FROM: &str = "messages m
      JOIN conversations c ON c.id = m.conversation_id
      JOIN accounts a ON a.id = m.account_id";
+
+/// Narrows a read to a set of senders, or to everyone when the parameter is NULL.
+///
+/// A JSON array through `json_each` rather than an `IN` list built by hand, because the number of
+/// senders is not known when the statement is written and interpolating them would put caller
+/// strings into SQL text. The bundled SQLite has JSON built in.
+///
+/// Two spellings because the parameter index differs between the two queries and rusqlite numbers
+/// positionally. Naming the index in the constant keeps the binding order visible at the call site.
+const SENDER_FILTER_OF_4: &str = "(?4 IS NULL OR m.sender_id IN (SELECT value FROM json_each(?4)))";
+const SENDER_FILTER_OF_5: &str = "(?5 IS NULL OR m.sender_id IN (SELECT value FROM json_each(?5)))";
+
+/// The sender filter's bound value: a JSON array, or `None` for "everyone".
+///
+/// An empty list means no filter rather than "match nothing", which is what makes the argument
+/// omittable at the tool without a second way to spell its absence.
+///
+/// Built through `Value` rather than `to_string`, which is fallible: its error case would have to
+/// become either `None` or an error, and `None` here means "every sender", so a filter that failed
+/// to serialise would widen the read instead of narrowing it. Since the caller of a narrowed read
+/// is often about to delete what it gets back, that failure has to be unrepresentable rather than
+/// merely unlikely.
+fn senders_json(sender_ids: &[String]) -> Option<String> {
+    if sender_ids.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::Value::Array(
+            sender_ids
+                .iter()
+                .map(|sender_id| serde_json::Value::String(sender_id.clone()))
+                .collect(),
+        )
+        .to_string(),
+    )
+}
 
 /// What excludes a recorded message from everything the agent is owed.
 ///
@@ -3682,7 +3724,7 @@ mod tests {
         );
 
         let history = store
-            .history("telegram:123", 10, None, None)
+            .history("telegram:123", &[], 10, None, None)
             .await
             .expect("read");
         let texts: Vec<(&str, bool)> = history
@@ -3980,7 +4022,7 @@ mod tests {
             "a first recording is a write"
         );
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         // The id is assigned on insert, so it is the one field the caller cannot predict.
@@ -4020,7 +4062,7 @@ mod tests {
             .expect("record");
 
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(
@@ -4046,7 +4088,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .history("telegram:1", 10, None, None)
+                .history("telegram:1", &[], 10, None, None)
                 .await
                 .expect("read")
                 .len(),
@@ -4068,7 +4110,7 @@ mod tests {
             store.record_message(record).await.expect("record");
         }
         let history = store
-            .history("telegram:1", 3, None, None)
+            .history("telegram:1", &[], 3, None, None)
             .await
             .expect("read");
         let texts: Vec<&str> = history.iter().map(|row| row.text.as_str()).collect();
@@ -4102,7 +4144,7 @@ mod tests {
         let mut cursor = None;
         loop {
             let page = store
-                .history("telegram:1", 2, cursor, None)
+                .history("telegram:1", &[], 2, cursor, None)
                 .await
                 .expect("read");
             let Some(oldest) = page.first() else { break };
@@ -4129,7 +4171,7 @@ mod tests {
             .await
             .expect("record");
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(history.len(), 1);
@@ -4163,17 +4205,249 @@ mod tests {
             .expect("record");
 
         let hits = store
-            .search_messages("certificate", None, 10)
+            .search_messages("certificate", None, &[], 10)
             .await
             .expect("search");
         assert_eq!(hits.len(), 2);
 
         let scoped = store
-            .search_messages("certificate", Some("telegram:2"), 10)
+            .search_messages("certificate", Some("telegram:2"), &[], 10)
             .await
             .expect("search");
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].conversation, "telegram:2");
+    }
+
+    #[tokio::test]
+    async fn history_can_be_narrowed_to_a_set_of_senders() {
+        // The read that precedes a purge: everything one person posted here, so their ids can go
+        // straight to `message_delete`.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for (message_id, sender_id, text) in [
+            ("1", "42", "morning"),
+            ("2", "99", "buy my course"),
+            ("3", "42", "anyone seen the deploy"),
+            ("4", "77", "buy my other course"),
+            ("5", "99", "dm me"),
+        ] {
+            let mut record = message(account, "telegram:1", message_id, text);
+            record.sender_id = Some(sender_id.to_string());
+            store.record_message(record).await.expect("record");
+        }
+
+        let one = store
+            .history("telegram:1", &["99".to_string()], 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(
+            one.iter()
+                .map(|row| row.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "5"],
+            "only that sender, in reading order"
+        );
+
+        let several = store
+            .history(
+                "telegram:1",
+                &["99".to_string(), "77".to_string()],
+                10,
+                None,
+                None,
+            )
+            .await
+            .expect("read");
+        assert_eq!(several.len(), 3, "the filter is a set, not one sender");
+
+        let everyone = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(everyone.len(), 5, "an empty filter means everyone");
+
+        let nobody = store
+            .history("telegram:1", &["1234".to_string()], 10, None, None)
+            .await
+            .expect("read");
+        assert!(nobody.is_empty(), "an id nobody has matches nothing");
+    }
+
+    #[tokio::test]
+    async fn the_sender_filter_composes_with_the_cursors() {
+        // The filter must narrow the page rather than be applied to one: paging a busy chat for one
+        // person's messages would otherwise return a page of somebody else's, filtered to nothing,
+        // and the agent would read that as "they said no more".
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for index in 0..10 {
+            let sender_id = if index % 2 == 0 { "42" } else { "99" };
+            let mut record = message(
+                account,
+                "telegram:1",
+                &index.to_string(),
+                &format!("message {index}"),
+            );
+            record.sender_id = Some(sender_id.to_string());
+            store.record_message(record).await.expect("record");
+        }
+
+        let first = store
+            .history("telegram:1", &["99".to_string()], 2, None, None)
+            .await
+            .expect("read");
+        assert_eq!(first.len(), 2, "a full page of that sender's messages");
+        assert!(
+            first
+                .iter()
+                .all(|row| row.sender_id.as_deref() == Some("99")),
+            "and nobody else's"
+        );
+
+        let cursor = first.first().map(|row| row.id).expect("a cursor");
+        let older = store
+            .history("telegram:1", &["99".to_string()], 2, Some(cursor), None)
+            .await
+            .expect("read");
+        // The length is asserted before anything else, because the checks below are `all` over this
+        // vector and an empty one satisfies them vacuously. An implementation that filtered after
+        // paging rather than within it would return nothing here and pass the rest of the test.
+        assert_eq!(older.len(), 2, "a full page again, not a filtered remnant");
+        assert!(
+            older.iter().all(|row| row.id < cursor),
+            "paging back stays behind the cursor"
+        );
+        assert!(
+            older
+                .iter()
+                .all(|row| row.sender_id.as_deref() == Some("99")),
+            "and stays on the sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_can_be_narrowed_to_a_set_of_senders() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for (message_id, sender_id) in [("1", "42"), ("2", "99")] {
+            let mut record = message(account, "telegram:1", message_id, "the deploy is stuck");
+            record.sender_id = Some(sender_id.to_string());
+            store.record_message(record).await.expect("record");
+        }
+
+        let hits = store
+            .search_messages("deploy", None, &["99".to_string()], 10)
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].sender_id.as_deref(), Some("99"));
+
+        let unfiltered = store
+            .search_messages("deploy", None, &[], 10)
+            .await
+            .expect("search");
+        assert_eq!(unfiltered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_search_narrowed_by_both_conversation_and_sender_binds_each_to_its_own_parameter() {
+        // The two filters sit at different parameter indices in this one statement and rusqlite
+        // numbers positionally, so a binding order that had drifted would silently filter on the
+        // wrong value. Every other test here leaves one of the two unset, which is exactly the
+        // shape that cannot catch it.
+        let (store, account) = seeded(&["telegram:1", "telegram:2"]).await;
+        for (conversation, message_id, sender_id) in [
+            ("telegram:1", "1", "42"),
+            ("telegram:1", "2", "99"),
+            ("telegram:2", "3", "99"),
+        ] {
+            let mut record = message(account, conversation, message_id, "the deploy is stuck");
+            record.sender_id = Some(sender_id.to_string());
+            store.record_message(record).await.expect("record");
+        }
+
+        let hits = store
+            .search_messages("deploy", Some("telegram:1"), &["99".to_string()], 10)
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 1, "both filters apply, not one of them");
+        assert_eq!(hits[0].message_id, "2");
+        assert_eq!(hits[0].conversation, "telegram:1");
+    }
+
+    #[tokio::test]
+    async fn a_forward_read_narrowed_by_sender_keeps_both() {
+        // `after` orders ASC and skips the reverse at the end, so it is a second path through the
+        // same query and the filter has to survive it too.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for (message_id, sender_id) in [("1", "42"), ("2", "99"), ("3", "42"), ("4", "99")] {
+            let mut record = message(account, "telegram:1", message_id, "hello");
+            record.sender_id = Some(sender_id.to_string());
+            store.record_message(record).await.expect("record");
+        }
+        let cursor = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read")
+            .first()
+            .map(|row| row.id)
+            .expect("a cursor");
+
+        let forward = store
+            .history("telegram:1", &["99".to_string()], 10, None, Some(cursor))
+            .await
+            .expect("read");
+        assert_eq!(
+            forward
+                .iter()
+                .map(|row| row.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "4"],
+            "everything that sender said after the cursor, oldest first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_sender_id_matches_no_filter() {
+        // Telegram records an anonymous admin and a channel post with no sender id at all. `NULL IN
+        // (...)` is NULL rather than true, which is the semantics wanted, but it is worth pinning
+        // because it means those messages are unreachable by a sender filter and so outlive a
+        // purge driven by one.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut anonymous = message(account, "telegram:1", "1", "posted as the chat itself");
+        anonymous.sender_id = None;
+        store.record_message(anonymous).await.expect("record");
+
+        let filtered = store
+            .history("telegram:1", &["42".to_string()], 10, None, None)
+            .await
+            .expect("read");
+        assert!(filtered.is_empty(), "no sender id cannot match a sender");
+        let everyone = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(everyone.len(), 1, "but it is still in the history");
+    }
+
+    #[tokio::test]
+    async fn a_sender_filter_holding_sql_is_matched_as_a_string() {
+        // The ids are bound as one JSON array rather than interpolated into an `IN` list, so a
+        // sender id that looks like SQL is a value that matches nothing rather than syntax.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .record_message(message(account, "telegram:1", "1", "hello"))
+            .await
+            .expect("record");
+
+        let hits = store
+            .history(
+                "telegram:1",
+                &["42') OR 1=1 --".to_string()],
+                10,
+                None,
+                None,
+            )
+            .await
+            .expect("read");
+        assert!(hits.is_empty(), "no row has that id, so nothing matches");
     }
 
     #[tokio::test]
@@ -4200,7 +4474,7 @@ mod tests {
             .expect("prune");
         assert_eq!(pruned, 1);
         let hits = store
-            .search_messages("ancient", None, 10)
+            .search_messages("ancient", None, &[], 10)
             .await
             .expect("search");
         assert_eq!(hits.len(), 1, "the pruned row must leave the index too");
@@ -4247,7 +4521,7 @@ mod tests {
         assert!(marked, "the row was there to mark");
 
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(history.len(), 1, "the row must survive the deletion");
@@ -4256,7 +4530,7 @@ mod tests {
             "and must say it was deleted"
         );
         let found = store
-            .search_messages("said", None, 10)
+            .search_messages("said", None, &[], 10)
             .await
             .expect("search");
         assert_eq!(found.len(), 1, "a deleted message is still searchable");
@@ -4294,7 +4568,7 @@ mod tests {
                 .expect("mark")
         );
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         let deleted: Vec<&str> = history
@@ -4334,7 +4608,7 @@ mod tests {
             "the second report changes nothing"
         );
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(
@@ -4370,7 +4644,7 @@ mod tests {
         assert_eq!(marked, 1, "only the older wording is marked");
 
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(history.len(), 2, "both wordings are kept");
@@ -4400,7 +4674,7 @@ mod tests {
         let (store, account) = seeded(&["telegram:1"]).await;
         let current = async || {
             store
-                .history("telegram:1", 10, None, None)
+                .history("telegram:1", &[], 10, None, None)
                 .await
                 .expect("read")
                 .into_iter()
@@ -4534,7 +4808,7 @@ mod tests {
         );
         assert!(
             store
-                .history("telegram:1", 10, None, None)
+                .history("telegram:1", &[], 10, None, None)
                 .await
                 .expect("read")
                 .iter()
@@ -4555,7 +4829,7 @@ mod tests {
         store.record_message(record).await.expect("record");
 
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         let row = history.first().expect("one row");
@@ -5800,7 +6074,7 @@ mod tests {
         // The first one dies. Exactly its two rows come back, and the count it reported with them.
         store.failed(stating, "gone", now()).await.expect("fail");
         let owed = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read")
             .into_iter()
@@ -6060,7 +6334,7 @@ mod tests {
         );
         assert!(
             store
-                .history("telegram:1", 10, None, None)
+                .history("telegram:1", &[], 10, None, None)
                 .await
                 .expect("read")
                 .iter()
@@ -6365,7 +6639,7 @@ mod tests {
 
         let store = Store::open(&path).await.expect("upgrades");
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         assert_eq!(
@@ -6676,7 +6950,7 @@ mod tests {
 
         let store = Store::open(&path).await.expect("upgrades");
         let history = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         let row = history.first().expect("the old row survives");
@@ -6801,7 +7075,7 @@ mod tests {
         );
 
         let history = store
-            .history("telegram:123", 10, None, None)
+            .history("telegram:123", &[], 10, None, None)
             .await
             .expect("read");
         let carried: Vec<(i64, &str, i64, bool, bool)> = history
@@ -6842,7 +7116,7 @@ mod tests {
         assert_eq!(threaded.file_ref, "threaded-photo");
         assert_eq!(
             store
-                .search_messages("hello", None, 10)
+                .search_messages("hello", None, &[], 10)
                 .await
                 .expect("search")
                 .len(),
@@ -6888,7 +7162,7 @@ mod tests {
         assert_ne!(new_handle, "7", "and its photo is not the old bot's photo");
 
         let history = store
-            .history("telegram:123", 10, None, None)
+            .history("telegram:123", &[], 10, None, None)
             .await
             .expect("read");
         assert!(
@@ -6908,7 +7182,7 @@ mod tests {
             .await
             .expect("record");
         let history = store
-            .history("telegram:123", 10, None, None)
+            .history("telegram:123", &[], 10, None, None)
             .await
             .expect("read");
         let flagged: Vec<(&str, bool)> = history
@@ -7037,13 +7311,13 @@ mod tests {
             store.record_message(record).await.expect("record");
         }
         let all = store
-            .history("telegram:1", 10, None, None)
+            .history("telegram:1", &[], 10, None, None)
             .await
             .expect("read");
         let first = all[0].id;
 
         let page = store
-            .history("telegram:1", 2, None, Some(first))
+            .history("telegram:1", &[], 2, None, Some(first))
             .await
             .expect("read");
         let texts: Vec<&str> = page.iter().map(|row| row.text.as_str()).collect();
@@ -7052,14 +7326,14 @@ mod tests {
         // A sweep keeps the newest cursor it was given, and the next call continues from it with
         // nothing read twice and nothing skipped.
         let next = store
-            .history("telegram:1", 2, None, Some(page[1].id))
+            .history("telegram:1", &[], 2, None, Some(page[1].id))
             .await
             .expect("read");
         let texts: Vec<&str> = next.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(texts, vec!["line 3", "line 4"]);
 
         let caught_up = store
-            .history("telegram:1", 2, None, Some(all[4].id))
+            .history("telegram:1", &[], 2, None, Some(all[4].id))
             .await
             .expect("read");
         assert!(

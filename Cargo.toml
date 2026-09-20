@@ -1,6 +1,6 @@
 [package]
 name = "mekabridge"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -49,7 +49,7 @@ twilight-gateway = { version = "0.17", default-features = false, features = ["ru
 twilight-http = { version = "0.17", default-features = false, features = ["decompression", "rustls-platform-verifier"] }
 twilight-mention = "0.17"
 twilight-model = "0.17"
-twilight-util = { version = "0.17", features = ["permission-calculator"] }
+twilight-util = { version = "0.17", features = ["permission-calculator", "snowflake"] }
 twilight-validate = "0.17"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }

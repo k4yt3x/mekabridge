@@ -89,14 +89,26 @@ An edit is one message, so replacement text long enough to need splitting is ref
 
 ## `message_delete`
 
-Remove a message.
+Remove messages, up to 100 in one call.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `conversation` | string | Conversation the message is in |
-| `message_id` | string | Message to delete |
+| `conversation` | string | Conversation the messages are in |
+| `message_ids` | string[] | Messages to delete, 1 to 100. All in the one conversation |
 
-The agent's own messages anywhere, and anyone's in a group where it is an administrator with the delete right. This cannot be undone and the message disappears for everyone, so it is logged at warn: that log line is the only remaining record.
+The agent's own messages anywhere, and anyone's in a group where it is an administrator with the delete right. This cannot be undone and the messages disappear for everyone, so it is logged at warn with every id: that log line is the only remaining record.
+
+Repeated ids are collapsed, since the second delete would fail on a message the first one removed. More than 100 is refused rather than split across several calls: a silent split would report success for one batch and failure for another when the agent asked for a single action, and it could not then tell which half had gone. 100 is also `history_read`'s ceiling, so one page of history is exactly one batch.
+
+**Clearing out one person.** Read their messages with `history_read` and its `sender_ids` filter, take the `message_id` of each, and pass them here. `member_moderate` will not do it: banning somebody deletes nothing they posted, on either platform.
+
+**Both platforms limit what can be deleted, and the limits are not the same.**
+
+Telegram lists a 48-hour limit on deleting a message, and separately says an administrator holding the delete right can remove any message in a supergroup or channel. The two are in tension and Telegram does not resolve them, so treat recent messages as reliably deletable and older ones as worth attempting rather than assuming either way. Batches of two or more go through `deleteMessages`, which skips ids it cannot find rather than failing, so a success means the call was accepted, not that every id existed. A single id goes through `deleteMessage`, which does say what was wrong with it. The bridge marks every id of a successful call as deleted in its own history, so where Telegram skips one silently the record and the chat can disagree.
+
+Discord has no age limit on deleting one message, but its bulk endpoint refuses the **entire** batch if any message in it is older than two weeks, works only in a server channel, and always requires Manage Messages even over the bot's own messages. So the bridge uses it only when it can carry two or more recent ids, and falls back to deleting one at a time whenever it is unavailable or declines. A direct message, or a bot without that right, therefore still works; it just takes one call per message. Like Telegram's, Discord's bulk call skips ids that do not exist rather than failing on them, so there too a success means the call was accepted.
+
+What a failure means depends on the platform, and the error says which. Telegram sends a batch as one call that it either takes whole or refuses whole, so a failure there means nothing was deleted. Discord can stop partway, and its error names how many went first, though not which: a bulk call does not go in the order given. It reports those deletions over its gateway, so the bridge's own history catches up on them shortly afterwards.
 
 ## `conversation_mute`, `conversation_unmute`, `conversation_block`, and `conversation_unblock`
 
@@ -200,12 +212,15 @@ Read back what was said, including messages the agent was never woken for.
 | `limit` | number, optional | Default 20, capped at 100 |
 | `before` | number, optional | `history_read` only. The `cursor` of the oldest message you were given, to page further back |
 | `after` | number, optional | `history_read` only. The `cursor` of the newest message you were given, to read only what has been said since |
+| `sender_ids` | string[], optional | Only messages from these people, by the numeric id on a header's `from:` line. Omit for everyone |
 
 This is what makes `conversation_mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
 
 The two cursors read opposite ways and at most one may be set. `before` pages backwards through what is already there. `after` follows a conversation forwards: it returns the **oldest** messages above the cursor, so a job sweeping a busy chat gets the next page in order rather than the latest page with a hole behind it. Keep the newest `cursor` you were handed, pass it back next time, and nothing is read twice or missed in between. A forward read that finds nothing says the chat has not moved, rather than offering the retention as a possible cause.
 
-Both read what the bridge recorded: nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent.
+**Reading one person.** `sender_ids` narrows either tool to a set of senders, matched on the numeric id exactly. Display names are not matched: several people can share one, and this filter feeds `message_delete`, where matching the wrong person means deleting their messages. The filter narrows the page rather than being applied to one, so paging a busy chat for one person's messages returns a full page of theirs rather than a page of everybody's with the others removed. Combined with `message_delete`, this is how an agent clears out everything one account posted: read a page of their ids, delete that page, then page further back with `before`. Note that deleting a message does not remove it from this history, it marks it `deleted`, so a second read without a cursor returns the same page again; page backwards, or skip the entries already marked. Messages with no sender id at all, such as an anonymous admin's or a channel post, match no filter and so are never swept up this way.
+
+Both read what the bridge recorded: nothing from before the bridge was installed, nothing past `history_retention`, nothing at all if it is `0s`, and nothing from a blocked conversation. An empty result says which of those it might be, rather than implying the chat was silent. A filtered `history_read` that finds nothing says so differently again, since the chat may be busy and simply hold nothing from those people.
 
 A long reply becomes several real messages, and the platform can refuse one after the earlier ones have gone out. The tool reports the failure and names the part, and the parts that landed are recorded, so `history_read` matches what the person can actually see rather than showing nothing at all.
 
@@ -252,13 +267,16 @@ rather than five tools that would each cost a line of the agent's bounded tool i
 | `user_id` | string | Numeric id from a header's `from:` line |
 | `action` | enum | `restrict`, `unrestrict`, `ban`, `unban`, `kick` |
 | `duration` | string, optional | For `restrict` and `ban` only |
-| `revoke_messages` | bool, optional | Also delete their history. Cannot be undone |
+
+**No action here deletes what the person posted.** Banning somebody leaves every message they sent exactly where it is, on both platforms. Removing their messages is `message_delete`, and the way to find them is `history_read` with `sender_ids`.
+
+That is worth stating plainly because the tool used to carry a `revoke_messages` argument documented as "also delete their history", which was wrong. Telegram's flag of that name does something else: it clears the chat's history from the removed person's own view, and Telegram forces it on in supergroups and channels regardless of what is sent. The bridge now sets it on every Telegram ban and kick rather than offering it, so a basic group behaves like every other chat kind. Discord needs no equivalent, since a banned member loses access to the server's history anyway.
 
 `unrestrict` restores whatever the group allows ordinary members, read back from the group rather than assumed, so it cannot leave somebody with more than everyone else has. `kick` removes without banning, which Telegram expresses as a ban lifted immediately and Discord has as a real primitive.
 
 **Durations must be between 30 seconds and 366 days on Telegram.** It treats anything outside that window as permanent, silently, so the bridge refuses it rather than letting a ten-second mute become a life sentence. A duration passed to an action that ignores it is refused for the same reason.
 
-**Discord's limits are different and are also enforced rather than rounded.** A `restrict` there is a timeout, which always expires: it requires a duration and caps at 28 days. A `ban` never expires, so a duration on one is refused with a pointer at `restrict`. `revoke_messages` deletes the last 7 days, which is Discord's own ceiling, rather than all of their history.
+**Discord's limits are different and are also enforced rather than rounded.** A `restrict` there is a timeout, which always expires: it requires a duration and caps at 28 days. A `ban` never expires, so a duration on one is refused with a pointer at `restrict`.
 
 Anonymous admins and channel posts have no user id and cannot be moderated this way.
 

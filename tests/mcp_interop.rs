@@ -184,12 +184,16 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn message_delete(&self, _conversation: &str, message_id: &str) -> Result<(), SinkError> {
+    async fn message_delete(
+        &self,
+        _conversation: &str,
+        message_ids: &[String],
+    ) -> Result<(), SinkError> {
         let mut deletes = self
             .deletes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        deletes.push(message_id.to_string());
+        deletes.extend(message_ids.iter().cloned());
         Ok(())
     }
 
@@ -199,7 +203,6 @@ impl OutboundSink for RecordingSink {
         user_id: &str,
         action: MemberAction,
         until: Option<chrono::DateTime<chrono::Utc>>,
-        _revoke_messages: bool,
     ) -> Result<(), SinkError> {
         let mut moderations = self
             .moderations
@@ -370,6 +373,7 @@ impl OutboundSink for RecordingSink {
     async fn history_read(
         &self,
         conversation: &str,
+        _sender_ids: &[String],
         _limit: usize,
         _before: Option<i64>,
         _after: Option<i64>,
@@ -397,6 +401,7 @@ impl OutboundSink for RecordingSink {
         &self,
         _query: &str,
         _conversation: Option<&str>,
+        _sender_ids: &[String],
         _limit: usize,
     ) -> Result<Vec<HistoryEntry>, SinkError> {
         Ok(Vec::new())
@@ -750,6 +755,70 @@ async fn input_schemas_survive_negotiation() {
         })
         .unwrap_or_default();
     assert!(required.contains(&"paths"), "schema: {schema}");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_batch_of_message_ids_survives_the_version_gap() {
+    // The array is the part worth proving on the wire. schemars and the server agree locally, but
+    // the client that validates arguments in production is somebody else's build, and a list read
+    // as a string would arrive as one id spelled oddly rather than as an error.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list works");
+    let delete = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "message_delete")
+        .expect("message_delete is advertised");
+    let schema = serde_json::to_value(&*delete.input_schema).expect("schema serializes");
+    assert_eq!(
+        schema["properties"]["message_ids"]["type"],
+        serde_json::json!("array"),
+        "an older client has to see the ids as a list: {schema}"
+    );
+
+    let result = client
+        .call_tool(tool_params(
+            "message_delete",
+            serde_json::json!({"conversation": "telegram:1", "message_ids": ["11", "12", "13"]}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
+
+    let recorded = harness.sink.deletes.lock().expect("lock").clone();
+    assert_eq!(recorded, ["11", "12", "13"], "every id crossed the wire");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn the_sender_filter_survives_the_version_gap() {
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list works");
+    let read = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "history_read")
+        .expect("history_read is advertised");
+    let schema = serde_json::to_value(&*read.input_schema).expect("schema serializes");
+    assert_eq!(
+        schema["properties"]["sender_ids"]["type"],
+        serde_json::json!("array"),
+        "an older client has to see the filter as a list: {schema}"
+    );
+
+    let result = client
+        .call_tool(tool_params(
+            "history_read",
+            serde_json::json!({"conversation": "telegram:1", "sender_ids": ["111"]}),
+        ))
+        .await
+        .expect("the call must succeed");
+    assert_eq!(result.is_error, Some(false));
 
     client.cancel().await.expect("clean shutdown");
 }

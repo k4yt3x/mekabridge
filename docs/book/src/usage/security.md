@@ -53,7 +53,7 @@ What neither prevents is an admitted sender persuading the agent to do something
 
 - **`conversation_mute`** and **`conversation_block`** can be aimed at any chat, including yours. A conversation blocked indefinitely is unreachable from inside the bridge, and a blocked one keeps nothing, so what was said while it was blocked cannot be recovered afterwards.
 - **`member_moderate`** and **`member_set_rights`** change somebody's standing in a group.
-- **`message_delete`** removes a message for everyone.
+- **`message_delete`** removes up to a hundred messages for everyone in one call, which is enough to clear out everything one person posted.
 
 Each of these logs at warn, which is often the only surviving record. Recovery is out of band:
 

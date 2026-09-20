@@ -56,7 +56,7 @@ use twilight_model::{
     },
     util::Timestamp,
 };
-use twilight_util::permission_calculator::PermissionCalculator;
+use twilight_util::{permission_calculator::PermissionCalculator, snowflake::Snowflake as _};
 
 use crate::{
     channel::{
@@ -85,8 +85,15 @@ const MAX_MEMBER_PAGE: usize = 1000;
 /// Discord's ceiling on a timeout, which it enforces and will not round for you.
 const MAX_TIMEOUT: chrono::TimeDelta = chrono::TimeDelta::days(28);
 
-/// Longest history a ban may delete, in seconds.
-const MAX_BAN_DELETE_SECONDS: u32 = 604_800;
+/// How old a message may be and still go through the bulk delete endpoint.
+///
+/// Discord refuses the whole batch with a 400 when any one id is older than two weeks, so this is
+/// what decides which ids may travel together rather than a limit that merely trims the result.
+const MAX_BULK_DELETE_AGE: chrono::TimeDelta = chrono::TimeDelta::days(14);
+
+/// Taken off [`MAX_BULK_DELETE_AGE`] so a message near the boundary is not sent to an endpoint that
+/// will refuse the batch it travels in. Discord measures the age at its clock, not ours.
+const BULK_DELETE_MARGIN: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// Ceiling on slowmode, in seconds.
 const MAX_SLOWMODE_SECONDS: u16 = 21_600;
@@ -1033,12 +1040,24 @@ impl DiscordChannel {
         guild_id: Id<GuildMarker>,
         channel_id: Id<ChannelMarker>,
         query: &str,
+        sender_ids: &[String],
         limit: usize,
     ) -> String {
         let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
         let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+        // Repeated rather than comma-joined: Discord reads several `author_id` parameters as "any
+        // of these", which is what the bridge's own filter means too.
+        let authors: String = sender_ids
+            .iter()
+            .map(|sender_id| {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(sender_id.as_bytes()).collect();
+                format!("&author_id={encoded}")
+            })
+            .collect();
         format!("guilds/{guild_id}/messages/search?content={encoded}")
             + &format!("&channel_id={channel_id}")
+            + &authors
             + &format!("&limit={limit}")
             + "&sort_by=timestamp"
     }
@@ -1053,9 +1072,10 @@ impl DiscordChannel {
         guild_id: Id<GuildMarker>,
         channel_id: Id<ChannelMarker>,
         query: &str,
+        sender_ids: &[String],
         limit: usize,
     ) -> Result<Vec<FoundMessage>, ChannelError> {
-        let path = self.search_path(guild_id, channel_id, query, limit);
+        let path = self.search_path(guild_id, channel_id, query, sender_ids, limit);
 
         for attempt in 0..SEARCH_INDEX_ATTEMPTS {
             let request = RequestBuilder::raw(Method::Get, path.clone())
@@ -1236,6 +1256,24 @@ fn is_forbidden(error: &twilight_http::Error) -> bool {
 
 fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(timestamp.as_micros())
+}
+
+/// Split message ids into those the bulk endpoint will take and those it will refuse.
+///
+/// Discord rejects an entire bulk call with a 400 when one id in it is older than two weeks, so
+/// this decides which may travel together rather than trimming a result. The age comes from the
+/// snowflake, which carries its own creation time, so no lookup is needed to know how old a message
+/// is. An id whose time will not convert is treated as old, since the safe mistake is the slower
+/// path rather than a batch Discord throws out whole.
+fn partition_by_bulk_age(
+    message_ids: &[Id<MessageMarker>],
+    now: DateTime<Utc>,
+) -> (Vec<Id<MessageMarker>>, Vec<Id<MessageMarker>>) {
+    let cutoff = now - MAX_BULK_DELETE_AGE + BULK_DELETE_MARGIN;
+    message_ids.iter().partition(|message_id| {
+        DateTime::from_timestamp_millis(message_id.timestamp())
+            .is_some_and(|created| created > cutoff)
+    })
 }
 
 /// One search hit, from the JSON Discord returned.
@@ -1809,13 +1847,77 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
+    async fn delete_messages(
+        &self,
+        conversation: &ConversationId,
+        message_ids: &[String],
+    ) -> Result<(), ChannelError> {
+        // Answered before the channel is even resolved, so asking to delete nothing costs nothing
+        // and cannot fail on a chat lookup for work that was never requested.
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let channel_id = self.target(conversation).await?;
+        let parsed = message_ids
+            .iter()
+            .map(|message_id| self.parse_message(message_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (young, old) = partition_by_bulk_age(&parsed, Utc::now());
+
+        // Bulk when it is allowed to carry the whole batch, one at a time otherwise. The two calls
+        // are not interchangeable: `bulk-delete` works only in a server channel and always demands
+        // Manage Messages, even over the bot's own messages, while deleting one needs no permission
+        // at all to retract something the bot itself sent. So a failed bulk call is retried singly
+        // rather than surfaced, which covers a direct message, a bot without that right, and
+        // anything else the endpoint declines. Discord validates a bulk call before deleting
+        // anything, so nothing is removed twice by the retry.
+        let mut deleted = 0usize;
+        // What is left to delete one at a time, in the order the caller gave wherever the whole
+        // batch is going that way.
+        let singly = if young.len() < 2 {
+            parsed.clone()
+        } else {
+            match self.http.delete_messages(channel_id, &young).await {
+                Ok(_) => {
+                    deleted = young.len();
+                    old
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        channel = %self.id.as_str(),
+                        count = young.len(),
+                        "deleting in bulk did not work, falling back to one at a time: {}",
+                        error
+                    );
+                    parsed.clone()
+                }
+            }
+        };
+        for message_id in singly {
+            self.http
+                .delete_message(channel_id, message_id)
+                .await
+                // The count matters more than the wording: with some already gone, resending the
+                // original list would report failures for messages that no longer exist. It does
+                // not say *which*, because a batch that went in bulk did not go in the order given.
+                .map_err(|error| {
+                    let doing = match deleted {
+                        0 => "deleting the messages".to_string(),
+                        done => format!("deleted {done} of {} before this failed", parsed.len()),
+                    };
+                    self.delivery_error(&doing, &error)
+                })?;
+            deleted += 1;
+        }
+        Ok(())
+    }
+
     async fn moderate_member(
         &self,
         conversation: &ConversationId,
         user_id: &str,
         action: MemberAction,
         until: Option<DateTime<Utc>>,
-        revoke_messages: bool,
     ) -> Result<(), ChannelError> {
         let channel_id = self.target(conversation).await?;
         let guild_id = self.guild_of(conversation, channel_id).await?;
@@ -1871,13 +1973,13 @@ impl Channel for DiscordChannel {
                                 .to_string(),
                     });
                 }
-                let mut request = self.http.create_ban(guild_id, user);
-                if revoke_messages {
-                    // Telegram deletes all of their history; Discord's ceiling is seven days, so
-                    // this is as close as the same request gets.
-                    request = request.delete_message_seconds(MAX_BAN_DELETE_SECONDS);
-                }
-                request
+                // Deliberately without `delete_message_seconds`. Banning is not a deletion on
+                // either platform, and this used to be the one place the two genuinely disagreed:
+                // Discord really erased a week of messages where Telegram erased nothing. Removing
+                // somebody's messages is `delete_messages`, which says so and has no ceiling of its
+                // own.
+                self.http
+                    .create_ban(guild_id, user)
                     .await
                     .map_err(|error| self.delivery_error("banning the member", &error))?;
             }
@@ -2237,6 +2339,7 @@ impl Channel for DiscordChannel {
         &self,
         conversation: &ConversationId,
         query: &str,
+        sender_ids: &[String],
         limit: usize,
     ) -> Result<Vec<FoundMessage>, ChannelError> {
         if !self.message_content {
@@ -2251,7 +2354,8 @@ impl Channel for DiscordChannel {
         // the moderation calls use, so a channel the cache has not heard of is looked up rather
         // than mistaken for a direct message.
         let guild_id = self.guild_of(conversation, channel_id).await?;
-        self.search_guild(guild_id, channel_id, query, limit).await
+        self.search_guild(guild_id, channel_id, query, sender_ids, limit)
+            .await
     }
 
     async fn set_activity(
@@ -2839,6 +2943,59 @@ mod tests {
         assert!(mine[0].own, "a hit the bot wrote is its own");
     }
 
+    #[test]
+    fn the_bulk_delete_boundary_keeps_a_batch_discord_will_accept() {
+        // Discord refuses an entire bulk call with a 400 when one id in it is over two weeks old,
+        // so a message near the boundary landing in the wrong half does not slow one deletion down,
+        // it loses the whole batch.
+        let now = Utc::now();
+        let at = |ago: chrono::TimeDelta| {
+            let millis = (now - ago).timestamp_millis();
+            // Discord's epoch, which is what a snowflake counts from.
+            let snowflake = ((millis - 1_420_070_400_000) as u64) << 22;
+            Id::<MessageMarker>::new(snowflake.max(1))
+        };
+
+        let young = at(chrono::TimeDelta::days(13));
+        let old = at(chrono::TimeDelta::days(15));
+        let (bulk, singly) = partition_by_bulk_age(&[young, old], now);
+        assert_eq!(bulk, [young], "thirteen days old still bulk deletes");
+        assert_eq!(singly, [old], "fifteen days old does not");
+
+        // The margin is what keeps a message half an hour short of the limit out of a batch Discord
+        // may measure as over it.
+        let (bulk, singly) = partition_by_bulk_age(
+            &[at(
+                chrono::TimeDelta::days(14) - chrono::TimeDelta::minutes(30)
+            )],
+            now,
+        );
+        assert!(bulk.is_empty(), "inside the margin, so not bulk deleted");
+        assert_eq!(singly.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_search_path_names_each_sender_it_was_given() {
+        // Repeated `author_id` rather than a comma-joined one: Discord reads the repetition as "any
+        // of these", which is what the bridge's own filter means.
+        let channel = identified();
+        let path = channel.search_path(
+            Id::new(900),
+            Id::new(2000),
+            "spam",
+            &["111".to_string(), "222".to_string()],
+            25,
+        );
+        assert!(path.contains("&author_id=111"), "{path}");
+        assert!(path.contains("&author_id=222"), "{path}");
+
+        let unfiltered = channel.search_path(Id::new(900), Id::new(2000), "spam", &[], 25);
+        assert!(
+            !unfiltered.contains("author_id"),
+            "no filter means no parameter at all: {unfiltered}"
+        );
+    }
+
     #[tokio::test]
     async fn the_search_path_is_a_legal_uri() {
         // This was built from a `\\`-continued literal once, and rustfmt joined the lines while
@@ -2846,7 +3003,7 @@ mod tests {
         // URI character, so every search failed to build a request and the whole Discord search leg
         // was silently dead. Assert on the shape rather than trusting the formatter.
         let channel = identified();
-        let path = channel.search_path(Id::new(900), Id::new(2000), "deploy find me", 25);
+        let path = channel.search_path(Id::new(900), Id::new(2000), "deploy find me", &[], 25);
         assert!(
             !path.contains(' '),
             "a space in the path makes the request unbuildable: {path:?}"

@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.17.0] - 2026-09-21
+## [0.18.0] - 2026-09-20
+
+### Added
+
+- `message_delete` takes up to 100 message ids in one call, so clearing a flood is one round trip.
+- `history_read` and `history_search` take `sender_ids`, reading only what named people said.
+
+### Changed
+
+- **Breaking:** `message_delete` takes `message_ids`, a list, in place of the single `message_id`.
+- **Breaking:** `member_moderate` loses `revoke_messages`; Telegram bans and kicks always set it.
+
+### Removed
+
+- **Breaking:** a Discord ban no longer deletes the last 7 days of messages. Use `message_delete`.
+
+### Fixed
+
+- `revoke_messages` was documented as deleting a person's messages; on Telegram it never did.
+
+## [0.17.0] - 2026-09-20
 
 ### Added
 

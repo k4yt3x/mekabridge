@@ -1191,10 +1191,10 @@ pub async fn history_show(
     let messages = match search {
         Some(query) => {
             store
-                .search_messages(query, Some(conversation), limit)
+                .search_messages(query, Some(conversation), &[], limit)
                 .await?
         }
-        None => store.history(conversation, limit, None, None).await?,
+        None => store.history(conversation, &[], limit, None, None).await?,
     };
     if messages.is_empty() {
         println!("nothing recorded");

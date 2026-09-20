@@ -111,8 +111,12 @@ pub trait OutboundSink: Send + Sync + 'static {
         session: Option<&str>,
     ) -> Result<(), SinkError>;
 
-    /// Remove a message.
-    async fn message_delete(&self, conversation: &str, message_id: &str) -> Result<(), SinkError>;
+    /// Delete messages, which the channel does in one call where the platform has a batch endpoint.
+    async fn message_delete(
+        &self,
+        conversation: &str,
+        message_ids: &[String],
+    ) -> Result<(), SinkError>;
 
     /// Restrict, ban, or reinstate somebody in a chat.
     async fn member_moderate(
@@ -121,7 +125,6 @@ pub trait OutboundSink: Send + Sync + 'static {
         user_id: &str,
         action: MemberAction,
         until: Option<chrono::DateTime<chrono::Utc>>,
-        revoke_messages: bool,
     ) -> Result<(), SinkError>;
 
     /// Grant exactly `rights`. An empty slice demotes.
@@ -214,20 +217,24 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// Read a conversation back, oldest first.
     ///
     /// `before` reads the page older than a cursor; `after` reads what has arrived since one. At
-    /// most one is ever set, which the tool enforces before calling.
+    /// most one is ever set, which the tool enforces before calling. `sender_ids` narrows to those
+    /// senders when it is not empty.
     async fn history_read(
         &self,
         conversation: &str,
+        sender_ids: &[String],
         limit: usize,
         before: Option<i64>,
         after: Option<i64>,
     ) -> Result<Vec<HistoryEntry>, SinkError>;
 
-    /// Search recorded messages, best matches first. `conversation` narrows to one chat.
+    /// Search recorded messages, best matches first. `conversation` narrows to one chat, and
+    /// `sender_ids` to a set of senders.
     async fn history_search(
         &self,
         query: &str,
         conversation: Option<&str>,
+        sender_ids: &[String],
         limit: usize,
     ) -> Result<Vec<HistoryEntry>, SinkError>;
 
@@ -477,6 +484,10 @@ pub struct ReadHistoryArgs {
     /// reading anything twice or missing anything in between.
     #[serde(default)]
     pub after: Option<i64>,
+    /// Only messages from these people, by the numeric id on a header's `from:` line. Omit for
+    /// everyone. Display names are not matched, since several people can share one.
+    #[serde(default)]
+    pub sender_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -489,6 +500,10 @@ pub struct SearchHistoryArgs {
     /// How many matches to return, best first. Defaults to 20.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Only messages from these people, by the numeric id on a header's `from:` line. Omit for
+    /// everyone. Display names are not matched, since several people can share one.
+    #[serde(default)]
+    pub sender_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -572,10 +587,11 @@ pub struct EditMessageArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteMessageArgs {
-    /// Conversation the message is in.
+    /// Conversation the messages are in.
     pub conversation: String,
-    /// Id of the message to delete.
-    pub message_id: String,
+    /// Ids of the messages to delete, up to 100 at a time. They must all be in the one
+    /// conversation. Pass a single id to delete one.
+    pub message_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -593,10 +609,6 @@ pub struct ModerateMemberArgs {
     /// anything outside that as permanent.
     #[serde(default)]
     pub duration: Option<String>,
-    /// Also delete everything they have posted. Only for `ban` and `kick`, and it cannot be
-    /// undone.
-    #[serde(default)]
-    pub revoke_messages: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -839,6 +851,13 @@ const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 /// one-line summaries and every one of them lands in the agent's context.
 const MAX_HISTORY_LIMIT: usize = 100;
 const DEFAULT_HISTORY_LIMIT: usize = 20;
+
+/// Most messages one `message_delete` call may remove.
+///
+/// Telegram's `deleteMessages` and Discord's bulk delete both stop at 100, and it is also
+/// [`MAX_HISTORY_LIMIT`], so one page of history is exactly one batch and the agent never has to do
+/// arithmetic between the two.
+const MAX_DELETE_BATCH: usize = 100;
 
 /// Which optional groups of tools to offer.
 ///
@@ -1247,15 +1266,17 @@ impl BridgeMcpServer {
         }
     }
 
-    /// Remove a message.
+    /// Remove one or more messages.
     #[tool(
-        description = "Delete a message. Use it to retract something you sent, or, where you are a \
-                       moderator, to remove somebody else's. This cannot be undone, the message \
-                       disappears for everyone, and the deletion is logged as the only remaining \
+        description = "Delete messages, taking up to 100 ids in one call. Use it to retract \
+                       something you sent, or, where you are a moderator, to remove somebody \
+                       else's. To clear out one person, list their ids with history_read's \
+                       sender_ids filter and pass them here. This cannot be undone, the messages \
+                       disappear for everyone, and the deletion is logged as the only remaining \
                        record of it, so prefer message_edit when you only want to correct \
                        yourself.",
         annotations(
-            title = "Delete message",
+            title = "Delete messages",
             read_only_hint = false,
             destructive_hint = true,
             open_world_hint = true
@@ -1265,15 +1286,55 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<DeleteMessageArgs>,
     ) -> Result<CallToolResult, McpError> {
+        // The ceiling is checked against the raw argument, before anything walks it. Refused rather
+        // than split across several calls: both platforms take 100 at once and history_read hands
+        // back at most 100, so a longer list did not come from a page of history, and splitting it
+        // silently would mean reporting a partial success for some batches and a failure for
+        // others. Bounding it here is also what keeps the scan below from being handed an
+        // arbitrarily long list to walk.
+        if args.message_ids.len() > MAX_DELETE_BATCH {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "{} ids is more than the {MAX_DELETE_BATCH} that can be deleted at once; send \
+                 them in batches of {MAX_DELETE_BATCH}.",
+                args.message_ids.len()
+            ))]));
+        }
+        // Deduped rather than refused: the same id twice is a list-building slip, not a different
+        // request, and the second delete would fail on a message the first one removed. Discord
+        // also rejects a whole bulk call that repeats one.
+        let mut message_ids: Vec<String> = Vec::with_capacity(args.message_ids.len());
+        for message_id in args.message_ids {
+            if !message_ids.contains(&message_id) {
+                message_ids.push(message_id);
+            }
+        }
+        if message_ids.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "`message_ids` is empty; pass the id of at least one message to delete.",
+            )]));
+        }
         match self
             .sink
-            .message_delete(&args.conversation, &args.message_id)
+            .message_delete(&args.conversation, &message_ids)
             .await
         {
-            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Deleted message {} in {}.",
-                args.message_id, args.conversation
-            ))])),
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                match message_ids.as_slice() {
+                    [message_id] => {
+                        format!("Deleted message {message_id} in {}.", args.conversation)
+                    }
+                    several => format!(
+                        "Deleted {} messages in {}.",
+                        several.len(),
+                        args.conversation
+                    ),
+                },
+            )])),
+            // No advice appended here about what may already be gone. Whether any of the batch was
+            // deleted depends on the platform, and only the channel knows: Telegram sends a batch
+            // as one call that either takes it or refuses it whole, while Discord can stop partway
+            // and says so by naming a count in this very error. A blanket "some may already be
+            // deleted" would be wrong for the Telegram case and redundant for the Discord one.
             Err(error) => Ok(sink_failure(&error)),
         }
     }
@@ -1284,9 +1345,10 @@ impl BridgeMcpServer {
                        `restrict` stops them posting but leaves them in, `unrestrict` gives back \
                        whatever the group allows everyone, `ban` removes and keeps them out, \
                        `unban` lifts a ban, and `kick` removes them but lets them rejoin. \
-                       `duration` suits `restrict` and `ban`; omit it for permanent. Every call \
-                       needs the matching admin right in that chat, and no bot can act on another \
-                       administrator.",
+                       `duration` suits `restrict` and `ban`; omit it for permanent. None of these \
+                       deletes what the person posted, on any platform: use message_delete for \
+                       that. Every call needs the matching admin right in that chat, and no bot \
+                       can act on another administrator.",
         annotations(
             title = "Moderate member",
             read_only_hint = false,
@@ -1312,13 +1374,7 @@ impl BridgeMcpServer {
         }
         match self
             .sink
-            .member_moderate(
-                &args.conversation,
-                &args.user_id,
-                args.action,
-                until,
-                args.revoke_messages,
-            )
+            .member_moderate(&args.conversation, &args.user_id, args.action, until)
             .await
         {
             Ok(()) => {
@@ -1957,7 +2013,9 @@ impl BridgeMcpServer {
     #[tool(
         description = "Read recent messages from a conversation, oldest first, including ones you \
                        were never woken for. This is how you catch up on a muted chat: somebody \
-                       mentions you halfway through a discussion, and this is the discussion. It \
+                       mentions you halfway through a discussion, and this is the discussion. Pass \
+                       sender_ids to read only what particular people said, which is how you \
+                       gather one person's messages before deleting them. It \
                        reads what this bridge recorded, so it does not go back before the bridge \
                        was installed or past the configured retention. A block stops a chat being \
                        recorded from that point on; whatever was recorded before it is still \
@@ -1990,23 +2048,38 @@ impl BridgeMcpServer {
         }
         match self
             .sink
-            .history_read(&args.conversation, limit, args.before, args.after)
+            .history_read(
+                &args.conversation,
+                &args.sender_ids,
+                limit,
+                args.before,
+                args.after,
+            )
             .await
         {
             Ok(entries) if entries.is_empty() => {
                 // Two different pieces of news, and the forward one is the common case: a watcher
                 // sweeping a quiet chat gets this every time, and telling it the retention might be
                 // at fault would send it investigating a room that simply has not moved.
-                let explanation = match args.after {
-                    Some(cursor) => format!(
+                // A filtered read that finds nothing is a different piece of news again: the chat
+                // may be busy and simply hold nothing from those people, so neither sentence below
+                // would be true of it.
+                let explanation = match (args.sender_ids.as_slice(), args.after) {
+                    ([], Some(cursor)) => format!(
                         "Nothing has been said in {} since message {cursor}.",
                         args.conversation
                     ),
-                    None => format!(
+                    ([], None) => format!(
                         "Nothing recorded for {}. Either nothing has been said there since this \
                          bridge started, it is older than the retention period, or the \
                          conversation is blocked and nothing from it is kept.",
                         args.conversation
+                    ),
+                    (senders, _) => format!(
+                        "Nothing recorded in {} from {}. They may have said nothing there, or \
+                         their ids may not be the ones on the `from:` lines you want.",
+                        args.conversation,
+                        senders.join(", ")
                     ),
                 };
                 Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -2021,7 +2094,8 @@ impl BridgeMcpServer {
     /// Search what was said.
     #[tool(
         description = "Search recorded messages for words, across every conversation or within \
-                       one. Use it to find something you were told a while ago, or to check what a \
+                       one, and optionally only from particular people with sender_ids. Use it to \
+                       find something you were told a while ago, or to check what a \
                        chat was discussing before it mentioned you. Matching is on whole words; \
                        `a OR b`, `a NOT b`, and \"quoted phrases\" work. Same limits as \
                        history_read: only what this bridge recorded, since it was installed and \
@@ -2046,7 +2120,12 @@ impl BridgeMcpServer {
             .clamp(1, MAX_HISTORY_LIMIT);
         match self
             .sink
-            .history_search(&args.query, args.conversation.as_deref(), limit)
+            .history_search(
+                &args.query,
+                args.conversation.as_deref(),
+                &args.sender_ids,
+                limit,
+            )
             .await
         {
             Ok(entries) if entries.is_empty() => {
@@ -2258,7 +2337,7 @@ mod tests {
         reactions: Mutex<Vec<(String, String, Option<String>)>>,
         edits: Mutex<Vec<(String, String, String, bool)>>,
         files: Mutex<Vec<FileOptions>>,
-        deletes: Mutex<Vec<(String, String)>>,
+        deletes: Mutex<Vec<(String, Vec<String>)>>,
         policies: Mutex<Vec<RecordedPolicy>>,
         history: Vec<HistoryEntry>,
         moderations: Mutex<Vec<RecordedModeration>>,
@@ -2390,7 +2469,7 @@ mod tests {
         async fn message_delete(
             &self,
             conversation: &str,
-            message_id: &str,
+            message_ids: &[String],
         ) -> Result<(), SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
@@ -2399,7 +2478,7 @@ mod tests {
                 .deletes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            deletes.push((conversation.to_string(), message_id.to_string()));
+            deletes.push((conversation.to_string(), message_ids.to_vec()));
             Ok(())
         }
 
@@ -2409,7 +2488,6 @@ mod tests {
             user_id: &str,
             action: MemberAction,
             until: Option<chrono::DateTime<chrono::Utc>>,
-            _revoke_messages: bool,
         ) -> Result<(), SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
@@ -2712,6 +2790,7 @@ mod tests {
         async fn history_read(
             &self,
             conversation: &str,
+            sender_ids: &[String],
             limit: usize,
             _before: Option<i64>,
             after: Option<i64>,
@@ -2724,6 +2803,13 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.conversation == conversation)
                 .filter(|entry| after.is_none_or(|cursor| entry.cursor > cursor))
+                .filter(|entry| {
+                    sender_ids.is_empty()
+                        || entry
+                            .sender_id
+                            .as_ref()
+                            .is_some_and(|sender_id| sender_ids.contains(sender_id))
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -2733,6 +2819,7 @@ mod tests {
             &self,
             query: &str,
             conversation: Option<&str>,
+            sender_ids: &[String],
             limit: usize,
         ) -> Result<Vec<HistoryEntry>, SinkError> {
             if let Some(reason) = self.fail_with {
@@ -2744,6 +2831,11 @@ mod tests {
                 .filter(|entry| {
                     conversation.is_none_or(|wanted| entry.conversation == wanted)
                         && entry.text.contains(query)
+                        && (sender_ids.is_empty()
+                            || entry
+                                .sender_id
+                                .as_ref()
+                                .is_some_and(|sender_id| sender_ids.contains(sender_id)))
                 })
                 .take(limit)
                 .cloned()
@@ -3348,15 +3440,113 @@ mod tests {
         let result = server
             .message_delete(Parameters(DeleteMessageArgs {
                 conversation: "telegram:1".to_string(),
-                message_id: "4471".to_string(),
+                message_ids: vec!["4471".to_string()],
             }))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
+        assert!(text_of(&result).contains("message 4471"), "{result:?}");
         assert_eq!(sink.deletes.lock().expect("lock").as_slice(), [(
             "telegram:1".to_string(),
-            "4471".to_string()
+            vec!["4471".to_string()]
         )]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_deletions_reaches_the_channel_as_one_call() {
+        // One call rather than a loop is the whole point: both platforms take up to a hundred ids
+        // at once, and the bridge sending them one at a time is what made purging a spammer cost a
+        // round trip per message.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .message_delete(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_ids: vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert!(text_of(&result).contains("3 messages"), "{result:?}");
+        let deletes = sink.deletes.lock().expect("lock");
+        assert_eq!(deletes.len(), 1, "one call, not three");
+        assert_eq!(deletes[0].1, ["1", "2", "3"], "in the order given");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_id_is_deleted_once() {
+        // The second delete would fail on a message the first one removed, and the agent building
+        // the list from two pages of history is the ordinary way to end up with a duplicate.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .message_delete(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_ids: vec!["7".to_string(), "7".to_string(), "8".to_string()],
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(sink.deletes.lock().expect("lock")[0].1, ["7", "8"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_of_ids_is_refused() {
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .message_delete(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_ids: Vec::new(),
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(sink.deletes.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn more_ids_than_one_batch_holds_is_refused_rather_than_split() {
+        // Split silently, a list of 150 would report one success and one failure for what the
+        // agent asked as a single action, and it could not tell which half had gone.
+        let (server, sink) = server_with(FakeSink::default());
+        let message_ids: Vec<String> = (0..=MAX_DELETE_BATCH).map(|id| id.to_string()).collect();
+        let result = server
+            .message_delete(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_ids,
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text_of(&result).contains(&MAX_DELETE_BATCH.to_string()),
+            "the refusal has to name the ceiling: {result:?}"
+        );
+        assert!(sink.deletes.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_reaches_the_agent_as_the_channel_described_it() {
+        // Deliberately no advice of the tool's own about what may already be gone. Only the channel
+        // knows: Telegram sends a batch as one call that either takes it whole or refuses it whole,
+        // while Discord can stop partway and names a count when it does. A blanket warning would be
+        // wrong for the first and redundant for the second.
+        let (server, _sink) = server_with(FakeSink {
+            fail_with: Some("deleted 2 of 5 before this failed"),
+            ..FakeSink::default()
+        });
+        let result = server
+            .message_delete(Parameters(DeleteMessageArgs {
+                conversation: "telegram:1".to_string(),
+                message_ids: vec!["1".to_string(), "2".to_string()],
+            }))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
+        assert!(text.contains("deleted 2 of 5"), "{text}");
+        assert!(
+            !text.contains("may already be deleted"),
+            "the tool must not invent a claim the channel did not make: {text}"
+        );
     }
 
     #[tokio::test]
@@ -3765,6 +3955,7 @@ mod tests {
                 limit: None,
                 before: Some(10),
                 after: Some(20),
+                sender_ids: Vec::new(),
             }))
             .await
             .expect("tool runs");
@@ -3786,6 +3977,7 @@ mod tests {
                 limit: None,
                 before: None,
                 after: Some(9_000),
+                sender_ids: Vec::new(),
             }))
             .await
             .expect("tool runs");
@@ -3892,6 +4084,7 @@ mod tests {
                 limit: None,
                 before: None,
                 after: None,
+                sender_ids: Vec::new(),
             }))
             .await
             .expect("tool runs");
@@ -3913,6 +4106,7 @@ mod tests {
                 limit: None,
                 before: None,
                 after: None,
+                sender_ids: Vec::new(),
             }))
             .await
             .expect("tool runs");
@@ -3931,7 +4125,6 @@ mod tests {
                 user_id: "999".to_string(),
                 action: MemberAction::Restrict,
                 duration: Some("1h".to_string()),
-                revoke_messages: false,
             }))
             .await
             .expect("tool runs");
@@ -3958,7 +4151,6 @@ mod tests {
                     user_id: "999".to_string(),
                     action,
                     duration: Some("1h".to_string()),
-                    revoke_messages: false,
                 }))
                 .await
                 .expect("tool runs");
@@ -4296,6 +4488,7 @@ mod tests {
                 limit: None,
                 before: None,
                 after: None,
+                sender_ids: Vec::new(),
             }))
             .await
             .expect("tool runs");
@@ -4469,6 +4662,50 @@ mod tests {
     /// Whether the schema offers `value` as a literal, rather than merely mentioning it in prose.
     fn value_is_offered(schema: &str, value: &str) -> bool {
         schema.contains(&format!("\"{value}\""))
+    }
+
+    #[test]
+    fn the_delete_and_history_schemas_show_their_lists_as_arrays() {
+        // An agent that read `message_ids` as a string would delete one message per call and never
+        // discover the batch, which is the whole of this change. Same for `sender_ids`: read as a
+        // string it would filter on one person where it meant several.
+        let router = BridgeMcpServer::tool_router();
+        let schema_of = |name: &str| {
+            let tool = router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            serde_json::to_value(&*tool.input_schema).expect("schema serializes")
+        };
+
+        let delete = schema_of("message_delete");
+        assert_eq!(
+            delete["properties"]["message_ids"]["type"],
+            serde_json::json!("array"),
+            "got: {delete}"
+        );
+        assert!(
+            delete["properties"].get("message_id").is_none(),
+            "the singular argument is gone: {delete}"
+        );
+
+        for name in ["history_read", "history_search"] {
+            let schema = schema_of(name);
+            let sender_ids = &schema["properties"]["sender_ids"];
+            assert!(
+                sender_ids["type"] == serde_json::json!("array")
+                    || sender_ids["type"] == serde_json::json!(["array", "null"]),
+                "{name} must offer sender_ids as a list: {schema}"
+            );
+        }
+
+        // And moderation no longer advertises a flag that never deleted anything on Telegram.
+        let moderate = schema_of("member_moderate");
+        assert!(
+            moderate["properties"].get("revoke_messages").is_none(),
+            "got: {moderate}"
+        );
     }
 
     #[test]

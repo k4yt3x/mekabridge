@@ -997,6 +997,37 @@ impl Channel for TelegramChannel {
             .map_err(|error| self.delivery_error(&error))
     }
 
+    async fn delete_messages(
+        &self,
+        conversation: &ConversationId,
+        message_ids: &[String],
+    ) -> Result<(), ChannelError> {
+        // Nothing to do, rather than an empty `deleteMessages`, which Telegram refuses: its
+        // `message_ids` must hold between 1 and 100. The tool never sends an empty list, but a
+        // caller that did would get an API error where the honest answer is that no work was asked
+        // for.
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        // One goes through the single endpoint, which is not an optimisation: `deleteMessages`
+        // reports nothing about which ids it skipped, so a lone id that does not exist would come
+        // back as success where `deleteMessage` says what was wrong with it.
+        let [message_id] = message_ids else {
+            let (chat, _thread) = self.target(conversation)?;
+            let parsed = message_ids
+                .iter()
+                .map(|message_id| self.message_id(message_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            return self
+                .bot
+                .delete_messages(Recipient::Id(chat), parsed)
+                .await
+                .map(|_| ())
+                .map_err(|error| self.delivery_error(&error));
+        };
+        self.delete_message(conversation, message_id).await
+    }
+
     async fn set_activity(
         &self,
         conversation: &ConversationId,
@@ -1021,7 +1052,6 @@ impl Channel for TelegramChannel {
         user_id: &str,
         action: MemberAction,
         until: Option<chrono::DateTime<chrono::Utc>>,
-        revoke_messages: bool,
     ) -> Result<(), ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
         let user = self.user_id(user_id)?;
@@ -1064,10 +1094,15 @@ impl Channel for TelegramChannel {
                     .map_err(|error| self.delivery_error(&error))
             }
             MemberAction::Ban => {
+                // Pinned rather than offered. Telegram's `revoke_messages` does not delete what the
+                // person posted, which is what the name suggests and what we once documented: it
+                // clears the chat from the removed person's own view, and Telegram forces it on in
+                // supergroups and channels whatever we send. Pinning it means a basic group behaves
+                // like every other chat kind instead of differing on a flag nobody could observe.
                 let mut request = self
                     .bot
                     .ban_chat_member(Recipient::Id(chat), user)
-                    .revoke_messages(revoke_messages);
+                    .revoke_messages(true);
                 if let Some(until) = until {
                     request = request.until_date(until);
                 }
@@ -1090,7 +1125,7 @@ impl Channel for TelegramChannel {
                 // while leaving them free to rejoin.
                 self.bot
                     .ban_chat_member(Recipient::Id(chat), user)
-                    .revoke_messages(revoke_messages)
+                    .revoke_messages(true)
                     .await
                     .map_err(|error| self.delivery_error(&error))?;
                 self.bot
@@ -1901,6 +1936,20 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item, InputMedia::Document(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_nothing_reaches_no_endpoint() {
+        // Telegram's `deleteMessages` requires between 1 and 100 ids, so an empty batch would be an
+        // API error rather than a no-op. The tool refuses an empty list before it gets here, but
+        // the trait is the contract and answering "nothing to do" costs one branch. The token here
+        // is fake, so anything that did reach the network would fail instead of returning.
+        let channel = channel(vec![1], vec![]);
+        let conversation = ConversationId::parse("telegram:1").expect("valid");
+        channel
+            .delete_messages(&conversation, &[])
+            .await
+            .expect("deleting nothing succeeds without a call");
     }
 
     #[tokio::test]

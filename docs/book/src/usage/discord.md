@@ -130,7 +130,7 @@ Available when `admin_tools` is on, which is the default. Discord refuses each c
 |---|---|---|
 | `member_moderate` `restrict` | Timeout | Needs a duration, capped at 28 days. Discord has no indefinite timeout, so the bridge refuses rather than silently choosing a length |
 | `member_moderate` `unrestrict` | Clears the timeout | Returns them to exactly their roles |
-| `member_moderate` `ban` | Ban | **Permanent.** Discord has no ban expiry, so a duration is refused with a pointer at `restrict`. `revoke_messages` deletes the last 7 days, which is Discord's ceiling |
+| `member_moderate` `ban` | Ban | **Permanent.** Discord has no ban expiry, so a duration is refused with a pointer at `restrict`. It deletes nothing they posted; use `message_delete` |
 | `member_moderate` `unban` | Unban | |
 | `member_moderate` `kick` | Kick | A real primitive, unlike Telegram's ban-then-unban |
 | `member_set_roles` | Replaces the roles somebody holds, by name | Discord has no per-member privileges, so this replaces `member_set_rights`, which is not offered on a Discord channel |
@@ -144,7 +144,7 @@ An operator can undo any of it from the Discord client, and `mekabridge policy` 
 
 The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds two things on top.
 
-**Deletions are honoured.** Discord tells the bridge when a message is deleted, so the recorded copy goes too. The agent cannot be handed back something its author removed. Telegram reports nothing, so its archive cannot do this.
+**Deletions are honoured.** Discord tells the bridge when a message is deleted, so the recorded copy is marked `deleted` rather than removed: the agent is never handed it back as missed context, but `history_read` and `history_search` still reach it and say it was retracted. Telegram reports nothing, so its archive cannot do this.
 
 **`history_search` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
 

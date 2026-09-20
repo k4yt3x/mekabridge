@@ -1057,21 +1057,53 @@ pub trait Channel: Send + Sync + 'static {
         })
     }
 
+    /// Delete several messages, which platforms with a batch endpoint do in one call.
+    ///
+    /// The default is the loop, so a channel that has no batch endpoint gets this for free and only
+    /// one that does needs to override. A failure partway through names how many went first: the
+    /// ones before it are gone and retrying the whole list would report failures for messages that
+    /// no longer exist.
+    async fn delete_messages(
+        &self,
+        conversation: &ConversationId,
+        message_ids: &[String],
+    ) -> Result<(), ChannelError> {
+        for (index, message_id) in message_ids.iter().enumerate() {
+            self.delete_message(conversation, message_id)
+                .await
+                .map_err(|error| match index {
+                    0 => error,
+                    done => ChannelError::Delivery {
+                        channel: self.id().as_str().to_string(),
+                        message: format!(
+                            "deleted {done} of {}, then stopped: {error}",
+                            message_ids.len()
+                        ),
+                    },
+                })?;
+        }
+        Ok(())
+    }
+
     /// Restrict, ban, or reinstate somebody in a chat.
     ///
     /// `until` applies only to the actions [`MemberAction::accepts_duration`] admits. Platforms set
     /// their own floor and ceiling on it and may round or ignore what falls outside, so an
     /// implementation that cannot honour a duration exactly should say what it did rather than
     /// pretend.
+    ///
+    /// None of these actions deletes what the person posted. Telegram's `banChatMember` has a
+    /// `revoke_messages` flag that sounds like it does and does not: it clears the chat from the
+    /// removed person's own view, and Telegram forces it on in supergroups and channels regardless.
+    /// Removing somebody's messages is [`Channel::delete_messages`].
     async fn moderate_member(
         &self,
         conversation: &ConversationId,
         user_id: &str,
         action: MemberAction,
         until: Option<DateTime<Utc>>,
-        revoke_messages: bool,
     ) -> Result<(), ChannelError> {
-        let _ = (conversation, user_id, action, until, revoke_messages);
+        let _ = (conversation, user_id, action, until);
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "moderating members",
@@ -1184,13 +1216,17 @@ pub trait Channel: Send + Sync + 'static {
     ///
     /// Best-effort by contract. A platform that is still indexing, or that will not answer for this
     /// chat, returns an error the caller is expected to fall back from rather than surface.
+    ///
+    /// `sender_ids` narrows to those senders when it is not empty, the same filter the bridge's own
+    /// history takes.
     async fn search_messages(
         &self,
         conversation: &ConversationId,
         query: &str,
+        sender_ids: &[String],
         limit: usize,
     ) -> Result<Vec<FoundMessage>, ChannelError> {
-        let _ = (conversation, query, limit);
+        let _ = (conversation, query, sender_ids, limit);
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "searching the platform's own history",

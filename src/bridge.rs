@@ -46,7 +46,7 @@ use crate::{
         AccountId, AccountIdentity, MessageKey, NewWatch, Policy, Store, UnseenSummary,
         WatchOutcome, WatchRecord,
     },
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 
 /// Buffer between the channel pollers and the durable writer.
@@ -1539,18 +1539,32 @@ impl OutboundSink for BridgeSink {
             .map_err(|error| SinkError::Internal(error.to_string()))
     }
 
-    async fn watch_create(
+    async fn watch_write(
         &self,
-        pattern: &str,
+        name: &str,
+        patterns: &[String],
         field: WatchField,
+        mode: WatchMode,
         conversation: Option<&str>,
         until: Option<chrono::DateTime<Utc>>,
         reason: Option<&str>,
     ) -> std::result::Result<WatchOutcome, SinkError> {
-        // Validated here rather than left to the matcher, so a pattern that will never fire is
+        // Validated here rather than left to the matcher, so a rule that could never fire is
         // refused while the agent is still looking at it instead of being stored and silently
-        // matching nothing.
-        crate::watch::compile_pattern(pattern).map_err(SinkError::Delivery)?;
+        // matching nothing. The offending pattern is named: with a list this long, "one of these
+        // is invalid" would leave the agent bisecting its own rule set.
+        if let Err(why) = crate::watch::validate_name(name) {
+            return Ok(WatchOutcome::Refused(format!(
+                "{name:?} is not a usable watch name: {why}"
+            )));
+        }
+        for pattern in patterns {
+            if let Err(why) = crate::watch::compile_pattern(pattern) {
+                return Ok(WatchOutcome::Refused(format!(
+                    "the pattern {pattern:?} cannot be used: {why}"
+                )));
+            }
+        }
         // Resolved for the same reason `set_policy` resolves: a watch scoped to an id that names no
         // configured channel would be stored and never consulted.
         let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
@@ -1564,12 +1578,14 @@ impl OutboundSink for BridgeSink {
             })
             .transpose()?;
         self.store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    name,
                     conversation: conversation.as_ref().map(ConversationId::as_str),
                     platform: platform.map(Platform::as_str),
                     field,
-                    pattern,
+                    mode,
+                    patterns,
                     until,
                     reason,
                 },
@@ -1579,9 +1595,12 @@ impl OutboundSink for BridgeSink {
             .map_err(|error| SinkError::Internal(error.to_string()))
     }
 
-    async fn watch_delete(&self, id: i64) -> std::result::Result<Option<WatchRecord>, SinkError> {
+    async fn watch_delete(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<WatchRecord>, SinkError> {
         self.store
-            .remove_watch(id)
+            .remove_watch(name)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))
     }

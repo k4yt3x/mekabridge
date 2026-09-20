@@ -15,7 +15,7 @@ use crate::{
     error::{BridgeError, Result},
     meka::MekaClient,
     store::{NewWatch, Policy, QueueState, Store, WatchOutcome},
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 
 /// Starter config written by `mekabridge config init`.
@@ -920,7 +920,7 @@ pub async fn policy_clear(config: &Config, conversation: &str) -> Result<()> {
 }
 
 /// List the watches in force.
-pub async fn watch_list(config: &Config) -> Result<()> {
+pub async fn watch_list(config: &Config, show_patterns: bool) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
     let watches = store.list_watches(Utc::now()).await?;
     if watches.is_empty() {
@@ -933,32 +933,69 @@ pub async fn watch_list(config: &Config) -> Result<()> {
             None => "indefinite".to_string(),
         };
         println!(
-            "  {:<5} {:<10} {:<28} {:<22} {:<30} {}",
-            watch.id,
+            "  {:<24} {:<10} {:<5} {:>4} pattern(s)  {:<28} {:<22} {}",
+            watch.name,
             watch.field.as_str(),
+            watch.mode.as_str(),
+            watch.patterns.len(),
             watch.conversation.as_deref().unwrap_or("(every chat)"),
             until,
-            watch.pattern,
             watch.reason.as_deref().unwrap_or("-")
         );
+        // Off by default: a rule set runs to a hundred patterns, and printing them all by default
+        // would bury the one line per watch that this listing exists to give.
+        if show_patterns {
+            for pattern in &watch.patterns {
+                println!("      {pattern}");
+            }
+        }
     }
     Ok(())
 }
 
-/// Add a watch from the command line.
-pub async fn watch_create(
+/// Write a watch from the command line, creating it or replacing what it holds.
+#[allow(clippy::too_many_arguments)]
+pub async fn watch_write(
     config: &Config,
-    pattern: &str,
+    name: &str,
+    patterns: &[String],
+    patterns_file: Option<&Path>,
     field: WatchField,
+    mode: WatchMode,
     conversation: Option<&str>,
     duration: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
-    // Compiled before anything is stored, so a pattern that could never match is refused while the
-    // operator is still looking at it rather than sitting in the table matching nothing.
-    crate::watch::compile_pattern(pattern).map_err(|error| {
-        BridgeError::config(format!("{pattern:?} is not a usable pattern: {error}"))
-    })?;
+    let mut collected: Vec<String> = patterns.to_vec();
+    if let Some(path) = patterns_file {
+        let raw = std::fs::read_to_string(path).map_err(|error| {
+            BridgeError::command(format!("could not read {}: {error}", path.display()))
+        })?;
+        // One per line, so a rules file is something an operator can keep under version control
+        // and diff. Comments and blank lines are skipped, since a file this long wants notes.
+        collected.extend(
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    if collected.is_empty() {
+        return Err(BridgeError::command(
+            "no patterns given; pass --pattern, --patterns-file, or both",
+        ));
+    }
+    // Compiled before anything is stored, so a rule that could never fire is refused while the
+    // operator is still looking at it. The offending pattern is named, because a file of a hundred
+    // would otherwise have to be bisected by hand.
+    crate::watch::validate_name(name)
+        .map_err(|error| BridgeError::command(format!("{name:?} is not a usable name: {error}")))?;
+    for pattern in &collected {
+        crate::watch::compile_pattern(pattern).map_err(|error| {
+            BridgeError::command(format!("{pattern:?} is not a usable pattern: {error}"))
+        })?;
+    }
+
     let until = duration
         .map(|duration| {
             let parsed = humantime::parse_duration(duration).map_err(|error| {
@@ -997,53 +1034,61 @@ pub async fn watch_create(
 
     let store = Store::open(&config.storage.path).await?;
     let outcome = store
-        .add_watch(
+        .write_watch(
             NewWatch {
+                name,
                 conversation: scope.as_ref().map(|(parsed, _)| parsed.as_str()),
                 platform: scope.as_ref().map(|(_, platform)| *platform),
                 field,
-                pattern,
+                mode,
+                patterns: &collected,
                 until,
                 reason,
             },
             Utc::now(),
         )
         .await?;
-    let scope = scope.as_ref().map_or_else(
+    let where_ = scope.as_ref().map_or_else(
         || "every muted conversation".to_string(),
         |(parsed, _)| parsed.to_string(),
     );
     match outcome {
-        WatchOutcome::Added(watch) => println!(
-            "watch {} added: {} in the {} of {scope}",
-            watch.id,
-            watch.pattern,
+        WatchOutcome::Created(watch) => println!(
+            "watch {:?} created: {} pattern(s), match {}, in the {} of {where_}",
+            watch.name,
+            watch.patterns.len(),
+            watch.mode.as_str(),
             watch.field.as_str()
         ),
-        WatchOutcome::Existing(watch) => println!(
-            "watch {} already covers {} in the {} of {scope}",
-            watch.id,
-            watch.pattern,
-            watch.field.as_str()
+        WatchOutcome::Updated {
+            record,
+            added,
+            removed,
+        } => println!(
+            "watch {:?} updated: {} pattern(s), match {}, in the {} of {where_} ({added} added, \
+             {removed} removed)",
+            record.name,
+            record.patterns.len(),
+            record.mode.as_str(),
+            record.field.as_str()
         ),
-        // An error rather than a printed note: the watch was not added and retrying will not add
-        // it, so a script that chained onto this must not read the refusal as success.
-        WatchOutcome::AtCapacity(held) => {
-            return Err(BridgeError::command(format!(
-                "not added: there are already {held} watches, which is the most this bridge holds; \
-                 remove one with `mekabridge watch delete`"
-            )));
-        }
+        // An error rather than a printed note: the watch is not what was asked for, so a script
+        // that chained onto this must not read the refusal as success.
+        WatchOutcome::Refused(why) => return Err(BridgeError::command(why)),
     }
     Ok(())
 }
 
 /// Remove a watch, including one the agent set on itself and cannot be asked to undo.
-pub async fn watch_delete(config: &Config, id: i64) -> Result<()> {
+pub async fn watch_delete(config: &Config, name: &str) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
-    match store.remove_watch(id).await? {
-        Some(watch) => println!("watch {} removed: {}", watch.id, watch.pattern),
-        None => println!("there is no watch {id}"),
+    match store.remove_watch(name).await? {
+        Some(watch) => println!(
+            "watch {:?} removed, with its {} pattern(s)",
+            watch.name,
+            watch.patterns.len()
+        ),
+        None => println!("there is no watch called {name:?}"),
     }
     Ok(())
 }

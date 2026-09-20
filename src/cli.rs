@@ -16,7 +16,7 @@ use crate::{
     config::{Config, LogFormat, default_config_path},
     error::Result,
     store::Policy,
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 
 /// Default row cap for the listing commands.
@@ -202,16 +202,34 @@ impl From<PolicyArg> for Policy {
 #[derive(Debug, Subcommand)]
 pub enum WatchCommand {
     /// List every watch currently standing.
-    List,
+    List {
+        /// Print each watch's patterns as well as its name and count.
+        #[arg(long)]
+        patterns: bool,
+    },
 
-    /// Add a watch.
-    Create {
-        /// Regular expression to look for. Case-insensitive unless it says `(?-i)`.
-        pattern: String,
+    /// Create a watch, or replace what the one by that name holds.
+    Write {
+        /// Name for the rule. Writing again under the same name replaces it.
+        name: String,
+
+        /// Regular expression to look for. Case-insensitive unless it says `(?-i)`. Repeat for
+        /// several, and combine with `--patterns-file`.
+        #[arg(long = "pattern")]
+        patterns: Vec<String>,
+
+        /// Read patterns from a file, one per line. Blank lines and lines starting with `#` are
+        /// skipped, so a rules file can carry its own notes.
+        #[arg(long)]
+        patterns_file: Option<PathBuf>,
 
         /// Which part of a message to match against.
         #[arg(long, default_value = "text")]
         field: WatchFieldArg,
+
+        /// Whether one pattern firing is enough, or every one has to match.
+        #[arg(long = "match", default_value = "any")]
+        mode: WatchModeArg,
 
         /// Confine it to one conversation. Omit to watch every muted chat.
         #[arg(long)]
@@ -226,11 +244,30 @@ pub enum WatchCommand {
         reason: Option<String>,
     },
 
-    /// Remove a watch by id.
+    /// Remove a watch by name.
     Delete {
-        /// Watch id, as printed by `mekabridge watch list`.
-        id: i64,
+        /// Watch name, as printed by `mekabridge watch list`.
+        name: String,
     },
+}
+
+/// Mirrors `watch::WatchMode`, for the same reason [`WatchFieldArg`] mirrors `watch::WatchField`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum WatchModeArg {
+    /// Wake on any one pattern matching.
+    Any,
+    /// Wake only when every pattern matches.
+    All,
+}
+
+impl From<WatchModeArg> for WatchMode {
+    fn from(value: WatchModeArg) -> Self {
+        match value {
+            WatchModeArg::Any => Self::Any,
+            WatchModeArg::All => Self::All,
+        }
+    }
 }
 
 /// Mirrors `watch::WatchField` rather than deriving `ValueEnum` on it, so the matcher stays free of
@@ -418,25 +455,31 @@ async fn dispatch(command: Command, config: Config) -> Result<()> {
             }
         },
         Command::Watch { command } => match command {
-            WatchCommand::List => commands::watch_list(&config).await,
-            WatchCommand::Create {
-                pattern,
+            WatchCommand::List { patterns } => commands::watch_list(&config, patterns).await,
+            WatchCommand::Write {
+                name,
+                patterns,
+                patterns_file,
                 field,
+                mode,
                 conversation,
                 duration,
                 reason,
             } => {
-                commands::watch_create(
+                commands::watch_write(
                     &config,
-                    &pattern,
+                    &name,
+                    &patterns,
+                    patterns_file.as_deref(),
                     field.into(),
+                    mode.into(),
                     conversation.as_deref(),
                     duration.as_deref(),
                     reason.as_deref(),
                 )
                 .await
             }
-            WatchCommand::Delete { id } => commands::watch_delete(&config, id).await,
+            WatchCommand::Delete { name } => commands::watch_delete(&config, &name).await,
         },
         Command::History {
             conversation,

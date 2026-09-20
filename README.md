@@ -73,7 +73,7 @@ meka retries a failed MCP connect in the background, so the wrong order recovers
 | Attachments | `attachment_view`, `attachment_download` |
 | Address book | `conversation_list`, `conversation_get` |
 | Attention | `conversation_mute`, `conversation_unmute`, `conversation_block`, `conversation_unblock`, `backlog_check` |
-| Watches | `watch_create`, `watch_delete`, `watch_list` |
+| Watches | `watch_write`, `watch_delete`, `watch_list` |
 | History | `history_read`, `history_search` |
 | Moderation | `member_moderate`, `member_set_rights`, `member_set_roles`, `message_pin`, `chat_set`, `member_get`, `member_list` |
 

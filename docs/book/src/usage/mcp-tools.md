@@ -127,38 +127,33 @@ $ mekabridge policy list
 $ mekabridge policy clear telegram:-1001234567890
 ```
 
-## `watch_create`, `watch_delete`, and `watch_list`
+## `watch_write`, `watch_delete`, and `watch_list`
 
-Patterns that wake the agent in a conversation it has otherwise muted. The third reason a muted chat
-reaches it, after a mention and a reply, and the only one the agent sets itself.
+Named rules whose patterns wake the agent in a conversation it has otherwise muted. The third reason a muted chat reaches it, after a mention and a reply, and the only one the agent sets itself.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `pattern` | string | Regular expression. Case-insensitive unless it says `(?-i)` |
+| `name` | string | Identifies the rule. Writing again under the same name replaces what it holds |
+| `patterns` | array of strings | One or more regular expressions. Case-insensitive unless one says `(?-i)` |
+| `match` | string, optional | `any` (default) or `all` |
 | `field` | string, optional | `text` (default), `sender`, or `sender_id` |
 | `conversation` | string, optional | Confine it to one chat. Omit to watch every muted chat |
 | `duration` | string, optional | `2h`, `7d`. Omit to keep it until removed |
 | `reason` | string, optional | Shown back when it fires, and when listing |
 
-`watch_delete` takes an `id`, from `watch_list` or from the `woke you:` line that said a watch
-fired. `watch_list` takes nothing and returns every watch standing.
+`watch_delete` takes a `name`, from `watch_list` or from the `woke you:` line that said a watch fired. `watch_list` takes nothing and returns every watch standing, each with its patterns and a `pattern_count`.
 
-One watch reads one field, and the wake line names which matched. Setting the same
-`(conversation, field, pattern)` twice returns the watch already there rather than a second copy, so
-an agent syncing a rule list it keeps elsewhere can call `watch_create` for every rule every time.
+**`watch_write` is an upsert.** The call describes the whole rule, so a pattern list kept elsewhere syncs in one call and the reply says what moved (`1 added, 0 removed`), with `0 added, 0 removed` when the call changed nothing. That is what makes a rule editable: keying on the pattern, as 0.16.0 did, meant an edited pattern was a different watch and a sync left the old one orphaned beside the new.
 
-A match decides only that a message is **worth a turn**. What it means is judged in the turn it
-wakes, with the surrounding conversation already printed alongside it. That division is what lets
-the pattern be tuned for recall: too broad costs turns and is visible in the wake line, too narrow
-misses silently.
+A rule set is one watch, not one watch per spelling. Every pattern of a field compiles into a single automaton the message passes through once, so a hundred patterns cost what one costs.
 
-At most 500 watches, each at most 256 characters, matched with a linear-time engine so a badly
-written rule cannot hang the bridge. A pattern that will not compile is refused when it is set, with
-the error explaining why. Watches are consulted only under `mute`: a chat heard in full delivers the
-message anyway, and a blocked one keeps nothing to match.
+**`match: all`** fires only when every pattern matches, anywhere in the field and in any order. It is how to say "these terms together", since the engine refuses lookaround (`(?=.*A)(?=.*B)`) outright, which is what guarantees a pattern cannot take super-linear time on a crafted message. On `sender`, which is two strings, `all` asks that each pattern match the field rather than the same string.
 
-`mekabridge watch list`, `mekabridge watch create` and `mekabridge watch delete` are the operator's
-side of the same controls. See [Group attention](./group-attention.md#watches).
+A match decides only that a message is **worth a turn**. What it means is judged in the turn it wakes, with the surrounding conversation already printed alongside it. That division is what lets the patterns be tuned for recall: too broad costs turns and is visible in the wake line, too narrow misses silently.
+
+At most 500 watches and 2000 patterns across them, each at most 256 characters, matched with a linear-time engine so a badly written rule cannot hang the bridge. A pattern that will not compile is refused when it is written, and the refusal names the pattern rather than the rule.
+
+`mekabridge watch list`, `mekabridge watch write` and `mekabridge watch delete` are the operator's side of the same controls, with `--patterns-file` for a rule set kept in a file. See [Group attention](./group-attention.md#watches).
 
 ## `backlog_check`
 

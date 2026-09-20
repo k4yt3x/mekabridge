@@ -38,8 +38,9 @@ Every message from a chat that is not one-to-one carries a `woke you:` line:
 woke you: you were named
 woke you: you were named, or this replies to something you said
 woke you: nothing here named you; this chat was being heard in full when it arrived
-woke you: this matched your watch #12 (`看我简介`, spam signature) in the text
-woke you: you were named, and this matched your watch #12 (`看我简介`)
+woke you: this matched your watch "spam-signatures" (`看我简介`, spam signature) in the text
+woke you: this matched your watch "pump-and-dump" (all 3 patterns) in the text
+woke you: you were named, and this matched your watch "deploys" (`deploy`)
 ```
 
 The third is written in the past tense on purpose. It reports why the message was delivered, which
@@ -82,7 +83,7 @@ A look-back is for one conversation the agent is already in the middle of. A wat
 wakes the agent in a room it has otherwise turned down, whenever a message matches a pattern it set.
 
 ```
-watch_create(pattern: "rolling back|rollback", reason: "I own this deploy")
+watch_write(name: "my-deploy", patterns: ["rolling back", "rollback"], reason: "I own this deploy")
 ```
 
 See [Watches](#watches) below.
@@ -148,26 +149,61 @@ and it is the exact confusion the notice exists to prevent.
 
 ## Watches
 
-A watch is a pattern that wakes the agent in a conversation it has otherwise turned down. It is the
-keyword notification every chat client has, and it exists for the same reason: mentions-only is the
-right default for a busy room and the wrong one for the two or three things in that room you would
-always want to know about.
+A watch is a **named rule**: one or more patterns that wake the agent in a conversation it has
+otherwise turned down. It is the keyword notification every chat client has, and it exists for the
+same reason: mentions-only is the right default for a busy room and the wrong one for the two or
+three things in that room you would always want to know about.
 
 ```
-watch_create(pattern: "看我简介", reason: "spam signature")
-watch_create(pattern: "^432688118$", field: "sender_id", conversation: "telegram:-1001234567890")
+watch_write(name: "spam-signatures", patterns: ["看我简介", "跑分", "日入过万"], reason: "spam")
+watch_write(name: "the-owner", patterns: ["^432688118$"], field: "sender_id",
+            conversation: "telegram:-1001234567890")
 ```
 
 | Argument | Meaning |
 |----------|---------|
-| `pattern` | Regular expression. Case-insensitive unless it says `(?-i)` |
-| `field` | What it reads: `text` (default), `sender`, or `sender_id` |
+| `name` | What identifies the rule. Writing again under the same name replaces what it holds |
+| `patterns` | One or more regular expressions. Case-insensitive unless a pattern says `(?-i)` |
+| `match` | `any` (default): one pattern firing is enough. `all`: every pattern must match |
+| `field` | What they read: `text` (default), `sender`, or `sender_id` |
 | `conversation` | Confine it to one chat. Omit to watch every muted chat |
 | `duration` | `2h`, `7d`. Omit to keep it until it is removed |
 | `reason` | Shown back when it fires, and when listing |
 
-`watch_list` shows what is standing, and `watch_delete` takes the id off it, or off the line that
+`watch_list` shows what is standing, and `watch_delete` takes the name off it, or off the line that
 said a watch fired.
+
+### One rule, many spellings
+
+A rule set is one reason to wake written several ways, so it is one watch. A hundred patterns cost
+what one costs: every pattern of a field compiles into a single automaton that the message is
+passed through once, so the count affects what you have to read, not what the bridge has to do.
+
+That is also why the name matters. It is the identity, so a rules file you keep elsewhere syncs in
+one call and the reply says what actually moved:
+
+```
+Updated watch "spam-signatures": 67 patterns, in the text of every muted conversation. 1 added, 0 removed.
+```
+
+Writing the same rule twice reports `0 added, 0 removed`, which is how a sync that had nothing to do
+says so. Nothing is orphaned, because the name is what the write lands on.
+
+### `any` and `all`
+
+`any` is a list of spellings for one thing, and the wake line names the spelling that hit.
+
+`all` fires only when every pattern matches, anywhere in the field and in any order. It is how you
+say "these terms together": the obvious spelling for that is lookahead, `(?=.*A)(?=.*B)`, and the
+engine here refuses lookaround outright, that refusal being what guarantees a rule cannot take
+super-linear time on a message somebody crafts. Saying it in the rule keeps both.
+
+```
+watch_write(name: "pump-and-dump", patterns: ["购买", "止盈", "止损"], match: "all")
+```
+
+On `sender`, which is two strings, `all` asks that every pattern match **the field** rather than the
+same string, so a rule may take one term from the display name and another from the username.
 
 ### One watch reads one field
 
@@ -175,10 +211,14 @@ said a watch fired.
 of which counts, because which of the two a person is known by differs by platform. `sender_id` is
 the platform id, which is how you follow one person rather than a turn of phrase.
 
-A rule inspects one of them, and the `woke you:` line says which matched. A watch that read
-everything would fire on a message whose body has nothing in it and leave the agent hunting for
-words that are only in somebody's display name. Two fields means two watches, each reporting for
-itself.
+A rule inspects one of them, and the `woke you:` line says which matched:
+
+```
+woke you: this matched your watch "spam-signatures" (`跑分`, spam) in the text
+woke you: this matched your watch "pump-and-dump" (all 3 patterns) in the text
+woke you: this matched your watches "spam-signatures" (`跑分`), "newcomers" (`^hi$`) and 1 more
+woke you: you were named, and this matched your watch "deploys" (`deploy`)
+```
 
 ### What a watch is not
 
@@ -195,10 +235,16 @@ workspace rather than here.
 
 ### Limits
 
-At most 500 watches, each pattern at most 256 characters. Patterns are matched with the `regex`
-crate, which is linear in the length of the message whatever the pattern does, so a rule the agent
-wrote badly cannot hang the bridge. One that will not compile is refused when it is set, with the
-error that explains why.
+At most 500 watches and 2000 patterns across all of them, each pattern at most 256 characters, and a
+name at most 64. Patterns are matched with the `regex` crate, which is linear in the length of the
+message whatever the pattern does, so a rule the agent wrote badly cannot hang the bridge. One that
+will not compile is refused when it is written, and the refusal names the pattern rather than the
+rule, so a list of a hundred does not have to be bisected by hand.
+
+A stored pattern that stops compiling (which means a hand-edited database) is skipped under `any`,
+where it only costs one of several ways to fire. Under `all` the whole watch is disabled instead,
+because dropping a term there would leave a rule that fires on strictly more than it was written
+for.
 
 Watches are consulted **only** where a conversation is on `mute`. In a chat heard in full every
 message already arrives, and a blocked chat keeps nothing to match against, so in both a watch would
@@ -210,14 +256,15 @@ The same way back as for policies, and for the same reason: the agent sets these
 that fires on everything is expensive to leave standing.
 
 ```console
-$ mekabridge watch list
-$ mekabridge watch create '看我简介' --reason 'spam signature'
-$ mekabridge watch create 'deploy' --field sender --conversation telegram:-1001234567890
-$ mekabridge watch delete 3
+$ mekabridge watch list [--patterns]
+$ mekabridge watch write spam-signatures --patterns-file ./rules/spam.txt --reason 'spam'
+$ mekabridge watch write pump --match all --pattern '购买' --pattern '止盈' --pattern '止损'
+$ mekabridge watch delete spam-signatures
 ```
 
-A change from either side is picked up by a running bridge within a couple of seconds, without a
-restart.
+`--patterns-file` reads one pattern per line, skipping blank lines and `#` comments, so a rule set
+can live in a file under version control and be diffed. It combines with `--pattern`. A change from
+either side is picked up by a running bridge within a couple of seconds, without a restart.
 
 ## `mekabridge unseen`
 

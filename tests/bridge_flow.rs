@@ -43,7 +43,7 @@ use mekabridge::{
         AccountId, AccountIdentity, ConversationRecord, HandOver, MessageKey, NewWatch, Policy,
         QueueState, QueueStats, Store, WatchOutcome,
     },
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -3193,12 +3193,14 @@ async fn a_watch_wakes_a_muted_group_exactly_once_and_names_the_rule() {
         .expect("mute");
     harness
         .store
-        .add_watch(
+        .write_watch(
             NewWatch {
+                name: "spam-signatures",
                 conversation: None,
                 platform: None,
                 field: WatchField::Text,
-                pattern: "看我简介",
+                mode: WatchMode::Any,
+                patterns: &["看我简介".to_string()],
                 until: None,
                 reason: Some("spam signature"),
             },
@@ -3236,7 +3238,8 @@ async fn a_watch_wakes_a_muted_group_exactly_once_and_names_the_rule() {
     let item = &items[0];
     assert!(
         item.contains(
-            "woke you: this matched your watch #1 (`看我简介`, spam signature) in the text"
+            "woke you: this matched your watch \"spam-signatures\" (`看我简介`, spam signature) in \
+             the text"
         ),
         "the agent has to be told which rule woke it:\n{item}"
     );
@@ -3259,6 +3262,147 @@ async fn a_watch_wakes_a_muted_group_exactly_once_and_names_the_rule() {
 }
 
 #[tokio::test]
+async fn one_watch_of_many_patterns_wakes_the_agent_once_and_names_the_term() {
+    // The shape a real rule set has: one rule, many spellings. Before 0.17.0 this was a hundred
+    // watches, a hundred ids, and the same reason written a hundred times.
+    let harness = Harness::start().await;
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            "telegram",
+            Policy::Mute,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    let patterns: Vec<String> = ["看我简介", "跑分", "日入过万", "兼职"]
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+    harness
+        .store
+        .write_watch(
+            NewWatch {
+                name: "spam-signatures",
+                conversation: None,
+                platform: None,
+                field: WatchField::Text,
+                mode: WatchMode::Any,
+                patterns: &patterns,
+                until: None,
+                reason: Some("spam signature"),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+
+    harness
+        .sender
+        .send(group_message("morning everyone", "1", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.items().is_empty(),
+        "nothing matched: {:?}",
+        harness.items()
+    );
+
+    harness
+        .sender
+        .send(group_message("想赚钱就来跑分", "2", false))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn the rule woke", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+
+    let items = harness.items();
+    assert_eq!(items.len(), 1, "one rule, one turn: {items:?}");
+    assert!(
+        items[0].contains("this matched your watch \"spam-signatures\" (`跑分`, spam signature)"),
+        "the rule and the term that hit both belong on the line:\n{}",
+        items[0]
+    );
+}
+
+#[tokio::test]
+async fn an_all_watch_stays_quiet_until_every_term_is_present() {
+    // The rule that replaces the lookahead the engine refuses. Half of it arriving must not be
+    // enough, or the feature would be a more expensive `any`.
+    let harness = Harness::start().await;
+    harness
+        .store
+        .set_policy(
+            "mock:-100",
+            "telegram",
+            Policy::Mute,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("mute");
+    let patterns: Vec<String> = ["购买", "止盈", "止损"]
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+    harness
+        .store
+        .write_watch(
+            NewWatch {
+                name: "pump-and-dump",
+                conversation: None,
+                platform: None,
+                field: WatchField::Text,
+                mode: WatchMode::All,
+                patterns: &patterns,
+                until: None,
+                reason: None,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("watch");
+
+    harness
+        .sender
+        .send(group_message("现在购买 设好止盈", "1", false))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.items().is_empty(),
+        "two terms of three must not wake it: {:?}",
+        harness.items()
+    );
+
+    harness
+        .sender
+        .send(group_message("止损 设好了 现在购买 记得止盈", "2", false))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn every term woke", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+    let items = harness.items();
+    assert_eq!(items.len(), 1, "got {items:?}");
+    assert!(
+        items[0].contains("this matched your watch \"pump-and-dump\" (all 3 patterns)"),
+        "the line has to say the rule took every term:\n{}",
+        items[0]
+    );
+}
+
+#[tokio::test]
 async fn a_watch_on_the_sender_reads_the_name_rather_than_the_message() {
     // The field is part of the rule, and the wake line says which one read. A name-matching rule
     // reported as a text match would send the agent looking for words that are not there.
@@ -3277,12 +3421,14 @@ async fn a_watch_on_the_sender_reads_the_name_rather_than_the_message() {
         .expect("mute");
     harness
         .store
-        .add_watch(
+        .write_watch(
             NewWatch {
+                name: "spammy-names",
                 conversation: None,
                 platform: None,
                 field: WatchField::Sender,
-                pattern: "free ?money",
+                mode: WatchMode::Any,
+                patterns: &["free ?money".to_string()],
                 until: None,
                 reason: None,
             },
@@ -3331,12 +3477,14 @@ async fn a_watch_confined_to_one_chat_does_not_wake_the_agent_in_another() {
     }
     harness
         .store
-        .add_watch(
+        .write_watch(
             NewWatch {
+                name: "deploys-here",
                 conversation: Some("mock:-200"),
                 platform: Some("telegram"),
                 field: WatchField::Text,
-                pattern: "deploy",
+                mode: WatchMode::Any,
+                patterns: &["deploy".to_string()],
                 until: None,
                 reason: None,
             },
@@ -3377,12 +3525,14 @@ async fn removing_a_watch_makes_the_room_quiet_again() {
         .expect("mute");
     let outcome = harness
         .store
-        .add_watch(
+        .write_watch(
             NewWatch {
+                name: "deploys",
                 conversation: None,
                 platform: None,
                 field: WatchField::Text,
-                pattern: "deploy",
+                mode: WatchMode::Any,
+                patterns: &["deploy".to_string()],
                 until: None,
                 reason: None,
             },
@@ -3390,7 +3540,7 @@ async fn removing_a_watch_makes_the_room_quiet_again() {
         )
         .await
         .expect("watch");
-    let WatchOutcome::Added(record) = outcome else {
+    let WatchOutcome::Created(record) = outcome else {
         panic!("the watch must be added");
     };
 
@@ -3408,7 +3558,7 @@ async fn removing_a_watch_makes_the_room_quiet_again() {
 
     harness
         .store
-        .remove_watch(record.id)
+        .remove_watch(&record.name)
         .await
         .expect("remove")
         .expect("the row");

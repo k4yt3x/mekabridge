@@ -62,7 +62,7 @@ mute_context = 5
 # What reaches the agent from a conversation nobody has ruled on, by kind of chat:
 #
 #   active  every message wakes the agent
-#   mute    everything is recorded, but only a mention, a reply, or a pattern the agent is
+#   mute    everything is recorded, but only a mention, a reply, or a rule the agent is
 #           watching for wakes it (see `mekabridge watch`)
 #   block   nothing is delivered and nothing is kept
 #

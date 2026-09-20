@@ -27,7 +27,7 @@ use mekabridge::{
         MemberCoverage, MemberInfo, MemberListing, MemberRight, OutboundSink, Policy, SendOptions,
         SinkError, ToolSurface, UnseenSummary, ViewedAttachment, WatchOutcome, WatchRecord, serve,
     },
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 use rmcp2::{
     ServiceExt,
@@ -308,10 +308,13 @@ impl OutboundSink for RecordingSink {
         })
     }
 
-    async fn watch_create(
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_write(
         &self,
-        pattern: &str,
+        name: &str,
+        patterns: &[String],
         field: WatchField,
+        mode: WatchMode,
         conversation: Option<&str>,
         until: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
@@ -322,23 +325,37 @@ impl OutboundSink for RecordingSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = WatchRecord {
             id: watches.len() as i64 + 1,
+            name: name.to_string(),
             conversation: conversation.map(str::to_string),
             field,
-            pattern: pattern.to_string(),
+            mode,
+            patterns: patterns.to_vec(),
             reason: reason.map(str::to_string),
             until,
             created_at: chrono::Utc::now(),
         };
-        watches.push(record.clone());
-        Ok(WatchOutcome::Added(record))
+        match watches.iter().position(|watch| watch.name == name) {
+            Some(position) => {
+                watches[position] = record.clone();
+                Ok(WatchOutcome::Updated {
+                    record,
+                    added: 0,
+                    removed: 0,
+                })
+            }
+            None => {
+                watches.push(record.clone());
+                Ok(WatchOutcome::Created(record))
+            }
+        }
     }
 
-    async fn watch_delete(&self, id: i64) -> Result<Option<WatchRecord>, SinkError> {
+    async fn watch_delete(&self, name: &str) -> Result<Option<WatchRecord>, SinkError> {
         let mut watches = self
             .watches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let position = watches.iter().position(|watch| watch.id == id);
+        let position = watches.iter().position(|watch| watch.name == name);
         Ok(position.map(|position| watches.remove(position)))
     }
 
@@ -561,9 +578,9 @@ async fn turning_off_admin_tools_removes_exactly_those() {
         "message_edit",
         "message_react",
         "message_send",
-        "watch_create",
         "watch_delete",
         "watch_list",
+        "watch_write",
     ]);
 
     client.cancel().await.expect("clean shutdown");
@@ -601,9 +618,9 @@ async fn all_tools_are_visible_to_an_older_client() {
         "message_pin",
         "message_react",
         "message_send",
-        "watch_create",
         "watch_delete",
         "watch_list",
+        "watch_write",
     ]);
 
     for tool in &tools {
@@ -788,10 +805,12 @@ async fn the_watch_tools_round_trip_across_the_version_gap() {
 
     let result = client
         .call_tool(tool_params(
-            "watch_create",
+            "watch_write",
             serde_json::json!({
-                "pattern": "^432688118$",
+                "name": "the-owner",
+                "patterns": ["^432688118$", "^432688119$"],
                 "field": "sender_id",
+                "match": "any",
                 "conversation": "telegram:1",
                 "reason": "the owner"
             }),
@@ -810,13 +829,22 @@ async fn the_watch_tools_round_trip_across_the_version_gap() {
         .filter_map(|block| block.as_text().map(|text| text.text.clone()))
         .collect::<String>();
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(parsed[0]["name"], "the-owner", "got: {text}");
     assert_eq!(parsed[0]["field"], "sender_id", "got: {text}");
+    assert_eq!(parsed[0]["match"], "any", "got: {text}");
     assert_eq!(parsed[0]["conversation"], "telegram:1", "got: {text}");
+    // The list has to survive as a list: a client that flattened it would turn a rule the agent
+    // can edit into one long alternation it cannot.
+    assert_eq!(
+        parsed[0]["patterns"].as_array().map(Vec::len),
+        Some(2),
+        "got: {text}"
+    );
 
     let removed = client
         .call_tool(tool_params(
             "watch_delete",
-            serde_json::json!({"id": parsed[0]["id"]}),
+            serde_json::json!({"name": "the-owner"}),
         ))
         .await
         .expect("the call must succeed");

@@ -170,6 +170,11 @@ not restricted.
 | `moderate_member` | `member_moderate` | | `set_member_rights` | `member_set_rights` |
 | `set_member_roles` | `member_set_roles` | | | |
 
+0.17.0 renamed one more: `watch_create` became **`watch_write`**, and it now takes `name` and a
+`patterns` array rather than a single `pattern`. A watch is a named rule holding many patterns, so
+writing under a name that exists replaces it. Watches stored by 0.16.0 are kept and named
+`watch-<id>`; rewrite them under a better name when convenient.
+
 The agent's own history is the other half. A session that has been running across the upgrade has
 old names in its transcript and may reach for one; meka answers with a "did you mean" hint that
 catches reordered words, so `send_message` points at `message_send`. Nothing needs to be reset.
@@ -202,7 +207,7 @@ conversational surface works at `read`:
 | Attachments | `attachment_view`, `attachment_download` |
 | Address book | `conversation_list`, `conversation_get` |
 | Attention | `conversation_mute`, `conversation_unmute`, `conversation_block`, `conversation_unblock`, `backlog_check` |
-| Watches | `watch_create`, `watch_delete`, `watch_list` |
+| Watches | `watch_write`, `watch_delete`, `watch_list` |
 | History | `history_read`, `history_search` |
 | Moderation | `member_moderate`, `member_set_rights`, `member_set_roles`, `message_pin`, `chat_set`, `member_get`, `member_list` |
 

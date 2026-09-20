@@ -3061,12 +3061,14 @@ allowed_users = [1]
         // addressed, and a rule the agent set that makes it worth a turn anyway.
         let store = muted_store("telegram:-100").await;
         store
-            .add_watch(
+            .write_watch(
                 crate::store::NewWatch {
+                    name: "rule-1",
                     conversation: None,
                     platform: None,
                     field: crate::watch::WatchField::Text,
-                    pattern: "deploy",
+                    mode: crate::watch::WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: Some("releases"),
                 },
@@ -3110,12 +3112,14 @@ allowed_users = [1]
         // is visible rather than hidden behind the mention that would have woken the agent anyway.
         let store = muted_store("telegram:-100").await;
         store
-            .add_watch(
+            .write_watch(
                 crate::store::NewWatch {
+                    name: "rule-2",
                     conversation: None,
                     platform: None,
                     field: crate::watch::WatchField::Text,
-                    pattern: "deploy",
+                    mode: crate::watch::WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -3143,12 +3147,14 @@ allowed_users = [1]
         // work with no decision attached and a `matches` line that explained nothing.
         let store = Store::open_in_memory().await.expect("opens");
         store
-            .add_watch(
+            .write_watch(
                 crate::store::NewWatch {
+                    name: "rule-3",
                     conversation: None,
                     platform: None,
                     field: crate::watch::WatchField::Text,
-                    pattern: "deploy",
+                    mode: crate::watch::WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -3213,12 +3219,14 @@ allowed_users = [1]
         // has to notice it without being restarted.
         let store = muted_store("telegram:-100").await;
         let outcome = store
-            .add_watch(
+            .write_watch(
                 crate::store::NewWatch {
+                    name: "rule-4",
                     conversation: None,
                     platform: None,
                     field: crate::watch::WatchField::Text,
-                    pattern: "deploy",
+                    mode: crate::watch::WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -3226,14 +3234,14 @@ allowed_users = [1]
             )
             .await
             .expect("add");
-        let crate::store::WatchOutcome::Added(record) = outcome else {
+        let crate::store::WatchOutcome::Created(record) = outcome else {
             panic!("must add");
         };
         let mut watches = Watches::default();
         let (disposition, _) = gated(&store, &mut watches, "telegram:-100", "deploy", false).await;
         assert_eq!(disposition, Disposition::Deliver);
 
-        store.remove_watch(record.id).await.expect("remove");
+        store.remove_watch(&record.name).await.expect("remove");
         let (disposition, matched) =
             gated(&store, &mut watches, "telegram:-100", "deploy", false).await;
         assert_eq!(disposition, Disposition::Withhold, "got {matched:?}");

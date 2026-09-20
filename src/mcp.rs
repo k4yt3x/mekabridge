@@ -26,7 +26,7 @@ pub use crate::{
         MemberListing, MemberRight, SendOptions,
     },
     store::{Policy, UnseenSummary, WatchOutcome, WatchRecord},
-    watch::WatchField,
+    watch::{WatchField, WatchMode},
 };
 
 /// Orientation handed to the agent at connect time, carrying only what nothing else can tell it.
@@ -46,7 +46,7 @@ mekabridge connects you to people on Telegram and Discord.
 Not every message wakes you. A busy group is often on mentions only, whether or not you asked for \
 that: there, only somebody naming you, replying to something you said, or matching a watch you set \
 gets through, and somebody answering you in ordinary prose does not. What did not wake you is still \
-recorded, and history_read and history_search reach it. watch_create is how you add a reason of \
+recorded, and history_read and history_search reach it. watch_write is how you add a reason of \
 your own.
 
 Each message here arrives as its own block: header lines, then its text inside a fence: \
@@ -192,18 +192,21 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// `conversation` narrows to one chat; `None` asks about everything the bridge holds.
     async fn backlog_check(&self, conversation: Option<&str>) -> Result<UnseenSummary, SinkError>;
 
-    /// Set a watch, or report the one already standing for the same rule.
-    async fn watch_create(
+    /// Create a named watch, or replace what the one by that name holds.
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_write(
         &self,
-        pattern: &str,
+        name: &str,
+        patterns: &[String],
         field: WatchField,
+        mode: WatchMode,
         conversation: Option<&str>,
         until: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
     ) -> Result<WatchOutcome, SinkError>;
 
-    /// Remove a watch by id. `None` means there was no such watch.
-    async fn watch_delete(&self, id: i64) -> Result<Option<WatchRecord>, SinkError>;
+    /// Remove a watch by name. `None` means there was no such watch.
+    async fn watch_delete(&self, name: &str) -> Result<Option<WatchRecord>, SinkError>;
 
     /// Every watch currently standing, oldest first.
     async fn watch_list(&self) -> Result<Vec<WatchRecord>, SinkError>;
@@ -277,8 +280,15 @@ const fn is_zero(count: &u64) -> bool {
 /// field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WatchSummary {
-    pub id: i64,
-    pub pattern: String,
+    /// What the agent refers to this rule by, and what the wake line prints.
+    pub name: String,
+    /// In the order they were written, which is the order a reported hit is taken from.
+    pub patterns: Vec<String>,
+    /// Alongside the list, so a long rule can be counted without being read.
+    pub pattern_count: usize,
+    /// `any` or `all`.
+    #[serde(rename = "match")]
+    pub mode: String,
     /// `text`, `sender`, or `sender_id`.
     pub field: String,
     /// The conversation it is confined to, or `every muted conversation`.
@@ -294,8 +304,10 @@ pub struct WatchSummary {
 impl From<WatchRecord> for WatchSummary {
     fn from(record: WatchRecord) -> Self {
         Self {
-            id: record.id,
-            pattern: record.pattern,
+            name: record.name,
+            pattern_count: record.patterns.len(),
+            patterns: record.patterns,
+            mode: record.mode.as_str().to_string(),
             field: record.field.as_str().to_string(),
             conversation: record
                 .conversation
@@ -717,9 +729,17 @@ pub struct UnmuteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WatchCreateArgs {
-    /// Regular expression to look for. Case-insensitive unless you write `(?-i)`.
-    pub pattern: String,
+pub struct WatchWriteArgs {
+    /// Name for this rule, which is how you refer to it afterwards. Writing again under the same
+    /// name replaces what it holds, so this is how you keep a watch in step with a rule list you
+    /// maintain elsewhere.
+    pub name: String,
+    /// Regular expressions to look for, case-insensitive unless you write `(?-i)`. At least one.
+    pub patterns: Vec<String>,
+    /// `any` (the default) fires when one pattern matches; `all` only when every one of them does,
+    /// in any order and anywhere in the field.
+    #[serde(default, rename = "match")]
+    pub mode: Option<WatchModeArg>,
     /// Which part of a message to read: `text` (the default), `sender` for the display name and
     /// username, or `sender_id` for the platform id.
     #[serde(default)]
@@ -755,10 +775,27 @@ impl From<WatchFieldArg> for WatchField {
     }
 }
 
+/// Mirrors [`WatchMode`], for the same reason [`WatchFieldArg`] mirrors [`WatchField`].
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchModeArg {
+    Any,
+    All,
+}
+
+impl From<WatchModeArg> for WatchMode {
+    fn from(value: WatchModeArg) -> Self {
+        match value {
+            WatchModeArg::Any => Self::Any,
+            WatchModeArg::All => Self::All,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WatchDeleteArgs {
-    /// Id of the watch to remove, from watch_list or from the line that said it fired.
-    pub id: i64,
+    /// Name of the watch to remove, from watch_list or from the line that said it fired.
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1741,75 +1778,100 @@ impl BridgeMcpServer {
         .await
     }
 
-    /// Watch for a pattern in a muted conversation.
+    /// Set a named watch in a muted conversation.
     #[tool(
         description = "Be woken by a word in a chat you have otherwise muted, the way a keyword \
-                       notification works in any chat client. `pattern` is a regular expression, \
-                       case-insensitive unless you write `(?-i)`, and `field` chooses what it \
-                       reads: the message `text` by default, `sender` for the display name and \
+                       notification works in any chat client. `name` identifies the rule: writing \
+                       again under the same name replaces what it holds, so a rule list you keep \
+                       elsewhere syncs in one call. `patterns` is one or more regular expressions, \
+                       case-insensitive unless you write `(?-i)`, and `match` decides how they \
+                       combine: `any` wakes you when one of them matches, `all` only when every \
+                       one does, anywhere in the field and in any order. `field` chooses what they \
+                       read: the message `text` by default, `sender` for the display name and \
                        username, or `sender_id` for the platform id, which is how you follow one \
                        person rather than a turn of phrase. Scope it to one chat with \
-                       `conversation`, or leave that off to watch every muted chat. Setting the \
-                       same rule twice returns the watch you already have rather than a second \
-                       copy. A match only decides that a message is worth a turn: what it means is \
-                       still yours to judge when you read it.",
-        annotations(title = "Create watch", read_only_hint = true, open_world_hint = false)
+                       `conversation`, or leave that off to watch every muted chat. A match only \
+                       decides that a message is worth a turn: what it means is still yours to \
+                       judge when you read it.",
+        annotations(title = "Write watch", read_only_hint = true, open_world_hint = false)
     )]
-    async fn watch_create(
+    async fn watch_write(
         &self,
-        Parameters(args): Parameters<WatchCreateArgs>,
+        Parameters(args): Parameters<WatchWriteArgs>,
     ) -> Result<CallToolResult, McpError> {
         let until = match parse_duration(args.duration.as_deref()) {
             Ok(until) => until,
             Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         };
         let field = args.field.map_or(WatchField::Text, WatchField::from);
+        let mode = args.mode.map_or(WatchMode::Any, WatchMode::from);
         let outcome = self
             .sink
-            .watch_create(
-                &args.pattern,
+            .watch_write(
+                &args.name,
+                &args.patterns,
                 field,
+                mode,
                 args.conversation.as_deref(),
                 until,
                 args.reason.as_deref(),
             )
             .await;
-        let (record, added) = match outcome {
-            Ok(WatchOutcome::Added(record)) => (record, true),
-            Ok(WatchOutcome::Existing(record)) => (record, false),
-            Ok(WatchOutcome::AtCapacity(held)) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "You already have {held} watches, which is the most this bridge holds. Remove \
-                     one with watch_delete before adding another; watch_list shows them."
-                ))]));
+        let (record, movement) = match outcome {
+            Ok(WatchOutcome::Created(record)) => (record, None),
+            Ok(WatchOutcome::Updated {
+                record,
+                added,
+                removed,
+            }) => (record, Some((added, removed))),
+            // The store understood and declined, so its sentence is the answer rather than a
+            // fault: it names the ceiling that was reached or the pattern that will not compile.
+            Ok(WatchOutcome::Refused(why)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(why)]));
             }
             Err(error) => return Ok(sink_failure(&error)),
         };
-        let verb = if added {
-            "Watching"
-        } else {
-            "Already watching"
-        };
+        let scope = record
+            .conversation
+            .as_deref()
+            .unwrap_or("every muted conversation");
         let lapses = match record.until {
             Some(until) => format!(", until {}", until.to_rfc3339()),
             None => String::new(),
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "{verb} for `{}` in the {} of {}{lapses}, as watch #{}. It wakes you only where a \
-             conversation is muted; a chat you hear in full already reaches you.",
-            record.pattern,
-            record.field.as_str(),
-            record
-                .conversation
-                .as_deref()
-                .unwrap_or("every muted conversation"),
-            record.id
-        ))]))
+        let patterns = if record.patterns.len() == 1 {
+            "1 pattern".to_string()
+        } else {
+            format!("{} patterns", record.patterns.len())
+        };
+        let combining = match record.mode {
+            WatchMode::Any => String::new(),
+            WatchMode::All => ", all of which must match".to_string(),
+        };
+        let summary = match movement {
+            None => format!(
+                "Created watch \"{}\": {patterns}{combining}, in the {} of {scope}{lapses}. It \
+                 wakes you only where a conversation is muted; a chat you hear in full already \
+                 reaches you.",
+                record.name,
+                record.field.as_str()
+            ),
+            // The counts are the point of writing again: an agent syncing a list it keeps
+            // elsewhere calls this every time, and "0 added, 0 removed" is how it learns the call
+            // changed nothing.
+            Some((added, removed)) => format!(
+                "Updated watch \"{}\": {patterns}{combining}, in the {} of {scope}{lapses}. \
+                 {added} added, {removed} removed.",
+                record.name,
+                record.field.as_str()
+            ),
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
     }
 
-    /// Stop watching for a pattern.
+    /// Stop watching.
     #[tool(
-        description = "Remove a watch by id, so its pattern stops waking you. The id is on the \
+        description = "Remove a watch by name, so its patterns stop waking you. The name is on the \
                        line that told you a watch fired, and in watch_list. Removing a watch \
                        changes nothing else about the conversation: a muted chat still reaches you \
                        when somebody names you or replies to you.",
@@ -1819,15 +1881,16 @@ impl BridgeMcpServer {
         &self,
         Parameters(args): Parameters<WatchDeleteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.sink.watch_delete(args.id).await {
+        match self.sink.watch_delete(&args.name).await {
             Ok(Some(record)) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Removed watch #{}; `{}` no longer wakes you.",
-                record.id, record.pattern
+                "Removed watch \"{}\" and its {} pattern(s); it no longer wakes you.",
+                record.name,
+                record.patterns.len()
             ))])),
             Ok(None) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "There is no watch #{}. It may have lapsed, or already been removed; watch_list \
-                 shows the ones still standing.",
-                args.id
+                "There is no watch called \"{}\". It may have lapsed, or already been removed; \
+                 watch_list shows the ones still standing.",
+                args.name
             ))])),
             Err(error) => Ok(sink_failure(&error)),
         }
@@ -1835,10 +1898,10 @@ impl BridgeMcpServer {
 
     /// List the watches in force.
     #[tool(
-        description = "List the patterns you are watching for, with the id, field and scope of \
-                       each, and why you set it. Read it before adding a rule, to see whether one \
+        description = "List the rules you are watching for: the name, patterns, field and scope of \
+                       each, and why you set it. Read it before writing a rule, to see whether one \
                        already covers what you are about to write, and when a watch is waking you \
-                       too often, to find the id to remove.",
+                       too often, to find the name to narrow or remove.",
         annotations(title = "List watches", read_only_hint = true, open_world_hint = false)
     )]
     async fn watch_list(&self) -> Result<CallToolResult, McpError> {
@@ -1846,8 +1909,8 @@ impl BridgeMcpServer {
             Ok(watches) if watches.is_empty() => {
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     "No watches. A muted conversation currently reaches you only when somebody \
-                     names you or replies to something you said; watch_create adds a pattern that \
-                     wakes you as well.",
+                     names you or replies to something you said; watch_write adds patterns that \
+                     wake you as well.",
                 )]))
             }
             Ok(watches) => Ok(json_result(
@@ -2210,7 +2273,7 @@ mod tests {
         sessions: Mutex<Vec<Option<String>>>,
         /// Watches this sink pretends to hold, and the ones it was asked to add.
         watches: Mutex<Vec<WatchRecord>>,
-        /// Forced outcome for the next `watch_create`, for the capacity path that would otherwise
+        /// Forced outcome for the next `watch_write`, for the capacity path that would otherwise
         /// need five hundred rows to reach.
         watches_full: Option<usize>,
     }
@@ -2556,10 +2619,12 @@ mod tests {
             })
         }
 
-        async fn watch_create(
+        async fn watch_write(
             &self,
-            pattern: &str,
+            name: &str,
+            patterns: &[String],
             field: WatchField,
+            mode: WatchMode,
             conversation: Option<&str>,
             until: Option<chrono::DateTime<chrono::Utc>>,
             reason: Option<&str>,
@@ -2567,35 +2632,61 @@ mod tests {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            crate::watch::compile_pattern(pattern).map_err(SinkError::Delivery)?;
+            if let Err(why) = crate::watch::validate_name(name) {
+                return Ok(WatchOutcome::Refused(why));
+            }
+            for pattern in patterns {
+                if let Err(why) = crate::watch::compile_pattern(pattern) {
+                    return Ok(WatchOutcome::Refused(format!(
+                        "the pattern {pattern:?} cannot be used: {why}"
+                    )));
+                }
+            }
             if let Some(held) = self.watches_full {
-                return Ok(WatchOutcome::AtCapacity(held));
+                return Ok(WatchOutcome::Refused(format!(
+                    "there are already {held} watches, which is the most this bridge holds; \
+                     remove one before adding another"
+                )));
             }
             let mut watches = self
                 .watches
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = watches.iter().find(|watch| {
-                watch.pattern == pattern
-                    && watch.field == field
-                    && watch.conversation.as_deref() == conversation
-            }) {
-                return Ok(WatchOutcome::Existing(existing.clone()));
-            }
             let record = WatchRecord {
                 id: watches.len() as i64 + 1,
+                name: name.to_string(),
                 conversation: conversation.map(str::to_string),
                 field,
-                pattern: pattern.to_string(),
+                mode,
+                patterns: patterns.to_vec(),
                 reason: reason.map(str::to_string),
                 until,
                 created_at: chrono::Utc::now(),
             };
-            watches.push(record.clone());
-            Ok(WatchOutcome::Added(record))
+            match watches.iter().position(|watch| watch.name == name) {
+                Some(position) => {
+                    let previous = watches[position].clone();
+                    let before: std::collections::HashSet<&str> =
+                        previous.patterns.iter().map(String::as_str).collect();
+                    let after: std::collections::HashSet<&str> =
+                        record.patterns.iter().map(String::as_str).collect();
+                    let added = after.difference(&before).count();
+                    let removed = before.difference(&after).count();
+                    watches[position] = record.clone();
+                    Ok(WatchOutcome::Updated {
+                        record,
+                        added,
+                        removed,
+                    })
+                }
+                None => {
+                    watches.push(record.clone());
+                    Ok(WatchOutcome::Created(record))
+                }
+            }
         }
 
-        async fn watch_delete(&self, id: i64) -> Result<Option<WatchRecord>, SinkError> {
+        async fn watch_delete(&self, name: &str) -> Result<Option<WatchRecord>, SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
@@ -2603,7 +2694,7 @@ mod tests {
                 .watches
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let position = watches.iter().position(|watch| watch.id == id);
+            let position = watches.iter().position(|watch| watch.name == name);
             Ok(position.map(|position| watches.remove(position)))
         }
 
@@ -3476,9 +3567,14 @@ mod tests {
         }
     }
 
-    fn watch_args(pattern: &str) -> WatchCreateArgs {
-        WatchCreateArgs {
-            pattern: pattern.to_string(),
+    fn watch_args(name: &str, patterns: &[&str]) -> WatchWriteArgs {
+        WatchWriteArgs {
+            name: name.to_string(),
+            patterns: patterns
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+            mode: None,
             field: None,
             conversation: None,
             duration: None,
@@ -3490,15 +3586,16 @@ mod tests {
     async fn creating_a_watch_says_what_it_will_do_and_where() {
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
-            .watch_create(Parameters(WatchCreateArgs {
+            .watch_write(Parameters(WatchWriteArgs {
                 reason: Some("releases".to_string()),
-                ..watch_args("deploy")
+                ..watch_args("deploys", &["deploy"])
             }))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
         let text = text_of(&result);
-        assert!(text.contains("`deploy`"), "got: {text}");
+        assert!(text.contains("Created watch \"deploys\""), "got: {text}");
+        assert!(text.contains("1 pattern"), "got: {text}");
         assert!(text.contains("every muted conversation"), "got: {text}");
         // The one thing an agent could otherwise get wrong about the feature: a watch changes
         // nothing in a chat it already hears in full.
@@ -3514,7 +3611,7 @@ mod tests {
         // explanation reaches it rather than being flattened into "invalid".
         let (server, sink) = server_with(FakeSink::default());
         let result = server
-            .watch_create(Parameters(watch_args("(unclosed")))
+            .watch_write(Parameters(watch_args("bad", &["(unclosed"])))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
@@ -3526,20 +3623,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setting_the_same_watch_twice_reports_the_one_already_there() {
-        // The agent keeps its rules somewhere of its own and syncs them, so this is called for
-        // every rule every time.
-        let (server, _sink) = server_with(FakeSink::default());
+    async fn writing_a_watch_again_replaces_it_and_says_what_moved() {
+        // The call an agent syncing a rule list it keeps elsewhere makes every time. The counts
+        // are what tell it whether this run actually changed anything.
+        let (server, sink) = server_with(FakeSink::default());
         server
-            .watch_create(Parameters(watch_args("deploy")))
+            .watch_write(Parameters(watch_args("spam", &["a", "b"])))
             .await
             .expect("tool runs");
-        let again = server
-            .watch_create(Parameters(watch_args("deploy")))
+
+        let unchanged = server
+            .watch_write(Parameters(watch_args("spam", &["a", "b"])))
             .await
             .expect("tool runs");
-        assert_eq!(again.is_error, Some(false));
-        assert!(text_of(&again).starts_with("Already watching"), "{again:?}");
+        let text = text_of(&unchanged);
+        assert!(text.contains("Updated watch \"spam\""), "got: {text}");
+        assert!(text.contains("0 added, 0 removed"), "got: {text}");
+
+        let edited = server
+            .watch_write(Parameters(watch_args("spam", &["a", "c", "d"])))
+            .await
+            .expect("tool runs");
+        let text = text_of(&edited);
+        assert!(text.contains("2 added, 1 removed"), "got: {text}");
+        // One rule, not three: the point of writing by name.
+        assert_eq!(sink.watch_list().await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_all_watch_says_that_every_pattern_has_to_match() {
+        // `all` is the reason lookahead is not needed, and the agent has to be able to see from
+        // the reply which kind of rule it just wrote.
+        let (server, _sink) = server_with(FakeSink::default());
+        let result = server
+            .watch_write(Parameters(WatchWriteArgs {
+                mode: Some(WatchModeArg::All),
+                ..watch_args("pump", &["buy", "target", "profit"])
+            }))
+            .await
+            .expect("tool runs");
+        let text = text_of(&result);
+        assert!(text.contains("3 patterns"), "got: {text}");
+        assert!(text.contains("all of which must match"), "got: {text}");
     }
 
     #[tokio::test]
@@ -3548,9 +3673,9 @@ mod tests {
         // representable range once panicked. A watch is the newest door onto it.
         let (server, sink) = server_with(FakeSink::default());
         let result = server
-            .watch_create(Parameters(WatchCreateArgs {
+            .watch_write(Parameters(WatchWriteArgs {
                 duration: Some("9999999999days".to_string()),
-                ..watch_args("deploy")
+                ..watch_args("deploys", &["deploy"])
             }))
             .await
             .expect("the tool must answer rather than panic");
@@ -3568,12 +3693,12 @@ mod tests {
             ..FakeSink::default()
         });
         let result = server
-            .watch_create(Parameters(watch_args("deploy")))
+            .watch_write(Parameters(watch_args("deploys", &["deploy"])))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
-        assert!(text.contains("watch_delete"), "got: {text}");
+        assert!(text.contains("500 watches"), "got: {text}");
     }
 
     #[tokio::test]
@@ -3587,13 +3712,16 @@ mod tests {
         );
 
         server
-            .watch_create(Parameters(watch_args("deploy")))
+            .watch_write(Parameters(watch_args("deploys", &["deploy"])))
             .await
             .expect("tool runs");
         let result = server.watch_list().await.expect("tool runs");
         let parsed: serde_json::Value =
             serde_json::from_str(&text_of(&result)).expect("JSON once there is one");
-        assert_eq!(parsed[0]["pattern"], "deploy");
+        assert_eq!(parsed[0]["name"], "deploys");
+        assert_eq!(parsed[0]["patterns"][0], "deploy");
+        assert_eq!(parsed[0]["pattern_count"], 1);
+        assert_eq!(parsed[0]["match"], "any");
         assert_eq!(parsed[0]["field"], "text");
         assert_eq!(parsed[0]["conversation"], "every muted conversation");
     }
@@ -3602,7 +3730,9 @@ mod tests {
     async fn removing_a_watch_that_is_not_there_says_so() {
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
-            .watch_delete(Parameters(WatchDeleteArgs { id: 7 }))
+            .watch_delete(Parameters(WatchDeleteArgs {
+                name: "nothing".to_string(),
+            }))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
@@ -3613,9 +3743,9 @@ mod tests {
     async fn a_watch_names_the_field_it_was_given() {
         let (server, _sink) = server_with(FakeSink::default());
         server
-            .watch_create(Parameters(WatchCreateArgs {
+            .watch_write(Parameters(WatchWriteArgs {
                 field: Some(WatchFieldArg::SenderId),
-                ..watch_args("^432688118$")
+                ..watch_args("the-owner", &["^432688118$"])
             }))
             .await
             .expect("tool runs");
@@ -4283,9 +4413,9 @@ mod tests {
             "message_pin",
             "message_react",
             "message_send",
-            "watch_create",
             "watch_delete",
             "watch_list",
+            "watch_write",
         ]);
         for tool in &tools {
             assert!(
@@ -4322,15 +4452,18 @@ mod tests {
         let tool = router
             .list_all()
             .into_iter()
-            .find(|tool| tool.name == "watch_create")
-            .expect("watch_create is registered");
+            .find(|tool| tool.name == "watch_write")
+            .expect("watch_write is registered");
         let schema = serde_json::to_string(&tool.input_schema).expect("schema serializes");
-        for value in ["text", "sender", "sender_id"] {
+        for value in ["text", "sender", "sender_id", "any", "all"] {
             assert!(
                 value_is_offered(&schema, value),
                 "{value} is absent from: {schema}"
             );
         }
+        // `patterns` is a list, and an agent that read it as a string would send one long
+        // alternation instead of a rule it can edit later.
+        assert!(schema.contains("\"patterns\""), "{schema}");
     }
 
     /// Whether the schema offers `value` as a literal, rather than merely mentioning it in prose.
@@ -4429,7 +4562,7 @@ mod tests {
         // which is whatever the last person to message the bot talked it into, so an unhandled
         // panic here is a stalled turn anybody can ask for. Reachable from `conversation_mute`,
         // `conversation_unmute`, `conversation_block`, `conversation_unblock`, `member_moderate`
-        // and `watch_create`.
+        // and `watch_write`.
         let refused = parse_duration(Some("9999999999days"));
         assert!(
             refused.is_err(),

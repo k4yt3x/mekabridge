@@ -10,6 +10,8 @@
 //! What a watch is *not* is a judgement. It decides that a message is worth a turn, and nothing
 //! about what the message means; the turn it wakes is where that is settled.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use regex::{Regex, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -82,15 +84,114 @@ impl WatchField {
     }
 }
 
+/// How a watch's patterns combine.
+///
+/// `All` exists because "these terms, in any order" is a rule people genuinely write, and its
+/// obvious spelling is lookahead (`(?=.*A)(?=.*B)`), which is exactly what the `regex` crate
+/// refuses. Saying it in the rule rather than in the pattern keeps both the rule and the
+/// linear-time guarantee that refusal buys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchMode {
+    /// Fires when any one pattern matches. What a keyword list means.
+    #[default]
+    Any,
+    /// Fires only when every pattern matches, in any order and anywhere in the field.
+    All,
+}
+
+impl WatchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::All => "all",
+        }
+    }
+
+    /// Parse the stored spelling. The CHECK constraint keeps anything else out of the column, so an
+    /// unrecognised value means a hand-edited database and is reported rather than guessed at.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "any" => Some(Self::Any),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Longest watch name accepted, in characters.
+pub const MAX_NAME_CHARS: usize = 64;
+
+/// Most patterns one deployment may hold across every watch.
+///
+/// The ceiling that actually matters now that a watch holds a list: [`MAX_WATCHES`] bounds the
+/// rules, and this bounds the work, since every pattern of a field is compiled into that field's
+/// one set.
+pub const MAX_PATTERNS: usize = 2000;
+
+/// Check a watch name, or say what is wrong with it.
+///
+/// A name is an identifier the agent chooses and then refers to, and it is printed inside quotes
+/// on the wake line, so it has to be one line and it has to be something a model can reproduce
+/// exactly. Nothing stricter than that: rejecting spaces or punctuation would only make the agent
+/// guess at a scheme nobody wrote down.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("the name is empty".to_string());
+    }
+    if trimmed != name {
+        return Err("the name has leading or trailing whitespace".to_string());
+    }
+    let length = name.chars().count();
+    if length > MAX_NAME_CHARS {
+        return Err(format!(
+            "the name is {length} characters, and at most {MAX_NAME_CHARS} are accepted"
+        ));
+    }
+    if name.chars().any(|character| {
+        character.is_control() || matches!(character, '\u{2028}' | '\u{2029}' | '\u{85}')
+    }) {
+        return Err("the name contains a line break or a control character".to_string());
+    }
+    Ok(())
+}
+
+/// What made a watch fire, as the wake line reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchHit {
+    /// The pattern that matched, under [`WatchMode::Any`]. The first one in the rule's own order,
+    /// where several did, because that is the one the person reading the rule will look for first.
+    Pattern(String),
+    /// How many patterns had to match, under [`WatchMode::All`]. Naming one of them would be
+    /// arbitrary and naming all of them would put a rule set on a header line.
+    All(usize),
+}
+
+impl Default for WatchHit {
+    /// What an item queued by 0.16.0 decodes to. It reports nothing about the hit, which is
+    /// honest: that release recorded a pattern under a numeric id this one no longer uses.
+    fn default() -> Self {
+        Self::All(0)
+    }
+}
+
 /// One watch that fired on one message.
 ///
 /// Carried on the message through the queue, so the item the agent reads can name the rule that
 /// woke it. Without that the agent is handed a message from a muted room with no way to tell which
 /// of its own rules is responsible, which is the one thing it needs in order to retune them.
+///
+/// `name` and `hit` default on decode so an item already queued when the bridge was upgraded still
+/// reads back. Such an item renders without naming its rule, which is the price of not draining
+/// the queue across an upgrade and lasts exactly as long as the items that predate it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchMatch {
-    pub id: i64,
-    pub pattern: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub hit: WatchHit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub field: WatchField,
@@ -134,12 +235,18 @@ pub struct Watchlist {
     fields: Vec<FieldSet>,
 }
 
-/// One field's patterns, and which row each came from.
+/// One field's patterns, and which rule each came from.
 struct FieldSet {
     field: WatchField,
     set: RegexSet,
-    /// Index into [`Watchlist::rows`] for each pattern in `set`, in the same order.
-    rows: Vec<usize>,
+    /// For each pattern in `set`, in the same order: its row in [`Watchlist::rows`], and its
+    /// position within that row's own list. Several entries point at one row now that a watch
+    /// holds many patterns, which is what turns a set hit back into a rule.
+    sources: Vec<(usize, usize)>,
+    /// How many patterns each row contributed, by row index. What [`WatchMode::All`] compares
+    /// against: a rule is satisfied when every pattern that *compiled* matched, and a row whose
+    /// patterns did not all compile is not in here at all.
+    counts: HashMap<usize, usize>,
 }
 
 impl Watchlist {
@@ -154,21 +261,46 @@ impl Watchlist {
         for field in [WatchField::Text, WatchField::Sender, WatchField::SenderId] {
             let mut patterns = Vec::new();
             let mut sources = Vec::new();
+            let mut counts: HashMap<usize, usize> = HashMap::new();
             for (index, row) in rows.iter().enumerate() {
                 if row.field != field {
                     continue;
                 }
-                match compile_pattern(&row.pattern) {
-                    Ok(_) => {
-                        patterns.push(row.pattern.clone());
-                        sources.push(index);
+                let mut compiled = Vec::new();
+                let mut broken = false;
+                for (position, pattern) in row.patterns.iter().enumerate() {
+                    match compile_pattern(pattern) {
+                        Ok(_) => compiled.push((position, pattern.clone())),
+                        Err(error) => {
+                            broken = true;
+                            tracing::error!(
+                                watch = %row.name,
+                                pattern = %pattern,
+                                "a stored watch pattern does not compile and is being ignored: {}",
+                                error
+                            );
+                        }
                     }
-                    Err(error) => tracing::error!(
-                        watch = row.id,
-                        pattern = %row.pattern,
-                        "a stored watch pattern does not compile and is being ignored: {}",
-                        error
-                    ),
+                }
+                // Under `all` a skipped pattern is a term the rule no longer requires, so dropping
+                // it would make the rule easier to satisfy and wake the agent on messages it
+                // never asked about. Under `any` the same skip only costs one of several ways to
+                // fire, so the rest of the rule still stands.
+                if broken && row.mode == WatchMode::All {
+                    tracing::error!(
+                        watch = %row.name,
+                        "a pattern of this `all` watch does not compile, so the whole watch is \
+                         disabled rather than being made easier to satisfy"
+                    );
+                    continue;
+                }
+                if compiled.is_empty() {
+                    continue;
+                }
+                counts.insert(index, compiled.len());
+                for (position, pattern) in compiled {
+                    patterns.push(pattern);
+                    sources.push((index, position));
                 }
             }
             if patterns.is_empty() {
@@ -182,7 +314,8 @@ impl Watchlist {
                 Ok(set) => fields.push(FieldSet {
                     field,
                     set,
-                    rows: sources,
+                    sources,
+                    counts,
                 }),
                 // Every pattern compiled on its own just above, so this is the combined size
                 // ceiling. Reported rather than retried one pattern at a time: the ceiling is
@@ -210,25 +343,32 @@ impl Watchlist {
     /// everywhere. The scope is filtered after matching rather than before, because the set is what
     /// makes matching one pass and it has no notion of which rows are relevant.
     pub fn matches(&self, message: &InboundMessage) -> Vec<WatchMatch> {
-        let mut hits: Vec<(usize, WatchField)> = Vec::new();
+        // Row to the positions of its patterns that matched, unioned across the field's haystacks.
+        // A set is one pass over one string, so a sender rule is two passes and everything else is
+        // one, whatever the rule count.
+        let mut matched: BTreeMap<usize, (WatchField, BTreeSet<usize>)> = BTreeMap::new();
         for field in &self.fields {
             for haystack in haystacks(field.field, message) {
                 if haystack.is_empty() {
                     continue;
                 }
-                for position in field.set.matches(haystack).into_iter() {
-                    let Some(&row) = field.rows.get(position) else {
+                for index in field.set.matches(haystack).into_iter() {
+                    let Some(&(row, position)) = field.sources.get(index) else {
                         continue;
                     };
-                    if !hits.iter().any(|(existing, _)| *existing == row) {
-                        hits.push((row, field.field));
-                    }
+                    matched
+                        .entry(row)
+                        .or_insert_with(|| (field.field, BTreeSet::new()))
+                        .1
+                        .insert(position);
                 }
             }
         }
-        hits.sort_unstable_by_key(|(row, _)| *row);
-        hits.into_iter()
-            .filter_map(|(row, field)| {
+        // `BTreeMap` iterates in row order, which is the order the store read the rules in, which
+        // is the order they were created.
+        matched
+            .into_iter()
+            .filter_map(|(row, (field, positions))| {
                 let record = self.rows.get(row)?;
                 let scoped_elsewhere = record
                     .conversation
@@ -237,9 +377,29 @@ impl Watchlist {
                 if scoped_elsewhere {
                     return None;
                 }
+                let hit = match record.mode {
+                    // The earliest pattern in the rule's own order, which is the one somebody
+                    // reading the rule looks for first.
+                    WatchMode::Any => {
+                        WatchHit::Pattern(record.patterns.get(*positions.first()?)?.clone())
+                    }
+                    // Every pattern that compiled, and `new` refuses to compile an `all` rule
+                    // partly, so this is every pattern the rule was written with.
+                    WatchMode::All => {
+                        let required = self
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.field == field)
+                            .and_then(|candidate| candidate.counts.get(&row).copied())?;
+                        if positions.len() < required {
+                            return None;
+                        }
+                        WatchHit::All(required)
+                    }
+                };
                 Some(WatchMatch {
-                    id: record.id,
-                    pattern: record.pattern.clone(),
+                    name: record.name.clone(),
+                    hit,
                     reason: record.reason.clone(),
                     field,
                 })
@@ -276,15 +436,24 @@ mod tests {
         Admission, ChannelId, ChatKind, ConversationId, InboundMessage, Platform, Sender,
     };
 
-    fn watch(id: i64, field: WatchField, pattern: &str) -> WatchRecord {
+    fn watch(name: &str, field: WatchField, patterns: &[&str]) -> WatchRecord {
         WatchRecord {
-            id,
+            id: 0,
+            name: name.to_string(),
             conversation: None,
             field,
-            pattern: pattern.to_string(),
+            mode: WatchMode::Any,
+            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
             reason: None,
             until: None,
             created_at: Utc::now(),
+        }
+    }
+
+    fn all_of(name: &str, field: WatchField, patterns: &[&str]) -> WatchRecord {
+        WatchRecord {
+            mode: WatchMode::All,
+            ..watch(name, field, patterns)
         }
     }
 
@@ -325,24 +494,24 @@ mod tests {
         // message and in a name, and a rule written for one firing on the other is a false wake
         // the agent cannot explain.
         let list = Watchlist::new(vec![
-            watch(1, WatchField::Text, "deploy"),
-            watch(2, WatchField::Sender, "deploy"),
+            watch("rule-1", WatchField::Text, &["deploy"]),
+            watch("rule-2", WatchField::Sender, &["deploy"]),
         ]);
         let in_text = list.matches(&message("telegram:-100", "deploy is stuck", "Alice", "7"));
         assert_eq!(in_text.len(), 1, "got {in_text:?}");
-        assert_eq!(in_text[0].id, 1);
+        assert_eq!(in_text[0].name, "rule-1");
         assert_eq!(in_text[0].field, WatchField::Text);
 
         let in_name = list.matches(&message("telegram:-100", "hello", "Deploy Bot", "7"));
         assert_eq!(in_name.len(), 1, "got {in_name:?}");
-        assert_eq!(in_name[0].id, 2);
+        assert_eq!(in_name[0].name, "rule-2");
     }
 
     #[test]
     fn a_sender_watch_reads_the_username_as_well_as_the_display_name() {
         // Which of the two a person is known by differs per platform and per person, so a rule
         // written for either has to fire.
-        let list = Watchlist::new(vec![watch(1, WatchField::Sender, "^handle$")]);
+        let list = Watchlist::new(vec![watch("rule-1", WatchField::Sender, &["^handle$"])]);
         let hit = list.matches(&message("telegram:-100", "hello", "Someone Else", "7"));
         assert_eq!(
             hit.len(),
@@ -355,14 +524,14 @@ mod tests {
     fn matching_ignores_case_unless_the_pattern_says_otherwise() {
         // The agent is writing something closer to a keyword than to a parser, and a rule that
         // misses on a capital letter is a rule that looks like it works.
-        let list = Watchlist::new(vec![watch(1, WatchField::Text, "deploy")]);
+        let list = Watchlist::new(vec![watch("rule-1", WatchField::Text, &["deploy"])]);
         assert_eq!(
             list.matches(&message("telegram:-100", "DEPLOY", "A", "7"))
                 .len(),
             1
         );
 
-        let exact = Watchlist::new(vec![watch(1, WatchField::Text, "(?-i)deploy")]);
+        let exact = Watchlist::new(vec![watch("rule-1", WatchField::Text, &["(?-i)deploy"])]);
         assert!(
             exact
                 .matches(&message("telegram:-100", "DEPLOY", "A", "7"))
@@ -373,7 +542,7 @@ mod tests {
 
     #[test]
     fn a_scoped_watch_fires_only_in_its_own_conversation() {
-        let mut scoped = watch(1, WatchField::Text, "deploy");
+        let mut scoped = watch("rule-1", WatchField::Text, &["deploy"]);
         scoped.conversation = Some("telegram:-100".to_string());
         let list = Watchlist::new(vec![scoped]);
         assert_eq!(
@@ -393,14 +562,156 @@ mod tests {
         // The agent is told which rules fired so it can retune them, and being told about one of
         // three would send it removing a rule that was not the noisy one.
         let list = Watchlist::new(vec![
-            watch(3, WatchField::Text, "deploy"),
-            watch(7, WatchField::Text, "stuck"),
-            watch(9, WatchField::SenderId, "^7$"),
+            watch("rule-3", WatchField::Text, &["deploy"]),
+            watch("rule-7", WatchField::Text, &["stuck"]),
+            watch("rule-9", WatchField::SenderId, &["^7$"]),
         ]);
         let hits = list.matches(&message("telegram:-100", "deploy is stuck", "A", "7"));
-        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![
-            3, 7, 9
-        ]);
+        assert_eq!(
+            hits.iter().map(|hit| hit.name.as_str()).collect::<Vec<_>>(),
+            vec!["rule-3", "rule-7", "rule-9"]
+        );
+    }
+
+    #[test]
+    fn an_any_watch_fires_on_one_pattern_and_reports_which() {
+        // The common rule: a list of spellings for one thing. The agent is told which spelling hit
+        // so it can narrow the rule without reading the whole list back.
+        let list = Watchlist::new(vec![watch("spam", WatchField::Text, &[
+            "看我简介",
+            "跑分",
+            "日入过万",
+        ])]);
+        let hits = list.matches(&message("telegram:-100", "来跑分吧", "A", "7"));
+        assert_eq!(
+            hits.len(),
+            1,
+            "one rule fired, not one per pattern: {hits:?}"
+        );
+        assert_eq!(hits[0].name, "spam");
+        assert_eq!(hits[0].hit, WatchHit::Pattern("跑分".to_string()));
+    }
+
+    #[test]
+    fn an_any_watch_hit_by_several_patterns_reports_the_first_in_the_rule() {
+        // Arbitrary either way, so it is the rule's own order: that is what somebody reading the
+        // rule scans, and it does not move when the message changes.
+        let list = Watchlist::new(vec![watch("spam", WatchField::Text, &["跑分", "日入过万"])]);
+        let hits = list.matches(&message("telegram:-100", "日入过万 跑分", "A", "7"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit, WatchHit::Pattern("跑分".to_string()));
+    }
+
+    #[test]
+    fn an_all_watch_waits_for_every_term() {
+        // What replaces the lookahead the engine refuses: "these terms, in any order, anywhere".
+        let list = Watchlist::new(vec![all_of("pump", WatchField::Text, &[
+            "购买", "止盈", "止损",
+        ])]);
+        assert!(
+            list.matches(&message("telegram:-100", "购买 止盈", "A", "7"))
+                .is_empty(),
+            "two of three is not the rule"
+        );
+        let hits = list.matches(&message(
+            "telegram:-100",
+            "止损 先 购买 然后 止盈",
+            "A",
+            "7",
+        ));
+        assert_eq!(hits.len(), 1, "order must not matter: {hits:?}");
+        assert_eq!(hits[0].hit, WatchHit::All(3));
+    }
+
+    #[test]
+    fn an_all_watch_on_a_sender_may_take_its_terms_from_either_string() {
+        // A sender is a display name and a username, and `all` asks that every pattern match the
+        // field rather than that all of them match the same string. Worth pinning down, because
+        // the other reading is just as defensible and the two differ exactly here.
+        let list = Watchlist::new(vec![all_of("split", WatchField::Sender, &[
+            "^Free", "handle$",
+        ])]);
+        let hits = list.matches(&message("telegram:-100", "hello", "Free Money", "7"));
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(hits[0].hit, WatchHit::All(2));
+    }
+
+    #[test]
+    fn a_broken_pattern_disables_an_all_watch_rather_than_loosening_it() {
+        // Skipping a term of an `all` rule would leave a rule that fires on strictly more than it
+        // was written to, which is the one direction a silent degradation must not go. Under
+        // `any` the same skip only costs one of several ways to fire.
+        let loosened = Watchlist::new(vec![all_of("pump", WatchField::Text, &[
+            "(unclosed",
+            "止盈",
+        ])]);
+        assert!(
+            loosened
+                .matches(&message("telegram:-100", "止盈", "A", "7"))
+                .is_empty(),
+            "the surviving term must not fire the rule on its own"
+        );
+
+        let narrowed = Watchlist::new(vec![watch("spam", WatchField::Text, &[
+            "(unclosed",
+            "止盈",
+        ])]);
+        assert_eq!(
+            narrowed
+                .matches(&message("telegram:-100", "止盈", "A", "7"))
+                .len(),
+            1,
+            "an `any` rule keeps the patterns that still compile"
+        );
+    }
+
+    #[test]
+    fn a_match_recorded_by_the_previous_release_still_decodes() {
+        // A message can sit in the queue across an upgrade, and its payload was written when a
+        // match was a numeric id and one pattern. Refusing to decode it would strand the message
+        // rather than the field, so the two fields that changed carry defaults.
+        let queued = serde_json::json!({
+            "id": 12,
+            "pattern": "看我简介",
+            "reason": "spam signature",
+            "field": "text"
+        });
+        let decoded: WatchMatch = serde_json::from_value(queued).expect("an old item must decode");
+        assert_eq!(decoded.field, WatchField::Text);
+        assert_eq!(decoded.reason.as_deref(), Some("spam signature"));
+        assert!(decoded.name.is_empty(), "there was no name to recover");
+        assert_eq!(decoded.hit, WatchHit::All(0));
+    }
+
+    #[test]
+    fn a_match_round_trips_through_the_queue_payload() {
+        let original = WatchMatch {
+            name: "spam-signatures".to_string(),
+            hit: WatchHit::Pattern("跑分".to_string()),
+            reason: Some("spam".to_string()),
+            field: WatchField::Sender,
+        };
+        let encoded = serde_json::to_string(&original).expect("encodes");
+        let decoded: WatchMatch = serde_json::from_str(&encoded).expect("decodes");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn a_name_has_to_be_one_usable_line() {
+        assert!(validate_name("spam-signatures").is_ok());
+        assert!(
+            validate_name("").is_err(),
+            "an empty name identifies nothing"
+        );
+        assert!(
+            validate_name(" padded").is_err(),
+            "a name is what the agent types back"
+        );
+        assert!(
+            validate_name("two\nlines").is_err(),
+            "the name is printed on a header line"
+        );
+        assert!(validate_name(&"n".repeat(MAX_NAME_CHARS + 1)).is_err());
     }
 
     #[test]
@@ -409,12 +720,12 @@ mod tests {
         // a hand-edited database. Failing the whole list over it would turn one bad row into a
         // bridge that silently stops watching for anything.
         let list = Watchlist::new(vec![
-            watch(1, WatchField::Text, "(unclosed"),
-            watch(2, WatchField::Text, "deploy"),
+            watch("rule-1", WatchField::Text, &["(unclosed"]),
+            watch("rule-2", WatchField::Text, &["deploy"]),
         ]);
         let hits = list.matches(&message("telegram:-100", "deploy", "A", "7"));
         assert_eq!(hits.len(), 1, "got {hits:?}");
-        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[0].name, "rule-2");
     }
 
     #[test]
@@ -422,7 +733,7 @@ mod tests {
         // A photo with no caption has no text, and a channel post has no sender id. Neither should
         // be matched by a pattern that happens to accept the empty string, because the agent meant
         // "a message that says this" rather than "a message with nothing in it".
-        let list = Watchlist::new(vec![watch(1, WatchField::Text, "x*")]);
+        let list = Watchlist::new(vec![watch("rule-1", WatchField::Text, &["x*"])]);
         assert!(
             list.matches(&message("telegram:-100", "", "A", "7"))
                 .is_empty()
@@ -453,6 +764,6 @@ mod tests {
         // The gate checks this before doing any work, which is what keeps a deployment that has
         // never set a watch from paying for the feature on every message.
         assert!(Watchlist::new(Vec::new()).is_empty());
-        assert!(!Watchlist::new(vec![watch(1, WatchField::Text, "x")]).is_empty());
+        assert!(!Watchlist::new(vec![watch("rule-1", WatchField::Text, &["x"])]).is_empty());
     }
 }

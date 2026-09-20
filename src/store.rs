@@ -37,7 +37,7 @@ use rusqlite::{
 };
 use uuid::Uuid;
 
-use crate::watch::{MAX_WATCHES, WatchField};
+use crate::watch::{MAX_PATTERNS, MAX_WATCHES, WatchField, WatchMode};
 
 /// Schema statements applied in order. The index of a statement is its schema version, tracked in
 /// SQLite's `user_version`, so adding a migration means appending to this array and never editing
@@ -54,6 +54,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_009.sql"),
     include_str!("store/schema_010.sql"),
     include_str!("store/schema_011.sql"),
+    include_str!("store/schema_012.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -342,13 +343,19 @@ impl UnseenSummary {
 /// hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRecord {
-    /// Row id, which is what the agent unwatches by and what the wake line names.
+    /// Row id. Internal from 0.17.0 on: the agent and the operator refer to a watch by
+    /// [`WatchRecord::name`], which is also what the wake line prints.
     pub id: i64,
+    /// The name whoever wrote the rule gave it, unique across the bridge.
+    pub name: String,
     /// The conversation this is confined to, or `None` for every conversation.
     pub conversation: Option<String>,
-    /// Which part of a message the pattern reads.
+    /// Which part of a message the patterns read.
     pub field: WatchField,
-    pub pattern: String,
+    /// Whether any pattern firing is enough, or every one has to.
+    pub mode: WatchMode,
+    /// In the order they were written, which is the order a hit is reported from.
+    pub patterns: Vec<String>,
     pub reason: Option<String>,
     /// When it lapses, or `None` for indefinite.
     pub until: Option<DateTime<Utc>>,
@@ -531,36 +538,48 @@ pub enum EnqueueOutcome {
     Dropped,
 }
 
-/// A watch to record, as [`Store::add_watch`] takes it.
+/// A watch to record, as [`Store::write_watch`] takes it.
 ///
 /// Grouped rather than passed as six arguments, the way [`MessageKey`] groups the four fields that
 /// identify a message: every one of these is part of one rule, and half of them are `Option`s that
 /// would otherwise be told apart only by position.
 #[derive(Debug, Clone, Copy)]
 pub struct NewWatch<'a> {
+    /// The rule's identity. Writing a watch under a name that already exists replaces it.
+    pub name: &'a str,
     /// The conversation to confine it to, or `None` for every conversation.
     pub conversation: Option<&'a str>,
     /// Needed only alongside `conversation`, to mint the conversation row if nothing has arrived
     /// from it yet.
     pub platform: Option<&'a str>,
     pub field: WatchField,
-    pub pattern: &'a str,
+    pub mode: WatchMode,
+    /// At least one. Duplicates are collapsed, keeping the first position of each.
+    pub patterns: &'a [String],
     pub until: Option<DateTime<Utc>>,
     pub reason: Option<&'a str>,
 }
 
-/// What happened to a [`Store::add_watch`] call.
+/// What happened to a [`Store::write_watch`] call.
 ///
 /// Three outcomes rather than a record and an error, following [`EnqueueOutcome`]: the two that
 /// are not a plain insert are both things the caller has to say out loud, and neither is a fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOutcome {
-    Added(WatchRecord),
-    /// The same rule was already standing. Handed back rather than duplicated, so an agent
-    /// syncing a list it keeps elsewhere can call this for every rule and be told what changed.
-    Existing(WatchRecord),
-    /// The deployment already holds [`crate::watch::MAX_WATCHES`], naming how many.
-    AtCapacity(usize),
+    /// There was no watch by that name, and now there is.
+    Created(WatchRecord),
+    /// A watch by that name was replaced. The counts are what actually moved, so an agent syncing
+    /// a rule list it keeps elsewhere can call this every time and be told whether it changed
+    /// anything.
+    Updated {
+        record: WatchRecord,
+        added: usize,
+        removed: usize,
+    },
+    /// The store understood the request and declined it, with the sentence saying why: an unusable
+    /// name, a pattern that will not compile, or a ceiling that is already reached. Carried rather
+    /// than returned as an error because none of it is a fault; it is the answer.
+    Refused(String),
 }
 
 /// Where a queue row is in its hand-over.
@@ -1392,31 +1411,70 @@ impl Store {
         Ok(records)
     }
 
-    /// Record a watch, hand back the one already standing for the same rule, or refuse for want of
-    /// room.
+    /// Write a watch: create it, or replace what the one by that name holds.
     ///
-    /// Identity is the whole rule, `(conversation, field, pattern)`: the same words pointed at a
-    /// different field are a different watch. Deliberately not a `UNIQUE` index, because SQLite
-    /// treats NULLs as distinct and one would constrain the scoped rows while letting duplicate
-    /// global ones through.
+    /// An upsert rather than an add, because the caller that matters keeps its rules somewhere
+    /// else and syncs them. Keying on the pattern, as 0.16.0 did, meant an edited pattern was a
+    /// different watch: the sync left the old one standing and added a second. Keying on a name
+    /// the caller chose means the call says what the watch should be and the row ends up equal to
+    /// it.
     ///
-    /// `platform` is needed only when `conversation` is given, to mint the conversation row the
-    /// same way [`Store::set_policy`] does when ruling on a chat nothing has arrived from yet.
+    /// Refusals come back as [`WatchOutcome::Refused`] rather than as an error. None of them is a
+    /// fault: an unusable name, a pattern the engine will not take, or a ceiling already reached
+    /// are all answers for whoever wrote the rule, and each needs its own sentence.
     ///
-    /// Lapsed rows are deleted here rather than swept on a timer, which keeps the ceiling honest:
-    /// a watch that has expired is not one of the [`MAX_WATCHES`] a deployment is allowed.
-    pub async fn add_watch(&self, watch: NewWatch<'_>, at: DateTime<Utc>) -> Result<WatchOutcome> {
+    /// Lapsed rows are deleted here rather than swept on a timer, which keeps the ceilings honest:
+    /// a watch that has expired is not one of the [`MAX_WATCHES`] a deployment is allowed, and its
+    /// patterns are not among the [`MAX_PATTERNS`].
+    pub async fn write_watch(
+        &self,
+        watch: NewWatch<'_>,
+        at: DateTime<Utc>,
+    ) -> Result<WatchOutcome> {
         let NewWatch {
+            name,
             conversation,
             platform,
             field,
-            pattern,
+            mode,
+            patterns,
             until,
             reason,
         } = watch;
+        // Collapsed here rather than in SQL, keeping the first position of each: the position is
+        // what orders a reported hit, and a rule written with a duplicate means the same thing as
+        // one without it.
+        let mut seen = std::collections::HashSet::new();
+        let patterns: Vec<String> = patterns
+            .iter()
+            .filter(|pattern| seen.insert(pattern.as_str()))
+            .cloned()
+            .collect();
+        if patterns.is_empty() {
+            return Ok(WatchOutcome::Refused(
+                "a watch needs at least one pattern".to_string(),
+            ));
+        }
+        // Validated here, at the only door into the table, rather than trusting every caller to
+        // have done it. A rule that cannot compile cannot fire, so storing one would leave the
+        // agent with a watch that looks set and is silently deaf; and under `all` the matcher
+        // disables the whole rule over it. The offending pattern is named, because a rule of a
+        // hundred would otherwise have to be bisected by hand.
+        if let Err(why) = crate::watch::validate_name(name) {
+            return Ok(WatchOutcome::Refused(format!(
+                "{name:?} is not a usable watch name: {why}"
+            )));
+        }
+        for pattern in &patterns {
+            if let Err(why) = crate::watch::compile_pattern(pattern) {
+                return Ok(WatchOutcome::Refused(format!(
+                    "the pattern {pattern:?} cannot be used: {why}"
+                )));
+            }
+        }
+        let name = name.to_string();
         let conversation = conversation.map(str::to_string);
         let platform = platform.map(str::to_string);
-        let pattern = pattern.to_string();
         let reason = reason.map(str::to_string);
         let outcome = self
             .connection
@@ -1441,81 +1499,119 @@ impl Store {
                         ],
                     )?;
                 }
-                // `IS` rather than `=`, and the same subquery whether or not a conversation was
-                // given: looking up a NULL address matches no row, so the subquery is NULL and
-                // this finds the unscoped watches, which is exactly the case a `= ?` would miss.
-                let existing = transaction
-                    .query_row(
-                        &format!(
-                            "SELECT {WATCH_COLUMNS} FROM {WATCH_FROM}
-                             WHERE w.pattern = ?1 AND w.field = ?2
-                               AND w.conversation_id IS {CONVERSATION_ID_OF_3}"
-                        ),
-                        rusqlite::params![&pattern, field.as_str(), &conversation],
-                        row_to_watch,
-                    )
-                    .optional()?;
-                if let Some(record) = existing {
-                    transaction.commit()?;
-                    return Ok(WatchOutcome::Existing(record));
+
+                let existing = read_watch(&transaction, &name)?;
+
+                // Both ceilings exclude whatever this name already holds, since a rewrite replaces
+                // those rather than adding to them. Counted inside the transaction so neither can
+                // move between the check and the write.
+                if existing.is_none() {
+                    let live: i64 =
+                        transaction
+                            .query_row("SELECT COUNT(*) FROM watches", [], |row| row.get(0))?;
+                    if live >= MAX_WATCHES as i64 {
+                        transaction.commit()?;
+                        return Ok(WatchOutcome::Refused(format!(
+                            "there are already {live} watches, which is the most this bridge \
+                             holds ({MAX_WATCHES}); remove one before adding another"
+                        )));
+                    }
                 }
-                let live: i64 =
-                    transaction.query_row("SELECT COUNT(*) FROM watches", [], |row| row.get(0))?;
-                if live >= MAX_WATCHES as i64 {
-                    // Decided inside the transaction, so the count cannot move between the check
-                    // and the insert. The lapsed rows were deleted above, so this counts only
-                    // watches that are actually standing.
+                let held: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM watch_patterns WHERE watch_id <> COALESCE(
+                         (SELECT id FROM watches WHERE name = ?1), -1)",
+                    [&name],
+                    |row| row.get(0),
+                )?;
+                let total = held.max(0) as usize + patterns.len();
+                if total > MAX_PATTERNS {
                     transaction.commit()?;
-                    return Ok(WatchOutcome::AtCapacity(live.max(0) as usize));
+                    return Ok(WatchOutcome::Refused(format!(
+                        "that would hold {total} patterns across every watch, over the \
+                         {MAX_PATTERNS} this bridge compiles; shorten the rule or remove another"
+                    )));
                 }
+
                 transaction.execute(
                     &format!(
                         "INSERT INTO watches
-                             (conversation_id, field, pattern, reason, until, created_at)
-                         VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6)"
+                             (name, conversation_id, field, mode, reason, until, created_at)
+                         VALUES (?1, {CONVERSATION_ID_OF_2}, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(name) DO UPDATE SET
+                             conversation_id = excluded.conversation_id,
+                             field = excluded.field,
+                             mode = excluded.mode,
+                             reason = excluded.reason,
+                             until = excluded.until"
                     ),
                     rusqlite::params![
+                        &name,
                         &conversation,
                         field.as_str(),
-                        &pattern,
+                        mode.as_str(),
                         reason,
                         until.map(to_rfc3339),
                         to_rfc3339(at),
                     ],
                 )?;
-                let id = transaction.last_insert_rowid();
-                let record = transaction.query_row(
-                    &format!("SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} WHERE w.id = ?1"),
-                    [id],
-                    row_to_watch,
+                let id: i64 = transaction.query_row(
+                    "SELECT id FROM watches WHERE name = ?1",
+                    [&name],
+                    |row| row.get(0),
                 )?;
+                transaction.execute("DELETE FROM watch_patterns WHERE watch_id = ?1", [id])?;
+                {
+                    let mut statement = transaction.prepare(
+                        "INSERT INTO watch_patterns (watch_id, position, pattern)
+                         VALUES (?1, ?2, ?3)",
+                    )?;
+                    for (position, pattern) in patterns.iter().enumerate() {
+                        statement.execute(rusqlite::params![id, position as i64, pattern])?;
+                    }
+                }
+                let record = read_watch(&transaction, &name)?
+                    .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
                 transaction.commit()?;
-                Ok(WatchOutcome::Added(record))
+
+                Ok(match existing {
+                    Some(previous) => {
+                        // A set difference rather than a length comparison: a rewrite that swaps
+                        // one pattern for another changes nothing about the count.
+                        let before: std::collections::HashSet<&str> =
+                            previous.patterns.iter().map(String::as_str).collect();
+                        let after: std::collections::HashSet<&str> =
+                            record.patterns.iter().map(String::as_str).collect();
+                        let added = after.difference(&before).count();
+                        let removed = before.difference(&after).count();
+                        WatchOutcome::Updated {
+                            record: record.clone(),
+                            added,
+                            removed,
+                        }
+                    }
+                    None => WatchOutcome::Created(record),
+                })
             })
             .await?;
-        // Unconditional, including the refusal: that path still commits the prune of lapsed rows
-        // above, so "nothing was added" is not the same as "nothing changed".
+        // Unconditional, including a refusal: that path still commits the prune of lapsed rows
+        // above, so "nothing was written" is not the same as "nothing changed".
         self.forget_cached_watches();
         Ok(outcome)
     }
 
-    /// Remove one watch by id, reporting what it was so the caller can say what it stopped
+    /// Remove one watch by name, reporting what it was so the caller can say what it stopped
     /// watching for. `None` means there was no such watch.
-    pub async fn remove_watch(&self, id: i64) -> Result<Option<WatchRecord>> {
+    pub async fn remove_watch(&self, name: &str) -> Result<Option<WatchRecord>> {
+        let name = name.to_string();
         let record = self
             .connection
             .call(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let record = transaction
-                    .query_row(
-                        &format!("SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} WHERE w.id = ?1"),
-                        [id],
-                        row_to_watch,
-                    )
-                    .optional()?;
+                let record = read_watch(&transaction, &name)?;
                 if record.is_some() {
-                    transaction.execute("DELETE FROM watches WHERE id = ?1", [id])?;
+                    // The patterns go with it through `ON DELETE CASCADE`.
+                    transaction.execute("DELETE FROM watches WHERE name = ?1", [&name])?;
                 }
                 transaction.commit()?;
                 Ok(record)
@@ -1548,6 +1644,7 @@ impl Store {
                     let rows = statement.query_map([], row_to_watch)?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
+                let records = attach_patterns(&transaction, records)?;
                 transaction.commit()?;
                 Ok((records, pruned))
             })
@@ -1568,7 +1665,7 @@ impl Store {
     /// The `Arc` is deliberately reused when a refetch finds the rows unchanged, so a caller can
     /// tell "these are the same watches" by pointer and skip recompiling a regex set it already
     /// built. Lapsed rows are filtered rather than deleted, because a read on the hot path should
-    /// not take a write lock; [`Store::list_watches`] and [`Store::add_watch`] do the pruning.
+    /// not take a write lock; [`Store::list_watches`] and [`Store::write_watch`] do the pruning.
     pub async fn watches(&self, at: DateTime<Utc>) -> Result<Arc<Vec<WatchRecord>>> {
         if let Some(cached) = self.cached_watches() {
             return Ok(cached);
@@ -1583,7 +1680,8 @@ impl Store {
                      ORDER BY w.id"
                 ))?;
                 let rows = statement.query_map([at], row_to_watch)?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
+                let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+                attach_patterns(connection, rows)
             })
             .await?;
         Ok(self.cache_watches(rows))
@@ -2967,16 +3065,21 @@ const POLICY_COLUMNS: &str = "c.address, p.mode, p.until, p.reason, p.dropped, p
 
 const POLICY_FROM: &str = "conversation_policy p JOIN conversations c ON c.id = p.conversation_id";
 
-/// The columns [`row_to_watch`] reads, in the order it reads them.
-const WATCH_COLUMNS: &str = "w.id, c.address, w.field, w.pattern, w.reason, w.until, w.created_at";
+/// The columns [`row_to_watch`] reads, in the order it reads them. The patterns are not among
+/// them; [`attach_patterns`] adds those.
+const WATCH_COLUMNS: &str =
+    "w.id, w.name, c.address, w.field, w.mode, w.reason, w.until, w.created_at";
 
 /// A `LEFT` join, because a watch with no conversation is one that applies to every conversation,
 /// and an inner join would drop exactly those.
 const WATCH_FROM: &str = "watches w LEFT JOIN conversations c ON c.id = w.conversation_id";
 
-/// [`CONVERSATION_ID_OF`] against the third bound parameter, for statements that need the address
+/// [`CONVERSATION_ID_OF`] against the second bound parameter, for statements that need the address
 /// somewhere other than first.
-const CONVERSATION_ID_OF_3: &str = "(SELECT id FROM conversations WHERE address = ?3)";
+///
+/// Looking up a NULL address matches no row, so the subquery is NULL and the column ends up NULL,
+/// which is how an unscoped watch is written without a second statement.
+const CONVERSATION_ID_OF_2: &str = "(SELECT id FROM conversations WHERE address = ?2)";
 
 /// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
 const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
@@ -3080,24 +3183,101 @@ fn row_to_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRecord> {
 }
 
 fn row_to_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchRecord> {
-    let field: String = row.get(2)?;
-    let until: Option<String> = row.get(5)?;
-    let created_at: String = row.get(6)?;
+    let field: String = row.get(3)?;
+    let mode: String = row.get(4)?;
+    let until: Option<String> = row.get(6)?;
+    let created_at: String = row.get(7)?;
     Ok(WatchRecord {
         id: row.get(0)?,
-        conversation: row.get(1)?,
+        name: row.get(1)?,
+        conversation: row.get(2)?,
         field: WatchField::parse(&field).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
-                2,
+                3,
                 rusqlite::types::Type::Text,
                 format!("{field:?} is not a known watch field").into(),
             )
         })?,
-        pattern: row.get(3)?,
-        reason: row.get(4)?,
+        mode: WatchMode::parse(&mode).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                format!("{mode:?} is not a known watch mode").into(),
+            )
+        })?,
+        // Filled by `attach_patterns`, which is a second query: a pattern may contain any
+        // separator a `group_concat` would join on, so folding them in SQL could not be undone.
+        patterns: Vec::new(),
+        reason: row.get(5)?,
         until: until.as_deref().map(parse_rfc3339).transpose()?,
         created_at: parse_rfc3339(&created_at)?,
     })
+}
+
+/// Load the patterns for `records` and fold them on, in position order.
+///
+/// One query for the lot rather than one per watch, since every caller is reading a list, and a
+/// separate query rather than a join so the header rows stay one per watch.
+fn attach_patterns(
+    connection: &rusqlite::Connection,
+    mut records: Vec<WatchRecord>,
+) -> rusqlite::Result<Vec<WatchRecord>> {
+    let Some(first) = records.first() else {
+        return Ok(records);
+    };
+    let mut by_id: HashMap<i64, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        by_id.insert(record.id, index);
+    }
+    // Narrowed to one watch when only one was asked for, which is the common call: `write_watch`
+    // reads the row before and after it writes, and scanning every pattern in the deployment twice
+    // to answer a question about one rule is work nobody asked for.
+    let (sql, single) = match records.len() {
+        1 => (
+            "SELECT watch_id, pattern FROM watch_patterns WHERE watch_id = ?1 ORDER BY position",
+            Some(first.id),
+        ),
+        _ => (
+            "SELECT watch_id, pattern FROM watch_patterns ORDER BY watch_id, position",
+            None,
+        ),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let map = |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+    let rows: Vec<(i64, String)> = match single {
+        Some(id) => statement
+            .query_map([id], map)?
+            .collect::<std::result::Result<_, _>>()?,
+        None => statement
+            .query_map([], map)?
+            .collect::<std::result::Result<_, _>>()?,
+    };
+    for (watch_id, pattern) in rows {
+        if let Some(&index) = by_id.get(&watch_id)
+            && let Some(record) = records.get_mut(index)
+        {
+            record.patterns.push(pattern);
+        }
+    }
+    Ok(records)
+}
+
+/// One watch by name, with its patterns, or `None`.
+fn read_watch(
+    connection: &rusqlite::Connection,
+    name: &str,
+) -> rusqlite::Result<Option<WatchRecord>> {
+    let record = connection
+        .query_row(
+            &format!("SELECT {WATCH_COLUMNS} FROM {WATCH_FROM} WHERE w.name = ?1"),
+            [name],
+            row_to_watch,
+        )
+        .optional()?;
+    match record {
+        Some(record) => Ok(attach_patterns(connection, vec![record])?.pop()),
+        None => Ok(None),
+    }
 }
 
 fn parse_rfc3339(raw: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Error> {
@@ -6198,12 +6378,14 @@ mod tests {
         // And the new table works, including the scoped form that needs the conversation row.
         assert!(store.list_watches(now()).await.expect("list").is_empty());
         let outcome = store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    name: "rule-1",
                     conversation: Some("telegram:1"),
                     platform: Some("telegram"),
                     field: WatchField::Text,
-                    pattern: "deploy",
+                    mode: WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6211,7 +6393,153 @@ mod tests {
             )
             .await
             .expect("add");
-        assert!(matches!(outcome, WatchOutcome::Added(_)));
+        assert!(matches!(outcome, WatchOutcome::Created(_)));
+    }
+
+    #[tokio::test]
+    async fn watches_from_before_names_keep_their_patterns_and_gain_one() {
+        // The upgrade every 0.16.0 deployment takes. A watch had one pattern and no name, and
+        // losing either would cost somebody a rule set over a release a week old.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("state.db");
+        legacy_database(&path, 11, |connection| {
+            connection.execute(
+                "INSERT INTO conversations (address, channel, platform, kind, created_at)
+                 VALUES ('telegram:1', 'telegram', 'telegram', 'group', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO watches (id, conversation_id, field, pattern, reason, created_at)
+                 VALUES (1, NULL, 'text', '看我简介', 'spam', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO watches (id, conversation_id, field, pattern, reason, created_at)
+                 VALUES (2, 1, 'sender', '跑分', NULL, '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await;
+
+        let store = Store::open(&path).await.expect("upgrades");
+        let watches = store.list_watches(now()).await.expect("list");
+        assert_eq!(watches.len(), 2, "no rule may be dropped: {watches:?}");
+
+        assert_eq!(watches[0].name, "watch-1");
+        assert_eq!(watches[0].patterns, vec!["看我简介"]);
+        assert_eq!(watches[0].field, WatchField::Text);
+        assert_eq!(
+            watches[0].mode,
+            WatchMode::Any,
+            "a single pattern is an `any` rule"
+        );
+        assert_eq!(watches[0].reason.as_deref(), Some("spam"));
+        assert_eq!(watches[0].conversation, None);
+
+        assert_eq!(watches[1].name, "watch-2");
+        assert_eq!(watches[1].patterns, vec!["跑分"]);
+        assert_eq!(watches[1].conversation.as_deref(), Some("telegram:1"));
+
+        // And the generated name is a real name: writing to it replaces the rule rather than
+        // adding a second, which is how an operator renames one by hand.
+        let patterns = ["看我简介".to_string(), "日入过万".to_string()];
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    name: "watch-1",
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    mode: WatchMode::Any,
+                    patterns: &patterns,
+                    until: None,
+                    reason: Some("spam"),
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        assert!(
+            matches!(outcome, WatchOutcome::Updated {
+                added: 1,
+                removed: 0,
+                ..
+            }),
+            "{outcome:?}"
+        );
+
+        // A brand new rule after the rebuild must not collide with a migrated id. The table is
+        // rebuilt under another name and renamed, so this really asks whether SQLite carried
+        // `sqlite_sequence` across the rename: if it had not, the next insert would reuse id 1 and
+        // fail the primary key, and the first thing anybody wrote after upgrading would error.
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    name: "brand-new",
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    mode: WatchMode::Any,
+                    patterns: &["fresh".to_string()],
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        let WatchOutcome::Created(fresh) = outcome else {
+            panic!("a new name must create: {outcome:?}");
+        };
+        assert!(fresh.id > 2, "id {} reuses a migrated one", fresh.id);
+    }
+
+    #[tokio::test]
+    async fn the_pattern_ceiling_counts_every_watch_but_not_the_one_being_replaced() {
+        // A rewrite replaces what the name holds rather than adding to it, so counting the old
+        // patterns against the new ones would make a large rule impossible to edit once written.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let full: Vec<String> = (0..MAX_PATTERNS)
+            .map(|index| format!("rule{index}"))
+            .collect();
+        let rule = NewWatch {
+            name: "everything",
+            conversation: None,
+            platform: None,
+            field: WatchField::Text,
+            mode: WatchMode::Any,
+            patterns: &full,
+            until: None,
+            reason: None,
+        };
+        assert!(matches!(
+            store.write_watch(rule, now()).await.expect("write"),
+            WatchOutcome::Created(_)
+        ));
+
+        // Rewriting the same name at the ceiling is fine: it is the same patterns.
+        assert!(matches!(
+            store.write_watch(rule, now()).await.expect("write"),
+            WatchOutcome::Updated { .. }
+        ));
+
+        // One more anywhere else is not.
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    name: "one-more",
+                    patterns: &["extra".to_string()],
+                    ..rule
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        let WatchOutcome::Refused(why) = &outcome else {
+            panic!("the pattern ceiling must refuse: {outcome:?}");
+        };
+        assert!(why.contains(&MAX_PATTERNS.to_string()), "got: {why}");
     }
 
     #[tokio::test]
@@ -6741,76 +7069,206 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_watch_is_recorded_once_however_often_it_is_asked_for() {
-        // The agent keeps its rules somewhere of its own and syncs them, so it calls this for every
-        // rule every time. A second row per call would fill the table and report every message
-        // twice.
+    async fn writing_a_watch_by_name_replaces_it_rather_than_adding_a_second() {
+        // The whole reason a watch has a name. The agent keeps its rules somewhere of its own and
+        // syncs them; keying on the pattern meant an edited pattern was a different watch, so the
+        // sync left the old rule standing and added a second beside it.
         let (store, _account) = seeded(&["telegram:1"]).await;
+        let first = ["deploy".to_string(), "rollback".to_string()];
         let rule = NewWatch {
+            name: "deploys",
             conversation: None,
             platform: None,
             field: WatchField::Text,
-            pattern: "deploy",
+            mode: WatchMode::Any,
+            patterns: &first,
             until: None,
             reason: Some("releases"),
         };
-        let WatchOutcome::Added(first) = store.add_watch(rule, now()).await.expect("add") else {
-            panic!("the first call must add");
+        let WatchOutcome::Created(created) = store.write_watch(rule, now()).await.expect("write")
+        else {
+            panic!("the first call must create");
         };
-        let WatchOutcome::Existing(again) = store.add_watch(rule, now()).await.expect("add") else {
-            panic!("the second call must find the first");
-        };
-        assert_eq!(first.id, again.id);
-        assert_eq!(store.list_watches(now()).await.expect("list").len(), 1);
+        assert_eq!(created.patterns, vec!["deploy", "rollback"]);
 
-        // The same words pointed at another field are a different rule, because they read a
-        // different string and fire on different messages.
-        let other = NewWatch {
-            field: WatchField::Sender,
-            ..rule
+        // Writing the same rule again changes nothing, and says so: that is what tells a sync it
+        // had nothing to do.
+        let WatchOutcome::Updated { added, removed, .. } =
+            store.write_watch(rule, now()).await.expect("write")
+        else {
+            panic!("the second call must update");
         };
-        let WatchOutcome::Added(_) = store.add_watch(other, now()).await.expect("add") else {
-            panic!("a different field must be a different watch");
+        assert_eq!((added, removed), (0, 0));
+
+        // An edit is a set difference, not a length comparison: swapping one term for another
+        // leaves the count alone.
+        let second = ["deploy".to_string(), "revert".to_string()];
+        let WatchOutcome::Updated {
+            record,
+            added,
+            removed,
+        } = store
+            .write_watch(
+                NewWatch {
+                    patterns: &second,
+                    ..rule
+                },
+                now(),
+            )
+            .await
+            .expect("write")
+        else {
+            panic!("an edit must update");
         };
-        assert_eq!(store.list_watches(now()).await.expect("list").len(), 2);
+        assert_eq!((added, removed), (1, 1));
+        assert_eq!(record.patterns, vec!["deploy", "revert"]);
+        assert_eq!(store.list_watches(now()).await.expect("list").len(), 1);
     }
 
     #[tokio::test]
-    async fn a_scoped_watch_and_an_unscoped_one_are_different_rules() {
-        // SQLite treats NULLs as distinct, so the duplicate check cannot be a unique index and is
-        // a query instead. This is the case that would slip through one.
+    async fn the_name_is_the_identity_even_when_everything_else_changes() {
+        // Scope, field and mode are all properties of the rule rather than part of what identifies
+        // it, so moving a rule to another field must move it, not fork it.
         let (store, _account) = seeded(&["telegram:1"]).await;
-        let global = NewWatch {
+        let patterns = ["deploy".to_string()];
+        let rule = NewWatch {
+            name: "deploys",
             conversation: None,
             platform: None,
             field: WatchField::Text,
-            pattern: "deploy",
+            mode: WatchMode::Any,
+            patterns: &patterns,
             until: None,
             reason: None,
         };
-        let scoped = NewWatch {
-            conversation: Some("telegram:1"),
-            platform: Some("telegram"),
-            ..global
-        };
-        assert!(matches!(
-            store.add_watch(global, now()).await.expect("add"),
-            WatchOutcome::Added(_)
-        ));
-        assert!(matches!(
-            store.add_watch(scoped, now()).await.expect("add"),
-            WatchOutcome::Added(_)
-        ));
-        // And the unscoped one is still found rather than added twice, which is the half a unique
-        // index over a nullable column would silently lose.
-        assert!(matches!(
-            store.add_watch(global, now()).await.expect("add"),
-            WatchOutcome::Existing(_)
-        ));
+        store.write_watch(rule, now()).await.expect("write");
+        store
+            .write_watch(
+                NewWatch {
+                    conversation: Some("telegram:1"),
+                    platform: Some("telegram"),
+                    field: WatchField::Sender,
+                    mode: WatchMode::All,
+                    ..rule
+                },
+                now(),
+            )
+            .await
+            .expect("write");
         let watches = store.list_watches(now()).await.expect("list");
-        assert_eq!(watches.len(), 2);
-        assert_eq!(watches[0].conversation, None);
-        assert_eq!(watches[1].conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(watches.len(), 1, "one rule, moved: {watches:?}");
+        assert_eq!(watches[0].conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(watches[0].field, WatchField::Sender);
+        assert_eq!(watches[0].mode, WatchMode::All);
+    }
+
+    #[tokio::test]
+    async fn duplicate_patterns_collapse_keeping_the_first_position() {
+        // Position orders a reported hit, and a rule written with the same term twice means what
+        // it would mean written once.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let patterns = [
+            "deploy".to_string(),
+            "rollback".to_string(),
+            "deploy".to_string(),
+        ];
+        let WatchOutcome::Created(record) = store
+            .write_watch(
+                NewWatch {
+                    name: "deploys",
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    mode: WatchMode::Any,
+                    patterns: &patterns,
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("write")
+        else {
+            panic!("must create");
+        };
+        assert_eq!(record.patterns, vec!["deploy", "rollback"]);
+    }
+
+    #[tokio::test]
+    async fn the_store_refuses_a_rule_that_could_never_fire() {
+        // The store is the only door into the table, so the invariant lives here rather than in
+        // every caller: what is stored is a rule that can actually match.
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let base = NewWatch {
+            name: "spam",
+            conversation: None,
+            platform: None,
+            field: WatchField::Text,
+            mode: WatchMode::Any,
+            patterns: &[],
+            until: None,
+            reason: None,
+        };
+
+        let broken = ["fine".to_string(), "(unclosed".to_string()];
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    patterns: &broken,
+                    ..base
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        let WatchOutcome::Refused(why) = &outcome else {
+            panic!("an uncompilable pattern must be refused: {outcome:?}");
+        };
+        assert!(
+            why.contains("(unclosed"),
+            "the pattern has to be named: {why}"
+        );
+
+        let named = ["fine".to_string()];
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    name: "two\nlines",
+                    patterns: &named,
+                    ..base
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        assert!(matches!(outcome, WatchOutcome::Refused(_)), "{outcome:?}");
+
+        assert!(
+            store.list_watches(now()).await.expect("list").is_empty(),
+            "nothing refused may reach the table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_needs_at_least_one_pattern() {
+        let (store, _account) = seeded(&["telegram:1"]).await;
+        let outcome = store
+            .write_watch(
+                NewWatch {
+                    name: "empty",
+                    conversation: None,
+                    platform: None,
+                    field: WatchField::Text,
+                    mode: WatchMode::Any,
+                    patterns: &[],
+                    until: None,
+                    reason: None,
+                },
+                now(),
+            )
+            .await
+            .expect("write");
+        assert!(matches!(outcome, WatchOutcome::Refused(_)), "{outcome:?}");
     }
 
     #[tokio::test]
@@ -6819,12 +7277,14 @@ mod tests {
         // is minted here exactly as `set_policy` mints one.
         let (store, _account) = seeded(&[]).await;
         let outcome = store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    name: "rule-6",
                     conversation: Some("telegram:-100"),
                     platform: Some("telegram"),
                     field: WatchField::Text,
-                    pattern: "deploy",
+                    mode: WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6832,7 +7292,7 @@ mod tests {
             )
             .await
             .expect("add");
-        let WatchOutcome::Added(record) = outcome else {
+        let WatchOutcome::Created(record) = outcome else {
             panic!("must add");
         };
         assert_eq!(record.conversation.as_deref(), Some("telegram:-100"));
@@ -6842,14 +7302,16 @@ mod tests {
     async fn a_lapsed_watch_stops_matching_and_is_swept() {
         let (store, _account) = seeded(&["telegram:1"]).await;
         let lapsed = NewWatch {
+            name: "rule-7",
             conversation: None,
             platform: None,
             field: WatchField::Text,
-            pattern: "deploy",
+            mode: WatchMode::Any,
+            patterns: &["deploy".to_string()],
             until: Some(now() - chrono::Duration::minutes(1)),
             reason: None,
         };
-        store.add_watch(lapsed, now()).await.expect("add");
+        store.write_watch(lapsed, now()).await.expect("add");
         // Gone from what the gate matches before anything has swept it, since the read filters
         // rather than waiting for a write.
         assert!(store.watches(now()).await.expect("read").is_empty());
@@ -6859,13 +7321,15 @@ mod tests {
     #[tokio::test]
     async fn removing_a_watch_reports_what_it_was() {
         let (store, _account) = seeded(&["telegram:1"]).await;
-        let WatchOutcome::Added(record) = store
-            .add_watch(
+        let WatchOutcome::Created(record) = store
+            .write_watch(
                 NewWatch {
+                    name: "rule-8",
                     conversation: None,
                     platform: None,
                     field: WatchField::Text,
-                    pattern: "deploy",
+                    mode: WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6876,11 +7340,11 @@ mod tests {
         else {
             panic!("must add");
         };
-        let removed = store.remove_watch(record.id).await.expect("remove");
-        assert_eq!(removed.expect("the row").pattern, "deploy");
+        let removed = store.remove_watch(&record.name).await.expect("remove");
+        assert_eq!(removed.expect("the row").patterns, vec!["deploy"]);
         assert!(
             store
-                .remove_watch(record.id)
+                .remove_watch(&record.name)
                 .await
                 .expect("remove")
                 .is_none(),
@@ -6895,12 +7359,14 @@ mod tests {
         // allocation rather than an equal one.
         let (store, _account) = seeded(&["telegram:1"]).await;
         store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    name: "rule-9",
                     conversation: None,
                     platform: None,
                     field: WatchField::Text,
-                    pattern: "deploy",
+                    mode: WatchMode::Any,
+                    patterns: &["deploy".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6916,12 +7382,14 @@ mod tests {
         );
 
         store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    name: "rule-10",
                     conversation: None,
                     platform: None,
                     field: WatchField::Sender,
-                    pattern: "spammer",
+                    mode: WatchMode::Any,
+                    patterns: &["spammer".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6940,14 +7408,17 @@ mod tests {
         // rules at runtime, so there has to be a limit that is not "until it gets slow".
         let (store, _account) = seeded(&["telegram:1"]).await;
         for index in 0..MAX_WATCHES {
+            let name = format!("rule-{index}");
             let pattern = format!("rule{index}");
             let outcome = store
-                .add_watch(
+                .write_watch(
                     NewWatch {
+                        name: &name,
                         conversation: None,
                         platform: None,
                         field: WatchField::Text,
-                        pattern: &pattern,
+                        mode: WatchMode::Any,
+                        patterns: std::slice::from_ref(&pattern),
                         until: None,
                         reason: None,
                     },
@@ -6955,15 +7426,19 @@ mod tests {
                 )
                 .await
                 .expect("add");
-            assert!(matches!(outcome, WatchOutcome::Added(_)), "at {index}");
+            assert!(matches!(outcome, WatchOutcome::Created(_)), "at {index}");
         }
         let outcome = store
-            .add_watch(
+            .write_watch(
                 NewWatch {
+                    // Deliberately outside the loop's own naming, or this would replace one of
+                    // the rules it just wrote and never reach the ceiling at all.
+                    name: "one-too-many",
                     conversation: None,
                     platform: None,
                     field: WatchField::Text,
-                    pattern: "one too many",
+                    mode: WatchMode::Any,
+                    patterns: &["one too many".to_string()],
                     until: None,
                     reason: None,
                 },
@@ -6971,7 +7446,10 @@ mod tests {
             )
             .await
             .expect("add");
-        assert_eq!(outcome, WatchOutcome::AtCapacity(MAX_WATCHES));
+        let WatchOutcome::Refused(why) = &outcome else {
+            panic!("one past the ceiling must be refused: {outcome:?}");
+        };
+        assert!(why.contains(&MAX_WATCHES.to_string()), "got: {why}");
         assert_eq!(
             store.list_watches(now()).await.expect("list").len(),
             MAX_WATCHES

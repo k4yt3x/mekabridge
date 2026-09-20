@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-09-21
+
+### Added
+
+- A watch is a named rule holding many patterns, so a rule set is one watch rather than a hundred.
+- `match: all` wakes the agent only when every pattern matches, which lookahead cannot express here.
+- `mekabridge watch write --patterns-file` loads a rule set from a file, one pattern per line.
+- `watch_list` reports each rule's patterns and a count, and `watch_delete` takes a name.
+
+### Changed
+
+- **Breaking:** `watch_create` is now `watch_write`, taking a `name` and a list of `patterns`.
+- **Breaking:** the database moves to schema 12; 0.16.0 watches are kept, named `watch-<id>`.
+- The `woke you:` line names the rule and the pattern that hit, rather than a numeric watch id.
+
 ## [0.16.0] - 2026-09-20
 
 ### Added
@@ -447,7 +462,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.16.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.17.0...HEAD
+[0.17.0]: https://github.com/k4yt3x/mekabridge/compare/0.16.0...0.17.0
 [0.16.0]: https://github.com/k4yt3x/mekabridge/compare/0.15.1...0.16.0
 [0.15.1]: https://github.com/k4yt3x/mekabridge/compare/0.15.0...0.15.1
 [0.15.0]: https://github.com/k4yt3x/mekabridge/compare/0.14.0...0.15.0

@@ -8,6 +8,8 @@
 //! What counts against a platform's limit differs by platform, so the budget is measured on emitted
 //! output rather than on visible length; see [`into_messages`].
 
+mod cjk;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// Inline styling that survives into every platform's markup.
@@ -246,6 +248,14 @@ pub fn plain(markdown: &str, limit: usize) -> Vec<String> {
 }
 
 fn parse_blocks(markdown: &str) -> Vec<Block> {
+    // The two calls into [`cjk`] are the whole of that workaround; see the module for what it does
+    // and when it can go.
+    let mut blocks = collect_blocks(&cjk::normalize(markdown));
+    cjk::restore(&mut blocks);
+    blocks
+}
+
+fn collect_blocks(markdown: &str) -> Vec<Block> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -538,9 +548,16 @@ impl ParseState {
 
     /// No platform here has table markup, so a table becomes a preformatted block where column
     /// alignment at least survives in a monospace font.
-    fn push_table(&mut self, table: TableState) {
+    fn push_table(&mut self, mut table: TableState) {
         if table.rows.is_empty() {
             return;
+        }
+        // Column widths are measured here, before [`cjk`] takes its sentinel back out, so a cell
+        // carrying one would pad its column a character too wide.
+        for row in &mut table.rows {
+            for cell in row.iter_mut() {
+                cjk::clear(cell);
+            }
         }
         let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut widths = vec![0_usize; column_count];

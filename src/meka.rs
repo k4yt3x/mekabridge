@@ -470,8 +470,8 @@ impl std::fmt::Display for InboxState {
 pub const INBOX_CLASS: &str = "steer";
 
 /// Who the header meka writes above each item names as the sender. The same name the MCP
-/// instructions use for this bridge, so the agent reads one name for it rather than whatever the
-/// operator described the token as.
+/// instructions use for this bridge, so the agent reads one name for it. Without it meka 0.63 and
+/// later name nobody, and earlier ones name whatever the operator described the token as.
 pub const INBOX_SOURCE: &str = "mekabridge";
 
 /// HTTP client for one `meka serve` instance.

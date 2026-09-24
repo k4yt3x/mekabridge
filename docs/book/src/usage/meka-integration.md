@@ -46,7 +46,8 @@ exists to end, and an `interrupt` would cut a reply being written to one person 
 else wrote.
 
 `source` is what meka names in the header it writes above each item, so the agent reads one name for
-this bridge rather than whatever the token was described as. That header is also why the bridge
+this bridge, the one its MCP instructions use. Without it the header would name nobody from meka
+0.63, and whatever the token was described as before that. That header is also why the bridge
 numbers nothing: meka says which item is which, and a count written here could only disagree with
 it. The item's own fence is unchanged and still does the work: meka passes the body through
 verbatim, which is why a client relaying text from strangers fences it itself.
@@ -449,16 +450,16 @@ It stops short of "everything outside a fence is the bridge's". That was an earl
 
 **Nothing that is true of every tool anywhere.** An earlier draft said "it posts nothing on its own, so a turn that calls no tool leaves every chat as it was". True, and worth as much as telling somebody their phone will not text people by itself. The failure it was guarding against, an agent that narrates a reply instead of sending one, is a prompting problem rather than a fact about this bridge, and the rule below puts prompting elsewhere. `message_send` reports the id it created and `history_read` now shows the agent's own messages, so "did I actually reply?" has an answer that does not depend on being reassured.
 
-**Nothing outside what this bridge does.** An earlier version opened with "nothing you write here reaches them: your turn text, your reasoning and your tool output are all invisible". That is a claim about the whole deployment, and the bridge cannot make it: an operator sitting at a meka REPL alongside these chats sees exactly the turn text the bridge does not relay, so it was false there and misleading everywhere else. Conduct goes the same way. Whether the agent should reply, stay quiet, or treat its reasoning as private is the operator's call, and the profile prompt is where it belongs.
+**Nothing outside what this bridge does.** An earlier version opened with "nothing you write here reaches them: your turn text, your reasoning and your tool output are all invisible". That is a claim about the whole deployment, and the bridge cannot make it: an operator sitting at a meka REPL alongside these chats sees exactly the turn text the bridge does not relay, so it was false there and misleading everywhere else. Conduct goes the same way. Whether the agent should reply, stay quiet, or treat its reasoning as private is the operator's call, and meka's standing instructions are where it belongs.
 
 Two constraints bound the length:
 
-- **meka truncates a server's `instructions` to 2048 characters** at handshake, silently, appending an ellipsis. The value is captured in a `OnceLock` on first connect, so a version that went over would stay cut until meka restarts. `the_instructions_fit_inside_mekas_cap` guards the length; trim a paragraph rather than raising it.
+- **meka truncates a server's `instructions` to 2048 characters** at handshake, silently, appending an ellipsis. It is taken again on every reconnect rather than once per process, so a shortened version replaces a cut one as soon as meka reconnects to it. `the_instructions_fit_inside_mekas_cap` guards the length; trim a paragraph rather than raising it.
 - **It is re-emitted in full after every compaction**, so its length is paid again each time rather than once per session.
 
 These survive compaction. They are not in the system prompt, which meka asserts deliberately, but
-meka drops `last_rendered_world` at a compaction boundary and re-states the whole world in full on
-the next turn, so the instructions come back on their own.
+since meka 0.61 a compaction re-states the whole world in full in the context it writes after the
+summary, so the instructions come back on their own.
 
 The one thing the handshake cannot carry is which account the agent appears as, because that is
 asked of each platform at startup and `get_info` is synchronous. It rides every item instead:

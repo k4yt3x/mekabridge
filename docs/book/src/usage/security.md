@@ -115,7 +115,7 @@ The bridge runs at meka's `read` permission by default. That covers the conversa
 
 Weigh that trade before raising the level. `unrestricted` is the whole machine, not just the moderation tools, so a deployment that wants the agent banning people and nothing more is better served by the `tool_permissions` override above than by moving the session. Three things to know either way:
 
-- **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those.
+- **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config, any `token_file`, and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those. The one exception is a process's own directory under `/proc`, refused whatever path names it, because its `environ` holds every `${VAR}` token; that makes the environment the one place a credential is out of `file_send`'s reach.
 - **`attachment_download` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.
 
 Confine the bridge with the systemd hardening in [Operations](./operations.md), and keep `[session].cwd` pointed at a directory that holds nothing you would mind the agent reading aloud.

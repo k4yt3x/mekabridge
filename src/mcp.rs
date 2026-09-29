@@ -7,7 +7,10 @@
 
 pub mod serve;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use rmcp::{
@@ -1112,6 +1115,19 @@ impl BridgeMcpServer {
             if !path.is_absolute() {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "every path must be absolute, got {raw:?}."
+                ))]));
+            }
+            // The canonical path as well as the one given, because a symlink or a `..` names the
+            // same entry by another path.
+            if is_process_proc_entry(&path)
+                || std::fs::canonicalize(&path)
+                    .is_ok_and(|canonical| is_process_proc_entry(&canonical))
+            {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{} is a process's own `/proc` entry, which is never sent: `environ`, \
+                     `cmdline` and `fd` carry what the process was given, this bridge's tokens \
+                     among them.",
+                    path.display()
                 ))]));
             }
             // Checked here rather than left to the platform so the agent gets "no such file"
@@ -2286,6 +2302,31 @@ fn sent_result(conversation: &str, message_ids: &[String]) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(summary)])
 }
 
+/// Whether `path` lies under a process's own directory in `/proc`: `/proc/<pid>`, `/proc/self` or
+/// `/proc/thread-self`.
+///
+/// Refused by `file_send` at every level, because the bridge cannot tell which level its caller
+/// runs at, and nothing in these is worth sending to a chat. `environ` is where a `${VAR}` in this
+/// bridge's config comes from, so it holds the bot tokens and meka's; `cmdline`, `fd` and `mem`
+/// hold the rest of what a process was given. The system-wide files beside them (`meminfo`,
+/// `cpuinfo`, `mounts`) carry no secret and stay sendable. The same line meka 0.68 draws for its
+/// own `file_read`.
+fn is_process_proc_entry(path: &Path) -> bool {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    if components.next() != Some(Component::Normal("proc".as_ref())) {
+        return false;
+    }
+    let Some(Component::Normal(process)) = components.next() else {
+        return false;
+    };
+    process.to_str().is_some_and(|name| {
+        name == "self" || name == "thread-self" || name.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 /// Serialize a value as the tool's text payload.
 fn json_result<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
@@ -3164,6 +3205,65 @@ mod tests {
             .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
         assert!(text_of(&result).contains("not a readable file"));
+    }
+
+    /// `/proc/self/environ` is a regular file to `is_file`, and it holds every `${VAR}` token the
+    /// config names, so an admitted sender who talks the agent into sending it would read the bot
+    /// token in the chat. A symlink to it is the same file by another path, so it is refused too,
+    /// and nothing reaches the sink either way.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn send_file_refuses_a_process_s_proc_entry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let link = directory.path().join("report.txt");
+        std::os::unix::fs::symlink("/proc/self/environ", &link).expect("symlink");
+        let (server, sink) = server_with(FakeSink::default());
+        for path in [
+            "/proc/self/environ".to_string(),
+            format!("/proc/{}/cmdline", std::process::id()),
+            link.display().to_string(),
+        ] {
+            let result = server
+                .file_send_inner(
+                    SendFileArgs {
+                        conversation: "telegram:1".to_string(),
+                        paths: vec![path.clone()],
+                        caption: None,
+                        as_photo: false,
+                        link_preview: false,
+                        reply_to: None,
+                        silent: false,
+                    },
+                    None,
+                )
+                .await
+                .expect("tool runs");
+            assert_eq!(result.is_error, Some(true), "{path}");
+            assert!(text_of(&result).contains("`/proc` entry"), "{path}");
+        }
+        assert!(sink.files.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn only_a_process_s_own_proc_directory_counts() {
+        for entry in [
+            "/proc/1234/environ",
+            "/proc/1234/mem",
+            "/proc/self/environ",
+            "/proc/thread-self/cmdline",
+            "/proc/42/fd/3",
+        ] {
+            assert!(is_process_proc_entry(Path::new(entry)), "{entry}");
+        }
+        for elsewhere in [
+            "/proc/meminfo",
+            "/proc/cpuinfo",
+            "/proc/net/tcp",
+            "/procfs/1234/environ",
+            "/var/lib/mekabridge/proc/self/environ",
+        ] {
+            assert!(!is_process_proc_entry(Path::new(elsewhere)), "{elsewhere}");
+        }
     }
 
     #[tokio::test]

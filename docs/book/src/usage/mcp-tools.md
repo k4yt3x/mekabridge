@@ -50,6 +50,8 @@ Several paths arrive as **one grouped post**: an album on Telegram, a single mes
 
 Relative paths and missing files are rejected before the platform is contacted, so the agent gets "not a readable file" instead of an opaque upload error. Every path is checked before any is sent, so one bad path in a group of five delivers nothing rather than most of an album, and the message names the path that was wrong.
 
+A process's own directory under `/proc` (`/proc/<pid>`, `/proc/self`, `/proc/thread-self`) is refused however the path names it, symlinks included. Its `environ` is where every `${VAR}` in the bridge's config comes from, so sending it would put the bot token in the chat. The system-wide files beside it, such as `/proc/meminfo`, are sent as usual.
+
 `as_photo` governs the whole call rather than each file, because Telegram will not group documents together with photos, and a per-file choice could describe a group it would refuse.
 
 `link_preview` does nothing on Telegram, and is accepted rather than refused there. `sendPhoto` and `sendDocument` carry no `link_preview_options` at all, so a caption's links never expand into a card; refusing the call would make the agent handle a platform difference it cannot see from the schema, for a request that is harmless.

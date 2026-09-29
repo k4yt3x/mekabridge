@@ -125,7 +125,7 @@ description = "mekabridge"
 scopes = ["sessions:r", "sessions:w"]
 ```
 
-`sessions:w` covers creating a session, posting to its inbox, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **the session feed**. Both are required, and neither is optional in practice: without `sessions:w` nothing can be handed over, and without `sessions:r` the bridge hands messages over and never learns what became of any of them.
+`sessions:w` covers creating a session, posting to its inbox, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **the session feed**. From meka 0.68 the feed takes `sessions:w` as well whenever opening it has to load the session, which happens after every meka restart and after an eviction. Both are required, and neither is optional in practice: without `sessions:w` nothing can be handed over, and without `sessions:r` the bridge hands messages over and never learns what became of any of them.
 
 `mekabridge doctor` says whether the token holds both, on meka 0.57 and later, which is the first release to report the calling token's scopes. It is the one thing about the token nothing else can check: every other question `doctor` asks needs a read scope only, so a token that cannot hand a message over answers all of them and the gap surfaces as a message that is never answered. Against an older meka the line is absent rather than guessed at.
 

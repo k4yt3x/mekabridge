@@ -66,21 +66,6 @@ impl Presence {
     }
 }
 
-/// Whether a meka `notice` is telling the caller that events went missing.
-///
-/// Two situations mean it: the replay ring no longer reaching the position asked for, and the
-/// re-attached subscription falling behind afterwards. Matched on prose because the event carries
-/// no code, which is fragile only in the cheap direction: a rewording means one reconciliation is
-/// not run on the notice, and every reconnect runs one anyway.
-///
-/// The gap notice is matched on the clause it has kept across rewordings rather than on its
-/// opening, which is what went stale: meka 0.46 replaced "Replay buffer does not reach" with "the
-/// replay does not reach", so a match on the first two words stopped firing a release before this
-/// bridge's own floor and nothing failed to say so.
-pub fn notice_reports_lost_events(text: &str) -> bool {
-    text.contains("does not reach your Last-Event-ID") || text.contains("Fell behind")
-}
-
 /// The MCP tool name meka exposes for this bridge's `message_send`, used to tell "the agent
 /// replied" apart from "the agent stayed quiet". meka namespaces MCP tools as
 /// `mcp__<server>__<tool>`, and the server segment is whatever the operator named this bridge in
@@ -368,35 +353,6 @@ mod tests {
         Activity, Channel, ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity,
         FetchedFile, InboundEvent, Platform, SendOptions,
     };
-
-    /// Every wording meka has emitted, copied from the emitting sites rather than paraphrased.
-    /// A drift in any of them means one reconciliation is not run on the notice; the reconnect
-    /// runs one regardless, which is why this is cheap to get wrong and still worth pinning.
-    ///
-    /// Both spellings of the gap notice are here because pinning only the one this bridge was
-    /// written against is what hid the drift: meka reworded it in 0.46, the assertion and the
-    /// matcher agreed with each other on a string meka no longer sent, and the test went on
-    /// passing.
-    #[test]
-    fn every_wording_of_mekas_lost_event_notices_is_recognised() {
-        // meka 0.46 onwards, which is this bridge's floor.
-        assert!(notice_reports_lost_events(
-            "the replay does not reach your Last-Event-ID, so events were dropped; read `GET \
-             /v1/sessions/{id}/messages` for the full transcript"
-        ));
-        // Before 0.46. Kept because reading a gap notice wrongly is the expensive direction, and
-        // matching a string no meka still sends costs nothing.
-        assert!(notice_reports_lost_events(
-            "Replay buffer does not reach your Last-Event-ID; some events were dropped."
-        ));
-        assert!(notice_reports_lost_events(
-            "Fell behind; 12 event(s) were dropped from this replay."
-        ));
-        // An ordinary notice must not trigger a reconciliation per notice.
-        assert!(!notice_reports_lost_events(
-            "Session was compacted before this turn."
-        ));
-    }
 
     /// A short ceiling, so the test that proves the indicator lapses does not take two minutes.
     const TEST_TYPING_MAX: Duration = Duration::from_secs(30);

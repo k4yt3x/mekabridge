@@ -21,8 +21,8 @@ pub enum TurnSource {
     Schedule { job_id: String },
     /// A background task reported back and earned a turn of its own.
     Background,
-    /// A name this build does not know, or none at all: before meka 0.57 the `turn.started`
-    /// synthesised when a feed attaches mid-turn carried no source.
+    /// A source this build does not act on, such as the `compaction` of the checkpoint turn `POST
+    /// /compact` runs, or none at all.
     Unknown(String),
 }
 
@@ -33,9 +33,8 @@ pub enum TurnEvent {
         started_at: String,
         source: TurnSource,
         /// Whether this is the announcement meka synthesises for a turn already running when the
-        /// feed attached, rather than a turn beginning. It carries no id and no time, and since
-        /// meka 0.57 it names the turn's source as a real one does; everything after it is the
-        /// real thing.
+        /// feed attached, rather than a turn beginning. It carries no id and no time, and names
+        /// the turn's source as a real one does; everything after it is the real thing.
         resumed: bool,
     },
     AssistantText {
@@ -109,6 +108,15 @@ pub enum TurnEvent {
     InboxWithdrawn {
         item_id: String,
     },
+    /// This connection's copy of the feed has a hole: the replay no longer reached the position it
+    /// resumed from, or what it fell behind by while connected. `dropped` is how many events, when
+    /// meka can count them.
+    ///
+    /// About the connection rather than the session, so it carries no `id` and no turn, and the
+    /// feed position does not move on it.
+    FeedGap {
+        dropped: Option<u64>,
+    },
     Finished {
         stop_reason: String,
         refusal_text: Option<String>,
@@ -150,8 +158,8 @@ pub struct Usage {
 /// One parsed frame: the event, and which turn it belongs to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parsed {
-    /// Off the payload's `turn_id`, which every event meka sends carries; `None` on a frame that
-    /// names none, such as the notice about a replay hole.
+    /// Off the payload's `turn_id`, which every turn's event carries; `None` on a frame that names
+    /// none, such as `feed.gap`.
     pub turn_id: Option<String>,
     pub event: TurnEvent,
 }
@@ -271,6 +279,9 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
         "inbox.withdrawn" => TurnEvent::InboxWithdrawn {
             item_id: string("item_id"),
         },
+        "feed.gap" => TurnEvent::FeedGap {
+            dropped: value.get("dropped").and_then(serde_json::Value::as_u64),
+        },
         "turn.finished" => TurnEvent::Finished {
             stop_reason: string("stop_reason"),
             refusal_text: optional_string("refusal_text"),
@@ -288,10 +299,7 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         },
-        // meka 0.46 respelled this with one `l` and kept no alias. Both are matched because a
-        // terminal event that falls through to `Unknown` fails silently rather than loudly:
-        // `is_terminal` says no, and the turn's tally is never closed out.
-        "turn.canceled" | "turn.cancelled" => TurnEvent::Cancelled {
+        "turn.canceled" => TurnEvent::Cancelled {
             reason: string("reason"),
         },
         other => TurnEvent::Unknown {
@@ -441,27 +449,18 @@ mod tests {
         ));
     }
 
-    /// What a feed attaching mid-turn opens with: the id of the turn in flight and `resumed`, with
-    /// no time, because it is synthesised rather than replayed. Both shapes are pinned because both
-    /// are in the field: meka names the source on it from 0.57 and named none before, and the
-    /// bridge reads `resumed` rather than the absent source to tell the two apart.
+    /// What a feed attaching mid-turn opens with: the id of the turn in flight, its source, and
+    /// `resumed`, with no time, because it is synthesised rather than replayed. `resumed` is what
+    /// tells it apart from a turn beginning.
     #[test]
     fn a_resumed_turn_is_told_apart_from_one_beginning() {
-        let parsed = parse(
-            "turn.started",
-            r#"{"turn_id":"t1","session_id":"s","resumed":true}"#,
-        )
-        .expect("parses")
-        .expect("event");
-        assert_eq!(parsed.turn_id.as_deref(), Some("t1"));
-        assert_eq!(parsed.event, TurnEvent::Started {
-            started_at: String::new(),
-            source: TurnSource::Unknown(String::new()),
-            resumed: true,
-        });
         let named = r#"{"turn_id":"t1","session_id":"s","resumed":true,
                         "source":"inbox","item_ids":["i1","i2"]}"#;
-        assert_eq!(event("turn.started", named), TurnEvent::Started {
+        let parsed = parse("turn.started", named)
+            .expect("parses")
+            .expect("event");
+        assert_eq!(parsed.turn_id.as_deref(), Some("t1"));
+        assert_eq!(parsed.event, TurnEvent::Started {
             started_at: String::new(),
             source: TurnSource::Inbox {
                 item_ids: vec!["i1".to_string(), "i2".to_string()]
@@ -513,15 +512,12 @@ mod tests {
         .expect("parses")
         .expect("event");
         assert_eq!(parsed.turn_id.as_deref(), Some("t7"));
-        // A frame naming no turn, such as the replay-hole notice, reads as none rather than as
-        // an empty one that would file under a turn called "".
-        let notice = parse(
-            "notice",
-            r#"{"level":"warn","text":"the replay does not reach"}"#,
-        )
-        .expect("parses")
-        .expect("event");
-        assert_eq!(notice.turn_id, None);
+        // A frame naming no turn, such as `feed.gap`, reads as none rather than as an empty one
+        // that would file under a turn called "".
+        let gap = parse("feed.gap", r#"{"session_id":"s","dropped":3}"#)
+            .expect("parses")
+            .expect("event");
+        assert_eq!(gap.turn_id, None);
     }
 
     #[test]
@@ -534,25 +530,73 @@ mod tests {
         );
     }
 
-    /// The two meka 0.57 added, which this bridge ignores on purpose rather than by oversight. They
-    /// are progress on a tool call the agent is running, for a client drawing it; nothing here
-    /// draws a tool call, and meka sends them with no `id:` and keeps them out of its replay ring,
-    /// so reading them changes neither the feed position nor what a reconnect is handed.
+    /// Progress on a tool call the agent is running, which this bridge ignores on purpose rather
+    /// than by oversight. It is for a client drawing the call, and nothing here draws one; meka
+    /// sends it with no `id:` and keeps it out of its replay ring, so reading it changes neither
+    /// the feed position nor what a reconnect is handed.
     #[test]
     fn a_running_tool_call_s_progress_is_read_and_ignored() {
+        let parsed = event("tool_call.output_delta", r#"{"id":"tu_1","chunk":"one\n"}"#);
+        assert_eq!(parsed, TurnEvent::Unknown {
+            event: "tool_call.output_delta".to_string()
+        });
+        assert!(!parsed.is_terminal());
+    }
+
+    /// The events meka 0.70 added to the session feed, none of which this bridge acts on. A nudge
+    /// in particular arrives inside a turn that carries on, so it must not read as that turn
+    /// ending.
+    #[test]
+    fn the_events_meka_0_70_added_are_read_and_ignored() {
         for (name, data) in [
-            ("tool_call.output_delta", r#"{"id":"tu_1","chunk":"one\n"}"#),
             (
-                "subagent.activity",
-                r#"{"id":"tu_1","summary":"read_file"}"#,
+                "turn.nudged",
+                r#"{"kind":"checklist","text":"[Checklist: ...]","turn_id":"t1","session_id":"s"}"#,
+            ),
+            (
+                "checklist.updated",
+                r#"{"items":[{"id":1,"text":"reply to Sam","status":"pending"}]}"#,
+            ),
+            (
+                "session.updated",
+                r#"{"id":"s","title":"","profile":"work","turn_in_flight":false}"#,
+            ),
+            (
+                "conversation.rewound",
+                r#"{"revision":3,"total":40,"turns_removed":1}"#,
+            ),
+            (
+                "permission_resolved",
+                r#"{"request_id":"r1","outcome":"expired"}"#,
             ),
         ] {
             let parsed = event(name, data);
-            assert_eq!(parsed, TurnEvent::Unknown {
-                event: name.to_string()
-            });
-            assert!(!parsed.is_terminal());
+            assert_eq!(
+                parsed,
+                TurnEvent::Unknown {
+                    event: name.to_string()
+                },
+                "{name}"
+            );
+            assert!(!parsed.is_terminal(), "{name} must not end a turn");
         }
+    }
+
+    /// How meka says some of the feed is gone. Missing it is not a parse failure but a hand-over
+    /// left waiting on an outcome that has been and gone, so the event has to be read, with and
+    /// without the count meka gives only when it can.
+    #[test]
+    fn a_hole_in_the_feed_is_read_whether_or_not_it_is_counted() {
+        let counted = parse("feed.gap", r#"{"session_id":"s","dropped":12}"#)
+            .expect("parses")
+            .expect("event");
+        assert_eq!(counted.event, TurnEvent::FeedGap { dropped: Some(12) });
+        assert_eq!(counted.turn_id, None);
+        assert!(!counted.event.is_terminal());
+        assert_eq!(
+            event("feed.gap", r#"{"session_id":"s"}"#),
+            TurnEvent::FeedGap { dropped: None }
+        );
     }
 
     #[test]
@@ -572,22 +616,15 @@ mod tests {
         assert!(!event("inbox.failed", r#"{"item_id":"i","reason":"r"}"#).is_terminal());
     }
 
-    /// The spelling meka 0.46 moved to, and the one it moved from. Reading only one of them is not
-    /// a parse failure but a leak: an unmatched terminal is `Unknown`, which is not terminal, so
-    /// the turn's tally and its typing window are never closed out.
+    /// Misspelling it is not a parse failure but a leak: an unmatched terminal is `Unknown`, which
+    /// is not terminal, so the turn's tally and its typing window are never closed out.
     #[test]
-    fn both_spellings_of_a_cancelled_turn_are_terminal() {
-        for name in ["turn.canceled", "turn.cancelled"] {
-            let parsed = event(name, r#"{"reason":"sse_lag"}"#);
-            assert_eq!(
-                parsed,
-                TurnEvent::Cancelled {
-                    reason: "sse_lag".to_string(),
-                },
-                "{name} must not fall through to Unknown"
-            );
-            assert!(parsed.is_terminal(), "{name} must end the turn");
-        }
+    fn a_cancelled_turn_is_terminal_and_says_why() {
+        let parsed = event("turn.canceled", r#"{"reason":"sse_lag"}"#);
+        assert_eq!(parsed, TurnEvent::Cancelled {
+            reason: "sse_lag".to_string(),
+        });
+        assert!(parsed.is_terminal());
     }
 
     #[test]

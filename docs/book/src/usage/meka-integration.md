@@ -2,20 +2,7 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
-**meka 0.55.0 or later is required, and nothing older works at all**, in both directions at once.
-Messages are handed over through the session inbox, `POST /v1/sessions/{id}/inbox`, which an older
-meka has no route for and answers with a 404; and their outcome is read from the session feed,
-`GET /v1/sessions/{id}/stream`, which before 0.55 was a view of one turn that closed at its terminal
-rather than the session's own feed. A bridge pointed at an older meka would hand nothing over and
-hear about one turn. `mekabridge doctor` fails on the version for that reason.
-
-Earlier renames are part of the same floor. `GET /v1/providers`, which the bridge reads the running
-model from, is `GET /v1/profiles`; the terminal SSE event for a stopped turn is `turn.canceled`, one
-`l`; and the `ask` permission level is gone, replaced by an `approvals` switch beside the level.
-
-Upgrading across 0.46 also changes the shape of meka's own `config.toml`, which it refuses to start
-against until converted. meka ships `migrate-0.45-to-0.46.py` as a release asset for that, and its
-upgrade guide is the authority on it. None of the snippets below are affected by the conversion.
+**meka 0.71.0 or later is required.** 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way the bridge hears of one, so against an older meka a hole opened while the feed is read slowly is found an hour or so later rather than at once. 0.70 moved `vision` from `GET /v1/info` onto each entry of `GET /v1/profiles`, and the bridge reads it only there, so before 0.70 `attachment_view` describes every image instead of showing it while everything else looks healthy. Before 0.55 nothing works at all, in both directions at once: messages are handed over through the session inbox, `POST /v1/sessions/{id}/inbox`, which an older meka has no route for and answers with a 404; and their outcome is read from the session feed, `GET /v1/sessions/{id}/stream`, which before 0.55 was a view of one turn that closed at its terminal rather than the session's own feed. `mekabridge doctor` fails on the version for all of these reasons.
 
 ## How a message gets to the agent
 
@@ -46,8 +33,7 @@ exists to end, and an `interrupt` would cut a reply being written to one person 
 else wrote.
 
 `source` is what meka names in the header it writes above each item, so the agent reads one name for
-this bridge, the one its MCP instructions use. Without it the header would name nobody from meka
-0.63, and whatever the token was described as before that. That header is also why the bridge
+this bridge, the one its MCP instructions use. Without it the header would name nobody. That header is also why the bridge
 numbers nothing: meka says which item is which, and a count written here could only disagree with
 it. The item's own fence is unchanged and still does the work: meka passes the body through
 verbatim, which is why a client relaying text from strangers fences it itself.
@@ -104,13 +90,13 @@ A dropped connection is reopened from the last event acted on, and meka replays 
 across turns. Two things follow for an operator:
 
 - **Raise `[serve] stream_replay_events`.** It defaults to 256, which a busy turn can outrun while
-  the bridge restarts. Something like `4096` costs a few megabytes and makes a hole rare.
-- **A hole is not a loss.** meka says so with a `notice`, and the bridge answers it by asking about
-  every hand-over it has out, under each one's own key. It does the same on every reconnect, so an
+  the bridge restarts, or while it reads the feed slowly enough to fall behind. Something like `4096` costs a few megabytes and makes a hole rare.
+- **A hole is not a loss.** meka says so with a `feed.gap` event, and the bridge answers it by asking
+  about every hand-over it has out, under each one's own key. It does the same on every reconnect, so an
   outcome reported while nothing was listening is never waited on for ever.
 - **A turn in flight is rejoined, not restarted.** meka opens the reattached feed with a
-  `turn.started` marked `resumed` for the turn it joined, and from meka 0.57 that names the items
-  the turn was opened on. It is how a bridge that restarted mid-turn knows whom that turn is
+  `turn.started` marked `resumed` for the turn it joined, and it names the items the turn was
+  opened on. It is how a bridge that restarted mid-turn knows whom that turn is
   answering, which is what the typing indicator is drawn from; nothing is handed over twice on the
   strength of it.
 
@@ -125,9 +111,9 @@ description = "mekabridge"
 scopes = ["sessions:r", "sessions:w"]
 ```
 
-`sessions:w` covers creating a session, posting to its inbox, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **the session feed**. From meka 0.68 the feed takes `sessions:w` as well whenever opening it has to load the session, which happens after every meka restart and after an eviction. Both are required, and neither is optional in practice: without `sessions:w` nothing can be handed over, and without `sessions:r` the bridge hands messages over and never learns what became of any of them.
+`sessions:w` covers creating a session, posting to its inbox, and cancelling. `sessions:r` covers reading session metadata and, less obviously, **the session feed**. The feed takes `sessions:w` as well whenever opening it has to load the session, which happens after every meka restart and after an eviction. Both are required, and neither is optional in practice: without `sessions:w` nothing can be handed over, and without `sessions:r` the bridge hands messages over and never learns what became of any of them.
 
-`mekabridge doctor` says whether the token holds both, on meka 0.57 and later, which is the first release to report the calling token's scopes. It is the one thing about the token nothing else can check: every other question `doctor` asks needs a read scope only, so a token that cannot hand a message over answers all of them and the gap surfaces as a message that is never answered. Against an older meka the line is absent rather than guessed at.
+`mekabridge doctor` says whether the token holds both. It is the one thing about the token nothing else can check: every other question `doctor` asks needs a read scope only, so a token that cannot hand a message over answers all of them and the gap surfaces as a message that is never answered.
 
 ### An MCP server entry
 
@@ -212,7 +198,7 @@ eager_load_tools = ["message_send", "conversation_list"]
 
 Leave the rest deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip. `history_read` is the one worth reconsidering if the agent lives in busy groups, since a muted conversation waking on a mention often needs it immediately.
 
-From meka 0.60 an eager tool buys more than that round trip. A deferred tool appears in the agent's `[Tool discovery]` index as a name and a one-line summary, and the whole index is capped at 8 KB across every MCP server at once. Past the cap the whole section drops a tier: every tool keeps its name and loses its summary, on every server, not just the one that overran. Nothing becomes unreachable and `tool_search` still finds a tool by keyword, but the summaries are what tell the agent when to reach for `backlog_check` rather than `history_read`, and they stop arriving.
+An eager tool buys more than that round trip. A deferred tool appears in the agent's `[Tool discovery]` index as a name and a one-line summary, and the whole index is capped at 8 KB across every MCP server at once. Past the cap the whole section drops a tier: every tool keeps its name and loses its summary, on every server, not just the one that overran. Nothing becomes unreachable and `tool_search` still finds a tool by keyword, but the summaries are what tell the agent when to reach for `backlog_check` rather than `history_read`, and they stop arriving.
 
 Measured against meka 0.61's own renderer, this bridge's 26 tools render to 5.1 KB, and 7.0 KB alongside meka's built-in MCP-resource tools. That is inside the cap with roughly four more described tools of headroom; 0.15.1's 23 longer-winded tools took 6.0 KB and left room for one. **Attaching a second server of any real size will still drop the tier**, so if its summaries matter, put this bridge's most-used tools in `eager_load_tools`: an eager tool is not in the index at all, so it keeps its full schema whatever else is attached, and it stops consuming the shared budget.
 
@@ -335,7 +321,7 @@ the refusal and backs off, and the messages wait in the queue until the connecti
 `[mcp].default_required` sets the default for `required` across every server, and it defaults to
 **`false`**, so leaving both unset is the silent case above rather than the safe one. Per-server is
 the better knob: whether a missing server should stop a turn is a property of that server, not of
-the installation. It was called `[mcp].strict` before meka 0.46.
+the installation.
 
 Restarting the bridge alone is fine, but meka's reconnect is lazy rather than immediate: nothing
 watches a server that is still marked `Connected`, and the reconnect is triggered by the next tool
@@ -380,6 +366,23 @@ meka keeps the session resident while the bridge's feed is attached, and revivin
 is part of opening that feed, so a bridge coming back after an outage finds its session rather than
 a 404.
 
+## The checklist
+
+meka gives the agent a checklist of what it has committed to do, and a turn cannot end while an item on it is pending or in progress. When the agent tries to stop with one open, meka sends it back to the list, up to three times in a row without a tool call and nine times in one turn. After that the turn ends with the items where they are, and the end of the next turn asks again. meka's own Checklist page has the whole rule.
+
+The rule exists to keep an agent from stopping halfway through a job, and this bridge runs one session for everybody. An item the agent left open while answering one person is still open when somebody else writes, so the end of that turn is sent back to the list too: up to three more model requests, each one billed, on every turn until the agent completes, cancels or defers the item. Compaction does not clear it, since meka copies the open list into the summary.
+
+A deferred item holds no turn while it waits. Deferral is how meka's tool descriptions and its nudge tell the agent to hold an item that waits on a person, an event or an explicit later, so the cost falls on items left pending or in progress, not on one the agent is waiting out. The exception is an item deferred on a background task: it reopens once the task reports, and the turn that report opens cannot end until the agent deals with it again.
+
+The bridge does not read the list. It ignores the feed's `checklist.updated` and `turn.nudged`, logs each nudge at info as a `meka notice: checklist: ...` line, and logs a turn that ended with items still open as a warning; see [Logs worth knowing](./operations.md#logs-worth-knowing).
+
+The only way to turn it off is meka's, and it applies to every session on that meka, not just this bridge's:
+
+```toml
+[tools]
+disabled_tools = ["checklist_add", "checklist_edit", "checklist_read"]
+```
+
 ## Permission prompts
 
 mekabridge creates its session with `supports_permission_prompts: false`, telling meka that this
@@ -411,10 +414,7 @@ bridge screens for both rather than discovering them from a placeholder:
 
 Telegram photos are JPEG, stickers are WebP, and video stills are JPEG, so all of them pass.
 
-When the active profile reports `vision = false` on `GET /v1/info`, `attachment_view` returns a
-description rather than an image. The probe result is cached, since it cannot change without
-restarting meka, and a failed probe is not cached so a transient error does not pin the bridge to
-"no vision" for the life of the process.
+When the session asking runs on a profile that reports `vision = false` on `GET /v1/profiles`, `attachment_view` returns a description rather than an image. An image shown to a session whose profile has no vision stays in its history, where the provider refuses it on every later request, so the profile that decides is the calling session's, which meka names in each call's `_meta`. That is not always the bridge's own session or meka's default: a sub-agent can run on a profile of its own, and any session can be moved to another, by `/profile` in a REPL opened on it or by a `PATCH`. A call made outside any turn names no session, and the bridge's own answers for it, or before one exists, the default profile it will get. The answer is asked for on every call rather than cached, since a profile can change while both processes run. When meka cannot be asked, the agent is told the check failed rather than that its model has no vision.
 
 ## What the agent is told
 
@@ -458,7 +458,7 @@ Two constraints bound the length:
 - **It is re-emitted in full after every compaction**, so its length is paid again each time rather than once per session.
 
 These survive compaction. They are not in the system prompt, which meka asserts deliberately, but
-since meka 0.61 a compaction re-states the whole world in full in the context it writes after the
+a compaction re-states the whole world in full in the context it writes after the
 summary, so the instructions come back on their own.
 
 The one thing the handshake cannot carry is which account the agent appears as, because that is

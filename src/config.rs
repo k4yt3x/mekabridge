@@ -384,10 +384,11 @@ pub enum TelegramParseMode {
 
 /// meka permission level a session runs at.
 ///
-/// The four rungs meka 0.46 defines. Asking about a call above the level is no longer a rung of its
-/// own but a switch beside one, which this bridge leaves off: it declares
-/// `supports_permission_prompts: false`, so there is no one here to ask.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The four rungs meka defines. Asking about a call above the level is a switch beside them, which
+/// this bridge leaves off: it declares `supports_permission_prompts: false`, so there is no one
+/// here to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Permission {
     None,
     Read,
@@ -403,42 +404,6 @@ impl Permission {
             Self::Read => "read",
             Self::Workspace => "workspace",
             Self::Unrestricted => "unrestricted",
-        }
-    }
-}
-
-/// Hand-written so the two levels meka has retired can be refused by name rather than as one more
-/// unknown variant.
-///
-/// Left to the derive, an operator upgrading meka would meet `unknown variant 'ask', expected one
-/// of ...`, which lists the survivors without saying that the level is gone or what took its place.
-/// Both refusals are the same shape as meka's own parser answering the same word.
-impl<'de> Deserialize<'de> for Permission {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "none" => Ok(Self::None),
-            "read" => Ok(Self::Read),
-            "workspace" => Ok(Self::Workspace),
-            "unrestricted" => Ok(Self::Unrestricted),
-            "ask" => Err(serde::de::Error::custom(
-                "permission `ask` was retired in meka 0.46, which replaced it with an `approvals` \
-                 switch beside the level, so a session cannot be created at it at all. This bridge \
-                 has nobody to put an approval to and never turns that switch on. Use \"read\" to \
-                 answer messages, or \"unrestricted\" to also moderate",
-            )),
-            "write" => Err(serde::de::Error::custom(
-                "permission `write` was retired in meka 0.42 and split in two: `workspace` for \
-                 writes confined to the session's roots, `unrestricted` for none. Only \
-                 `unrestricted` reaches this bridge's moderation tools; see the meka Integration \
-                 page",
-            )),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown permission `{other}`: expected `none`, `read`, `workspace` or \
-                 `unrestricted`"
-            ))),
         }
     }
 }
@@ -1522,32 +1487,19 @@ token = \"meka-token\"
     }
 
     #[test]
-    fn a_config_still_setting_a_retired_level_is_refused_by_name() {
-        // The upgrade cases. meka retired `write` in 0.42 and `ask` in 0.46, so leaving either in
-        // place would be a session creation that 422s on the first message; each error has to name
-        // the replacement rather than read as one more unknown word.
-        //
-        // Asserting on the level and its replacement alone proves nothing: the fallback arm names
-        // the offending word and lists every valid level, so it satisfies both and the test passes
-        // with these arms deleted. `retired` appears only in the messages written for them.
-        for (level, replacement) in [("write", "workspace"), ("ask", "approvals")] {
-            let raw = format!("{MINIMAL}\n[session]\npermission = \"{level}\"\n");
-            let error = parse(&raw).expect_err("a retired level must be refused");
-            let message = error.to_string();
-            assert!(message.contains("retired"), "{level} got: {message}");
-            assert!(message.contains(replacement), "{level} got: {message}");
-        }
-    }
-
-    #[test]
     fn an_unknown_level_is_refused_with_the_ladder() {
-        // The other half, so the arm above cannot be widened into a catch-all that swallows a typo
-        // and blames it on the 0.42 upgrade.
+        // A typo has to come back naming the word and the levels meka has, not as a bare parse
+        // failure.
         let raw = format!("{MINIMAL}\n[session]\npermission = \"writeable\"\n");
         let error = parse(&raw).expect_err("a level that never existed must be refused");
         let message = error.to_string();
         assert!(message.contains("writeable"), "got: {message}");
-        assert!(!message.contains("retired"), "got: {message}");
+        assert!(
+            ["none", "read", "workspace", "unrestricted"]
+                .iter()
+                .all(|level| message.contains(&format!("`{level}`"))),
+            "got: {message}"
+        );
     }
 
     #[test]

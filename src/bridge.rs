@@ -41,7 +41,7 @@ use crate::{
         ConversationSummary, DownloadedAttachment, HistoryEntry, OutboundSink, SinkError,
         ToolSurface, ViewedAttachment, serve,
     },
-    meka::MekaClient,
+    meka::{MekaClient, find_profile},
     store::{
         AccountId, AccountIdentity, MessageKey, NewWatch, Policy, Store, UnseenSummary,
         WatchOutcome, WatchRecord,
@@ -608,11 +608,6 @@ pub struct BridgeSink {
     default_policy: DefaultPolicy,
     meka: MekaClient,
     presence: Arc<Presence>,
-    /// Whether meka's active profile accepts images, resolved on first use.
-    ///
-    /// Cached because it cannot change without restarting meka, and queried lazily rather than at
-    /// startup because the bridge deliberately comes up before meka does.
-    vision: tokio::sync::OnceCell<bool>,
     /// Which account each channel speaks as, which is part of the identity of everything the
     /// agent sends.
     accounts: Arc<ChannelAccounts>,
@@ -636,32 +631,58 @@ impl BridgeSink {
             default_policy,
             meka,
             presence,
-            vision: tokio::sync::OnceCell::new(),
             accounts,
         }
     }
 
-    /// Whether meka will accept an image block, asked once and remembered.
-    async fn vision_enabled(&self) -> bool {
-        if let Some(known) = self.vision.get() {
-            return *known;
-        }
-        match self.meka.info().await {
-            Ok(info) => {
-                // Only a successful answer is cached; a transient failure must not pin this to
-                // false for the life of the process.
-                let _ = self.vision.set(info.vision);
-                info.vision
+    /// Whether the session asking can be shown an image, which is its profile's `vision`, asked
+    /// afresh each time.
+    ///
+    /// `caller` is the session meka names on the call, and the one whose history keeps the image,
+    /// which is not always the bridge's own: a sub-agent spawned from it runs on a profile of its
+    /// own. A call naming none was made outside any meka turn, so no session keeps the image and
+    /// the bridge's own answers for it, or before one is bound, the default profile a new one
+    /// starts on. Not cached, because a request can move a session to another profile while both
+    /// processes run.
+    async fn session_has_vision(
+        &self,
+        caller: Option<&str>,
+    ) -> std::result::Result<bool, SinkError> {
+        let session_id = match caller {
+            Some(caller) => Some(uuid::Uuid::parse_str(caller).map_err(|error| {
+                SinkError::Internal(format!(
+                    "the call names session {caller:?}, which is not a session id: {error}"
+                ))
+            })?),
+            None => self
+                .store
+                .session_id()
+                .await
+                .map_err(|error| SinkError::Internal(error.to_string()))?,
+        };
+        let profile = async {
+            match session_id {
+                Some(session_id) => self
+                    .meka
+                    .session(session_id)
+                    .await
+                    .map(|session| Some(session.profile)),
+                None => Ok(None),
             }
-            Err(error) => {
-                tracing::warn!(
-                    "could not read meka's vision capability ({}); describing images instead of \
-                     showing them",
-                    error
-                );
-                false
-            }
-        }
+        };
+        let (profile, profiles) = tokio::try_join!(profile, self.meka.profiles())
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        // Not answered as "no vision" when the profile is missing: that is a session meka cannot
+        // run, or a meka with no default, and either is a check that failed rather than a model
+        // that cannot see.
+        find_profile(&profiles, profile.as_deref())
+            .map(|profile| profile.vision)
+            .ok_or_else(|| {
+                SinkError::Internal(match profile {
+                    Some(name) => format!("meka has no profile {name:?}"),
+                    None => "meka has no default profile".to_string(),
+                })
+            })
     }
 
     /// Resolve a handle to its record and the channel that can fetch it.
@@ -1287,16 +1308,35 @@ impl OutboundSink for BridgeSink {
     async fn attachment_view(
         &self,
         handle: &str,
+        session: Option<&str>,
     ) -> std::result::Result<ViewedAttachment, SinkError> {
         let (record, channel) = self.attachment(handle).await?;
 
-        if !self.vision_enabled().await {
-            return Ok(ViewedAttachment::Description(format!(
-                "This is a {} ({}). The current model has no vision, so it cannot be shown. Use \
-                 attachment_download to get the file itself.",
-                record.kind,
-                describe_file(&record)
-            )));
+        match self.session_has_vision(session).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(ViewedAttachment::Description(format!(
+                    "This is a {} ({}). The current model has no vision, so it cannot be shown. \
+                     Use attachment_download to get the file itself.",
+                    record.kind,
+                    describe_file(&record)
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not ask meka whether the calling session's profile has vision ({}); \
+                     describing the file instead of showing it",
+                    error
+                );
+                // Not "no vision": that would stay in the agent's history as a fact about its
+                // model, when all that failed was asking.
+                return Ok(ViewedAttachment::Description(format!(
+                    "This is a {} ({}). Whether the current model can see images could not be \
+                     checked, so it is not shown. Use attachment_download to get the file itself.",
+                    record.kind,
+                    describe_file(&record)
+                )));
+            }
         }
 
         // A video, animation, or animated sticker is not a viewable image, but the platform already

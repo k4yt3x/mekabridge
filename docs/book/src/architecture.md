@@ -53,7 +53,7 @@ All of it exists for the same moment: a bridge that stops between posting an ite
 
 Per row rather than per batch, because two hand-overs can be outstanding for one conversation at once. What has already been reported is then a *set*, not a high-water mark: the first item states the backlog and marks it seen, the second counts only what has landed since, and if the first dies it gives back its own half while the second keeps its own. A watermark cannot express that.
 
-The same question is asked whenever the feed reconnects, and whenever meka says a replay had a hole in it. A hand-over is never left waiting on an outcome that has already been and gone.
+The same question is asked whenever the feed reconnects, and whenever meka says the feed has a hole in it. A hand-over is never left waiting on an outcome that has already been and gone.
 
 ## Why messages still arrive together
 
@@ -77,7 +77,7 @@ meka writes its own header above each item, naming this bridge as the sender, wh
 
 ## What one item looks like
 
-The agent's only source of routing information, because meka sends no session identity with a `tools/call`.
+The agent's only source of routing information, because a `tools/call` names the session it came from but not the conversation, and one session talks to everybody.
 
 ```
 [mekabridge] You are @mybot on telegram.
@@ -163,7 +163,7 @@ The line running through all of it: a hand-over is spent when the feed says the 
 | The item is taken back unread (`inbox.withdrawn`), as cancelling the turn it opened does | Nothing was read, so the messages go back into the queue and are handed over afresh, a bounded number of times |
 | A turn fails or is cancelled after the model read the messages | Not handed over again: the work is done and a second run would repeat it with the agent unable to remember the first. The owner is told; the chats are told only where the agent had not got a word in |
 | The feed connection drops | Reopened from the last event acted on, and meka replays what was missed across turns. Every hand-over still out is then asked about, so an outcome reported while nothing was listening is not waited on for ever |
-| meka says a replay had a hole in it | The same question, for every hand-over out. The notice is the cue rather than the mechanism, so a rewording costs nothing |
+| meka says the feed has a hole in it (`feed.gap`) | The same question, for every hand-over out. The event is the cue rather than the mechanism, since every reconnect asks as well |
 | An attachment is too large to view, or the profile has no vision | `attachment_view` returns a description naming the file and pointing at `attachment_download`, rather than failing |
 | meka reports the session is gone | A replacement is bound and anything not yet accepted posted into it. Anything the old session had is closed, and its messages come back as a backlog rather than being replayed blind |
 | The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the messages are offered again rather than silently dropped |

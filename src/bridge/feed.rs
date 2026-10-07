@@ -4,8 +4,9 @@
 //! The reader does one thing: keep the connection open and hand every frame to the session task as
 //! fast as it arrives. It never touches the store and decides nothing, which is what keeps meka's
 //! per-consumer buffer drained while the session task is busy with a request of its own. A reader
-//! that fell behind would be told so with a notice and kept, but a model streaming a reply produces
-//! frames faster than a request round trip, so the two have to be separate tasks.
+//! that falls behind is caught up from meka's replay ring, and told with a `feed.gap` once the ring
+//! no longer reaches back far enough, but a model streaming a reply produces frames faster than a
+//! request round trip, so the two have to be separate tasks.
 //!
 //! A dropped connection is reopened from the last id the session task handled, and meka replays
 //! what was missed, across turns. The reader says when a connection has spoken, since that is when

@@ -1,9 +1,10 @@
 //! The MCP server meka connects to, and the outbound tool surface it exposes.
 //!
-//! Routing has to be explicit because of a hard constraint in meka: a `tools/call` carries a
-//! progress token and a tool-use id in `_meta`, but no session identity, so an MCP server cannot
-//! infer which conversation a call belongs to. Every send therefore takes a `conversation` id,
-//! which the agent reads off the header attached to each inbound message.
+//! Routing has to be explicit because nothing on the wire names a conversation. A `tools/call`
+//! carries a progress token, a tool-use id and the session it came from in `_meta`, but one session
+//! talks to everybody, so knowing the session says nothing about who a call is for. Every send
+//! therefore takes a `conversation` id, which the agent reads off the header attached to each
+//! inbound message.
 
 pub mod serve;
 
@@ -175,7 +176,16 @@ pub trait OutboundSink: Send + Sync + 'static {
     ) -> Result<MemberListing, SinkError>;
 
     /// Retrieve an attachment for viewing, without writing it to disk.
-    async fn attachment_view(&self, handle: &str) -> Result<ViewedAttachment, SinkError>;
+    ///
+    /// `session` names the meka session that asked. Whether it may be shown the picture at all is
+    /// its profile's answer, because the image lands in its history, and that is not always the
+    /// bridge's own session: a sub-agent spawned from it reaches the same tools on a profile of its
+    /// own.
+    async fn attachment_view(
+        &self,
+        handle: &str,
+        session: Option<&str>,
+    ) -> Result<ViewedAttachment, SinkError>;
 
     /// Write an attachment to local disk and report where it landed.
     async fn attachment_download(&self, handle: &str) -> Result<DownloadedAttachment, SinkError>;
@@ -1678,8 +1688,14 @@ impl BridgeMcpServer {
     async fn attachment_view(
         &self,
         Parameters(args): Parameters<AttachmentArgs>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        match self.sink.attachment_view(&args.attachment).await {
+        let session = calling_session(&context);
+        match self
+            .sink
+            .attachment_view(&args.attachment, session.as_deref())
+            .await
+        {
             Ok(ViewedAttachment::Image {
                 media_type,
                 data,
@@ -1712,9 +1728,7 @@ impl BridgeMcpServer {
                        refused; the error says the limit.",
         // `read_only_hint` deserves the caveat: this does write a file. It writes only into
         // `[storage].attachment_dir`, which exists for exactly this, is bounded by
-        // `attachment_max_bytes`, and is swept on `attachment_retention`. Marking it otherwise would
-        // put it at meka's `write` level, where a bridge run at `read` could receive a document and
-        // never open it.
+        // `attachment_max_bytes`, and is swept on `attachment_retention`. Marking it otherwise would put it above meka's `read` level, where a bridge run at `read` could receive a document and never open it.
         annotations(title = "Download attachment", read_only_hint = true, open_world_hint = true)
     )]
     async fn attachment_download(
@@ -2654,7 +2668,11 @@ mod tests {
             })
         }
 
-        async fn attachment_view(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
+        async fn attachment_view(
+            &self,
+            handle: &str,
+            _session: Option<&str>,
+        ) -> Result<ViewedAttachment, SinkError> {
             match handle {
                 "417" => Ok(ViewedAttachment::Image {
                     media_type: "image/png".to_string(),

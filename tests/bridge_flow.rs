@@ -296,8 +296,9 @@ struct MekaRecorder {
     /// `Last-Event-ID` values seen on the feed, so a test can assert the bridge resumed from the
     /// right place rather than replaying from the start.
     attaches: Mutex<Vec<Option<u64>>>,
-    /// Whether the next attach reports a replay hole, as meka does when its ring no longer reaches
-    /// the client's position.
+    /// Whether the next attach meets a meka that has restarted, which opens the feed with a
+    /// `feed.gap` carrying no count, since the position the client resumed from is one it never
+    /// issued.
     feed_gap: Mutex<bool>,
     /// Feed attaches to refuse with a 404, standing in for a session meka has lost.
     feed_404_first: Mutex<usize>,
@@ -316,6 +317,8 @@ struct MekaRecorder {
     readiness: Mutex<Option<(u16, String)>>,
     /// What `GET /v1/sessions/{id}` reports for `turn_in_flight`.
     turn_in_flight: Mutex<bool>,
+    /// What `GET /v1/sessions/{id}` reports as each session's profile, `work` for one not named.
+    session_profiles: Mutex<HashMap<String, String>>,
     /// The turn running right now, if any: its id and the items it opened on.
     ///
     /// meka runs one turn at a time per session and reads every item waiting for it into that
@@ -884,9 +887,9 @@ async fn open_feed(
 
     let mut opening = vec!["retry: 3000\n\n".to_string()];
     // What meka opens a feed with when a turn is already running: the turn it joined, `resumed` to
-    // tell it from one beginning, and since 0.57 the source that turn was opened on. Synthesised
-    // rather than replayed, so it carries no `id:` and no `started_at`, and it comes before the
-    // gap notice and the backlog.
+    // tell it from one beginning, and the source that turn was opened on. Synthesised rather than
+    // replayed, so it carries no `id:` and no `started_at`, and it comes before the `feed.gap` and
+    // the backlog.
     if let Some((turn, items)) = recorder
         .in_turn
         .lock()
@@ -910,14 +913,10 @@ async fn open_feed(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
         recorder.set(&recorder.feed_gap, false);
-        // meka's wording for a ring that no longer reaches the client's position. Deliberately
-        // carries no `id:`, so a client cannot move its position onto a notice.
-        opening.push(
-            "event: notice\ndata: {\"level\":\"warn\",\"text\":\"the replay does not reach your \
-             Last-Event-ID, so events were dropped; read `GET /v1/sessions/{id}/messages` for the \
-             full transcript\"}\n\n"
-                .to_string(),
-        );
+        // What a restarted meka opens with: the client's position is one it never issued, so the
+        // hole cannot be counted. Deliberately carries no `id:`, since the hole is the connection's
+        // rather than the session's, so a client cannot move its position onto it.
+        opening.push("event: feed.gap\ndata: {\"session_id\":\"s\"}\n\n".to_string());
     }
     opening.extend(backlog.iter().map(Frame::encode));
 
@@ -1012,22 +1011,36 @@ async fn get_session(
         .turn_in_flight
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // `none` rather than the config's level, so the reconcile path is the one under test. It is
-    // also what meka 0.46 migrates an `ask` session to, which is the case that most needs moving.
+    let profile = recorder
+        .session_profiles
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| "work".to_string());
+    // `none` rather than the config's level, so the reconcile path is the one under test.
     axum::Json(serde_json::json!({
         "id": id,
         "permission": "none",
         "title": "stub",
+        "profile": profile,
         "turn_in_flight": in_flight,
         "inbox_pending": 0,
     }))
 }
 
-async fn info() -> impl IntoResponse {
+/// The default with vision, one without, and one with that is not the default, so an image shown or
+/// withheld says which profile was asked.
+async fn profiles() -> impl IntoResponse {
     axum::Json(serde_json::json!({
-        "version": "test",
-        "model": "test-model",
-        "vision": true,
+        "profiles": [
+            {"name": "work", "account": "work", "backend": "anthropic-messages",
+             "vision": true, "active": true},
+            {"name": "text", "account": "work", "backend": "anthropic-messages",
+             "vision": false, "active": false},
+            {"name": "eyes", "account": "work", "backend": "anthropic-messages",
+             "vision": true, "active": false},
+        ],
     }))
 }
 
@@ -1048,7 +1061,7 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
         .route("/v1/sessions/{id}/inbox", post(enqueue_item))
         .route("/v1/sessions/{id}/stream", axum::routing::get(open_feed))
         .route("/v1/sessions/{id}/cancel", post(cancel_turn))
-        .route("/v1/info", axum::routing::get(info))
+        .route("/v1/profiles", axum::routing::get(profiles))
         .route("/v1/health/ready", axum::routing::get(ready))
         .with_state(recorder);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4565,6 +4578,122 @@ async fn a_forgotten_session_is_replaced_and_the_batch_handed_to_the_new_one() {
 }
 
 #[tokio::test]
+async fn whether_an_image_is_shown_is_the_calling_session_s_profile_s_answer() {
+    // The image lands in the history of whichever session asked, and a provider without vision
+    // refuses that history on every later request. So it is the caller's profile that answers, not
+    // the default's or the bridge's own session's, and it is asked each time, because a request can
+    // move a session to another profile while both processes run.
+    let recorder = Arc::new(MekaRecorder::default());
+    let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
+    let store = Store::open_in_memory().await.expect("store");
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    let bound = uuid::Uuid::new_v4();
+    store.set_session_id(bound).await.expect("binds");
+    let worker = uuid::Uuid::new_v4().to_string();
+    let move_to = |session: &str, profile: &str| {
+        recorder
+            .session_profiles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session.to_string(), profile.to_string());
+    };
+    move_to(&bound.to_string(), "text");
+    move_to(&worker, "eyes");
+
+    let channel = Arc::new(MockChannel::new("mock"));
+    channel.put_file("AgACphoto", ONE_PIXEL_PNG.to_vec());
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&channel) as Arc<dyn Channel>
+    ]));
+
+    let account = mock_account(&store).await;
+    let handle = store
+        .register_attachment(mekabridge::store::AttachmentRecord {
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: "1".to_string(),
+            revision: 0,
+            position: 0,
+            kind: "photo".to_string(),
+            file_ref: "AgACphoto".to_string(),
+            thumb_ref: None,
+            file_name: Some("photo.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            bytes: Some(ONE_PIXEL_PNG.len() as u64),
+            path: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("registers");
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let sink = sink_against_meka(
+        store.clone(),
+        channels,
+        directory.path().to_path_buf(),
+        Arc::new(Presence::default()),
+        address,
+    )
+    .await;
+    let shown = |viewed: &ViewedAttachment| matches!(viewed, ViewedAttachment::Image { .. });
+    let refused = |viewed: &ViewedAttachment| matches!(viewed, ViewedAttachment::Description(text) if text.contains("has no vision"));
+
+    // A worker on a profile with vision is shown it, although the bridge's own session is on one
+    // without and the default is neither of the two.
+    let viewed = sink
+        .attachment_view(&handle, Some(&worker))
+        .await
+        .expect("resolves");
+    assert!(
+        shown(&viewed),
+        "the caller's profile was not the one asked: {viewed:?}"
+    );
+
+    // A call that names no session falls back to the bridge's own, not to the default.
+    let viewed = sink.attachment_view(&handle, None).await.expect("resolves");
+    assert!(
+        refused(&viewed),
+        "the default answered for the bound session: {viewed:?}"
+    );
+
+    // Moved off vision, the worker is refused, so an earlier answer was not kept.
+    move_to(&worker, "text");
+    let viewed = sink
+        .attachment_view(&handle, Some(&worker))
+        .await
+        .expect("resolves");
+    assert!(
+        refused(&viewed),
+        "an earlier answer was kept after the session moved: {viewed:?}"
+    );
+
+    // On a profile meka does not have, the check failed: the model is not known to be blind.
+    move_to(&worker, "gone");
+    let viewed = sink
+        .attachment_view(&handle, Some(&worker))
+        .await
+        .expect("resolves");
+    assert!(
+        matches!(viewed, ViewedAttachment::Description(ref text) if text.contains("could not be checked") && !text.contains("no vision")),
+        "a missing profile was taken for one without vision: {viewed:?}"
+    );
+
+    move_to(&worker, "eyes");
+    let viewed = sink
+        .attachment_view(&handle, Some(&worker))
+        .await
+        .expect("resolves");
+    shutdown.cancel();
+    assert!(
+        shown(&viewed),
+        "an earlier refusal was kept after the session moved: {viewed:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
     // The still frame is what "show me" resolves to for a video, and it is tens of kilobytes. The
     // pre-fetch size check reads `record.bytes`, which is the size of the *main* file, so checking
@@ -4617,7 +4746,7 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
         address,
     )
     .await;
-    let viewed = sink.attachment_view(&handle).await.expect("resolves");
+    let viewed = sink.attachment_view(&handle, None).await.expect("resolves");
     shutdown.cancel();
 
     match viewed {
@@ -4916,10 +5045,11 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
     .await;
 
     // meka is unreachable here, so the vision probe fails and the sink degrades to a description
-    // rather than pretending the model can see.
-    let viewed = sink.attachment_view(&handle).await.expect("resolves");
+    // rather than pretending the model can see, or telling it the model cannot, which would stay in
+    // its history as a fact.
+    let viewed = sink.attachment_view(&handle, None).await.expect("resolves");
     assert!(
-        matches!(viewed, ViewedAttachment::Description(ref text) if text.contains("no vision")),
+        matches!(viewed, ViewedAttachment::Description(ref text) if text.contains("could not be checked") && !text.contains("no vision")),
         "got: {viewed:?}"
     );
 
@@ -4954,7 +5084,7 @@ async fn an_unknown_attachment_handle_is_a_clear_error() {
     let sink = sink_for(store, channels).await;
 
     let error = sink
-        .attachment_view("9999")
+        .attachment_view("9999", None)
         .await
         .expect_err("an invented handle must not resolve");
     assert!(error.to_string().contains("9999"), "got: {error}");
@@ -5867,12 +5997,19 @@ async fn a_hand_over_meka_never_saw_is_posted_again_after_a_restart() {
 
 #[tokio::test]
 async fn a_replay_that_lost_events_makes_the_bridge_ask_about_what_it_has_out() {
-    // meka's ring is bounded, so a resume can come back saying events are gone rather than handing
-    // over a transcript that silently skips. Among them can be the one event that says a batch was
-    // read, and nothing else ever will: the turn is over, and waiting for an outcome that has been
-    // and gone leaves the messages in flight for ever. Asking meka about the item under its own
-    // key is what settles it, and costs one request that changes nothing on meka's side.
-    let harness = Harness::start_script(TurnScript::Hold).await;
+    // meka's ring is bounded, so a resume, or a reader that fell behind, can be told with a
+    // `feed.gap` that events are gone rather than handed a transcript that silently skips. Among
+    // them can be the one event that says a batch was read, and nothing else ever will: the
+    // turn is over, and waiting for an outcome that has been and gone leaves the messages in
+    // flight for ever. Asking meka about the item under its own key is what settles it, and
+    // costs one request that changes nothing on meka's side.
+    // Well past the wait below, so the sweep that asks about anything meka has held too long cannot
+    // settle this first and pass the test without the gap ever being read.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup {
+        hand_over_within: Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
     harness
         .sender
         .send(message("are you there?", "1"))
@@ -5894,13 +6031,9 @@ async fn a_replay_that_lost_events_makes_the_bridge_ask_about_what_it_has_out() 
         .expect("one item");
     harness.recorder.mark(&item, "delivered");
     harness.recorder.feed.push(
-        "notice",
+        "feed.gap",
         None,
-        serde_json::json!({
-            "level": "warn",
-            "text": "the replay does not reach your Last-Event-ID, so events were dropped; read \
-                     `GET /v1/sessions/{id}/messages` for the full transcript",
-        }),
+        serde_json::json!({ "session_id": "s", "dropped": 7 }),
     );
 
     harness
@@ -5913,6 +6046,81 @@ async fn a_replay_that_lost_events_makes_the_bridge_ask_about_what_it_has_out() 
         2,
         "the hand-over and the one question about it"
     );
+}
+
+#[tokio::test]
+async fn a_feed_meka_restarted_under_is_resumed_from_the_new_numbering() {
+    // A restarted meka numbers its events from the start again, and says so by opening the feed
+    // with a `feed.gap` it cannot count. The position the bridge held belongs to the old process:
+    // kept, it outranks every new id until they pass it, so every reconnect reads as another hole,
+    // and one after they pass it resumes from it and skips what lies below without a word.
+    let harness = Harness::start().await;
+    harness
+        .sender
+        .send(message("first", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("the first batch", |stats| stats.done == 1)
+        .await;
+    let attaches = |harness: &Harness| {
+        harness
+            .recorder
+            .attaches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    };
+
+    harness.recorder.set(&harness.recorder.feed_gap, true);
+    harness.recorder.feed.cut();
+    harness
+        .wait_for("the reopened feed's gap to be read", |harness| {
+            attaches(harness).len() >= 2
+                && !*harness
+                    .recorder
+                    .feed_gap
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+        .await;
+    let session = harness
+        .store
+        .session_id()
+        .await
+        .expect("store")
+        .expect("bound");
+    harness
+        .wait_until("the old position to be dropped", async |store| {
+            store.feed_position(session).await.ok().flatten() == Some(0)
+        })
+        .await;
+
+    harness.recorder.feed.cut();
+    harness
+        .wait_for("the feed to be reopened again", |harness| {
+            attaches(harness).len() >= 3
+        })
+        .await;
+    let attaches = attaches(&harness);
+    assert!(
+        attaches[1].is_some_and(|last| last > 0),
+        "the first reconnect resumed from the position it held: {attaches:?}"
+    );
+    assert_eq!(
+        attaches[2], None,
+        "the old process's position outlived the restart: {attaches:?}"
+    );
+
+    // And messages still go through on the new numbering.
+    harness
+        .sender
+        .send(message("second", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("the second batch", |stats| stats.done == 2)
+        .await;
 }
 
 #[tokio::test]
@@ -5969,11 +6177,11 @@ async fn a_dropped_feed_is_reopened_from_where_it_left_off() {
 #[tokio::test]
 async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
     // meka opens a feed that attached mid-turn with a `turn.started` for the turn it joined, marked
-    // `resumed`, and since 0.57 that announcement names the source too: for this bridge, the inbox
-    // items the turn was opened on. So the arm that handles a turn beginning is now entered twice
-    // for one turn, and everything it is trusted not to disturb has to survive being entered again
-    // -- the message is read once, the turn is one turn, and what the turn is known to be answering
-    // is still known, which is what lets the indicator go up for the message it writes afterwards.
+    // `resumed`, and that announcement names the source too: for this bridge, the inbox items the
+    // turn was opened on. So the arm that handles a turn beginning is now entered twice for one
+    // turn, and everything it is trusted not to disturb has to survive being entered again -- the
+    // message is read once, the turn is one turn, and what the turn is known to be answering is
+    // still known, which is what lets the indicator go up for the message it writes afterwards.
     let harness =
         Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(1500))
             .await;
@@ -6027,11 +6235,11 @@ async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
 
 #[tokio::test]
 async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_write() {
-    // Why the resumed announcement is worth reading rather than merely tolerating. Whom the turn
-    // is answering was known to a typist that died with the process, and the turn is still running:
-    // meka 0.57 names that turn's items on the feed the new process attaches to, and there is
-    // nowhere else for it to learn them. Without it the send this turn composes next raises no
-    // indicator, because a turn this bridge was handed nothing for has nobody waiting on it.
+    // Why the resumed announcement is worth reading rather than merely tolerating. Whom the turn is
+    // answering was known to a typist that died with the process, and the turn is still running:
+    // meka names that turn's items on the feed the new process attaches to, and there is nowhere
+    // else for it to learn them. Without it the send this turn composes next raises no indicator,
+    // because a turn this bridge was handed nothing for has nobody waiting on it.
     let directory = tempfile::tempdir().expect("tempdir");
     let database = directory.path().join("state.db");
     let recorder = Arc::new(MekaRecorder::default());

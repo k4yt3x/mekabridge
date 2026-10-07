@@ -50,15 +50,9 @@ nothing on your machine, so replying sits at meka's `read` level:
 - `workspace`: it can also write, confined to the session's roots.
 - `unrestricted`: no boundary, and the only level that reaches the five moderation tools.
 
-> **Two levels have been retired and are refused at startup by name:** `write`, which meka 0.42
-> split into `workspace` and `unrestricted`, and `ask`, which meka 0.46 replaced with an
-> `approvals` switch beside the level. Refusing them here rather than passing them on is the point:
-> meka would otherwise reject the session on the first message rather than at launch.
-
 > **`permission = "none"` cannot reply**, and `doctor` reports it as a failure: no tool is
-> executable at that level, `message_send` included. It is also what meka's 0.46 store migration
-> turns an existing `ask` session into, so that is where a bridge upgraded across it lands. Naming
-> a workable level and restarting is enough; the bridge reconciles a running session's level with
+> executable at that level, `message_send` included. Naming a workable level and restarting is
+> enough; the bridge reconciles a running session's level with
 > the config before its next turn.
 
 Why moderation needs the top rung rather than `workspace` is

@@ -6,7 +6,7 @@ meka namespaces them by the server name from its config, so with `name = "mekabr
 
 ## Why routing is explicit
 
-meka's MCP client sends a progress token and a tool-use id in `_meta` on a `tools/call`, and nothing else. There is no session identity on the wire, so an MCP server cannot work out which conversation a call belongs to.
+meka's MCP client sends a progress token, a tool-use id and the calling session's id in `_meta` on a `tools/call`, and nothing else. The bridge's one session talks to everybody, so none of that says which conversation a call belongs to.
 
 Every send therefore takes a `conversation` id. The agent reads it off the header attached to each inbound message, looks it up with `conversation_list`, or is simply told one in its own instructions. That constraint is also what makes the interesting behaviour possible: because the target is always explicit, replying to somebody else, replying on a different platform, or messaging first are all the same operation.
 
@@ -362,7 +362,7 @@ Returns the image itself, which meka forwards to the provider as a multimodal bl
 
 Prefer triaging from the `attachment:` line first. It carries the media type, pixel size, running time and byte count, which is usually enough to decide whether a file is worth looking at, and what an agent looks at stays in its context for the life of the session.
 
-Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `attachment_download` instead. So does everything when the active profile has no vision.
+Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `attachment_download` instead. So does everything when the profile of the session asking has no vision.
 
 ## `attachment_download`
 

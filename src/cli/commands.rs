@@ -13,7 +13,7 @@ use crate::{
     channel::{ChannelError, ChannelRegistry, ConversationId, Platform},
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
-    meka::MekaClient,
+    meka::{MekaClient, Profile, find_profile},
     store::{NewWatch, Policy, QueueState, Store, WatchOutcome},
     watch::{WatchField, WatchMode},
 };
@@ -23,12 +23,23 @@ const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
 /// The oldest meka this bridge can drive, as `(major, minor)`.
 ///
-/// A floor rather than a recommendation, and this one is total in both directions. Messages are
-/// handed over through the session inbox, which an older meka answers with a 404, so nothing ever
-/// reaches the agent. And `GET /v1/sessions/{id}/stream` was a view of one turn that closed at its
-/// terminal before 0.55, where it is now the session's feed and does not end, so a bridge that
-/// followed it on an older meka would hear about one turn and then nothing.
-const MEKA_MINIMUM: (u64, u64) = (0, 55);
+/// A floor rather than a recommendation. meka 0.71 reports a hole in the session feed as a
+/// `feed.gap` event, which is the only way this bridge hears of one; an older meka says it in a
+/// notice, so a hole opened while the feed is read slowly is found only when the hand-overs it left
+/// waiting are asked about, an hour or so later. Before 0.70 meka did not report `vision` per
+/// profile, which is where this bridge reads it, so `attachment_view` never shows the agent an
+/// image. Before 0.55 nothing works at all: messages are handed over through the session inbox,
+/// which an older meka answers with a 404, and a session's stream was a view of one turn that
+/// closed at its terminal rather than a feed of every turn.
+const MEKA_MINIMUM: (u64, u64) = (0, 71);
+
+/// Whose profile `doctor` judges vision on.
+enum VisionSubject {
+    /// No session yet, or one meka has forgotten, so the next starts on the default profile.
+    Default,
+    /// The bound session, on the profile it records.
+    Session { id: uuid::Uuid, profile: String },
+}
 
 /// Whether `version` is older than [`MEKA_MINIMUM`], or `None` when it cannot be read as one.
 ///
@@ -123,10 +134,42 @@ fn report(checks: &[Check]) -> (usize, usize) {
     verdict(checks)
 }
 
+/// Whether `attachment_view` will show the bridge's own session a picture, judged the way it judges
+/// one, so the two cannot disagree.
+///
+/// `None` when there is nothing to say here: a default profile that is missing is reported with the
+/// profiles. A session's profile that meka no longer has is a failure, because meka cannot run that
+/// session, so nothing handed to it is ever answered.
+fn assess_vision(profiles: &[Profile], subject: &VisionSubject) -> Option<Check> {
+    let name = match subject {
+        VisionSubject::Default => None,
+        VisionSubject::Session { profile, .. } => Some(profile.as_str()),
+    };
+    match find_profile(profiles, name) {
+        Some(profile) if profile.vision => Some(Check::Ok(format!(
+            "profile {} has vision, so attachment_view hands the agent the picture itself",
+            profile.name
+        ))),
+        Some(profile) => Some(Check::Warn(format!(
+            "profile {} has vision off, so attachment_view returns a description rather than the \
+             image and the agent can only reach a file through attachment_download. Set `vision = \
+             true` under [profiles.{}].",
+            profile.name, profile.name
+        ))),
+        None => match subject {
+            VisionSubject::Default => None,
+            VisionSubject::Session { id, profile } => Some(Check::Fail(format!(
+                "the session is on profile {profile:?}, which meka does not have, so no turn can \
+                 run on it; move it to one meka has with PATCH /v1/sessions/{id} and a `profile`"
+            ))),
+        },
+    }
+}
+
 /// Decide what the scopes meka reports for `[meka].token` mean.
 ///
-/// `None` when meka said nothing: every build before 0.57 reports no scopes, and so would one this
-/// bridge could not reach. Neither is a token with nothing.
+/// `None` when meka said nothing, which only a meka too old for this bridge does, and the version
+/// check already fails that one. It is not a token with nothing.
 ///
 /// Worth a round trip because it is the one thing about the token nothing else here can check.
 /// Reading the version, the profiles and the readiness all take a read scope, so a token that
@@ -306,20 +349,24 @@ pub async fn doctor(config: &Config) -> Result<()> {
     println!("meka at {}", config.meka.base_url);
     let meka = MekaClient::new(&config.meka)?;
     // Carried out of the match so the verdict can be printed under `session`, next to the other
-    // two permission checks. Empty means either meka said nothing (a build predating the field) or
-    // it could not be reached, and both read the same way: no opinion, so no verdict.
+    // two permission checks. Empty means meka could not be reached, or is too old to say, and both
+    // read the same way: no opinion, so no verdict.
     let mut enabled_permissions: Vec<String> = Vec::new();
+    // Carried out for the vision verdict, which is about the profile the bridge's session is on and
+    // so waits for the session to be read. `None` when they could not be read, which is no verdict
+    // rather than an empty listing.
+    let mut profiles: Option<Vec<Profile>> = None;
     match meka.info().await {
         Ok(info) => {
             println!("  ok     reachable, version {}", info.version);
             if meka_is_too_old(&info.version) == Some(true) {
-                // Ahead of everything else this block reports: on a meka this old none of it
-                // matters, because no turn will run at all.
+                // Ahead of everything else this block reports, which assumes a meka this bridge can
+                // drive and is misleading about one it cannot.
                 println!(
-                    "  fail   this bridge needs meka {}.{} or later. Messages are handed over \
-                     through the session inbox, which an older one has no route for, and their \
-                     outcome is read from the session feed, which an older one ends after a \
-                     single turn",
+                    "  fail   this bridge needs meka {}.{} or later. An older one reports a hole \
+                     in the session feed in a way this bridge no longer reads, before 0.70 \
+                     attachment_view never shows the agent an image, and before 0.55 no message \
+                     reaches the agent at all",
                     MEKA_MINIMUM.0, MEKA_MINIMUM.1
                 );
                 failures += 1;
@@ -329,12 +376,11 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 failures += failed;
                 warnings += warned;
             }
-            // A separate call since meka 0.44, which took `model` off `/v1/info` because the word
-            // there named a backend while the same word on `POST /v1/sessions` names a profile.
-            match meka.profiles().await {
-                Ok(profiles) => match profiles.iter().find(|profile| profile.active) {
+            let listing = meka.profiles().await;
+            match &listing {
+                Ok(listed) => match find_profile(listed, None) {
                     Some(profile) => println!(
-                        "  ok     sessions run on profile {} (account {}, {}), model {}",
+                        "  ok     a new session starts on profile {} (account {}, {}), model {}",
                         profile.name,
                         profile.account,
                         // Absent where the profile names an account `config.toml` does not have,
@@ -362,27 +408,11 @@ pub async fn doctor(config: &Config) -> Result<()> {
                     }
                 },
                 Err(error) => {
-                    // Named rather than left to the error, which on the version that moved this
-                    // endpoint is a bare 404 with no body to explain itself.
-                    println!(
-                        "  warn   could not read the profiles: {error}. meka 0.46 or later is \
-                         required; before it this was GET /v1/providers"
-                    );
+                    println!("  warn   could not read the profiles: {error}");
                     warnings += 1;
                 }
             }
-            if info.vision {
-                println!(
-                    "  ok     vision is on, so attachment_view hands the agent the picture itself"
-                );
-            } else {
-                println!(
-                    "  warn   the active profile has vision off, so attachment_view returns a \
-                     description rather than the image and the agent can only reach a file through \
-                     attachment_download. Set `vision = true` under [profiles.<name>]."
-                );
-                warnings += 1;
-            }
+            profiles = listing.ok();
             enabled_permissions = info.enabled_permissions;
         }
         Err(error) => {
@@ -404,16 +434,25 @@ pub async fn doctor(config: &Config) -> Result<()> {
     println!("session");
     let store = Store::open(&config.storage.path).await.ok();
     let bound = match &store {
-        Some(store) => store.session_id().await.unwrap_or(None),
-        None => None,
+        Some(store) => store.session_id().await.map_err(|error| error.to_string()),
+        None => Err("the database could not be opened".to_string()),
     };
+    // `None` when the session could not be read, which gets no verdict rather than the default's.
+    let mut vision_subject = None;
     match bound {
-        None => println!("  ok     no session yet; one is created on the first message"),
-        Some(session_id) => match meka.session(session_id).await {
+        Err(error) => {
+            println!("  warn   could not tell which session is bound: {error}");
+            warnings += 1;
+        }
+        Ok(None) => {
+            println!("  ok     no session yet; one is created on the first message");
+            vision_subject = Some(VisionSubject::Default);
+        }
+        Ok(Some(session_id)) => match meka.session(session_id).await {
             Ok(info) => {
-                // meka omits the level for a row that records none since 0.46. Not a session this
-                // bridge made, which always names one, so there is no level to hold against the
-                // ladder below and saying so beats inventing one.
+                // meka omits the level for a row that records none. Not a session this bridge made,
+                // which always names one, so there is no level to hold against the ladder below and
+                // saying so beats inventing one.
                 let level = info.permission.as_deref();
                 println!(
                     "  ok     bound to {session_id} (permission {})",
@@ -428,18 +467,30 @@ pub async fn doctor(config: &Config) -> Result<()> {
                     println!("  fail   the session is at permission {level:?}. {problem}");
                     failures += 1;
                 }
+                vision_subject = Some(VisionSubject::Session {
+                    id: session_id,
+                    profile: info.profile,
+                });
             }
             Err(error) if error.is_session_missing() => {
                 println!(
                     "  warn   meka no longer knows session {session_id}; a replacement will be created"
                 );
                 warnings += 1;
+                vision_subject = Some(VisionSubject::Default);
             }
             Err(error) => {
                 println!("  warn   could not read session {session_id}: {error}");
                 warnings += 1;
             }
         },
+    }
+    if let (Some(profiles), Some(subject)) = (&profiles, &vision_subject)
+        && let Some(check) = assess_vision(profiles, subject)
+    {
+        let (failed, warned) = report(std::slice::from_ref(&check));
+        failures += failed;
+        warnings += warned;
     }
     if let Some(problem) = permission_problem(config.session.permission.as_str()) {
         println!(
@@ -611,25 +662,9 @@ pub async fn doctor(config: &Config) -> Result<()> {
 ///
 /// Falling short of the moderation tools is not a failure here, since a bridge that never moderates
 /// is correct at `read`; [`moderation_reach`] reports that separately.
-///
-/// Neither retired level is reachable from `[session].permission`, which refuses both while
-/// parsing. They are reachable from the level meka reports for a session created before it retired
-/// them, which a store carried across the upgrade still points at, and that is what those two arms
-/// are for.
 fn permission_problem(level: &str) -> Option<&'static str> {
     match level {
         "read" | "workspace" | "unrestricted" => None,
-        "ask" => Some(
-            "meka 0.46 retired `ask` for an `approvals` switch beside the level, so a session \
-             cannot run at it any more; upgrading meka moves this one to `none`, where every call \
-             is denied including message_send. Set [session].permission to \"read\" and restart: \
-             the bridge reconciles the level before its next turn, so no session reset is needed.",
-        ),
-        "write" => Some(
-            "meka 0.42 retired `write` and split it into `workspace` and `unrestricted`, so a \
-             session cannot be created at this level at all. Use \"read\" to answer messages, or \
-             \"unrestricted\" to also moderate.",
-        ),
         _ => Some(
             "no tools are executable at this level, so the agent cannot reply. Use \"read\" to let \
              it answer messages.",
@@ -1790,9 +1825,8 @@ mod tests {
                 "the failure must count against the exit code"
             );
         }
-        // No scopes at all is a meka too old to report them, or one that could not be reached.
-        // Reading it as a token holding nothing would fail every deployment on meka 0.55 and 0.56,
-        // which work.
+        // No scopes at all is a meka that could not be reached, or one too old to report them,
+        // which the version floor already fails. Neither says the token holds nothing.
         assert_eq!(assess_scopes(&[]), None);
     }
 
@@ -1825,16 +1859,53 @@ mod tests {
     }
 
     #[test]
+    fn vision_is_judged_on_the_profile_the_session_is_on() {
+        let profile = |name: &str, vision: bool, active: bool| Profile {
+            name: name.to_string(),
+            account: "work".to_string(),
+            backend: Some("anthropic-messages".to_string()),
+            model: None,
+            vision,
+            active,
+        };
+        let profiles = [profile("work", true, true), profile("text", false, false)];
+        let session = |name: &str| VisionSubject::Session {
+            id: uuid::Uuid::nil(),
+            profile: name.to_string(),
+        };
+
+        // A session moved off the default is judged on where it is, not on where it started.
+        assert!(matches!(
+            assess_vision(&profiles, &session("text")),
+            Some(Check::Warn(line)) if line.contains("profile text")
+        ));
+        assert!(matches!(
+            assess_vision(&profiles, &VisionSubject::Default),
+            Some(Check::Ok(line)) if line.contains("profile work")
+        ));
+        // A profile meka no longer has is a session it cannot run, which is a failure rather than a
+        // missing line.
+        assert!(matches!(
+            assess_vision(&profiles, &session("gone")),
+            Some(Check::Fail(line)) if line.contains("\"gone\"") && line.contains("PATCH")
+        ));
+        // A missing default is reported with the profiles, so it is not reported twice.
+        assert_eq!(assess_vision(&profiles[1..], &VisionSubject::Default), None);
+    }
+
+    #[test]
     fn a_meka_below_the_floor_is_caught_before_the_first_message() {
-        // The failure it prevents is total: an older meka has no inbox to hand a message to, so
-        // without this the deployment looks healthy and answers nobody.
+        // The failure it prevents is quiet: a meka from 0.55 to 0.70 runs every turn, but a hole in
+        // its feed goes unheard and, before 0.70, every image the agent asks to see comes back as a
+        // description, while the deployment looks healthy. Older than that, nothing reaches the
+        // agent at all.
+        assert_eq!(meka_is_too_old("0.70.1"), Some(true));
         assert_eq!(meka_is_too_old("0.54.1"), Some(true));
-        assert_eq!(meka_is_too_old("0.48.0"), Some(true));
-        assert_eq!(meka_is_too_old("0.55.0"), Some(false));
-        assert_eq!(meka_is_too_old("0.56.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.71.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.72.0"), Some(false));
         assert_eq!(meka_is_too_old("1.0.0"), Some(false));
         // The patch component is never compared, so a pre-release riding it is read as its minor.
-        assert_eq!(meka_is_too_old("0.55.0-rc1"), Some(false));
+        assert_eq!(meka_is_too_old("0.71.0-rc1"), Some(false));
         // No opinion beats a wrong one: a build that does not report a version this can read must
         // not fail an otherwise healthy deployment.
         for unreadable in ["", "dev", "0", "nightly.1", "0.x.0"] {
@@ -1845,26 +1916,6 @@ mod tests {
     #[test]
     fn none_is_reported_as_unworkable() {
         assert!(permission_problem("none").is_some());
-    }
-
-    #[test]
-    fn a_retired_level_is_named_rather_than_lumped_in_with_a_typo() {
-        // What an operator upgrading meka actually hits, since a session created before the level
-        // was retired keeps pointing at it. A session cannot run at either any more, so each
-        // message has to say so and name what replaced it, or the reader concludes the bridge
-        // stopped supporting a level meka still has.
-        //
-        // The version is what separates these from the catch-all arm, which would otherwise
-        // satisfy an assertion on the level name alone.
-        for (level, version, replacement) in [
-            ("write", "0.42", "unrestricted"),
-            ("ask", "0.46", "approvals"),
-        ] {
-            let problem =
-                permission_problem(level).unwrap_or_else(|| panic!("{level} must be rejected"));
-            assert!(problem.contains(version), "{level} got: {problem}");
-            assert!(problem.contains(replacement), "{level} got: {problem}");
-        }
     }
 
     #[test]

@@ -79,7 +79,7 @@ meka retries a failed MCP connect in the background, so the wrong order recovers
 
 All but five are annotated read-only, so the conversational surface works at meka's `read` permission level. `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` and `chat_set` act irreversibly on somebody else's account or on the room, and need `unrestricted`. The moderation group is offered only where a configured platform can honour it and `admin_tools` is on, which is the default.
 
-Routing is explicit because it has to be: meka's MCP client sends no session identity with a tool call, so an MCP server cannot infer which conversation a call belongs to. Every send names its target, which is also what makes messaging somebody else, or messaging first, the same operation as replying.
+Routing is explicit because it has to be: meka's MCP client names the session a tool call came from but not the conversation, and one session talks to everybody, so an MCP server cannot infer which conversation a call belongs to. Every send names its target, which is also what makes messaging somebody else, or messaging first, the same operation as replying.
 
 The agent is not woken for everything. Groups and server channels default to mentions only; the rest is recorded and reachable through the history tools. See [Group attention](./docs/book/src/usage/group-attention.md).
 

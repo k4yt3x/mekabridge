@@ -4,13 +4,13 @@
 //! The two are separate processes, each free to link whatever rmcp it likes, and the protocol
 //! negotiates a mutually supported version at `initialize`. What this bridge owes is a surface that
 //! survives that negotiation rather than one that happens to match a crate version: meka has moved
-//! its own pin through 1.3, 1.5, 1.7, 2.1 and 3.1, and each move is the kind of thing that breaks
-//! quietly. So these tests drive the real server over a real socket with a real rmcp 2.x client,
-//! one major behind the server's own, on every `cargo test`.
+//! its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, and each move is the kind of thing that
+//! breaks quietly. So these tests drive the real server over a real socket with a real rmcp 2.x
+//! client, one major behind the server's own, on every `cargo test`.
 //!
-//! The client is deliberately not the version meka pins today, which since meka 0.42 is the same
-//! major as the server's. Pinning the test to whatever meka currently links would make it agree
-//! with the server by construction, which is the one thing it must not do.
+//! The client is deliberately not the version meka pins today, which is the same major as the
+//! server's. Pinning the test to whatever meka currently links would make it agree with the server
+//! by construction, which is the one thing it must not do.
 
 // Integration tests live in their own crate, so the `allow-*-in-tests` clippy settings that cover
 // `#[cfg(test)]` modules do not apply here. Assertions read better with `expect` than with matches.
@@ -31,7 +31,7 @@ use mekabridge::{
 };
 use rmcp2::{
     ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientInfo, Meta},
     transport::StreamableHttpClientTransport,
 };
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,8 @@ struct RecordingSink {
     policies: Mutex<Vec<(String, Policy, Option<chrono::DateTime<chrono::Utc>>)>>,
     roles: Mutex<Vec<Vec<String>>>,
     watches: Mutex<Vec<WatchRecord>>,
+    /// The session each `attachment_view` named, in call order.
+    viewers: Mutex<Vec<Option<String>>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -116,7 +118,15 @@ impl OutboundSink for RecordingSink {
         Ok(())
     }
 
-    async fn attachment_view(&self, handle: &str) -> Result<ViewedAttachment, SinkError> {
+    async fn attachment_view(
+        &self,
+        handle: &str,
+        session: Option<&str>,
+    ) -> Result<ViewedAttachment, SinkError> {
+        self.viewers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(session.map(str::to_string));
         match handle {
             // A one-pixel PNG, so the assertion is against real image bytes rather than a stub.
             "417" => Ok(ViewedAttachment::Image {
@@ -1109,6 +1119,53 @@ async fn view_attachment_returns_a_real_image_block_to_an_older_client() {
         .expect("the result must carry an image block, not a text description");
     assert_eq!(image.mime_type, "image/png");
     assert_eq!(image.data, ONE_PIXEL_PNG);
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_view_names_the_session_that_asked() {
+    // Whether the picture may be shown is the calling session's profile's answer, and the session
+    // is read off `_meta` at the protocol edge and consumed two layers down, so nothing in between
+    // fails when the wiring is cut. A sub-agent on a profile without vision would then be handed an
+    // image its provider refuses for the rest of its session.
+    let harness = start().await;
+    let client = connect(&harness).await;
+
+    let mut asked = tool_params(
+        "attachment_view",
+        serde_json::json!({ "attachment": "417" }),
+    );
+    let mut meta = Meta::new();
+    meta.0.insert(
+        "meka/sessionId".to_string(),
+        serde_json::json!("6f1a4b9c-0000-4000-8000-000000000001"),
+    );
+    asked.meta = Some(meta);
+    client
+        .call_tool(asked)
+        .await
+        .expect("the call must succeed");
+    client
+        .call_tool(tool_params(
+            "attachment_view",
+            serde_json::json!({ "attachment": "417" }),
+        ))
+        .await
+        .expect("the call must succeed");
+
+    assert_eq!(
+        *harness
+            .sink
+            .viewers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec![
+            Some("6f1a4b9c-0000-4000-8000-000000000001".to_string()),
+            None
+        ],
+        "the session in `_meta` has to reach the sink, and a call naming none must not borrow one"
+    );
 
     client.cancel().await.expect("clean shutdown");
 }

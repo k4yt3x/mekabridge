@@ -62,9 +62,9 @@ pub struct ProblemDetail {
     /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
     ///
     /// meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
-    /// cap, and since 0.44 on a `RetryableProvider` too, which is the case that matters most: a
-    /// rate limit now arrives carrying the one number that is not a guess. It used to be dropped
-    /// at the boundary that turns an error into a Problem Detail.
+    /// cap, and on a `RetryableProvider` too, which is the case that matters most: a rate limit
+    /// now arrives carrying the one number that is not a guess. It used to be dropped at the
+    /// boundary that turns an error into a Problem Detail.
     ///
     /// Never the discriminator between a transient upstream failure and a permanent one, which is
     /// what [`ProblemKind::ProviderUnavailable`] is for. Most transient failures carry none: a
@@ -77,7 +77,7 @@ pub struct ProblemDetail {
     /// meka's `detail` on a 502 names its server log rather than the failure, so without this the
     /// owner's notice says only that the provider refused and an operator has to go and read
     /// meka's log to learn whether a credential died or a quota ran out. Absent when the operator
-    /// set `[serve] relay_provider_errors = false`, and from any meka before it had the key.
+    /// set `[serve] relay_provider_errors = false`.
     pub provider_response: Option<String>,
 }
 
@@ -92,10 +92,7 @@ impl ProblemDetail {
             "not-found" => ProblemKind::NotFound,
             "session-locked" => ProblemKind::SessionLocked,
             "turn-in-flight" => ProblemKind::TurnInFlight,
-            // Respelled in 0.46. Both are matched for the reason the SSE terminal is: an
-            // unrecognised type falls to `Other`, where the status alone decides, and that decides
-            // wrongly without saying so.
-            "turn-canceled" | "turn-cancelled" => ProblemKind::TurnCancelled,
+            "turn-canceled" => ProblemKind::TurnCancelled,
             "concurrency-limit" => ProblemKind::ConcurrencyLimit,
             "sse-lag" => ProblemKind::SseLag,
             "stream-detached" => ProblemKind::StreamDetached,
@@ -213,10 +210,6 @@ impl MekaError {
     /// retry cannot help", and asks clients not to be built so that they never retry it. The queue
     /// bounds the attempts, which is the part meka does warn against leaving open.
     ///
-    /// On meka 0.44 those two shared the `provider` URI, so a bridge reading that bucket as
-    /// permanent gave up on every rate limit at the first attempt. Retrying both keeps that from
-    /// coming back on an older meka while the split does the work on a newer one.
-    ///
     /// [`ProblemKind::ContextOverflow`] is the exception, and why meka split it out as well: it
     /// will refuse the same conversation forever.
     pub fn is_retryable(&self) -> bool {
@@ -306,7 +299,7 @@ type Result<T> = std::result::Result<T, MekaError>;
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionInfo {
     pub id: Uuid,
-    /// Omitted since meka 0.46 for a row that records no level, rather than sent as `""`.
+    /// Omitted for a row that records no level.
     ///
     /// Never this bridge's own session, which is created naming a level, so a session that answers
     /// without one was made by another hand and there is nothing to check it against.
@@ -316,15 +309,17 @@ pub struct SessionInfo {
     /// Omitted by meka when the session has no working directory of its own.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The profile the session runs on, which a request may move it off, so it is not always the
+    /// one marked [`Profile::active`].
+    pub profile: String,
     /// Whether a turn is running on this session right now.
     ///
     /// Read by `mekabridge session show` and by nothing that decides anything: what became of a
     /// hand-over is what the feed says, and a session busy with somebody else's turn is no
     /// obstacle to putting a message in its inbox.
     pub turn_in_flight: bool,
-    /// Inbox items waiting to be appended. Reported for a loaded session only, and by no meka
-    /// before 0.55, so it is optional rather than defaulted to a zero that would read as "nothing
-    /// waiting".
+    /// Inbox items waiting to be appended. Reported for a loaded session only, so it is optional
+    /// rather than defaulted to a zero that would read as "nothing waiting".
     #[serde(default)]
     pub inbox_pending: Option<u64>,
 }
@@ -333,47 +328,33 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerInfo {
     pub version: String,
-    /// Whether the active provider profile can look at images at all.
-    ///
-    /// The bridge attaches nothing to a turn, so this gates `attachment_view` instead. Worth being
-    /// precise about why, because the obvious reason is wrong: meka checks `vision` only on the
-    /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
-    /// provider whatever the setting says. So this check is not belt and braces over one of
-    /// meka's, it is the only thing standing between a non-vision profile and an image block
-    /// committed to the session's history, which the provider then rejects on every later
-    /// request in that session.
-    pub vision: bool,
     /// The permission levels this meka will create a session at, from `[permissions].enabled`.
     ///
     /// Asking for one outside the set is a 422 at session creation, which happens on the first
     /// message rather than at startup, so without this the misconfiguration surfaces as a message
     /// that never gets answered.
     ///
-    /// Defaulted rather than required, so an older meka that does not send it reads as "no
-    /// opinion" and the check is skipped instead of taking `doctor` down.
+    /// Defaulted rather than required, so a meka too old to send it still decodes and `doctor` can
+    /// say it is too old, rather than reporting a body it could not read.
     #[serde(default)]
     pub enabled_permissions: Vec<String>,
-    /// The scopes `[meka].token` holds, which meka reports from 0.57.
+    /// The scopes `[meka].token` holds, as meka reports them.
     ///
     /// The one thing about the token nothing else here could check. Every call `doctor` makes
     /// needs a read scope only, so a token that cannot hand a message over answers all of them and
-    /// the gap surfaces at the first message instead. Empty on an older meka, which reads as "no
-    /// opinion" the same way [`Self::enabled_permissions`] does.
+    /// the gap surfaces at the first message instead. Defaulted for the reason
+    /// [`Self::enabled_permissions`] is.
     #[serde(default)]
     pub scopes: Vec<String>,
 }
 
-/// One configured profile, as returned by `GET /v1/profiles`.
-///
-/// Where the model came from once meka 0.44 dropped `model` and `provider` from `GET /v1/info`.
-/// The two words meant different things on the two endpoints -- `provider` on `/v1/info` was a
-/// backend, `provider` on `POST /v1/sessions` was a profile -- and this endpoint names them apart.
+/// One configured profile, as returned by `GET /v1/profiles`, which is where the model, the backend
+/// and whether a session can be shown an image all come from.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     /// The profile name, which is what `POST /v1/sessions` would take.
     pub name: String,
-    /// The account it bills, which is where the credential and the backend live since meka 0.46
-    /// split one `[providers.<name>]` table into two.
+    /// The account it bills, which is where the credential and the backend live.
     #[serde(default)]
     pub account: String,
     /// The wire protocol the account speaks, such as `anthropic-messages`.
@@ -385,10 +366,28 @@ pub struct Profile {
     /// Omitted by meka when the profile configures none.
     #[serde(default)]
     pub model: Option<String>,
-    /// Whether a session naming no profile gets this one. The bridge never names one, so this
-    /// marks the profile its session actually runs on.
+    /// Whether a session on this profile can look at images at all.
+    ///
+    /// The bridge attaches nothing to a turn, so this gates `attachment_view` instead. Worth being
+    /// precise about why, because the obvious reason is wrong: meka checks `vision` only on the
+    /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
+    /// provider whatever the setting says. So this check is not belt and braces over one of
+    /// meka's, it is the only thing standing between a non-vision profile and an image block
+    /// committed to the session's history, which the provider then rejects on every later request
+    /// in that session.
+    pub vision: bool,
+    /// Whether a session naming no profile gets this one. The bridge never names one, so this is
+    /// the profile its session starts on.
     #[serde(default)]
     pub active: bool,
+}
+
+/// The profile called `name` in a listing, or the one a new session gets when `name` is `None`.
+pub fn find_profile<'a>(profiles: &'a [Profile], name: Option<&str>) -> Option<&'a Profile> {
+    profiles.iter().find(|profile| match name {
+        Some(name) => profile.name == name,
+        None => profile.active,
+    })
 }
 
 /// Readiness as returned by `GET /v1/health/ready`.
@@ -400,11 +399,7 @@ pub struct ReadyStatus {
     pub session_db: bool,
     /// Whether `config.toml` names at least one profile. Not whether its credential works, which
     /// meka only finds out when a session first needs it.
-    ///
-    /// `provider_configured` until 0.46 renamed it. Aliased rather than simply renamed because
-    /// every field here defaults: a rename alone reads a 0.45 body as `false` and `doctor` calls a
-    /// healthy deployment unservable, which is the failure this flag exists to report.
-    #[serde(default, alias = "provider_configured")]
+    #[serde(default)]
     pub profile_configured: bool,
     #[serde(default)]
     pub mcp_servers_healthy: bool,
@@ -470,8 +465,8 @@ impl std::fmt::Display for InboxState {
 pub const INBOX_CLASS: &str = "steer";
 
 /// Who the header meka writes above each item names as the sender. The same name the MCP
-/// instructions use for this bridge, so the agent reads one name for it. Without it meka 0.63 and
-/// later name nobody, and earlier ones name whatever the operator described the token as.
+/// instructions use for this bridge, so the agent reads one name for it. Without it the header
+/// names nobody.
 pub const INBOX_SOURCE: &str = "mekabridge";
 
 /// HTTP client for one `meka serve` instance.
@@ -590,10 +585,6 @@ impl MekaClient {
     }
 
     /// `GET /v1/profiles`: the configured profiles, one of them marked as the default.
-    ///
-    /// `GET /v1/providers` until meka 0.46 renamed the endpoint and the key together. Not read
-    /// under both names: the old path answers 404 on a new meka and the new one answers 404 on an
-    /// old one, and `doctor` prints that either way rather than quietly reporting the wrong thing.
     pub async fn profiles(&self) -> Result<Vec<Profile>> {
         #[derive(Deserialize)]
         struct ProfilesResponse {
@@ -775,8 +766,9 @@ impl MekaClient {
     /// Every event of every turn on the session, whoever started it, for as long as the connection
     /// is held; it does not end with a turn. `last_event_id` is the last id already handled, and
     /// meka replays what came after it before following the live feed, across turns. A resume that
-    /// outruns meka's replay ring is reported on the feed as a `notice` rather than as a silent
-    /// hole, which is the caller's cue to reconcile what it was waiting on.
+    /// outruns meka's replay ring, or names a position a restarted meka never issued, is reported
+    /// on the feed as a `feed.gap` rather than as a silent hole, which is the caller's cue to
+    /// reconcile what it was waiting on.
     ///
     /// Opening the feed loads the session, so the bridge subscribes before it has anything to hand
     /// over, and a session evicted for idleness comes back rather than answering 404. It is also
@@ -811,12 +803,13 @@ pub struct StreamItem {
     /// Not "whenever meka omits one", which is the obvious reading and is wrong:
     /// `eventsource-stream` implements the spec's persistent last-event-ID buffer, so an event
     /// sent without an `id:` line is reported carrying the previous one. meka does send
-    /// several that way, including the synthesised `turn.started` that opens a resumed feed
-    /// and the notice about a replay hole. Inheriting the previous id is harmless here, since
-    /// resuming from it is idempotent.
+    /// several that way, including the synthesised `turn.started` that opens a resumed feed and
+    /// `feed.gap`. Inheriting the previous id is harmless here, since resuming from it is
+    /// idempotent, and the parser starts afresh with each connection, so a `feed.gap` that opens
+    /// one carries no id at all.
     pub id: Option<u64>,
-    /// Which turn the event belongs to, off the payload. Every event meka sends carries one;
-    /// `None` on a frame that names none, such as the notice about a replay hole.
+    /// Which turn the event belongs to, off the payload. Every turn's event carries one; `None` on
+    /// a frame that names none, such as `feed.gap`.
     pub turn_id: Option<String>,
     pub event: TurnEvent,
 }
@@ -971,17 +964,15 @@ mod tests {
         );
     }
 
-    /// meka 0.59 moved every `type` URI from `meka.so` to `meka.run`, keeping the segment after the
-    /// last slash. Both hosts are in support at once, since the floor is 0.55, and routing on that
-    /// last segment is what makes the move invisible here rather than a table to keep in step.
+    /// The segment after the last slash is the whole contract, so meka moving its URIs to another
+    /// host, as it once did, changes nothing here.
     #[test]
     fn the_host_a_type_uri_sits_under_decides_nothing() {
-        for host in ["https://meka.so", "https://meka.run"] {
+        for host in ["https://meka.run", "https://errors.example"] {
             assert_eq!(
                 problem(&format!("{host}/errors/context-overflow")).kind(),
                 ProblemKind::ContextOverflow,
-                "{host} must route like the other, or one of the two mekas this build supports \
-                 has every error fall to `Other`"
+                "{host} must route by the segment alone"
             );
         }
     }
@@ -1002,12 +993,10 @@ mod tests {
         assert!(MekaError::Problem(problem("https://meka.run/errors/internal")).is_retryable());
     }
 
-    /// Where a provider rate limit or an overload lands once meka's own retries are spent.
-    ///
-    /// Up to meka 0.43 it was `internal`, which the test above covers. 0.44 gave
-    /// `RetryableProvider` an arm of its own and pointed it at the existing `provider` URI, so this
-    /// bucket stopped being purely permanent and reading it that way turned every rate limit into a
-    /// message given up on at the first attempt.
+    /// meka's catch-all for an upstream failure it could not classify, which it documents as
+    /// meaning not classified as transient rather than will fail again. It holds transient failures
+    /// meka did not recognise as such, so reading it as permanent would give up on those at the
+    /// first attempt.
     #[test]
     fn a_provider_failure_is_worth_another_attempt() {
         assert!(MekaError::Problem(problem("https://meka.run/errors/provider")).is_retryable());
@@ -1161,10 +1150,6 @@ mod tests {
         assert!(
             !MekaError::Problem(problem("https://meka.run/errors/invalid-body")).is_retryable()
         );
-        // `provider` used to be asserted here, on the grounds that meka's `Provider` and
-        // `InvalidRequest` both mapped onto it and the agent loop had already tried to repair
-        // them. meka 0.44 pointed `RetryableProvider` at the same URI, so the bucket now holds
-        // transient failures too and is retried; see `a_provider_failure_is_worth_another_attempt`.
         assert!(
             !MekaError::Problem(problem("https://meka.run/errors/session-not-found"))
                 .is_retryable()
@@ -1214,76 +1199,57 @@ mod tests {
         assert_eq!(InboxState::Delivered.to_string(), "delivered");
     }
 
-    /// The count is new in 0.55 and reported for a loaded session only, so both "not sent" and
-    /// "sent as zero" have to read back as what they are.
+    /// The count is reported for a loaded session only, so both "not sent" and "sent as zero" have
+    /// to read back as what they are.
     #[test]
     fn session_info_reads_the_inbox_count_when_meka_sends_one() {
         let counted = r#"{"id":"6f1a4b9c-0000-4000-8000-000000000000","title":"",
-                          "turn_in_flight":true,"inbox_pending":2}"#;
+                          "profile":"work","turn_in_flight":true,"inbox_pending":2}"#;
         let info: SessionInfo = serde_json::from_str(counted).expect("must deserialize");
         assert_eq!(info.inbox_pending, Some(2));
         let uncounted = r#"{"id":"6f1a4b9c-0000-4000-8000-000000000000","title":"",
-                            "turn_in_flight":false}"#;
+                            "profile":"work","turn_in_flight":false}"#;
         let info: SessionInfo = serde_json::from_str(uncounted).expect("must deserialize");
         assert_eq!(info.inbox_pending, None);
     }
 
-    /// `/v1/info` has to be read across the versions this bridge supports, and it changed in both
-    /// directions at once: meka 0.44 dropped `model` and `provider` and added `default_permission`.
-    /// A field arriving that this build has never heard of is the easy half; the half that bit is
-    /// that a field going missing is silent, because a missing `Option` deserializes to `None`
-    /// rather than failing. `doctor` reported "(none configured)" for every deployment on 0.44
-    /// while nothing looked wrong.
+    /// A field arriving that this build has never heard of is the easy half of reading `/v1/info`;
+    /// the half that bites is a field going missing. That is silent for an `Option`, which reads as
+    /// `None`, and fatal for anything required: while `vision` was required here, meka 0.70 moving
+    /// it to `/v1/profiles` stopped the whole body decoding, and `doctor` lost its version and
+    /// scope checks with it.
     #[test]
     fn server_info_reads_every_meka_this_bridge_supports() {
-        let recent = r#"{"version":"0.44.0","default_permission":"read",
-                         "enabled_permissions":["read","workspace"],"vision":true}"#;
-        let info: ServerInfo = serde_json::from_str(recent).expect("0.44 must deserialize");
-        assert_eq!(info.version, "0.44.0");
-        assert!(info.vision);
+        let body = r#"{"version":"0.71.0","default_permission":"read",
+                       "enabled_permissions":["read","workspace"],
+                       "scopes":["sessions:r","sessions:w"]}"#;
+        let info: ServerInfo = serde_json::from_str(body).expect("0.71 must deserialize");
+        assert_eq!(info.version, "0.71.0");
         assert_eq!(info.enabled_permissions, ["read", "workspace"]);
-
-        let older = r#"{"version":"0.43.0","model":null,"provider":"anthropic-messages",
-                        "vision":false,"enabled_permissions":[]}"#;
-        let info: ServerInfo = serde_json::from_str(older).expect("0.43 must deserialize");
-        assert!(
-            !info.vision,
-            "the fields it dropped must not shadow the ones it kept"
-        );
-        assert!(
-            info.scopes.is_empty(),
-            "a meka that reports no scopes has said nothing, not that the token holds nothing"
-        );
-
-        let scoped = r#"{"version":"0.57.0","default_permission":"read",
-                         "enabled_permissions":["read"],"vision":true,
-                         "scopes":["sessions:r","sessions:w"]}"#;
-        let info: ServerInfo = serde_json::from_str(scoped).expect("0.57 must deserialize");
         assert_eq!(info.scopes, ["sessions:r", "sessions:w"]);
+
+        // And one this bridge does not support, which still has to decode so that `doctor` can say
+        // it is too old rather than report a decode error.
+        let older = r#"{"version":"0.69.0","default_permission":"read",
+                        "enabled_permissions":["read"],"vision":true,
+                        "scopes":["sessions:r","sessions:w"]}"#;
+        let info: ServerInfo = serde_json::from_str(older).expect("0.69 must still decode");
+        assert_eq!(info.version, "0.69.0");
     }
 
-    /// The rename that reads as a healthy deployment being unservable. Every field on
-    /// [`ReadyStatus`] defaults, so a name meka no longer sends is `false` rather than an error,
-    /// and `doctor` fails the run over it.
+    /// Every field on [`ReadyStatus`] defaults, so a name meka does not send reads as `false`
+    /// rather than an error, and `doctor` fails the run over it. The flag has to be read under the
+    /// name meka uses.
     #[test]
-    fn readiness_reads_the_configured_profile_flag_under_either_name() {
-        let new = r#"{"status":"ok","session_db":true,"profile_configured":true,
-                      "mcp_servers_healthy":true}"#;
-        let ready: ReadyStatus = serde_json::from_str(new).expect("0.46 must deserialize");
+    fn readiness_reads_the_configured_profile_flag() {
+        let body = r#"{"status":"ok","session_db":true,"profile_configured":true,
+                       "mcp_servers_healthy":true}"#;
+        let ready: ReadyStatus = serde_json::from_str(body).expect("must deserialize");
         assert!(ready.profile_configured);
-
-        let old = r#"{"status":"ok","session_db":true,"provider_configured":true,
-                      "mcp_servers_healthy":true}"#;
-        let ready: ReadyStatus = serde_json::from_str(old).expect("0.45 must deserialize");
-        assert!(
-            ready.profile_configured,
-            "the old spelling must not read as no profile configured"
-        );
     }
 
-    /// meka 0.46 omits the level for a row that records none, where it used to send `""`. A
-    /// required field here would turn `doctor` reporting on somebody else's session into a decode
-    /// error.
+    /// meka omits the level for a row that records none. A required field here would turn `doctor`
+    /// reporting on somebody else's session into a decode error.
     #[test]
     fn a_session_that_records_no_level_still_reads() {
         let body = r#"{"id":"6f1a4b9c-0000-4000-8000-000000000000","title":"",
@@ -1293,29 +1259,37 @@ mod tests {
         assert!(!info.turn_in_flight);
     }
 
-    /// Where the model went. The bridge names no profile, so the one marked `active` is the one its
-    /// session runs on.
+    /// The bridge names no profile, so its session starts on the one marked `active`. A request can
+    /// move it to another afterwards, and from then on whether it can be shown an image is that
+    /// profile's answer, not the default's.
     #[test]
-    fn the_active_profile_is_the_one_the_bridge_gets() {
+    fn a_profile_is_found_by_name_or_as_the_default() {
         #[derive(serde::Deserialize)]
         struct Response {
             profiles: Vec<Profile>,
         }
 
         let body = r#"{"profiles":[
-            {"name":"cheap","account":"personal","backend":"openai-responses","active":false},
+            {"name":"cheap","account":"personal","backend":"openai-responses","vision":false,
+             "active":false},
             {"name":"work","account":"work","backend":"anthropic-messages",
-             "model":"claude-opus-5","active":true}]}"#;
+             "model":"claude-opus-5","vision":true,"active":true}]}"#;
         let parsed: Response = serde_json::from_str(body).expect("profiles must deserialize");
-        let active = parsed
-            .profiles
-            .iter()
-            .find(|profile| profile.active)
-            .expect("one profile is the default");
+        let active = find_profile(&parsed.profiles, None).expect("one profile is the default");
         assert_eq!(active.name, "work");
         assert_eq!(active.account, "work");
         assert_eq!(active.backend.as_deref(), Some("anthropic-messages"));
         assert_eq!(active.model.as_deref(), Some("claude-opus-5"));
+        assert!(active.vision);
+        let moved = find_profile(&parsed.profiles, Some("cheap")).expect("found by name");
+        assert!(
+            !moved.vision,
+            "a session moved off the default answers for the profile it is on"
+        );
+        assert!(
+            find_profile(&parsed.profiles, Some("gone")).is_none(),
+            "a profile that has left the config is not stood in for by another"
+        );
         // meka omits `model` for a profile that configures none, rather than sending null.
         assert_eq!(parsed.profiles[0].model, None);
     }
@@ -1325,7 +1299,7 @@ mod tests {
     /// field here would turn the row that explains the misconfiguration into a decode error.
     #[test]
     fn a_profile_on_a_missing_account_still_reads() {
-        let body = r#"{"name":"work","account":"gone","active":true}"#;
+        let body = r#"{"name":"work","account":"gone","vision":true,"active":true}"#;
         let profile: Profile = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(profile.backend, None);
         assert_eq!(profile.account, "gone");
@@ -1347,7 +1321,7 @@ mod tests {
             detail.to_string(),
             "t (409): d. The provider said: 401 invalid_api_key"
         );
-        // Absent where the operator turned relaying off, or on a meka predating the key.
+        // Absent where the operator turned relaying off.
         assert_eq!(
             problem("https://meka.run/errors/provider").to_string(),
             "t (409): d"

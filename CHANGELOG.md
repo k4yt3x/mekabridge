@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-10-07
+
+### Added
+
+- `doctor` fails when the bridge's session is on a profile meka no longer has.
+
+### Changed
+
+- **Breaking:** meka 0.71 or later is required; `doctor` fails against anything older.
+- meka's notices are logged at meka's own level, so a checklist nudge is no longer a warning.
+
+### Removed
+
+- Reading meka's pre-0.46 names: `turn.cancelled`, `turn-cancelled` and `provider_configured`.
+- Naming `ask` and `write` as retired in `[session].permission`; both are refused as unknown levels.
+
+### Fixed
+
+- `attachment_view` shows images again: meka 0.70 moved `vision` off `/v1/info` onto each profile.
+- `attachment_view` checks vision on the profile of the session calling it, not on the default one.
+- `attachment_view` no longer tells the agent it has no vision when the check itself failed.
+- A hole in the session feed is acted on again: meka 0.71 reports it as `feed.gap`, not a notice.
+- After meka restarts, the feed resumes from meka's new numbering, not the old process's position.
+- `doctor` reads a `/v1/info` without `vision`, so its version and scope checks run, not fail.
+- `doctor` judges vision on the profile the bridge's session is on, not on the default one.
+- `doctor` warns when it cannot read which session is bound, rather than reporting none.
+
 ## [0.18.2] - 2026-09-29
 
 ### Security
@@ -494,7 +521,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.18.2...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.19.0...HEAD
+[0.19.0]: https://github.com/k4yt3x/mekabridge/compare/0.18.2...0.19.0
 [0.18.2]: https://github.com/k4yt3x/mekabridge/compare/0.18.1...0.18.2
 [0.18.1]: https://github.com/k4yt3x/mekabridge/compare/0.18.0...0.18.1
 [0.18.0]: https://github.com/k4yt3x/mekabridge/compare/0.17.0...0.18.0

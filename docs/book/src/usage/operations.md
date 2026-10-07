@@ -111,7 +111,9 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `inbound queue is full` | Messages are being shed; the agent is told how many on the next item handed over |
 | `lost the session feed (...); reconnecting` | The connection to meka dropped. It is reopened from the last event acted on and meka replays what was missed; nothing is lost and nothing is delivered twice |
 | `could not open the session feed (...); trying again` | The reconnect itself failed. Retried with backoff up to 30s; only repeated lines are a concern |
-| `meka notice: the replay does not reach your Last-Event-ID ...` or `Fell behind ...` | Some events are gone. Every hand-over still out is asked about under its own key, so nothing is waiting on an outcome that has already passed |
+| `the session feed has a hole; asking what became of every hand-over still out` | Some events are gone, from a reconnect meka's replay no longer reached or a read that fell too far behind; `dropped` says how many when meka can count them. Every hand-over still out is asked about under its own key, so nothing is waiting on an outcome that has already passed |
+| `meka notice: checklist: N open items, continuing, nudge K of 3` | At info. The agent tried to end a turn with [checklist](./meka-integration.md#the-checklist) items open, and meka sent it back to them |
+| `meka notice: checklist: N items left open after K nudges` | At warn. meka stopped sending the agent back, so the items are still open, and the end of the next turn, whoever it answers, asks again |
 | `meka has had a message longer than an outcome can take; asking what became of it` | An outcome that arrived and could not be written down. meka gives up on an item within the hour, so anything older has an answer waiting; the bridge asks rather than leaving the message with meka |
 | `meka had no record of a message it had accepted` | meka's store was replaced, or `[meka].token` was rotated, which changes the scope of the key. It is handed over afresh, and on a rotation the agent may read it twice |
 | `skipping a feed frame this build cannot read` | One event this version does not understand. Skipped rather than reconnected over, since a reconnect would replay it and fail identically |
@@ -197,7 +199,7 @@ into and it is gone.
 `[session].permission` being `none`, at which meka denies the send. (`read` is fine, and so is
 everything above it: the send tools are annotated read-only.) The
 give-away in the log is `turn finished ... sends=0 tool_calls=0` with a non-zero `text_chars`, which
-means the agent wrote a reply that had nowhere to go. Since meka 0.37 the bridge reconciles a
+means the agent wrote a reply that had nowhere to go. The bridge reconciles a
 running session's level with the config on the next turn, so fixing the config and restarting is
 enough; no session reset needed.
 
@@ -217,11 +219,11 @@ If it persists on 0.2.1 or later, then look at the network. One cause worth ruli
 resolves `api.telegram.org` to IPv6 with no working IPv6 route; compare `curl -4` and `curl -6`
 against `https://api.telegram.org/`, since plain `curl` hides it by falling back.
 
-**Every tool is denied and the agent cannot reply.** The session is at `permission = "none"`, where nothing is executable, `message_send` included, so nothing gets sent. The common way to arrive here is meka's 0.46 upgrade: it retired the `ask` level, and its store migration turns an existing `ask` session into `none` with approvals on, which denies every call because this bridge has nobody to put an approval to. Set `[session].permission` to `read` and restart; as above, the bridge reconciles the level before its next turn, so no session reset is needed. The `approvals` switch the migration left on can stay: with no one to ask, meka denies an above-level call either way.
+**Every tool is denied and the agent cannot reply.** The session is at `permission = "none"`, where nothing is executable, `message_send` included, so nothing gets sent. Set `[session].permission` to `read` and restart; as above, the bridge reconciles the level before its next turn, so no session reset is needed. If meka's `approvals` switch is on for the session it can stay: with no one to ask, meka denies an above-level call either way.
 
 **The agent chats but will not ban, purge or rename.** The session is below `unrestricted`, where meka puts every tool annotated destructive. `workspace` is not enough and looks like it should be; [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) explains why and gives the narrower alternative. `mekabridge doctor` reports exactly this pairing. The refusal is otherwise visible only inside the tool result, so nothing in the log names it.
 
-**The agent says it cannot see an image.** Check that it actually called `attachment_view`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and got a description instead of the image, the profile has `vision = false`; `mekabridge doctor` reports the setting.
+**The agent says it cannot see an image.** Check that it actually called `attachment_view`: nothing is downloaded on arrival, so a picture only enters the context when the agent asks for it. If it did call the tool and was told its model has no vision, the profile of the session that called has `vision = false`; `mekabridge doctor` reports the setting for the bridge's own session, and a sub-agent runs on whichever profile it was spawned on. If it was told instead that the check could not be made, meka did not answer, and the bridge's log says why.
 
 **The bot ignores a user.** Their id is not in `allowed_users`, or their conversation is blocked. Run with `-v` to see the drop at debug level, and check `mekabridge policy list`.
 

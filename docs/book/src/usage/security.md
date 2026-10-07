@@ -88,7 +88,7 @@ Note that this only helps if the session is *not* already at `unrestricted`, and
 
 It works in the other direction as well, and that is the more useful one here: `tool_permissions` is the first step of meka's resolution chain, so naming a tool `"read"` puts it back within reach of a `read` session. That is how a deployment moderates without handing the agent an unrestricted machine.
 
-Whether the agent says what it is about to do before a ban or a purge is up to its instructions. meka's system prompt used to tell every agent to explain consequential or destructive actions before proceeding; from meka 0.63 it carries no conduct at all, so if you want that behaviour, put the line in meka's standing instructions.
+Whether the agent says what it is about to do before a ban or a purge is up to its instructions. meka's system prompt carries no conduct, so if you want the agent to explain a consequential or destructive action before taking it, put that line in meka's standing instructions.
 
 ## Privacy mode
 

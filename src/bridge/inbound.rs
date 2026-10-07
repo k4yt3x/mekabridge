@@ -30,7 +30,7 @@ use crate::{
         ChannelAccounts,
         envelope::{Item, MissedContext, MissedMessage},
         feed::FeedEvent,
-        turn::{TurnTally, TurnTypist, notice_reports_lost_events},
+        turn::{TurnTally, TurnTypist},
     },
     channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
@@ -1547,9 +1547,9 @@ async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
 
 /// Ask meka what became of everything it has, for the events that may have been missed.
 ///
-/// Run on every reconnect, not only on a notice saying the replay had a hole: the notice is matched
-/// on prose, and a post under a key meka already holds costs one request and changes nothing on its
-/// side.
+/// Run on every reconnect as well as on a `feed.gap`: a post under a key meka already holds costs
+/// one request and changes nothing on its side, which is cheaper than being sure no event was
+/// missed.
 async fn reconcile(context: &SessionContext, session_id: Uuid, before: DateTime<Utc>) {
     let posted = match context.store.rows_in(QueueState::Posted).await {
         Ok(posted) => posted,
@@ -1811,19 +1811,17 @@ async fn apply(
                             "the agent was woken for this bridge's messages"
                         );
                     }
-                    // Taken from a resumed announcement too, which is the whole worth of meka 0.57
-                    // naming the source on one: a bridge that restarted mid-turn learns here whom
-                    // the turn is answering, and without it a send composed after the reattach
-                    // raises no indicator, since the typist has no target for a turn it was handed
-                    // nothing for. Only the items the turn *opened* on, which is what meka records
-                    // as its source; one appended at a later round boundary is learnt from its own
+                    // Taken from a resumed announcement too, which names its source as a real one
+                    // does: a bridge that restarted mid-turn learns here whom the turn is
+                    // answering, and without it a send composed after the reattach raises no
+                    // indicator, since the typist has no target for a turn it was handed nothing
+                    // for. Only the items the turn *opened* on, which is what meka records as its
+                    // source; one appended at a later round boundary is learnt from its own
                     // `inbox.delivered` if that is still in the replay.
                     typist.expect(turn, conversations);
                 }
-                // A turn already running when the feed attached, and already counted. meka names
-                // the source on that announcement since 0.57, so a resumed one no longer arrives
-                // as `Unknown`: the inbox arm above takes its own, and everything else says only
-                // that this is a rejoin.
+                // A turn already running when the feed attached, and already counted. The inbox arm
+                // above takes its own, and everything else says only that this is a rejoin.
                 _ if *resumed => {
                     tracing::debug!(turn, "joined a turn already running");
                 }
@@ -1942,14 +1940,29 @@ async fn apply(
             .await
         }
         TurnEvent::Notice { level, text } => {
-            tracing::warn!(level = %level, "meka notice: {}", text);
-            if notice_reports_lost_events(text) {
-                // Everything meka has, however recently: the notice says events were dropped, and
-                // nothing here can say which.
-                reconcile(context, session_id, Utc::now()).await;
-                return true;
-            }
+            log_notice(level, text);
             false
+        }
+        TurnEvent::FeedGap { dropped } => {
+            tracing::warn!(
+                dropped,
+                "the session feed has a hole; asking what became of every hand-over still out"
+            );
+            if dropped.is_none() {
+                // meka never issued the position this feed resumed from, which is a meka that
+                // restarted or reloaded the session and numbers its events from the start again.
+                // Kept, the old position would outrank every new id until they passed it: each
+                // reconnect would read as another hole, and one after they passed it would resume
+                // from it and skip what lay below without a word.
+                context.position.store(0, Ordering::SeqCst);
+                if let Err(error) = context.store.set_feed_position(session_id, 0).await {
+                    tracing::error!("failed to reset the feed position: {}", error);
+                }
+            }
+            // Everything meka has, however recently: the event says events were dropped, and
+            // nothing here can say which.
+            reconcile(context, session_id, Utc::now()).await;
+            true
         }
         TurnEvent::ContextCompacted {
             source,
@@ -1983,6 +1996,19 @@ async fn apply(
             false
         }
         TurnEvent::Thinking { .. } | TurnEvent::Unknown { .. } => false,
+    }
+}
+
+/// Log a meka notice at meka's own level.
+///
+/// Every notice used to be a warning. From meka 0.70 each checklist nudge is an `info` notice,
+/// routine on any turn that keeps working past its answer, and as a warning it made a working turn
+/// look like a fault. A level this build does not know stays a warning rather than being quieted.
+fn log_notice(level: &str, text: &str) {
+    if level == "info" {
+        tracing::info!(level, "meka notice: {}", text);
+    } else {
+        tracing::warn!(level, "meka notice: {}", text);
     }
 }
 
@@ -2562,9 +2588,9 @@ impl NoticeLog {
 /// Bring a session's permission level in line with `[session].permission`.
 ///
 /// A session's level is fixed when it is created, so without this an operator who edits the config
-/// sees no effect and no explanation. A session carried across meka 0.46 is the case that makes it
-/// matter: one created at `ask` was migrated to `none` with approvals on, which denies every call
-/// including `message_send`, so it cannot reply to anyone until its level changes.
+/// sees no effect and no explanation. A session at `none` is the case that makes it matter, and
+/// meka's own upgrades have left sessions there: every call is denied, `message_send` included, so
+/// it cannot reply to anyone until its level changes.
 ///
 /// Runs once per process, when the session is bound, which waits meka out because the bridge
 /// comes up before meka does.
@@ -2673,6 +2699,47 @@ mod tests {
         Admission, Attachment, AttachmentKind, ChannelId, ChatKind, InboundMessage, Platform,
         Sender,
     };
+
+    /// A checklist nudge is meka saying the turn goes on, which is routine, so it must not reach
+    /// the log as a warning. A level no meka sends today must not be quieted either.
+    #[test]
+    fn a_notice_is_logged_at_mekas_own_level() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Levels(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(*event.metadata().level());
+            }
+        }
+
+        let levels = Levels::default();
+        let subscriber = tracing_subscriber::registry().with(levels.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            log_notice("info", "checklist: 1 open item, continuing, nudge 1 of 3");
+            log_notice("warn", "checklist: 1 item left open after 3 nudges");
+            log_notice("critical", "a level no meka sends today");
+        });
+        assert_eq!(
+            *levels
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                tracing::Level::INFO,
+                tracing::Level::WARN,
+                tracing::Level::WARN
+            ]
+        );
+    }
 
     fn attachment(file_ref: &str) -> Attachment {
         Attachment {

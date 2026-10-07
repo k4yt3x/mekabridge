@@ -1,8 +1,9 @@
 //! Builds one inbox item: the text of one message as the agent is handed it.
 //!
-//! This is the agent's only source of routing information. meka's MCP client sends no session
-//! identity with a `tools/call`, so the conversation id printed here is what the agent has to echo
-//! back to `message_send` in order to reply to the right person.
+//! This is the agent's only source of routing information. A `tools/call` names the meka session it
+//! came from but not the conversation, and one session talks to everybody, so the conversation id
+//! printed here is what the agent has to echo back to `message_send` in order to reply to the right
+//! person.
 //!
 //! One item per message, because meka batches for itself: one turn reads every item posted around
 //! it and writes one block per item into a user message, under a header of its own. A second layer

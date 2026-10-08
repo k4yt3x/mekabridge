@@ -6,6 +6,24 @@
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
 - Rust 1.88 or newer if building from source.
 
+## Pre-built binaries
+
+Download the latest release for your platform from the [GitHub Releases](https://github.com/k4yt3x/mekabridge/releases/latest) page.
+
+| Platform | Archive |
+|----------|---------|
+| Linux (x86_64) | `mekabridge-linux-amd64.tar.gz` |
+| macOS (Apple Silicon) | `mekabridge-macos-arm64.tar.gz` |
+| Windows (x86_64) | `mekabridge-windows-amd64.zip` |
+
+Extract the binary and place it somewhere on your `$PATH`. The [systemd unit](../usage/operations.md#systemd) runs it from `/usr/local/bin`:
+
+```bash
+# Linux/macOS
+tar -xzf mekabridge-*.tar.gz
+sudo cp mekabridge /usr/local/bin/
+```
+
 ## From source
 
 ```bash

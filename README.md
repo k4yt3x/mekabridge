@@ -17,6 +17,8 @@ One instance owns exactly one meka session, permanently. That session is the age
 
 ## Installation
 
+Download a pre-built binary for Linux (x86_64), macOS (Apple Silicon), or Windows (x86_64) from [GitHub Releases](https://github.com/k4yt3x/mekabridge/releases/latest), or install with Cargo:
+
 ```bash
 cargo install --locked --git https://github.com/k4yt3x/mekabridge.git
 ```

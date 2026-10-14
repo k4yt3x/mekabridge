@@ -117,6 +117,7 @@ Weigh that trade before raising the level. `unrestricted` is the whole machine, 
 
 - **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config, any `token_file`, and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those. The one exception is a process's own directory under `/proc`, refused whatever path names it, because its `environ` holds every `${VAR}` token; that makes the environment the one place a credential is out of `file_send`'s reach.
 - **`attachment_download` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.
+- **meka's `[permissions].confine_reads` does not bind `file_send`.** It confines meka's own file tools and commands; `file_send` reads in the bridge's process, with the bridge's rights. Keeping the agent out of a directory therefore means keeping the bridge out of it too, as the systemd units do for home directories with a user of its own and `ProtectHome=true`, or taking `file_send` away with `tool_permissions`.
 
 Confine the bridge with the systemd hardening in [Operations](./operations.md), and keep `[session].cwd` pointed at a directory that holds nothing you would mind the agent reading aloud.
 

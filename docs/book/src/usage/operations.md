@@ -115,7 +115,7 @@ That asymmetry is what the restart policy is for. Telegram holds undelivered upd
 | `meka notice: checklist: N open items, continuing, nudge K of 3` | At info. The agent tried to end a turn with [checklist](./meka-integration.md#the-checklist) items open, and meka sent it back to them |
 | `meka notice: checklist: N items left open after K nudges` | At warn. meka stopped sending the agent back, so the items are still open, and the end of the next turn, whoever it answers, asks again |
 | `meka has had a message longer than an outcome can take; asking what became of it` | An outcome that arrived and could not be written down. meka gives up on an item within the hour, so anything older has an answer waiting; the bridge asks rather than leaving the message with meka |
-| `meka had no record of a message it had accepted` | meka's store was replaced, or `[meka].token` was rotated, which changes the scope of the key. It is handed over afresh, and on a rotation the agent may read it twice |
+| `meka had no record of a message it had accepted` | meka's store was replaced, `[meka].token` was rotated, which changes the scope of the key, or meka's `[session].turn_retention` deleted the item after the bridge missed its outcome for longer than that window. It is handed over afresh, and after a rotation or a deletion the agent may read it twice |
 | `skipping a feed frame this build cannot read` | One event this version does not understand. Skipped rather than reconnected over, since a reconnect would replay it and fail identically |
 | `logged in` | Which account a channel resolved to at startup, which is what every message it records is keyed on |
 | `this channel is logged in as a different account than last time` | The bot behind a channel was replaced. Nothing is lost, but messages recorded under the old account cannot be replied to, reacted to, edited, or deleted from the new one, and the history tools mark them |
@@ -250,3 +250,5 @@ The other two causes are the agent having muted or blocked the chat itself (same
 **Replies in a busy group are consistently delayed by the same amount.** The chat never goes quiet for a full `settle`, so `settle_max` is releasing every pass rather than acting as an occasional fallback. Lower `settle_max`, or accept it as the price of one turn per burst instead of one per message.
 
 **A file was not downloaded.** It exceeded `attachment_max_bytes`. The `attachment:` line says so, and the agent can tell the user.
+
+**The agent cannot read a file it downloaded.** meka's `[permissions].confine_reads` is on, and `[storage].attachment_dir` is outside what it lets the session read. See [Attachments](./meka-integration.md#attachments).

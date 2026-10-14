@@ -372,7 +372,7 @@ Write a file to disk and get its path back.
 |----------|------|---------|
 | `attachment` | string | The handle in square brackets on an `attachment:` line |
 
-For the cases where the agent needs the file rather than a look at it: reading a document, running a tool over an archive. Files land in `[storage].attachment_dir` and are bounded by `attachment_max_bytes`. Calling it twice returns the same path without fetching again.
+For the cases where the agent needs the file rather than a look at it: reading a document, running a tool over an archive. Files land in `[storage].attachment_dir` and are bounded by `attachment_max_bytes`. Calling it twice returns the same path without fetching again. With meka's `confine_reads` on, the agent can read the file only once that directory is readable to it; see [meka Integration](./meka-integration.md#attachments).
 
 ## `conversation_list`
 

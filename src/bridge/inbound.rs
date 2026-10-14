@@ -1598,14 +1598,19 @@ async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessa
         Ok(receipt) if !receipt.replayed => {
             // meka has no record of the key, so the post just made is the hand-over now.
             //
-            // One thing reaches here in practice: `[meka].token` was rotated, since meka scopes a
-            // key to the token that used it. A meka whose store was replaced has no session either
-            // and answers 404, which rebinds rather than arriving here.
+            // Two things reach here in practice. `[meka].token` was rotated, since meka scopes a
+            // key to the token that used it. Or meka's `[session].turn_retention` swept the item,
+            // which it does once an item has been delivered or withdrawn for longer than that
+            // window, taking the key with it, so a bridge that missed the outcome for that long
+            // asks under a key meka has forgotten. A meka whose store was replaced has no session
+            // either and answers 404, which rebinds rather than arriving here.
             //
-            // The item made under the old token is still meka's to deliver, so the agent reads this
-            // message twice. Taken rather than prevented: withdrawing the copy just made would
-            // leave the old one's fate unknowable and its message owed back, which trades one kind
-            // of repetition for another, and this way it is delivered.
+            // Either way the agent may read this message twice, and that is taken rather than
+            // prevented. After a rotation the item made under the old token is still meka's to
+            // deliver, and withdrawing the copy just made would leave the old one's fate unknowable
+            // and its message owed back, which trades one kind of repetition for another. A swept
+            // item was delivered unless it was withdrawn, and nothing left on meka's side says
+            // which, so keeping the copy is the one way the message is not lost.
             tracing::warn!(
                 seq = row.seq,
                 item = %receipt.item_id,

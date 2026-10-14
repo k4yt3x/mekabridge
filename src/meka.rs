@@ -734,7 +734,9 @@ impl MekaClient {
     /// `key` is recorded on the item. A retry after an ambiguous failure, or after a restart on
     /// either side, is answered with the item it already made and that item's current state rather
     /// than a second copy, which is also how a hand-over whose events were missed is reconciled.
-    /// body has to be byte-identical on a replay: meka refuses the same key with other words.
+    /// That lasts as long as the item does: meka's `[session].turn_retention` deletes one, key and
+    /// all, once it has been delivered or withdrawn for longer than the window. `body` has to be
+    /// byte-identical on a replay: meka refuses the same key with other words.
     ///
     /// Never retried here. The session task schedules the retry, where the wait is written down
     /// and survives a restart.

@@ -235,7 +235,7 @@ able to open it.
 
 The alternative would gate replying behind a level above `read`, and that reads badly once you look
 at what the levels mean in practice. In every other meka front-end, answering the user is not
-permission-gated at all: the REPL just prints the reply. Here it travels as a tool call, which is a
+permission-gated at all: the screen just shows the reply. Here it travels as a tool call, which is a
 property of the transport rather than a difference in kind. Gating it would make `read` mean "the
 agent may run commands, fetch URLs and read every file, but may not say hello", which is not a
 posture anyone would pick deliberately, and its failure is silent from both ends.
@@ -414,7 +414,7 @@ bridge screens for both rather than discovering them from a placeholder:
 
 Telegram photos are JPEG, stickers are WebP, and video stills are JPEG, so all of them pass.
 
-When the session asking runs on a profile that reports `vision = false` on `GET /v1/profiles`, `attachment_view` returns a description rather than an image. An image shown to a session whose profile has no vision stays in its history, where the provider refuses it on every later request, so the profile that decides is the calling session's, which meka names in each call's `_meta`. That is not always the bridge's own session or meka's default: a sub-agent can run on a profile of its own, and any session can be moved to another, by `/profile` in a REPL opened on it or by a `PATCH`. A call made outside any turn names no session, and the bridge's own answers for it, or before one exists, the default profile it will get. The answer is asked for on every call rather than cached, since a profile can change while both processes run. When meka cannot be asked, the agent is told the check failed rather than that its model has no vision.
+When the session asking runs on a profile that reports `vision = false` on `GET /v1/profiles`, `attachment_view` returns a description rather than an image. An image shown to a session whose profile has no vision stays in its history, where the provider refuses it on every later request, so the profile that decides is the calling session's, which meka names in each call's `_meta`. That is not always the bridge's own session or meka's default: a sub-agent can run on a profile of its own, and any session can be moved to another, by `/profile` on a meka screen opened on it or by a `PATCH`. A call made outside any turn names no session, and the bridge's own answers for it, or before one exists, the default profile it will get. The answer is asked for on every call rather than cached, since a profile can change while both processes run. When meka cannot be asked, the agent is told the check failed rather than that its model has no vision.
 
 ## What the agent is told
 
@@ -450,7 +450,7 @@ It stops short of "everything outside a fence is the bridge's". That was an earl
 
 **Nothing that is true of every tool anywhere.** An earlier draft said "it posts nothing on its own, so a turn that calls no tool leaves every chat as it was". True, and worth as much as telling somebody their phone will not text people by itself. The failure it was guarding against, an agent that narrates a reply instead of sending one, is a prompting problem rather than a fact about this bridge, and the rule below puts prompting elsewhere. `message_send` reports the id it created and `history_read` now shows the agent's own messages, so "did I actually reply?" has an answer that does not depend on being reassured.
 
-**Nothing outside what this bridge does.** An earlier version opened with "nothing you write here reaches them: your turn text, your reasoning and your tool output are all invisible". That is a claim about the whole deployment, and the bridge cannot make it: an operator sitting at a meka REPL alongside these chats sees exactly the turn text the bridge does not relay, so it was false there and misleading everywhere else. Conduct goes the same way. Whether the agent should reply, stay quiet, or treat its reasoning as private is the operator's call, and meka's standing instructions are where it belongs.
+**Nothing outside what this bridge does.** An earlier version opened with "nothing you write here reaches them: your turn text, your reasoning and your tool output are all invisible". That is a claim about the whole deployment, and the bridge cannot make it: an operator with meka's screen open alongside these chats sees exactly the turn text the bridge does not relay, so it was false there and misleading everywhere else. Conduct goes the same way. Whether the agent should reply, stay quiet, or treat its reasoning as private is the operator's call, and meka's standing instructions are where it belongs.
 
 Two constraints bound the length:
 
@@ -489,6 +489,8 @@ already given rather than minting a second one for the same file.
 
 Anything downloaded is recorded, so `[storage].attachment_retention` reclaims it later. Files the agent
 never asked for cost nothing, because they were never fetched.
+
+With meka's `[permissions].confine_reads` on, the agent's file tools and commands read only under the session's roots and the system directories, and `attachment_dir` is in neither unless you put it there. `attachment_download` still succeeds, and the `file_read` after it is refused as outside the readable roots. Add the directory to meka's `[shell].readable_paths`, which its file tools honour as well as its commands, or keep `attachment_dir` inside the working directory the bridge's session was created with.
 
 ## What a restart costs
 

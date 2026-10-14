@@ -1111,6 +1111,18 @@ struct MockChannel {
     /// Each `delete_messages` call, as the batch it was given. One entry per call rather than per
     /// id, so a test can tell one batch from several single deletes.
     deletes: Mutex<Vec<Vec<String>>>,
+    /// The fresh sessions not yet caught up from, for `catch_up`. Recorded by hand, by
+    /// [`MockChannel::open_session`].
+    openings: Arc<mekabridge::channel::Openings>,
+    /// Conversations whose next `backfill` fails, once each.
+    fail_backfill_once: Mutex<std::collections::HashSet<String>>,
+    /// What `backfill` finds in each conversation.
+    missed: Mutex<std::collections::HashMap<String, Vec<InboundEvent>>>,
+    /// Every `backfill` call, as the conversation and the message it started after.
+    backfills: Mutex<Vec<(String, Option<String>)>>,
+    /// What `fetch_message` can find, by id. `None` stands in for a platform with no such lookup,
+    /// as Telegram is.
+    fetchable: Mutex<Option<std::collections::HashMap<String, FoundMessage>>>,
 }
 
 impl MockChannel {
@@ -1138,7 +1150,24 @@ impl MockChannel {
             activities: Mutex::new(Vec::new()),
             files: Mutex::new(std::collections::HashMap::new()),
             deletes: Mutex::new(Vec::new()),
+            openings: Arc::new(mekabridge::channel::Openings::default()),
+            fail_backfill_once: Mutex::new(std::collections::HashSet::new()),
+            missed: Mutex::new(std::collections::HashMap::new()),
+            backfills: Mutex::new(Vec::new()),
+            fetchable: Mutex::new(None),
         }
+    }
+
+    /// Stand in for a fresh session, opened at `opened`, whose servers have all arrived.
+    fn open_session(&self, opened: chrono::DateTime<Utc>) {
+        self.openings.record(opened);
+    }
+
+    fn backfills(&self) -> Vec<(String, Option<String>)> {
+        self.backfills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Make a file available to `fetch` under `file_ref`.
@@ -1434,6 +1463,66 @@ impl Channel for MockChannel {
             display_name: "Mock".to_string(),
             username: Some("mockbot".to_string()),
             reads_all_group_messages: true,
+        })
+    }
+
+    async fn fetch_message(
+        &self,
+        _conversation: &ConversationId,
+        message_id: &str,
+    ) -> Result<Option<FoundMessage>, ChannelError> {
+        match &*self
+            .fetchable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            Some(fetchable) => Ok(fetchable.get(message_id).cloned()),
+            None => Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "fetching a message by its id",
+            }),
+        }
+    }
+
+    fn catch_up(&self) -> Option<mekabridge::channel::CatchUp> {
+        Some(mekabridge::channel::CatchUp {
+            openings: Arc::clone(&self.openings),
+            window: Duration::from_secs(24 * 60 * 60),
+        })
+    }
+
+    async fn backfill(
+        &self,
+        conversation: &ConversationId,
+        after: Option<&str>,
+        _since: chrono::DateTime<Utc>,
+        _limit: usize,
+    ) -> Result<mekabridge::channel::Backfill, ChannelError> {
+        self.backfills
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((conversation.as_str().to_string(), after.map(str::to_string)));
+        if self
+            .fail_backfill_once
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation.as_str())
+        {
+            return Err(ChannelError::Transport {
+                channel: self.id.as_str().to_string(),
+                message: "a bad minute on the platform's side".to_string(),
+            });
+        }
+        let events = self
+            .missed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(conversation.as_str())
+            .cloned()
+            .unwrap_or_default();
+        Ok(mekabridge::channel::Backfill {
+            events,
+            truncated: false,
         })
     }
 }
@@ -5633,7 +5722,7 @@ async fn the_sender_filter_reaches_the_store_through_the_sink() {
     }
 
     let entries = sink
-        .history_read("mock:1", &["99".to_string()], 20, None, None)
+        .history_read("mock:1", &["99".to_string()], 20, None, None, None)
         .await
         .expect("read runs");
     assert_eq!(
@@ -5644,6 +5733,554 @@ async fn the_sender_filter_reaches_the_store_through_the_sink() {
         ["b", "c"],
         "only the one sender's messages come back"
     );
+}
+
+#[tokio::test]
+async fn reading_a_chat_through_the_sink_clears_what_it_owed() {
+    // Only a hand-over used to mark anything seen, so a muted chat the agent kept up with by
+    // reading it owed the same messages for as long as they were kept: the same four, for a week,
+    // in the report from the field.
+    let (sink, _channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    for message_id in ["a", "b", "c"] {
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: "mock:1".to_string(),
+                account,
+                message_id: message_id.to_string(),
+                revision: 0,
+                sender_id: Some("42".to_string()),
+                sender_name: "Someone".to_string(),
+                text: "hello".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: false,
+                own: false,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now(),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+    let owed = async || {
+        store
+            .unseen_summary(Some("mock:1"))
+            .await
+            .expect("summary")
+            .count
+    };
+
+    let newest = sink
+        .history_read("mock:1", &[], 2, None, None, None)
+        .await
+        .expect("read runs");
+    assert!(
+        newest.iter().all(|entry| entry.unseen),
+        "each entry says it was news: {newest:?}"
+    );
+    assert_eq!(owed().await, 1, "what was read stops counting");
+
+    let everything = sink
+        .history_read("mock:1", &[], 10, None, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(
+        everything
+            .iter()
+            .filter(|entry| entry.unseen)
+            .map(|entry| entry.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a"],
+        "a second read says only the one it had not shown before"
+    );
+    assert_eq!(owed().await, 0);
+}
+
+#[tokio::test]
+async fn particular_messages_come_from_the_record_and_then_from_the_platform() {
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    store
+        .record_message(mekabridge::store::MessageRecord {
+            id: 0,
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: "a".to_string(),
+            revision: 0,
+            sender_id: Some("42".to_string()),
+            sender_name: "Someone".to_string(),
+            text: "recorded".to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            seen: false,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: Utc::now(),
+            previous_account: false,
+        })
+        .await
+        .expect("record");
+
+    // A platform that cannot be asked, as Telegram cannot: only the record answers.
+    let lookup = sink
+        .history_lookup("mock:1", &["a".to_string(), "z".to_string()], None)
+        .await
+        .expect("lookup runs");
+    assert_eq!(
+        lookup
+            .entries
+            .iter()
+            .map(|entry| entry.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    assert!(lookup.entries[0].unseen, "it says it was news");
+    assert_eq!(lookup.missing.len(), 1);
+    assert!(
+        lookup.missing[0].reason.contains("no way to fetch"),
+        "{}",
+        lookup.missing[0].reason
+    );
+    assert_eq!(
+        store
+            .unseen_summary(Some("mock:1"))
+            .await
+            .expect("summary")
+            .count,
+        0,
+        "and a lookup is a read, so it is seen"
+    );
+
+    // A platform that can, as Discord can: what the record lacks is asked for there.
+    *channel
+        .fetchable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::collections::HashMap::from(
+        [("y".to_string(), FoundMessage {
+            message_id: "y".to_string(),
+            sender_name: "Someone".to_string(),
+            text: "from before the bridge".to_string(),
+            own: false,
+            timestamp: Utc::now() - chrono::Duration::days(400),
+        })],
+    ));
+    let lookup = sink
+        .history_lookup(
+            "mock:1",
+            &["a".to_string(), "y".to_string(), "z".to_string()],
+            None,
+        )
+        .await
+        .expect("lookup runs");
+    assert_eq!(
+        lookup
+            .entries
+            .iter()
+            .map(|entry| entry.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["y", "a"],
+        "in the order they were said, the platform's among the record's"
+    );
+    assert!(
+        lookup.missing[0].reason.contains("no such message"),
+        "{}",
+        lookup.missing[0].reason
+    );
+}
+
+#[tokio::test]
+async fn a_backlog_question_covers_the_chats_its_scope_chooses() {
+    use mekabridge::store::BacklogScope;
+
+    let store = Store::open_in_memory().await.expect("store");
+    let account = mock_account(&store).await;
+    // A direct chat, active by default; a group, muted by default; and a group the agent blocked.
+    for (address, kind) in [
+        ("mock:1", "direct"),
+        ("mock:2", "group"),
+        ("mock:3", "group"),
+    ] {
+        store
+            .upsert_conversation(ConversationRecord {
+                kind: kind.to_string(),
+                ..direct_conversation(address)
+            })
+            .await
+            .expect("conversation");
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: address.to_string(),
+                account,
+                message_id: "1".to_string(),
+                revision: 0,
+                sender_id: Some("42".to_string()),
+                sender_name: "Someone".to_string(),
+                text: "hello".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: false,
+                own: false,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now(),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+    store
+        .set_policy("mock:3", "telegram", Policy::Block, None, None, Utc::now())
+        .await
+        .expect("block");
+    let defaults = DefaultPolicy {
+        direct: Policy::Active,
+        group: Policy::Mute,
+        channel: Policy::Mute,
+    };
+    let ask = async |scope: BacklogScope| {
+        mekabridge::bridge::backlog(&store, defaults, &scope)
+            .await
+            .expect("backlog")
+    };
+    let chats = |report: &mekabridge::store::BacklogReport| {
+        report.conversations.keys().cloned().collect::<Vec<_>>()
+    };
+
+    let everything = ask(BacklogScope::default()).await;
+    assert_eq!(
+        everything.total.count, 2,
+        "a blocked chat owes nothing unless it is named"
+    );
+    assert_eq!(chats(&everything), ["mock:1", "mock:2"]);
+
+    let muted = ask(BacklogScope {
+        policy: Some(Policy::Mute),
+        ..BacklogScope::default()
+    })
+    .await;
+    assert_eq!(
+        chats(&muted),
+        ["mock:2"],
+        "muted by the default for its kind, with no ruling of its own"
+    );
+
+    let named = ask(BacklogScope {
+        conversations: ["mock:3", "mock:3", "mock:9"].map(str::to_string).to_vec(),
+        ..BacklogScope::default()
+    })
+    .await;
+    assert_eq!(
+        named.total.count, 1,
+        "named, a blocked chat is answered for, and only once however often it is named"
+    );
+    assert_eq!(
+        named.conversations.get("mock:9").map(|chat| chat.count),
+        Some(0),
+        "a named chat nothing has come from is present at zero"
+    );
+
+    let rest = ask(BacklogScope {
+        exclude: vec!["mock:1".to_string()],
+        ..BacklogScope::default()
+    })
+    .await;
+    assert_eq!(chats(&rest), ["mock:2"]);
+}
+
+#[tokio::test]
+async fn a_fresh_session_catches_up_each_chat_from_the_newest_message_recorded_in_it() {
+    let store = Store::open_in_memory().await.expect("store");
+    let account = mock_account(&store).await;
+    // Two sessions opened before the catch-up got to either: ten minutes ago, and again five
+    // minutes ago. Catching up from the later one would start after "live", which arrived over the
+    // first, and skip the gap before it; the earlier one is where it has to start.
+    //
+    // In mock:1, "b" is the last thing somebody else said before the first opening. "mine" is
+    // newer, but the bot's own, sent over HTTP while the gateway was down, so it sits in the
+    // middle of the gap. "a" is recorded after "b" but said before it, the way an edit arrives, so
+    // the anchor has to come from the platform's time and not from the order rows were written in.
+    let first = Utc::now() - chrono::Duration::minutes(10);
+    let second = Utc::now() - chrono::Duration::minutes(5);
+    for (address, kind, message_id, own, seconds_ago) in [
+        ("mock:1", "direct", "b", false, 720),
+        ("mock:1", "direct", "a", false, 900),
+        ("mock:1", "direct", "mine", true, 690),
+        ("mock:1", "direct", "live", false, 540),
+        ("mock:2", "group", "x", false, 780),
+        ("mock:3", "group", "y", false, 720),
+    ] {
+        store
+            .upsert_conversation(ConversationRecord {
+                kind: kind.to_string(),
+                ..direct_conversation(address)
+            })
+            .await
+            .expect("conversation");
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: address.to_string(),
+                account,
+                message_id: message_id.to_string(),
+                revision: 0,
+                sender_id: Some("42".to_string()),
+                sender_name: "Someone".to_string(),
+                text: "hello".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: true,
+                own,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now() - chrono::Duration::seconds(seconds_ago),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+    // Known, but nothing recorded there: nothing to start from, and no reason to ask.
+    store
+        .upsert_conversation(direct_conversation("mock:4"))
+        .await
+        .expect("conversation");
+    store
+        .set_policy("mock:3", "telegram", Policy::Block, None, None, Utc::now())
+        .await
+        .expect("block");
+    let channel = Arc::new(MockChannel::new("mock"));
+    channel
+        .missed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert("mock:1".to_string(), vec![message("said while away", "c")]);
+    // mock:2 fails the first time and is tried again.
+    channel
+        .fail_backfill_once
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert("mock:2".to_string());
+    let (sender, mut receiver) = mpsc::channel(16);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(mekabridge::bridge::catch_up_on_reconnect(
+        store.clone(),
+        Arc::clone(&channel) as Arc<dyn Channel>,
+        channel.catch_up().expect("this channel catches up"),
+        sender,
+        mekabridge::bridge::CatchUpSettings {
+            default_policy: DefaultPolicy {
+                direct: Policy::Active,
+                group: Policy::Mute,
+                channel: Policy::Mute,
+            },
+            history_retention: Duration::from_secs(30 * 24 * 60 * 60),
+            retry_after: Duration::from_millis(50),
+        },
+        shutdown.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        channel.backfills().is_empty(),
+        "nothing is fetched before a session opens"
+    );
+
+    channel.open_session(second);
+    channel.open_session(first);
+    let caught = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("something is fed in")
+        .expect("the sender is still open");
+    let InboundEvent::Message(caught) = caught else {
+        panic!("a message");
+    };
+    assert_eq!(caught.message_id, "c", "what was missed goes to the writer");
+
+    // The event can land before the other chats have been asked, so wait for every call rather
+    // than read whatever has happened by now: mock:1 once, mock:2 twice.
+    let mut asked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let asked = channel.backfills();
+            if asked.len() >= 3 {
+                return asked;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every chat is asked");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        channel.backfills().len(),
+        3,
+        "and nothing else: not the blocked chat, not the one with nothing recorded, and not a \
+         second pass for the second opening, which the first one already covered"
+    );
+    asked.sort();
+    assert_eq!(
+        asked,
+        [
+            ("mock:1".to_string(), Some("b".to_string())),
+            ("mock:2".to_string(), Some("x".to_string())),
+            ("mock:2".to_string(), Some("x".to_string())),
+        ],
+        "each chat from the newest thing somebody else said before the earliest opening, and the \
+         one that failed asked again"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("it stops with the bridge")
+        .expect("it does not panic");
+}
+
+#[tokio::test]
+async fn only_the_bridges_own_session_reading_clears_what_it_owed() {
+    // What is owed is owed to the session the bridge hands messages to. A sub-agent, or any other
+    // session reading the same chat, has not shown it to that one, and clearing it would leave its
+    // next mention there with nothing to say about what it missed.
+    let (sink, _channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    let bound = uuid::Uuid::new_v4();
+    store.set_session_id(bound).await.expect("bind");
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    for message_id in ["a", "b", "c"] {
+        store
+            .record_message(mekabridge::store::MessageRecord {
+                id: 0,
+                conversation: "mock:1".to_string(),
+                account,
+                message_id: message_id.to_string(),
+                revision: 0,
+                sender_id: Some("42".to_string()),
+                sender_name: "Someone".to_string(),
+                text: "hello".to_string(),
+                notes: None,
+                attachments: Vec::new(),
+                addressed: false,
+                seen: false,
+                own: false,
+                session_id: None,
+                deleted_at: None,
+                superseded_at: None,
+                timestamp: Utc::now(),
+                previous_account: false,
+            })
+            .await
+            .expect("record");
+    }
+    let owed = async || {
+        store
+            .unseen_summary(Some("mock:1"))
+            .await
+            .expect("summary")
+            .count
+    };
+    let another = uuid::Uuid::new_v4().to_string();
+
+    sink.history_read("mock:1", &[], 10, None, None, Some(&another))
+        .await
+        .expect("read runs");
+    sink.history_lookup("mock:1", &["a".to_string()], Some(&another))
+        .await
+        .expect("lookup runs");
+    assert_eq!(owed().await, 3, "another session reading clears nothing");
+
+    sink.history_lookup("mock:1", &["a".to_string()], Some(&bound.to_string()))
+        .await
+        .expect("lookup runs");
+    assert_eq!(
+        owed().await,
+        2,
+        "the bound session's lookup clears what it returned"
+    );
+
+    sink.history_read("mock:1", &[], 10, None, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(
+        owed().await,
+        0,
+        "and a read naming no session is taken to be the bridge's own"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_chat_owes_nothing_in_the_conversation_list_either() {
+    // `backlog_check` leaves a blocked chat out, and the list said otherwise: what was recorded
+    // before the block showed as owed for as long as it was kept.
+    let (sink, _channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    store
+        .record_message(mekabridge::store::MessageRecord {
+            id: 0,
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: "a".to_string(),
+            revision: 0,
+            sender_id: Some("42".to_string()),
+            sender_name: "Someone".to_string(),
+            text: "hello".to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            seen: false,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: Utc::now(),
+            previous_account: false,
+        })
+        .await
+        .expect("record");
+    let listed = async || {
+        sink.conversations(None, 10)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|summary| summary.id == "mock:1")
+            .expect("listed")
+            .unseen
+    };
+    assert_eq!(listed().await, 1);
+
+    store
+        .set_policy("mock:1", "telegram", Policy::Block, None, None, Utc::now())
+        .await
+        .expect("block");
+    assert_eq!(listed().await, 0, "a blocked chat owes nothing");
+
+    store.clear_policy("mock:1").await.expect("unblock");
+    assert_eq!(listed().await, 1, "and lifting the block owes it again");
 }
 
 #[tokio::test]

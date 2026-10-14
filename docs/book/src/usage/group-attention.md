@@ -90,25 +90,34 @@ See [Watches](#watches) below.
 
 ### Gate a scheduled job
 
-For a room worth sweeping on a timer, a recurring job with a gate costs nothing while the room is
+For rooms worth sweeping on a timer, a recurring job with a gate costs nothing while they are
 quiet. `backlog_check` is the gate, and a tool gate runs at `read`:
 
 ```
 schedule_create(
   every: "2m",
   gate: {
-    check: { tool: "mcp__mekabridge__backlog_check",
-             arguments: { conversation: "telegram:-1001234567890" } },
+    check: { tool: "mcp__mekabridge__backlog_check", arguments: { policy: "mute" } },
     when: { at: "/latest", is: "changed" }
   },
-  prompt: "Something new was said in the deploy group since you last looked. ..."
+  prompt: "Something new was said in a muted chat since you last looked. ..."
 )
 ```
 
+The arguments choose the rooms and the gate watches the top level, which covers exactly those:
+`policy: "mute"` is every chat that does not wake the agent, including ones muted later;
+`conversations: [...]` is particular rooms; `exclude: [...]` is everything but a few. A gate
+watches one pointer, so a set of rooms has to be chosen in the question rather than picked out of
+the answer.
+
 The pointer matters. `latest` moves when, and only when, somebody else says something that still
-stands; `unseen` is the backlog and falls to zero every time an ordinary turn sweeps the
-conversation, so a gate on that would fire on the sweep and announce news the agent had just been
-handed. Gating on the whole result has the same fault, since it contains both.
+stands; `unseen` is the backlog and falls whenever the agent reads or is handed a chat, so a gate
+watching that for a change would fire on the reading and announce news the agent had just been
+handed. Gating on the whole result has the same fault, since it contains both. `{ at: "/newest",
+is: "not_empty" }` is the other useful gate: it fires for as long as anything is unread, which
+suits a job that should keep at it until it has read everything, every page of it. Point a gate
+into `conversations` only at a chat the question named: an unnamed one leaves the answer once its
+backlog is read, and a `changed` gate fires on that.
 
 `mekabridge unseen` is the shell form of the same question, for a gate outside meka or a job that
 predates the tool:
@@ -116,7 +125,7 @@ predates the tool:
 ```
 schedule_create(
   every: "2m",
-  gate: { check: { command: "mekabridge unseen telegram:-1001234567890" }, when: "changed" },
+  gate: { check: { command: "mekabridge unseen --policy mute" }, when: "changed" },
   prompt: "..."
 )
 ```
@@ -127,7 +136,10 @@ Prefer the tool gate. A shell gate runs unattended with no sandbox, so meka requ
 
 Pair it with `history_read(after: <cursor>)` in the prompt and the sweep reads exactly what it has
 not seen: keep the newest `cursor` you were handed, pass it back next time, and nothing is read
-twice or missed in between.
+twice or missed in between. Reading counts as seeing, so the sweep also clears the backlog it read,
+and a room the agent keeps up with this way stops reporting messages it has already been through.
+A room it does not care to read at all is better left out of the gate with `exclude` than read to
+clear it.
 
 ### Join the discussion
 
@@ -274,7 +286,18 @@ $ mekabridge unseen telegram:-1001234567890
 3 unseen, newest 2026-08-14T10:22:31+00:00
 $ echo $?
 0
+$ mekabridge unseen --policy mute --exclude discord:1183429847290374144
+2026-08-14T10:22:31+00:00
+4 unseen, newest 2026-08-14T10:22:31+00:00
+  telegram:-1001234567890: 3 unseen, newest 2026-08-14T10:22:31+00:00
+  telegram:-1009876543210: 1 unseen, newest 2026-08-14T10:20:07+00:00
 ```
+
+It takes the same choice of chats as `backlog_check`: any number of conversation ids, or every chat
+narrowed by `--exclude` for each one to leave out and `--policy` for the chats under one policy now,
+not both. `--policy block` is accepted here, for an operator asking what a block left behind. Unless
+the question named exactly one chat, stderr breaks the backlog down by chat beneath the total, so
+the total never leaves you guessing which chat it came from.
 
 **stdout** carries one value and nothing else: when anything was last said there, or `never`. That
 is what a `when: "changed"` gate compares. It is the same instant `backlog_check` reports as
@@ -298,10 +321,11 @@ The three are distinct because a gate can only tell "fired" from "did not". A wa
 failure as "nothing new" would go quiet exactly like a room that had, and stay quiet until somebody
 noticed. A malformed conversation id is a `2` for the same reason.
 
-Omit the conversation to ask about every chat at once.
+Omit the conversations to ask about every chat at once. A blocked chat is left out of that unless
+named.
 
 Asking does **not** count as having seen anything, so the turn a watcher goes on to trigger still
-finds the backlog waiting for `history_read`.
+finds the backlog waiting for `history_read`, and reading it there is what clears it.
 
 Nothing volatile appears on either stream. A relative time or a chat title would fire a watcher on
 its own.

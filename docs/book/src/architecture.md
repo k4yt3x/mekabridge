@@ -47,7 +47,7 @@ Claiming happens in one transaction, so a session task racing a restart cannot h
 
 One claimed message becomes one **inbox item**, and its queue row *is* the hand-over: the same row holds the `Idempotency-Key`, the rendered item byte for byte, and whatever that item stated once and nothing else will state again.
 
-Two things fall into that last category. The count of messages the queue had to shed is carried by the first item of a claimed pass. A conversation's backlog is carried by the first item from that conversation, and every history row it named is marked seen against that row (`messages.accounted_by`) in the same transaction that stores the item.
+Two things fall into that last category. The count of messages the queue had to shed is carried by the first item of a claimed pass. A conversation's backlog is carried by the first item from that conversation, and every history row it named is marked seen against that row (`messages.accounted_by`) in the same transaction that stores the item. A read through `history_read` by the session the bridge hands messages to marks what it returns seen as well, and takes it off any hand-over that had accounted for it, since it has been shown whatever becomes of that item.
 
 All of it exists for the same moment: a bridge that stops between posting an item and hearing what became of it. On the next start it posts the same bytes under the same key, and meka answers with the item it already made and that item's current state rather than making a second. If the item is never read, the shed count goes back on the counter and exactly the rows it named are owed again.
 

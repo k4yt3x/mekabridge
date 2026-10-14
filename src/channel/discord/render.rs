@@ -36,9 +36,7 @@ fn render_group(blocks: &[Block]) -> String {
         match block {
             Block::Text { spans, quoted, .. } => {
                 let mut body = String::new();
-                for span in spans {
-                    render_span(span, &mut body);
-                }
+                render_spans(spans, &mut body);
                 push_quoted(&body, *quoted, &mut out);
             }
             Block::Heading {
@@ -54,17 +52,17 @@ fn render_group(blocks: &[Block]) -> String {
                         body.push('#');
                     }
                     body.push(' ');
-                    for span in spans {
-                        render_span(span, &mut body);
-                    }
+                    render_spans(spans, &mut body);
                 } else {
-                    body.push_str("**");
-                    for span in spans {
-                        let mut span = span.clone();
-                        span.style.bold = false;
-                        render_span(&span, &mut body);
-                    }
-                    body.push_str("**");
+                    let bold: Vec<Span> = spans
+                        .iter()
+                        .map(|span| {
+                            let mut span = span.clone();
+                            span.style.bold = true;
+                            span
+                        })
+                        .collect();
+                    render_spans(&bold, &mut body);
                 }
                 push_quoted(&body, *quoted, &mut out);
             }
@@ -103,60 +101,213 @@ fn push_quoted(body: &str, quoted: bool, out: &mut String) {
     }
 }
 
-fn render_span(span: &Span, out: &mut String) {
-    let opening = if span.link.is_some() { "[" } else { "" };
-    out.push_str(opening);
+/// One delimiter pair Discord reads around a run of text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark<'a> {
+    Link(&'a str),
+    Strikethrough,
+    Bold,
+    Italic,
+}
 
-    if span.style.code {
-        // Nothing inside a code span is markup, so the other styles have nowhere to go and the text
-        // is passed through unescaped. A backtick in the body is fenced with a longer run, which is
-        // Discord's own escape for this.
-        let fence = if span.text.contains("``") {
-            "```"
-        } else if span.text.contains('`') {
-            "``"
-        } else {
-            "`"
-        };
-        out.push_str(fence);
-        if fence.len() > 1 {
-            out.push(' ');
+impl Mark<'_> {
+    /// The marks a span carries, in the order they open when nothing else decides it.
+    ///
+    /// Less any style its own code would cut short. Discord's emphasis rules know nothing of code
+    /// spans, so `**` inside code inside bold closes the bold there and prints the rest as
+    /// asterisks. Such a span goes out unstyled instead, with the style closed around it and
+    /// reopened after, which loses the emphasis on that one span rather than the markup of the
+    /// whole run. A link's address cannot clash, since [`push_link_target`] encodes every
+    /// delimiter in it.
+    fn of(span: &Span) -> Vec<Mark<'_>> {
+        let code = span.style.code.then_some(span.text.as_str());
+        let clashes = |delimiter: &str| code.is_some_and(|code| code.contains(delimiter));
+        let mut marks = Vec::new();
+        if let Some(link) = &span.link {
+            marks.push(Mark::Link(link));
         }
-        out.push_str(&span.text);
-        if fence.len() > 1 {
-            out.push(' ');
+        if span.style.strikethrough && !clashes("~~") {
+            marks.push(Mark::Strikethrough);
         }
-        out.push_str(fence);
-    } else {
-        // A fixed open order means the matching close order is fixed too, so nesting can never
-        // interleave incorrectly.
-        if span.style.strikethrough {
-            out.push_str("~~");
+        if span.style.bold && !clashes("**") {
+            marks.push(Mark::Bold);
         }
-        if span.style.bold {
-            out.push_str("**");
+        // Any `*`, not only a pair: italic's closing rule accepts `**` inside but stops at one.
+        if span.style.italic && !clashes("*") {
+            marks.push(Mark::Italic);
         }
-        if span.style.italic {
-            out.push('*');
+        marks
+    }
+
+    /// `after_close` is whether the last thing written was a closing delimiter.
+    fn open(self, after_close: bool, out: &mut String) {
+        // An opening `*` straight after a closing one runs the two into one delimiter, so
+        // `**a***b*` reads as nothing Discord can match and the asterisks are printed. A zero-width
+        // space keeps them apart without showing. Two that both open are left alone: `***` is
+        // bold and italic at once, and Discord reads it that way.
+        if after_close && matches!(self, Mark::Bold | Mark::Italic) && out.ends_with('*') {
+            out.push('\u{200b}');
         }
-        escape(&span.text, out);
-        if span.style.italic {
-            out.push('*');
-        }
-        if span.style.bold {
-            out.push_str("**");
-        }
-        if span.style.strikethrough {
-            out.push_str("~~");
+        match self {
+            Mark::Link(_) => out.push('['),
+            Mark::Strikethrough => out.push_str("~~"),
+            Mark::Bold => out.push_str("**"),
+            Mark::Italic => out.push('*'),
         }
     }
 
-    if let Some(link) = &span.link {
-        out.push_str("](");
-        // Only the delimiters need handling: percent-encoding the whole URL would corrupt one that
-        // is already encoded, and Discord accepts spaces inside angle brackets.
-        out.push_str(&link.replace(')', "%29"));
-        out.push(')');
+    fn close(self, out: &mut String) {
+        match self {
+            Mark::Link(link) => {
+                out.push_str("](");
+                push_link_target(link, out);
+                out.push(')');
+            }
+            Mark::Strikethrough => out.push_str("~~"),
+            Mark::Bold => out.push_str("**"),
+            Mark::Italic => out.push('*'),
+        }
+    }
+}
+
+/// Emit a block's spans with each style opened once for as long as it runs.
+///
+/// Delimiting every span on its own closed a style and reopened it wherever a neighbour shared it,
+/// so `**bold *italic* bold**` went out as `**bold *****italic***** bold**`, a run Discord cannot
+/// match and prints as asterisks. Here a mark stays open while the spans around it carry it, and
+/// the marks a span opens go longest-running first, so the one that ends soonest is innermost and
+/// what closes always closes in order.
+fn render_spans(spans: &[Span], out: &mut String) {
+    let wanted: Vec<Vec<Mark<'_>>> = spans.iter().map(Mark::of).collect();
+    let mut open: Vec<Mark<'_>> = Vec::new();
+    for ((index, span), here) in spans.iter().enumerate().zip(&wanted) {
+        // Closed from the first open mark this span does not carry, since only the top of the
+        // stack can close. A mark above it that this span does carry reopens below.
+        let kept = open
+            .iter()
+            .position(|mark| !here.contains(mark))
+            .unwrap_or(open.len());
+        let mut after_close = false;
+        if open.len() > kept {
+            let trailing = take_trailing_space(out);
+            while open.len() > kept {
+                if let Some(mark) = open.pop() {
+                    mark.close(out);
+                    after_close = true;
+                }
+            }
+            if !trailing.is_empty() {
+                out.push_str(&trailing);
+                after_close = false;
+            }
+        }
+        let ahead = wanted.get(index..).unwrap_or_default();
+        let mut opening: Vec<Mark<'_>> = here
+            .iter()
+            .copied()
+            .filter(|mark| !open.contains(mark))
+            .collect();
+        // Stable, so marks running equally far keep the order `Mark::of` gives them.
+        opening.sort_by_key(|mark| {
+            std::cmp::Reverse(
+                ahead
+                    .iter()
+                    .take_while(|marks| marks.contains(mark))
+                    .count(),
+            )
+        });
+        // A span of nothing but space opens nothing: anything opened around it would close again
+        // with nothing inside once the space moved out, and `****` prints as it is. The next span
+        // opens what it needs.
+        if !span.style.code && span.text.trim_start_matches(EDGE_SPACE).is_empty() {
+            opening.clear();
+        }
+        // Space at the start of the span goes before what opens rather than inside it, for the
+        // same reason as at a close; see `take_trailing_space`.
+        let mut body = span.text.as_str();
+        if !opening.is_empty() && !span.style.code {
+            let trimmed = body.trim_start_matches(EDGE_SPACE);
+            let leading = body.get(..body.len() - trimmed.len()).unwrap_or_default();
+            if !leading.is_empty() {
+                escape(leading, out);
+                after_close = false;
+            }
+            body = trimmed;
+        }
+        for mark in opening {
+            mark.open(after_close, out);
+            after_close = false;
+            open.push(mark);
+        }
+        if span.style.code {
+            push_code(body, out);
+        } else {
+            escape(body, out);
+        }
+    }
+    let trailing = take_trailing_space(out);
+    while let Some(mark) = open.pop() {
+        mark.close(out);
+    }
+    out.push_str(&trailing);
+}
+
+/// The space characters moved out from beside a delimiter. Newlines among them, since a message
+/// is preferably split at one and a delimiter left against it fails the same way.
+const EDGE_SPACE: [char; 3] = [' ', '\t', '\n'];
+
+/// Remove and return the spaces at the end of `out`, so a closing delimiter goes before them.
+///
+/// Discord's italic and strikethrough will not close right after a space, nor open right before
+/// one, so `*see *` and `~~old ~~` print their delimiters. Bold tolerates it, but nothing loses by
+/// moving the space outside, and a style that closes beside a code span or at the end of a split
+/// message would otherwise leave exactly that.
+fn take_trailing_space(out: &mut String) -> String {
+    let kept = out.trim_end_matches(EDGE_SPACE).len();
+    out.split_off(kept)
+}
+
+/// Nothing inside a code span is markup, so its text is passed through unescaped. A backtick in
+/// the body is fenced with a longer run, which is Discord's own escape for this.
+fn push_code(text: &str, out: &mut String) {
+    // Two code spans with nothing between them would run their fences together into one.
+    if out.ends_with('`') {
+        out.push('\u{200b}');
+    }
+    let fence = if text.contains("``") {
+        "```"
+    } else if text.contains('`') {
+        "``"
+    } else {
+        "`"
+    };
+    out.push_str(fence);
+    if fence.len() > 1 {
+        out.push(' ');
+    }
+    out.push_str(text);
+    if fence.len() > 1 {
+        out.push(' ');
+    }
+    out.push_str(fence);
+}
+
+/// A link's address, with every character that could end it early or close a style around it
+/// percent-encoded.
+///
+/// Only those: encoding the whole address would corrupt one that is already encoded, and Discord
+/// accepts spaces inside it. `(` and `)` because Discord's link rule matches parentheses and stops
+/// at an unpaired one, and `*` and `~` because its emphasis rules do not know where a link's
+/// address begins, so a `*` there would close an italic around the link.
+fn push_link_target(link: &str, out: &mut String) {
+    for character in link.chars() {
+        match character {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '*' => out.push_str("%2A"),
+            '~' => out.push_str("%7E"),
+            other => out.push(other),
+        }
     }
 }
 
@@ -221,6 +372,112 @@ mod tests {
         assert_eq!(render("*italic*"), "*italic*");
         assert_eq!(render("~~gone~~"), "~~gone~~");
         assert_eq!(render("`code`"), "`code`");
+    }
+
+    /// Each span used to open and close its own delimiters, so a style shared with a neighbour was
+    /// closed and reopened at the seam: `**bold *****italic***** bold**`, which Discord cannot
+    /// match and prints as asterisks. Reported from the field for the first two.
+    #[test]
+    fn a_style_stays_open_across_what_is_nested_inside_it() {
+        assert_eq!(render("**bold *italic* bold**"), "**bold *italic* bold**");
+        assert_eq!(render("**bold `code` bold**"), "**bold `code` bold**");
+        assert_eq!(
+            render("*italic **bold** italic*"),
+            "*italic **bold** italic*"
+        );
+        assert_eq!(
+            render("~~strike **bold** strike~~"),
+            "~~strike **bold** strike~~"
+        );
+        assert_eq!(render("***both***"), "***both***");
+    }
+
+    #[test]
+    fn code_holding_the_styles_own_delimiter_is_set_outside_it() {
+        // Discord reads emphasis without knowing about code, so the `**` inside closed the bold
+        // early and printed the rest as asterisks. The code loses its bold; the run keeps its
+        // markup.
+        assert_eq!(
+            render("**Run `ls src/**/*.rs` first**"),
+            "**Run** `ls src/**/*.rs` **first**"
+        );
+        assert_eq!(render("*see `a*b` here*"), "*see* `a*b` *here*");
+        assert_eq!(render("~~old `x~~y` way~~"), "~~old~~ `x~~y` ~~way~~");
+        // One `*` cannot close bold, so bold keeps it.
+        assert_eq!(render("**see `a*b` here**"), "**see `a*b` here**");
+    }
+
+    #[test]
+    fn a_link_address_can_neither_end_the_link_nor_a_style_early() {
+        assert_eq!(
+            render("*see [it](https://e.com/?q=*) now*"),
+            "*see [it](https://e.com/?q=%2A) now*"
+        );
+        assert_eq!(
+            render("**[glob](https://e.com/**/x)**"),
+            "[**glob**](https://e.com/%2A%2A/x)"
+        );
+        // An unpaired parenthesis in the address used to swallow what came after the link.
+        assert_eq!(
+            render("[0](https://e.com/x_(y)) `fn()`"),
+            "[0](https://e.com/x_%28y%29) `fn()`"
+        );
+    }
+
+    #[test]
+    fn a_span_of_only_space_opens_nothing() {
+        // The style closes around each code span, and opening it around the space between them
+        // left `****`, which Discord prints.
+        assert_eq!(render("**x `**` `**` y**"), "**x** `**` `**` **y**");
+        assert_eq!(render("*see `a*b` `c*d` now*"), "*see* `a*b` `c*d` *now*");
+        assert_eq!(render("~~`~~a` `~~b`~~"), "`~~a` `~~b`");
+    }
+
+    #[test]
+    fn code_spans_left_touching_keep_their_own_fences() {
+        assert_eq!(render("`a`*`*`*`b`"), "`a`\u{200b}`*`\u{200b}`b`");
+    }
+
+    #[test]
+    fn a_delimiter_never_sits_against_a_space_it_cannot_close_or_open_beside() {
+        // Discord's italic and strikethrough refuse `*see *` and `* now*`, printing the asterisks.
+        // A long italic run split across messages left exactly that at every cut.
+        for source in [
+            format!("*{}end*", "word ".repeat(600)),
+            format!("*{}end*", "line of words\n".repeat(200)),
+        ] {
+            for chunk in to_markdown(&source, MESSAGE_LIMIT) {
+                assert!(
+                    !chunk.ends_with(" *")
+                        && !chunk.ends_with("\n*")
+                        && !chunk.starts_with("* ")
+                        && !chunk.starts_with("*\n"),
+                    "a delimiter against a space at {:?} .. {:?}",
+                    chunk.chars().take(12).collect::<String>(),
+                    chunk.chars().rev().take(12).collect::<String>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_code_span_keeps_the_style_around_it() {
+        // Code used to drop every other style, so bold around it vanished without a trace.
+        assert_eq!(render("**`code`**"), "**`code`**");
+    }
+
+    #[test]
+    fn a_styled_word_inside_a_link_leaves_it_one_link() {
+        assert_eq!(
+            render("[**a** b](https://example.com)"),
+            "[**a** b](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn a_style_closing_where_another_opens_is_kept_apart() {
+        // `*a***b**` is a run of three Discord cannot split back into a close and an open.
+        assert_eq!(render("_a_**b**"), "*a*\u{200b}**b**");
     }
 
     #[test]

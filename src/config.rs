@@ -370,6 +370,14 @@ pub struct DiscordConfig {
     pub mention_everyone: bool,
     /// Allow an outgoing message to ping a role.
     pub mention_roles: bool,
+    /// How far back to fetch what was said while the gateway was not connected, each time it
+    /// connects afresh. Zero turns it off.
+    ///
+    /// Discord replays a dropped connection only when the session resumes. A bridge restart, or a
+    /// session Discord would not resume, starts clean, and without this everything said in between
+    /// is never recorded at all. Telegram has no setting because it holds undelivered updates for
+    /// a day on its own side, which is what the default here matches.
+    pub backfill: Duration,
 }
 
 /// How Telegram messages are formatted on the wire.
@@ -660,6 +668,8 @@ struct FileDiscord {
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: bool,
+    #[serde(default = "default_backfill", with = "humantime_serde")]
+    backfill: Duration,
 }
 
 /// Parse a list of Discord snowflakes, naming the field and the offending value on failure.
@@ -981,6 +991,7 @@ impl FileConfig {
                     presence: discord.presence,
                     mention_everyone: discord.mention_everyone,
                     mention_roles: discord.mention_roles,
+                    backfill: discord.backfill,
                 }),
             });
         }
@@ -1270,6 +1281,11 @@ const fn default_telegram_parse_mode() -> TelegramParseMode {
 
 const fn default_poll_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+/// A day, the window Telegram holds undelivered updates for, so an outage loses the same on both.
+const fn default_backfill() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 #[cfg(test)]

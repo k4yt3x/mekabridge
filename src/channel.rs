@@ -406,6 +406,71 @@ pub struct FoundMessage {
     pub timestamp: DateTime<Utc>,
 }
 
+/// How a channel that loses what is said while it is disconnected asks to be caught up.
+#[derive(Debug)]
+pub struct CatchUp {
+    /// The fresh sessions the channel has opened that nobody has caught up from yet.
+    pub openings: Arc<Openings>,
+    /// How far back to look.
+    pub window: Duration,
+}
+
+/// When a channel opened fresh sessions with its platform, held until somebody catches up from
+/// them. A resumed session replays what it missed by itself, so it does not count.
+///
+/// The opening time rather than a bare signal, because live messages are recorded from the moment
+/// a session opens, and the newest of those is not where the gap ends: where to catch up from has
+/// to be judged as of the opening, not as of whenever the question is asked. The earliest one not
+/// yet taken rather than the latest, because sessions flap during exactly the outages that make
+/// this matter, and catching up from the latest of two would start after what the first one heard
+/// live and skip the gap before it. Catching up from the earliest covers every later gap too, since
+/// it fetches everything up to the present.
+#[derive(Debug, Default)]
+pub struct Openings {
+    earliest: std::sync::Mutex<Option<DateTime<Utc>>>,
+    recorded: tokio::sync::Notify,
+}
+
+impl Openings {
+    /// Note a session that opened at `opened` and is ready to be asked what it missed.
+    pub fn record(&self, opened: DateTime<Utc>) {
+        {
+            let mut earliest = self
+                .earliest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *earliest = Some(earliest.map_or(opened, |earlier| earlier.min(opened)));
+        }
+        // A permit is kept when nobody is waiting yet, so a session recorded before the first
+        // `next` is not missed.
+        self.recorded.notify_one();
+    }
+
+    /// Wait for a session nobody has caught up from, and take the earliest of them.
+    pub async fn next(&self) -> DateTime<Utc> {
+        loop {
+            let taken = self
+                .earliest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(opened) = taken {
+                return opened;
+            }
+            self.recorded.notified().await;
+        }
+    }
+}
+
+/// What [`Channel::backfill`] found in one conversation.
+#[derive(Debug, Default)]
+pub struct Backfill {
+    /// As live delivery would have produced them, oldest first.
+    pub events: Vec<InboundEvent>,
+    /// Whether more was said than the limit let through. What was left behind is the oldest of it.
+    pub truncated: bool,
+}
+
 /// A transient "something is coming" signal shown in a chat.
 ///
 /// Platforms model this as a declaration of what the user is about to receive rather than as a
@@ -1205,6 +1270,54 @@ pub trait Channel: Send + Sync + 'static {
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "looking a conversation up",
+        })
+    }
+
+    /// The fresh sessions this channel opens with its platform, for one that loses what was said
+    /// while it was disconnected, and how far back to look when one opens.
+    ///
+    /// `None` for a platform that holds what it has not delivered, as Telegram does for a day, and
+    /// for one where the operator switched catching up off. Asked for before [`Channel::run`]
+    /// starts, so the session it opens first is not missed.
+    fn catch_up(&self) -> Option<CatchUp> {
+        None
+    }
+
+    /// What was said in a conversation after the message `after` and no earlier than `since`: the
+    /// newest `limit` of it, oldest first, as the events live delivery would have produced.
+    ///
+    /// Best-effort by contract. A chat that is gone, or that the bot can no longer read, returns an
+    /// error the caller logs and moves past, since nothing about one chat is worth leaving the rest
+    /// uncaught for.
+    async fn backfill(
+        &self,
+        conversation: &ConversationId,
+        after: Option<&str>,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Backfill, ChannelError> {
+        let _ = (conversation, after, since, limit);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "fetching what was said while disconnected",
+        })
+    }
+
+    /// One message by its id, from the platform's own record, or `None` when the platform has no
+    /// such message in this conversation.
+    ///
+    /// For a message the bridge never recorded: one from before it was installed, past its
+    /// retention, or said while it was not listening. Most platforms give a bot no way to ask,
+    /// Telegram among them, hence the default.
+    async fn fetch_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+    ) -> Result<Option<FoundMessage>, ChannelError> {
+        let _ = (conversation, message_id);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "fetching a message by its id",
         })
     }
 

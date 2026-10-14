@@ -188,6 +188,28 @@ An agent whose transcript predates the upgrade may send `message_id` to `message
 is refused with a schema error naming the missing `message_ids`, rather than deleting the wrong
 thing.
 
+### Upgrading to 0.20.0, which changed `backlog_check`
+
+`backlog_check` takes `conversations`, a list, in place of `conversation`, along with `exclude` and
+`policy`, and answers for the chats it covers taken together and one by one. The top-level
+`unseen`, `newest` and `latest` are where they were, so a gate pointing at `/latest` needs only its
+arguments changed. See [MCP Tools](./mcp-tools.md#backlog_check).
+
+**Unlike 0.18.0's changes, this one is in stored state.** A scheduled job keeps the arguments its
+gate was created with, so a watcher the agent set up before the upgrade still passes
+`conversation`. That argument is refused by name rather than ignored, since ignoring it would have
+quietly widened the watcher to every chat. A gate pointing at a field, as `/latest` does, then
+fails: meka logs a warning carrying the refusal, and tells the agent once the failure persists. A
+gate comparing the whole result instead fires once, showing the agent the refusal, and then stays
+quiet for good. Recreate those jobs with `conversations: ["<id>"]`, or ask the agent to; the
+refusal names the call to make. `mekabridge unseen <id>` is unchanged, so a shell gate keeps
+working.
+
+`history_read` now marks what it returns to the bridge's own session as seen, so a backlog the
+agent has read stops being reported. A watcher gating on `/latest` is unaffected; one that compared
+the whole result will fire once more as the counts settle. `conversation_list` and `backlog_check`
+no longer count what a blocked chat recorded before the block.
+
 ## Eager loading
 
 meka ships MCP tools **deferred** by default: the agent has to call `tool_load` before it can use one. For a bridge that is exactly backwards, because `message_send` is used on almost every turn.

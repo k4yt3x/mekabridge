@@ -171,37 +171,52 @@ At most 500 watches and 2000 patterns across them, each at most 256 characters, 
 
 ## `backlog_check`
 
-How much is recorded that the agent has not been shown, and when the most recent of it arrived.
+How much is recorded that the agent has not been shown, and when somebody last spoke, across the chats it chooses and chat by chat.
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `conversation` | string, optional | Chat to ask about. Omit for every chat at once |
+| `conversations` | string[], optional | Only these chats, each answered for even when nothing is waiting. Omit for every chat the bridge has a record of. Not combined with the two below |
+| `exclude` | string[], optional | Chats to leave out when `conversations` is omitted |
+| `policy` | `active` or `mute`, optional | Only the chats under that policy now, when `conversations` is omitted. `mute` is the chats that wake the agent just for a mention, a reply or a watch, including ones muted later |
 
-Asking does not count as having seen anything, so `history_read` still returns the same messages
-afterwards.
+Asking does not count as having seen anything. Reading does: what `history_read` returns to the bridge's own session stops counting here.
 
 The answer is JSON, because the useful reader is a scheduled job:
 
 ```json
-{ "conversation": "telegram:-1001234567890", "unseen": 3,
-  "newest": "2026-08-14T10:22:31+00:00", "latest": "2026-08-14T10:22:31+00:00" }
+{
+  "unseen": 4,
+  "newest": "2026-08-14T10:22:31+00:00",
+  "latest": "2026-08-14T10:24:02+00:00",
+  "conversations": {
+    "discord:1183429847290374144": { "unseen": 1, "newest": "2026-08-14T10:20:07+00:00", "latest": "2026-08-14T10:24:02+00:00" },
+    "telegram:-1001234567890": { "unseen": 3, "newest": "2026-08-14T10:22:31+00:00", "latest": "2026-08-14T10:22:31+00:00" }
+  }
+}
 ```
 
-The two counts are separate fields because only one of them can be gated on. `unseen` is the
-backlog, which is what the agent wants to **read**, and it falls to zero every time an ordinary turn
-sweeps the conversation, so a gate on it fires on the sweep. `latest` moves when, and only when,
-somebody else says something that still stands, which makes it the field to **watch**:
+The top level covers every chat the arguments chose, taken together, and is what a gate watches. A gate watches one JSON pointer, so "any of these three rooms" can only be watched if one value covers exactly those three, which is what the arguments are for. `conversations` breaks the same down chat by chat: every chat named in the question, even at zero, and otherwise only the chats with something unseen. Point a gate into it only at a chat the question named, such as `/conversations/telegram:-1001234567890/latest` with `conversations: ["telegram:-1001234567890"]`: an unnamed chat leaves the answer once its backlog is read, and a `changed` gate fires on that. A conversation id holds no `/`, so a pointer names one exactly as it is written. For when every chat was last active, whether or not anything is waiting there, `conversation_list` is the tool.
+
+The three fields answer different questions, and only two of them are worth watching:
+
+| Field | Means | Watch it with |
+|-------|-------|---------------|
+| `latest` | When somebody else last said something that still stands, shown or not. Moves when somebody speaks, and also when a message is deleted or a chat joins or leaves the chats asked about, as a mute set or lapsing does under `policy: "mute"` | `is: "changed"`, to fire once per new message |
+| `newest` | When the most recent unseen message arrived. Present only while something is unseen | `is: "not_empty"`, to fire until every unseen message has been read, which can mean paging back with `before` |
+| `unseen` | How many messages are waiting. Falls whenever the agent reads or is handed a chat | Nothing. Watched for a change it fires on the reading, and meka counts even `0` as present, so `not_empty` fires every time |
+
+The watcher most agents want is every chat that does not wake them, which a chat muted later joins without being named:
 
 ```
 gate: {
-  check: { tool: "mcp__mekabridge__backlog_check", arguments: { conversation: "..." } },
+  check: { tool: "mcp__mekabridge__backlog_check", arguments: { policy: "mute" } },
   when: { at: "/latest", is: "changed" }
 }
 ```
 
-`newest` and `latest` are absent rather than null when there is nothing to report, and
-`conversation` is absent when the question was about every chat. See
-[Group attention](./group-attention.md).
+Watching every chat instead wakes the agent a second time for each message in an active chat, which already woke it once, and so does `exclude` on its own. `conversations: [...]` watches particular rooms, and `exclude: [...]` with `policy: "mute"` watches every muted chat but a few. Naming chats and narrowing every chat are not combined: a named chat is promised an entry, and a filter that took one back out would break that for whichever gate pointed at it.
+
+A blocked chat is left out unless it is named, since a block stops it being recorded and whatever was recorded before would otherwise count forever. `newest` and `latest` are absent rather than null when there is nothing to report. `conversation`, the single chat this took before 0.20.0, is refused by name, with the call to make instead, so a gate still passing it fails loudly rather than quietly widening to every chat. See [Group attention](./group-attention.md).
 
 ## `history_read` and `history_search`
 
@@ -215,10 +230,17 @@ Read back what was said, including messages the agent was never woken for.
 | `before` | number, optional | `history_read` only. The `cursor` of the oldest message you were given, to page further back |
 | `after` | number, optional | `history_read` only. The `cursor` of the newest message you were given, to read only what has been said since |
 | `sender_ids` | string[], optional | Only messages from these people, by the numeric id on a header's `from:` line. Omit for everyone |
+| `message_ids` | string[], optional | `history_read` only. Particular messages instead, by the ids on their `message:` lines, up to 100. Takes no cursor and no `sender_ids`, and `limit` does not apply |
 
 This is what makes `conversation_mute` usable: somebody mentions the agent halfway through a discussion, and the discussion is here. `mute_context` already prints the last few alongside the mention, so these are for going deeper.
 
 The two cursors read opposite ways and at most one may be set. `before` pages backwards through what is already there. `after` follows a conversation forwards: it returns the **oldest** messages above the cursor, so a job sweeping a busy chat gets the next page in order rather than the latest page with a hole behind it. Keep the newest `cursor` you were handed, pass it back next time, and nothing is read twice or missed in between. A forward read that finds nothing says the chat has not moved, rather than offering the retention as a possible cause.
+
+**Reading is seeing.** What `history_read` returns stops counting as unseen, in `backlog_check` and in `conversation_list`. An entry marked `unseen: true` had not reached the agent in any form before: no read had returned it, and no wake-up had carried it or counted it, since a wake-up in a muted chat accounts for every message it says was missed, including the ones it does not quote. Before 0.20.0 only a hand-over marked anything seen, so a muted chat the agent kept up with by reading it reported the same backlog for as long as the messages were kept.
+
+Only a read by the bridge's own session counts, the one it hands messages to, or a call naming no session at all. A sub-agent, or another session reading the same chat, has not shown it to that one, so its reads leave the backlog where it was; reporting a backlog once more is the safer of the two mistakes. `history_search` does not mark anything: a search is a lookup rather than catching up, and marking its scattered hits would lower the count without the agent having caught up on anything, and would leave holes in the context the next mention there brings with it.
+
+**Particular messages.** `message_ids` fetches messages by id rather than by position: a message somebody linked, or the one a reply points at. They come from the bridge's record first, every revision of an edited one included, and are marked seen like any read. On Discord, an id the bridge never recorded is asked of Discord itself, which reaches back before the bot joined; such an entry has a `cursor` of zero and no attachments, the same as a Discord hit in `history_search`. Telegram gives a bot no way to fetch a message by id, so there only the record answers. Whatever neither had is listed after the JSON, one line each with why. What the record had is marked seen only once the platform has answered for the rest, so a lookup that runs out of time marks nothing it never returned.
 
 **Reading one person.** `sender_ids` narrows either tool to a set of senders, matched on the numeric id exactly. Display names are not matched: several people can share one, and this filter feeds `message_delete`, where matching the wrong person means deleting their messages. The filter narrows the page rather than being applied to one, so paging a busy chat for one person's messages returns a full page of theirs rather than a page of everybody's with the others removed. Combined with `message_delete`, this is how an agent clears out everything one account posted: read a page of their ids, delete that page, then page further back with `before`. Note that deleting a message does not remove it from this history, it marks it `deleted`, so a second read without a cursor returns the same page again; page backwards, or skip the entries already marked. Messages with no sender id at all, such as an anonymous admin's or a channel post, match no filter and so are never swept up this way.
 

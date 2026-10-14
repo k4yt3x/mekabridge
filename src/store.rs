@@ -24,7 +24,7 @@
 //! because a platform message id is only unique within the account that issued it.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
@@ -296,7 +296,7 @@ pub struct PendingWindow {
 }
 
 /// What a conversation, or the whole bridge, is holding for the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnseenSummary {
     /// Recorded messages the agent has not been shown.
     pub count: u64,
@@ -320,7 +320,8 @@ impl UnseenSummary {
     /// message.
     ///
     /// Two things move it backwards, and both are news of a kind: the author deleting the newest
-    /// message, and retention pruning the last of them.
+    /// message, and retention pruning the last of them. Over a chosen set of chats, a chat joining
+    /// or leaving the set moves it either way, as a mute set or lapsing does to `policy: mute`.
     pub fn marker(&self) -> String {
         self.latest.map_or_else(|| "never".to_string(), to_rfc3339)
     }
@@ -334,6 +335,35 @@ impl UnseenSummary {
             None => format!("{} unseen", self.count),
         }
     }
+
+    /// Fold another chat's answer into this one, as if the two were asked about together.
+    pub fn absorb(&mut self, other: &Self) {
+        self.count += other.count;
+        self.newest = self.newest.max(other.newest);
+        self.latest = self.latest.max(other.latest);
+    }
+}
+
+/// Which chats a backlog question covers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BacklogScope {
+    /// Only these chats, each answered for even when nothing is waiting. Empty means every chat
+    /// anything has been recorded from.
+    pub conversations: Vec<String>,
+    /// Never these, whatever else would include them.
+    pub exclude: Vec<String>,
+    /// Only chats whose policy is this one now.
+    pub policy: Option<Policy>,
+}
+
+/// A backlog question's answer: the chats it covers taken together, and the ones worth naming.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BacklogReport {
+    /// Every chat in scope, folded into one answer. What a gate watches.
+    pub total: UnseenSummary,
+    /// Each chat named in the scope, and otherwise each in it with something unseen, keyed by
+    /// address. Ordered, so two answers to the same question compare equal when nothing moved.
+    pub conversations: BTreeMap<String, UnseenSummary>,
 }
 
 /// One watch: a pattern the agent set, which wakes it in a muted conversation.
@@ -2566,6 +2596,43 @@ impl Store {
         Ok(records)
     }
 
+    /// Particular messages in one conversation, by their platform ids, oldest first.
+    ///
+    /// Every recorded row for each, so an edited message comes back with the wording it replaced
+    /// as well, marked superseded, exactly as reading the conversation would show it.
+    pub async fn messages_by_id(
+        &self,
+        address: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<MessageRecord>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let address = address.to_string();
+        let ids = serde_json::Value::Array(
+            message_ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect(),
+        )
+        .to_string();
+        let records = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS}
+                     FROM {MESSAGE_FROM}
+                     WHERE c.address = ?1
+                       AND m.message_id IN (SELECT value FROM json_each(?2))
+                     ORDER BY m.timestamp, m.id"
+                ))?;
+                let rows = statement.query_map(rusqlite::params![address, ids], row_to_message)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(records)
+    }
+
     /// Full-text search across recorded messages, best matches first.
     ///
     /// `conversation` narrows to one chat. The query goes to FTS5 verbatim, so its operators work,
@@ -2693,6 +2760,29 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Record that the agent has read these rows, so they stop counting as owed to it.
+    ///
+    /// Takes the rows off any hand-over that had accounted for them, as well as marking them, since
+    /// a hand-over closed without delivery puts what it accounted for back among the unseen, and
+    /// these have been shown whether or not it ever is.
+    pub async fn mark_read(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = serde_json::Value::Array(ids.iter().map(|id| (*id).into()).collect()).to_string();
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE messages SET seen = 1, accounted_by = NULL
+                     WHERE id IN (SELECT value FROM json_each(?1))
+                       AND (seen = 0 OR accounted_by IS NOT NULL)",
+                    rusqlite::params![ids],
+                )
+            })
+            .await?;
+        Ok(())
+    }
+
     /// How much is owed to the agent, without spending any of it.
     ///
     /// The read-only half of [`Store::take_unseen`], which exists because asking for the backlog
@@ -2706,46 +2796,73 @@ impl Store {
     /// exactly as it does as time, and chrono's per-row fractional-second precision does not break
     /// that: `+` and `.` both sort below every digit.
     pub async fn unseen_summary(&self, conversation: Option<&str>) -> Result<UnseenSummary> {
-        // Counting a `CASE` rather than summing it, so an empty table answers 0 instead of NULL.
-        //
-        // The unseen pair shares `MESSAGE_CURRENT` rather than spelling that rule out again;
-        // writing the third by hand is how it came to disagree with the contract on
-        // `UnseenSummary::marker` without anything saying so.
-        //
-        // The third column is what a watcher polls, so its filter decides when a scheduled job
-        // wakes. Own messages are excluded or the agent replying moves the marker, firing the
-        // watcher on a room whose only new message the agent wrote itself. Retracted rows are
-        // excluded because a deletion moving the marker back is news, which used to happen by
-        // itself when the row was removed and now has to be said explicitly.
-        let columns = format!(
-            "COUNT(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN 1 END),
-             MAX(CASE WHEN m.seen = 0 AND {MESSAGE_CURRENT} THEN m.timestamp END),
-             MAX(CASE WHEN m.own = 0 AND m.deleted_at IS NULL THEN m.timestamp END)"
-        );
-        let conversation = conversation.map(str::to_string);
-        let (count, newest, latest): (i64, Option<String>, Option<String>) = self
+        let named = conversation.map(|address| vec![address.to_string()]);
+        let mut summary = UnseenSummary::default();
+        for chat in self.backlogs(named.as_deref()).await?.values() {
+            summary.absorb(chat);
+        }
+        Ok(summary)
+    }
+
+    /// What chats are holding for the agent, keyed by address: the ones `addresses` names, or every
+    /// conversation the bridge knows when it is `None`.
+    ///
+    /// One row per conversation, each answered by indexed lookups into that conversation's own rows
+    /// rather than by one aggregate over the whole table. A busy bridge holds a million rows, and a
+    /// scheduler gate asks this every couple of minutes on the one connection everything else
+    /// waits on: the aggregate took a second there, and a named chat paid for every other one. The
+    /// unseen pair walks `idx_messages_unseen`, which holds only what is owed, and `latest` walks
+    /// `idx_messages_conversation` back from the newest row and stops at the first that counts.
+    ///
+    /// The unseen pair shares `MESSAGE_CURRENT` rather than spelling that rule out again; writing
+    /// the third by hand is how it came to disagree with the contract on [`UnseenSummary::marker`]
+    /// without anything saying so. The third is what a watcher polls, so its filter decides when a
+    /// scheduled job wakes. Own messages are excluded or the agent replying moves the marker,
+    /// firing the watcher on a room whose only new message the agent wrote itself. Retracted rows
+    /// are excluded because a deletion moving the marker back is news, which used to happen by
+    /// itself when the row was removed and now has to be said explicitly.
+    pub async fn backlogs(
+        &self,
+        addresses: Option<&[String]>,
+    ) -> Result<BTreeMap<String, UnseenSummary>> {
+        let addresses = addresses.map(|addresses| {
+            serde_json::Value::Array(
+                addresses
+                    .iter()
+                    .map(|address| serde_json::Value::String(address.clone()))
+                    .collect(),
+            )
+            .to_string()
+        });
+        let rows: Vec<(String, i64, Option<String>, Option<String>)> = self
             .connection
-            .call(move |connection| match conversation {
-                Some(address) => connection.query_row(
-                    &format!(
-                        "SELECT {columns} FROM messages m
-                         WHERE m.conversation_id = {CONVERSATION_ID_OF}"
-                    ),
-                    [address],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                ),
-                None => {
-                    connection.query_row(&format!("SELECT {columns} FROM messages m"), [], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                }
+            .call(move |connection| {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT c.address,
+                            (SELECT COUNT(*) FROM messages m
+                             WHERE m.conversation_id = c.id AND m.seen = 0 AND {MESSAGE_CURRENT}),
+                            (SELECT MAX(m.timestamp) FROM messages m
+                             WHERE m.conversation_id = c.id AND m.seen = 0 AND {MESSAGE_CURRENT}),
+                            (SELECT m.timestamp FROM messages m
+                             WHERE m.conversation_id = c.id AND m.own = 0
+                               AND m.deleted_at IS NULL
+                             ORDER BY m.timestamp DESC
+                             LIMIT 1)
+                     FROM conversations c
+                     WHERE ?1 IS NULL OR c.address IN (SELECT value FROM json_each(?1))"
+                ))?;
+                let rows = statement.query_map([addresses], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
             })
             .await?;
-        Ok(UnseenSummary {
-            count: count.max(0) as u64,
-            newest: newest.as_deref().map(parse_rfc3339).transpose()?,
-            latest: latest.as_deref().map(parse_rfc3339).transpose()?,
-        })
+        rows.into_iter()
+            .map(|(address, count, newest, latest)| {
+                let summary = unseen_from_columns(count, newest.as_deref(), latest.as_deref())?;
+                Ok((address, summary))
+            })
+            .collect()
     }
 
     /// Drop recorded messages older than `before`. The FTS index follows through its triggers.
@@ -2834,6 +2951,47 @@ impl Store {
             })
             .await?;
         Ok(marked)
+    }
+
+    /// The conversations on a channel with anything recorded, each with the platform id of the
+    /// newest message somebody else said in it before `before`, most recently active first: where
+    /// catching up after a disconnection starts from.
+    ///
+    /// Bounded in time because live messages are recorded again from the moment a session opens,
+    /// and one of those is where the gap ends rather than where it starts. Not the bot's own,
+    /// which are recorded when sent over HTTP, possibly while the gateway was down, and would pass
+    /// for the end of a gap they sit in the middle of. Newest by the platform's time rather than by
+    /// row, since an edit lands as a new row carrying its message's original id. `None` where only
+    /// the bot has spoken, which asks for the whole window. A conversation with nothing recorded,
+    /// because retention has taken it all or it was only ever addressed, is left out.
+    pub async fn catch_up_points(
+        &self,
+        channel: &str,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let channel = channel.to_string();
+        let before = to_rfc3339(before);
+        let points = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT c.address,
+                            (SELECT m.message_id FROM messages m
+                             WHERE m.conversation_id = c.id AND m.own = 0 AND m.timestamp < ?2
+                             ORDER BY m.timestamp DESC, m.id DESC
+                             LIMIT 1)
+                     FROM conversations c
+                     WHERE c.channel = ?1
+                       AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+                     ORDER BY COALESCE(c.last_inbound_at, c.last_outbound_at, c.created_at) DESC",
+                )?;
+                let rows = statement.query_map(rusqlite::params![channel, before], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(points)
     }
 
     /// Unseen counts for every conversation that has any, keyed by address.
@@ -3320,6 +3478,19 @@ fn read_watch(
         Some(record) => Ok(attach_patterns(connection, vec![record])?.pop()),
         None => Ok(None),
     }
+}
+
+/// An [`UnseenSummary`] from the three values [`Store::backlogs`] reads per conversation.
+fn unseen_from_columns(
+    count: i64,
+    newest: Option<&str>,
+    latest: Option<&str>,
+) -> Result<UnseenSummary> {
+    Ok(UnseenSummary {
+        count: count.max(0) as u64,
+        newest: newest.map(parse_rfc3339).transpose()?,
+        latest: latest.map(parse_rfc3339).transpose()?,
+    })
 }
 
 fn parse_rfc3339(raw: &str) -> std::result::Result<DateTime<Utc>, rusqlite::Error> {
@@ -6289,6 +6460,78 @@ mod tests {
             3,
             "and the shed count it reported"
         );
+    }
+
+    #[tokio::test]
+    async fn what_the_agent_read_is_not_owed_back_when_a_hand_over_dies() {
+        // A hand-over that dies gives back the backlog it accounted for. One of those rows read
+        // through `history_read` in the meantime was shown regardless, and owing it back would
+        // offer the agent as missed something it had already read.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for id in ["old-1", "old-2"] {
+            store
+                .record_message(message(account, "telegram:1", id, "said earlier"))
+                .await
+                .expect("record");
+        }
+        let through = now() + chrono::Duration::hours(1);
+        let (_, _, watermark) = store
+            .take_unseen("telegram:1", through, 10)
+            .await
+            .expect("take");
+        let stating = hand_over(
+            &store,
+            account,
+            "telegram:1",
+            "stating",
+            Some(Backlog { watermark, through }),
+        )
+        .await;
+        let newest = store
+            .history("telegram:1", &[], 1, None, None)
+            .await
+            .expect("read");
+        store
+            .mark_read(&newest.iter().map(|row| row.id).collect::<Vec<_>>())
+            .await
+            .expect("mark");
+
+        store.failed(stating, "gone", now()).await.expect("fail");
+        let owed = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read")
+            .into_iter()
+            .filter(|row| !row.seen)
+            .map(|row| row.message_id)
+            .collect::<Vec<_>>();
+        assert_eq!(owed, vec!["old-1".to_string()], "only what was never read");
+    }
+
+    #[tokio::test]
+    async fn reading_rows_stops_them_counting_and_nothing_else() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        for id in ["a", "b", "c"] {
+            store
+                .record_message(message(account, "telegram:1", id, "words"))
+                .await
+                .expect("record");
+        }
+        let newest = store
+            .history("telegram:1", &[], 2, None, None)
+            .await
+            .expect("read");
+        store
+            .mark_read(&newest.iter().map(|row| row.id).collect::<Vec<_>>())
+            .await
+            .expect("mark");
+        store.mark_read(&[]).await.expect("nothing to mark");
+
+        let summary = store
+            .unseen_summary(Some("telegram:1"))
+            .await
+            .expect("summary");
+        assert_eq!(summary.count, 1, "the one row not read still counts");
     }
 
     #[tokio::test]

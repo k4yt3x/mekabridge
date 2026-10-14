@@ -171,7 +171,7 @@ impl Item<'_> {
         let shown = if missed.recent.len() as u64 == missed.count {
             "In full".to_string()
         } else {
-            format!("The last {}", missed.recent.len())
+            format!("The last {} of them", missed.recent.len())
         };
         let _ = writeln!(out, "{shown}, oldest first:");
         let _ = writeln!(out, "<<<{}", self.nonce);
@@ -1072,7 +1072,7 @@ mod tests {
             rendered.contains("history_read"),
             "the agent has to be told how to reach the rest:\n{rendered}"
         );
-        assert!(rendered.contains("The last 2, oldest first:"));
+        assert!(rendered.contains("The last 2 of them, oldest first:"));
         assert!(rendered.contains("Alice: the deploy is stuck"));
         assert!(rendered.contains("Bob: rolling back"));
     }

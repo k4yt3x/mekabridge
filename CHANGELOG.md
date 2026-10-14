@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-10-14
+
+### Added
+
+- `backlog_check` takes `exclude` and `policy`, and breaks its answer down chat by chat.
+- `history_read` takes `message_ids`, and on Discord asks Discord for any it never recorded.
+- `history_read` marks as `unseen` each entry that had not reached the agent in any form before.
+- A fresh Discord session fetches back what each chat with history missed while it was disconnected.
+- `[[channels.discord]].backfill` sets how far back: a day by default, never past retention.
+- `mekabridge unseen` takes several chats, or every chat narrowed by `--exclude` and `--policy`.
+
+### Changed
+
+- **Breaking:** `backlog_check` takes `conversations`, a list; `conversation` is refused by name.
+- A blocked chat is left out of `backlog_check` and `mekabridge unseen` unless it is named.
+- `conversation_list` reports nothing unseen in a blocked chat.
+
+### Fixed
+
+- What the bridge's own session reads with `history_read` is marked seen, so a backlog clears.
+- Discord shows italic inside bold, and bold around code, as formatting rather than asterisks.
+- Discord keeps a style around inline code, unless the code holds that style's own delimiter.
+- A link with styled words inside it goes to Discord as one link rather than one per part.
+- A long italic or struck-through run split across Discord messages no longer shows its delimiters.
+- A parenthesis, `*` or `~` in a link's address no longer ends the link or a style early on Discord.
+- Two inline code spans with nothing between them stay two on Discord rather than merging.
+
 ## [0.19.1] - 2026-10-08
 
 ### Added
@@ -527,7 +554,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...HEAD
+[0.20.0]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...0.20.0
 [0.19.1]: https://github.com/k4yt3x/mekabridge/compare/0.19.0...0.19.1
 [0.19.0]: https://github.com/k4yt3x/mekabridge/compare/0.18.2...0.19.0
 [0.18.2]: https://github.com/k4yt3x/mekabridge/compare/0.18.1...0.18.2

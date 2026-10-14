@@ -168,6 +168,10 @@ allowed_users = [123456789]
 # # writing to a room it does not own, and @everyone in a large server is a loud mistake to make.
 # # mention_roles = true
 # # mention_everyone = true
+# # How far back to fetch what was said while the gateway was not connected, each time it connects
+# # afresh: after a restart, or a session Discord would not resume. A day by default, which is how
+# # long Telegram holds what it has not delivered. "0s" turns it off.
+# # backfill = "24h"
 
 [log]
 level = "info"

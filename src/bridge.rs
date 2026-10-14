@@ -32,19 +32,19 @@ use crate::{
         turn::{Presence, TurnTypist},
     },
     channel::{
-        Channel, ChannelRegistry, ChatKind, ConversationId, FileOptions, InboundEvent, Platform,
-        SendOptions,
+        Channel, ChannelError, ChannelRegistry, ChatKind, ConversationId, FileOptions,
+        FoundMessage, InboundEvent, Platform, SendOptions,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
     mcp::{
-        ConversationSummary, DownloadedAttachment, HistoryEntry, OutboundSink, SinkError,
-        ToolSurface, ViewedAttachment, serve,
+        ConversationSummary, DownloadedAttachment, HistoryEntry, HistoryLookup, MissingMessage,
+        OutboundSink, SinkError, ToolSurface, ViewedAttachment, serve,
     },
     meka::{MekaClient, find_profile},
     store::{
-        AccountId, AccountIdentity, MessageKey, NewWatch, Policy, Store, UnseenSummary,
-        WatchOutcome, WatchRecord,
+        AccountId, AccountIdentity, BacklogReport, BacklogScope, MessageKey, NewWatch, Policy,
+        Store, WatchOutcome, WatchRecord,
     },
     watch::{WatchField, WatchMode},
 };
@@ -312,6 +312,21 @@ pub async fn run(config: Config) -> Result<()> {
         let shutdown = shutdown.clone();
         let live_channels = Arc::clone(&live_channels);
         let deaf = deaf.clone();
+        // Asked before the channel runs, so the first session it opens is not missed.
+        let catching_up = channel.catch_up().map(|catch_up| {
+            tokio::spawn(catch_up_on_reconnect(
+                store.clone(),
+                Arc::clone(&channel),
+                catch_up,
+                sender.clone(),
+                CatchUpSettings {
+                    default_policy: config.bridge.default_policy,
+                    history_retention: config.storage.history_retention,
+                    retry_after: CATCH_UP_RETRY_AFTER,
+                },
+                shutdown.clone(),
+            ))
+        });
         tasks.spawn(async move {
             let id = channel.id().clone();
             match channel.run(sender, shutdown).await {
@@ -321,6 +336,11 @@ pub async fn run(config: Config) -> Result<()> {
                 Err(error) => {
                     tracing::error!(channel = %id, "channel stopped with an error: {}", error);
                 }
+            }
+            // It holds a sender, and the writer ends only once every sender is gone, so it has to
+            // stop with the channel it was catching up.
+            if let Some(catching_up) = catching_up {
+                catching_up.abort();
             }
             if live_channels.fetch_sub(1, Ordering::SeqCst) == 1 {
                 tracing::error!(
@@ -714,6 +734,39 @@ impl BridgeSink {
     /// knows: Telegram refuses a user who never started the bot but accepts a group the bot
     /// sits in silently. Asking it and passing the answer back beats a guess made from the
     /// address book.
+    /// Whether a read by the session `caller` counts as the agent having seen it.
+    ///
+    /// Seen is what the bridge owes its own session, so only that session reading counts. A
+    /// sub-agent or another session reading a chat has not shown it to the one this bridge hands
+    /// messages to, and marking it would leave that session's next mention there with nothing to
+    /// say about what it missed; over-reporting a backlog is the safer of the two mistakes. A call
+    /// that names no session is taken to be the bridge's own, as one made outside any turn is.
+    async fn read_counts_as_seen(&self, caller: Option<&str>) -> bool {
+        let Some(caller) = caller else {
+            return true;
+        };
+        match self.store.session_id().await {
+            Ok(Some(bound)) => uuid::Uuid::parse_str(caller).is_ok_and(|caller| caller == bound),
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!("could not read which session is bound: {}", error);
+                false
+            }
+        }
+    }
+
+    /// Mark what a read returned as seen, logging rather than failing the read: what was read was
+    /// read, and the cost of a miss is a backlog reported once more.
+    async fn mark_read(&self, conversation: &ConversationId, ids: &[i64]) {
+        if let Err(error) = self.store.mark_read(ids).await {
+            tracing::error!(
+                conversation = %conversation,
+                "failed to record what the agent read: {}",
+                error
+            );
+        }
+    }
+
     fn resolve(&self, id: &str) -> std::result::Result<ConversationId, SinkError> {
         let conversation = ConversationId::parse(id)
             .ok_or_else(|| SinkError::MalformedConversation(id.to_string()))?;
@@ -1571,15 +1624,16 @@ impl OutboundSink for BridgeSink {
 
     async fn backlog_check(
         &self,
-        conversation: Option<&str>,
-    ) -> std::result::Result<UnseenSummary, SinkError> {
+        scope: &BacklogScope,
+    ) -> std::result::Result<BacklogReport, SinkError> {
         // Parsed rather than trusted, so an id naming no configured channel is refused instead of
         // quietly matching nothing, which from the caller's side is indistinguishable from a room
         // that has gone quiet. `resolve` does not rewrite the id, so the string reaching the store
         // is the one the caller passed.
-        let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
-        self.store
-            .unseen_summary(conversation.as_ref().map(ConversationId::as_str))
+        for id in scope.conversations.iter().chain(&scope.exclude) {
+            self.resolve(id)?;
+        }
+        backlog(&self.store, self.default_policy, scope)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))
     }
@@ -1664,6 +1718,7 @@ impl OutboundSink for BridgeSink {
         limit: usize,
         before: Option<i64>,
         after: Option<i64>,
+        session: Option<&str>,
     ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
         let conversation = self.resolve(conversation)?;
         let records = self
@@ -1671,7 +1726,82 @@ impl OutboundSink for BridgeSink {
             .history(conversation.as_str(), sender_ids, limit, before, after)
             .await
             .map_err(|error| SinkError::Internal(error.to_string()))?;
+        // Reading is seeing. Left unmarked, a muted chat the agent kept up with through this tool
+        // owed it the same messages for as long as they were kept, since only a hand-over marked
+        // anything. Marked after the read, so each entry still says whether it was news.
+        if self.read_counts_as_seen(session).await {
+            let ids: Vec<i64> = records.iter().map(|record| record.id).collect();
+            self.mark_read(&conversation, &ids).await;
+        }
         Ok(records.into_iter().map(history_entry).collect())
+    }
+
+    async fn history_lookup(
+        &self,
+        conversation: &str,
+        message_ids: &[String],
+        session: Option<&str>,
+    ) -> std::result::Result<HistoryLookup, SinkError> {
+        let conversation = self.resolve(conversation)?;
+        let records = self
+            .store
+            .messages_by_id(conversation.as_str(), message_ids)
+            .await
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        // Shown, so seen, the same as a read of the whole conversation. Marked once everything else
+        // has answered rather than now: the platform is asked for what the record lacks one id at a
+        // time, and a call that runs out of time in between would leave these marked and never
+        // shown.
+        let read: Vec<i64> = records.iter().map(|record| record.id).collect();
+        let recorded: HashSet<String> = records
+            .iter()
+            .map(|record| record.message_id.clone())
+            .collect();
+        let mut lookup = HistoryLookup {
+            entries: records.into_iter().map(history_entry).collect(),
+            missing: Vec::new(),
+        };
+
+        // `resolve` above refused a channel that is not configured, so this only fails if the
+        // registry changed underneath, which it does not.
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        for message_id in message_ids
+            .iter()
+            .filter(|message_id| !recorded.contains(*message_id))
+        {
+            let reason = match channel.fetch_message(&conversation, message_id).await {
+                Ok(Some(found)) => {
+                    lookup.entries.push(platform_entry(&conversation, found));
+                    continue;
+                }
+                Ok(None) => "not in this bridge's record, and the platform has no such message \
+                             here"
+                    .to_string(),
+                Err(ChannelError::Unsupported { .. }) => "not in this bridge's record, and this \
+                                                          platform gives a bot no way to fetch a \
+                                                          message by id"
+                    .to_string(),
+                Err(error) => {
+                    format!("not in this bridge's record, and fetching it failed: {error}")
+                }
+            };
+            lookup.missing.push(MissingMessage {
+                message_id: message_id.clone(),
+                reason,
+            });
+        }
+        // Reading order, with what the platform supplied placed among what was recorded. RFC 3339
+        // at one offset sorts as text exactly as it does as time.
+        lookup
+            .entries
+            .sort_by(|first, second| first.timestamp.cmp(&second.timestamp));
+        if self.read_counts_as_seen(session).await {
+            self.mark_read(&conversation, &read).await;
+        }
+        Ok(lookup)
     }
 
     async fn history_search(
@@ -1730,30 +1860,7 @@ impl OutboundSink for BridgeSink {
                         if seen.contains(&message.message_id) {
                             continue;
                         }
-                        entries.push(HistoryEntry {
-                            conversation: conversation.as_str().to_string(),
-                            message_id: message.message_id,
-                            sender: message.sender_name,
-                            sender_id: None,
-                            text: message.text,
-                            notes: None,
-                            attachments: Vec::new(),
-                            addressed: false,
-                            // The connector settles this one from its own account id. The rest are
-                            // unknowable from a platform search, which returns a message id, an
-                            // author and a time and nothing the bridge recorded about it, so they
-                            // are left at their defaults rather than guessed, the same way
-                            // `attachments` and `addressed` above are.
-                            own: message.own,
-                            session: None,
-                            deleted: false,
-                            superseded: false,
-                            previous_account: false,
-                            timestamp: message.timestamp.to_rfc3339(),
-                            // Not a row in the bridge's history, so there is nothing to page back
-                            // from. Zero is the value `history_read` already treats as no cursor.
-                            cursor: 0,
-                        });
+                        entries.push(platform_entry(conversation, message));
                     }
                 }
                 Err(error) => tracing::debug!(
@@ -1828,6 +1935,351 @@ impl OutboundSink for BridgeSink {
     }
 }
 
+/// What the chats a scope covers are holding for the agent, together and one by one.
+///
+/// Shared by the `backlog_check` tool and `mekabridge unseen`, so the tool and the gate command
+/// cannot disagree about which chats a question covers. Each chat's policy is the one in force now,
+/// an explicit ruling or else the configured default for its kind, since "the chats that do not
+/// wake me" is a question about now.
+pub async fn backlog(
+    store: &Store,
+    default_policy: DefaultPolicy,
+    scope: &BacklogScope,
+) -> std::result::Result<BacklogReport, crate::store::StoreError> {
+    let named = !scope.conversations.is_empty();
+    let mut backlogs = store
+        .backlogs(named.then_some(scope.conversations.as_slice()))
+        .await?;
+    let policies = Policies::load(store, default_policy).await?;
+
+    let candidates: Vec<String> = if named {
+        scope.conversations.clone()
+    } else {
+        backlogs.keys().cloned().collect()
+    };
+    let mut counted = HashSet::new();
+    let mut report = BacklogReport::default();
+    for address in candidates {
+        if scope.exclude.contains(&address) || !counted.insert(address.clone()) {
+            continue;
+        }
+        let policy = policies.of(&address);
+        match scope.policy {
+            Some(wanted) if policy != wanted => continue,
+            // A blocked chat owes nothing: the agent ruled it out, and what was recorded before the
+            // block would otherwise count against it for as long as it was kept. Named, it is
+            // answered for like any other.
+            None if policy == Policy::Block && !named => continue,
+            _ => {}
+        }
+        let summary = backlogs.remove(&address).unwrap_or_default();
+        report.total.absorb(&summary);
+        // A named chat is always present, so a gate pointing into it never sees the field vanish
+        // when its backlog is read. Unnamed, only the ones with something waiting, which keeps the
+        // answer to "every chat" readable on a bridge in hundreds of them.
+        if named || summary.count > 0 {
+            report.conversations.insert(address, summary);
+        }
+    }
+    Ok(report)
+}
+
+/// The policy in force for each conversation now: its own ruling while that stands, and otherwise
+/// the configured default for its kind.
+struct Policies {
+    rulings: HashMap<String, Policy>,
+    kinds: HashMap<String, String>,
+    default_policy: DefaultPolicy,
+}
+
+impl Policies {
+    async fn load(
+        store: &Store,
+        default_policy: DefaultPolicy,
+    ) -> std::result::Result<Self, crate::store::StoreError> {
+        let kinds = store
+            .list_conversations(None, usize::MAX)
+            .await?
+            .into_iter()
+            .map(|record| (record.address, record.kind))
+            .collect();
+        let now = Utc::now();
+        let rulings = store
+            .list_policies()
+            .await?
+            .into_iter()
+            .filter(|ruling| !ruling.expired(now))
+            .map(|ruling| (ruling.conversation, ruling.policy))
+            .collect();
+        Ok(Self {
+            rulings,
+            kinds,
+            default_policy,
+        })
+    }
+
+    fn of(&self, address: &str) -> Policy {
+        self.rulings.get(address).copied().unwrap_or_else(|| {
+            self.default_policy.for_kind(chat_kind(
+                self.kinds.get(address).map_or("", String::as_str),
+            ))
+        })
+    }
+}
+
+/// How far before a session opened a recorded message has to be to count as where its gap starts.
+///
+/// The session's opening is this machine's clock and a message's time is the platform's, so a
+/// message said just after the opening can carry a time just before it. Starting a little earlier
+/// costs only messages fetched twice, which the writer recognises as redeliveries; starting from
+/// one said after the opening would skip the whole gap.
+const CATCH_UP_CLOCK_MARGIN: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Most messages fetched back for one conversation each time a channel catches up.
+///
+/// Up to six requests' worth on Discord. Past it the oldest of what was missed is left behind and
+/// the log says so.
+const MAX_CATCH_UP_PER_CONVERSATION: usize = 500;
+
+/// How long a catch-up waits before trying again what it could not do the first time.
+pub const CATCH_UP_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// What [`catch_up_on_reconnect`] needs from the bridge's configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct CatchUpSettings {
+    /// What a conversation with no ruling of its own follows, to tell which are blocked.
+    pub default_policy: DefaultPolicy,
+    /// `[storage].history_retention`, which bounds how far back is fetched.
+    pub history_retention: Duration,
+    /// [`CATCH_UP_RETRY_AFTER`], a setting only so a test need not wait it out.
+    pub retry_after: Duration,
+}
+
+/// Fetch what each conversation on `channel` missed every time it opens a fresh session, and feed
+/// it in as though it had just arrived.
+///
+/// Through the same writer as everything live, so it is gated, recorded and woken for exactly as
+/// it would have been, and what overlaps with live delivery or the record is recognised there as a
+/// redelivery. Starts from the newest message somebody else said in each conversation before the
+/// session opened, so a chat nothing was said in costs one request and nothing else. Not from the
+/// bot's own: those are sent over HTTP, which can keep working while the gateway is down, and one
+/// sent in the middle of an outage would pass for the end of the gap before it. Nor from one that
+/// arrived live while the session waited for its servers, for the same reason.
+///
+/// Only conversations with something recorded are asked about, so `history_retention` bounds the
+/// list: a chat the bot left long ago, which would answer every session with a refusal Discord
+/// counts against it, ages out. Blocked conversations are skipped, since the writer would only
+/// throw their messages away.
+pub async fn catch_up_on_reconnect(
+    store: Store,
+    channel: Arc<dyn Channel>,
+    catch_up: crate::channel::CatchUp,
+    sender: mpsc::Sender<InboundEvent>,
+    settings: CatchUpSettings,
+    shutdown: CancellationToken,
+) {
+    // Nothing older than the history keeps is fetched back. The operator chose not to keep it, and
+    // fetching it again would only count it as owed until the janitor deleted it once more.
+    let window = if settings.history_retention.is_zero() {
+        catch_up.window
+    } else {
+        catch_up.window.min(settings.history_retention)
+    };
+    let window = chrono::TimeDelta::from_std(window).unwrap_or(chrono::TimeDelta::MAX);
+    loop {
+        let opened = tokio::select! {
+            () = shutdown.cancelled() => return,
+            opened = catch_up.openings.next() => opened,
+        };
+        let since = opened
+            .checked_sub_signed(window)
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+        let before = opened
+            .checked_sub_signed(CATCH_UP_CLOCK_MARGIN)
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+        let read = match store.catch_up_points(channel.id().as_str(), before).await {
+            Ok(points) => Policies::load(&store, settings.default_policy)
+                .await
+                .map(|policies| (points, policies)),
+            Err(error) => Err(error),
+        };
+        let (points, policies) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::error!(
+                    channel = %channel.id(),
+                    "could not read where to catch up from; trying again shortly: {}",
+                    error
+                );
+                // Put back, so the next attempt catches up from this opening rather than from
+                // whatever opens after it.
+                catch_up.openings.record(opened);
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(settings.retry_after) => continue,
+                }
+            }
+        };
+
+        let mut fetched = 0_usize;
+        let mut conversations = 0_usize;
+        let mut failed = Vec::new();
+        for (address, newest) in points {
+            if policies.of(&address) == Policy::Block {
+                continue;
+            }
+            let Some(conversation) = ConversationId::parse(&address) else {
+                continue;
+            };
+            match catch_up_conversation(
+                &*channel,
+                &conversation,
+                newest.as_deref(),
+                since,
+                &sender,
+                &shutdown,
+            )
+            .await
+            {
+                CaughtUp::Fetched(0) => {}
+                CaughtUp::Fetched(count) => {
+                    fetched += count;
+                    conversations += 1;
+                }
+                CaughtUp::Failed(error) => {
+                    tracing::warn!(
+                        conversation = %conversation,
+                        "could not fetch what was said while disconnected; trying again shortly: {}",
+                        error
+                    );
+                    failed.push((conversation, newest));
+                }
+                CaughtUp::Stopped => return,
+            }
+        }
+        // Once, after a pause: what fails here is usually Discord having a bad minute, which is
+        // also when sessions drop. A chat that fails twice is given up on until the next session.
+        if !failed.is_empty() {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(settings.retry_after) => {}
+            }
+            for (conversation, newest) in failed {
+                match catch_up_conversation(
+                    &*channel,
+                    &conversation,
+                    newest.as_deref(),
+                    since,
+                    &sender,
+                    &shutdown,
+                )
+                .await
+                {
+                    CaughtUp::Fetched(0) => {}
+                    CaughtUp::Fetched(count) => {
+                        fetched += count;
+                        conversations += 1;
+                    }
+                    CaughtUp::Failed(error) => tracing::warn!(
+                        conversation = %conversation,
+                        "gave up fetching what was said while disconnected: {}",
+                        error
+                    ),
+                    CaughtUp::Stopped => return,
+                }
+            }
+        }
+        if fetched > 0 {
+            tracing::info!(
+                channel = %channel.id(),
+                fetched,
+                conversations,
+                "fetched what was said while disconnected"
+            );
+        }
+    }
+}
+
+/// What came of catching up one conversation.
+enum CaughtUp {
+    /// This many messages went to the writer, redeliveries included.
+    Fetched(usize),
+    Failed(crate::channel::ChannelError),
+    /// The bridge is stopping, or the writer is gone.
+    Stopped,
+}
+
+/// Fetch what one conversation missed and feed it to the writer.
+async fn catch_up_conversation(
+    channel: &dyn Channel,
+    conversation: &ConversationId,
+    newest: Option<&str>,
+    since: chrono::DateTime<Utc>,
+    sender: &mpsc::Sender<InboundEvent>,
+    shutdown: &CancellationToken,
+) -> CaughtUp {
+    let found = tokio::select! {
+        () = shutdown.cancelled() => return CaughtUp::Stopped,
+        found = channel.backfill(conversation, newest, since, MAX_CATCH_UP_PER_CONVERSATION) => found,
+    };
+    let found = match found {
+        Ok(found) => found,
+        Err(error) => return CaughtUp::Failed(error),
+    };
+    if found.truncated {
+        tracing::warn!(
+            conversation = %conversation,
+            "more was said while disconnected than {} messages; the oldest of it is not recorded",
+            MAX_CATCH_UP_PER_CONVERSATION
+        );
+    }
+    let count = found.events.len();
+    for event in found.events {
+        if sender.send(event).await.is_err() {
+            return CaughtUp::Stopped;
+        }
+    }
+    CaughtUp::Fetched(count)
+}
+
+/// The stored spelling of a conversation's shape, as the policy defaults are keyed.
+fn chat_kind(kind: &str) -> ChatKind {
+    match kind {
+        "direct" => ChatKind::Direct,
+        "group" => ChatKind::Group,
+        "channel" => ChatKind::Channel,
+        _ => ChatKind::Unknown,
+    }
+}
+
+/// A message the platform supplied, as the history tools hand one back.
+///
+/// The connector settles whether it was the bot's own from its account id. The rest is unknowable
+/// from a platform's record, which gives a message id, an author and a time and nothing the bridge
+/// recorded about it, so it is left at its defaults rather than guessed.
+fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> HistoryEntry {
+    HistoryEntry {
+        conversation: conversation.as_str().to_string(),
+        message_id: message.message_id,
+        sender: message.sender_name,
+        sender_id: None,
+        text: message.text,
+        notes: None,
+        attachments: Vec::new(),
+        addressed: false,
+        unseen: false,
+        own: message.own,
+        session: None,
+        deleted: false,
+        superseded: false,
+        previous_account: false,
+        timestamp: message.timestamp.to_rfc3339(),
+        // Not a row in the bridge's history, so there is nothing to page back from. Zero is the
+        // value `history_read` already treats as no cursor.
+        cursor: 0,
+    }
+}
+
 /// Translate a stored message into what the history tools hand back.
 fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
     HistoryEntry {
@@ -1839,6 +2291,7 @@ fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
         notes: record.notes,
         attachments: record.attachments,
         addressed: record.addressed,
+        unseen: !record.seen,
         own: record.own,
         session: record.session_id,
         deleted: record.deleted_at.is_some(),
@@ -1918,14 +2371,8 @@ impl BridgeSink {
         unseen: u64,
     ) -> ConversationSummary {
         let live = policy.filter(|policy| !policy.expired(Utc::now()));
-        let kind = match record.kind.as_str() {
-            "direct" => ChatKind::Direct,
-            "group" => ChatKind::Group,
-            "channel" => ChatKind::Channel,
-            _ => ChatKind::Unknown,
-        };
         let effective = live.as_ref().map_or_else(
-            || self.default_policy.for_kind(kind),
+            || self.default_policy.for_kind(chat_kind(&record.kind)),
             |policy| policy.policy,
         );
         ConversationSummary {
@@ -1941,7 +2388,13 @@ impl BridgeSink {
                 Some(until) => until.to_rfc3339(),
                 None => "indefinite".to_string(),
             }),
-            unseen,
+            // A blocked chat owes nothing, as `backlog_check` has it: what was recorded before the
+            // block would otherwise be reported as owed for as long as it was kept.
+            unseen: if effective == Policy::Block {
+                0
+            } else {
+                unseen
+            },
         }
     }
 }

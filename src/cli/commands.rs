@@ -14,7 +14,7 @@ use crate::{
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::{MekaClient, Profile, find_profile},
-    store::{NewWatch, Policy, QueueState, Store, WatchOutcome},
+    store::{BacklogScope, NewWatch, Policy, QueueState, Store, WatchOutcome},
     watch::{WatchField, WatchMode},
 };
 
@@ -1136,73 +1136,77 @@ pub async fn watch_delete(config: &Config, name: &str) -> Result<()> {
 /// silent and stays silent. 2 keeps those apart.
 ///
 /// The line on stdout is the other half: a gate watching for it to change needs it to change when
-/// and only when something was said, which is what [`crate::store::UnseenSummary::line`] is for.
-pub fn unseen(config_path: Option<&Path>, conversation: Option<&str>) -> std::process::ExitCode {
+/// and only when something was said, which is what [`crate::store::UnseenSummary::marker`] is for.
+/// Which chats it covers is decided by [`crate::bridge::backlog`], the same function the
+/// `backlog_check` tool answers from.
+pub fn unseen(config_path: Option<&Path>, scope: &BacklogScope) -> std::process::ExitCode {
     /// Could not answer, which is not the same as nothing to report.
     const UNAVAILABLE: u8 = 2;
     /// Nothing waiting, the conventional "no match" of a predicate.
     const NOTHING: u8 = 1;
 
     let answer = super::block_on(async {
-        // Checked rather than passed through, because an id the store simply does not match reads
-        // as an empty room. A gate built around a typo would then decline to fire for as long as
-        // anybody left it running.
-        let parsed = match conversation.map(crate::channel::ConversationId::parse) {
-            Some(None) => {
-                return Err(BridgeError::command(format!(
-                    "{:?} is not a conversation id; expected something like \
-                     `telegram:-1001234567890`",
-                    conversation.unwrap_or_default()
-                )));
-            }
-            other => other.flatten(),
-        };
         let config = Config::load(config_path)?;
-        // The other half of the same mistake, and the one that survives a well-formed id: a channel
-        // segment naming nothing configured can never match a row. The `backlog_check` tool
-        // refuses this
-        // through the channel registry, and a gate reading the exit code deserves the same answer
-        // from out here.
-        if let Some(parsed) = &parsed
-            && !config
+        // Checked rather than passed through, because an id the store simply does not match reads
+        // as an empty room, and a gate built around a typo would decline to fire for as long as
+        // anybody left it running. A well-formed id on a channel nothing is configured as can
+        // never match a row either; the `backlog_check` tool refuses that through the channel
+        // registry, and a gate reading the exit code deserves the same answer from out here.
+        for id in scope.conversations.iter().chain(&scope.exclude) {
+            let Some(parsed) = ConversationId::parse(id) else {
+                return Err(BridgeError::command(format!(
+                    "{id:?} is not a conversation id; expected something like \
+                     `telegram:-1001234567890`"
+                )));
+            };
+            if !config
                 .channels
                 .iter()
                 .any(|channel| channel.id == parsed.channel())
-        {
-            return Err(BridgeError::command(format!(
-                "no channel named {:?} is configured, so {} can never match anything",
-                parsed.channel(),
-                parsed
-            )));
+            {
+                return Err(BridgeError::command(format!(
+                    "no channel named {:?} is configured, so {} can never match anything",
+                    parsed.channel(),
+                    parsed
+                )));
+            }
         }
         let store = Store::open(&config.storage.path).await?;
-        let summary = store.unseen_summary(conversation).await?;
+        let report = crate::bridge::backlog(&store, config.bridge.default_policy, scope).await?;
         // A well-formed id for a chat nothing has arrived from yet is not an error: watching a
         // room before it has said anything is the point. Still worth a word, because it is also
         // what a mistyped id looks like, and the two are otherwise identical from out here. On
         // stderr, which a gate ignores and a person running this by hand will want.
-        if let Some(conversation) = conversation
-            && summary.count == 0
-            && store.conversation(conversation).await?.is_none()
-        {
-            eprintln!(
-                "mekabridge: nothing has ever been recorded from {conversation}, so this will \
-                 report nothing until something is"
-            );
+        for (id, summary) in &report.conversations {
+            if summary.count == 0 && store.conversation(id).await?.is_none() {
+                eprintln!(
+                    "mekabridge: nothing has ever been recorded from {id}, so this will report \
+                     nothing about it until something is"
+                );
+            }
         }
-        Ok(summary)
+        Ok(report)
     });
     match answer {
-        Ok(summary) => {
+        Ok(report) => {
             // Split across the two streams because a gate and a person want different answers and
             // only one of them can have stdout. A watcher comparing output needs a value that
-            // moves when the chat does and at no other time, which the backlog is not: it falls to
-            // zero on every ordinary turn, and a watcher would fire on that and announce news the
-            // agent had just been handed. The count is the useful answer for anybody reading, and
-            // it is on stderr, which a gate ignores and a terminal shows.
-            println!("{}", summary.marker());
-            eprintln!("{}", summary.line());
-            if summary.count > 0 {
+            // moves when the chat does and at no other time, which the backlog is not: it falls
+            // whenever the agent reads, and a watcher would fire on that and announce news the
+            // agent had just read. The count is the useful answer for anybody reading, and it is
+            // on stderr, which a gate ignores and a terminal shows.
+            println!("{}", report.total.marker());
+            eprintln!("{}", report.total.line());
+            // One named chat is the total already, however often it was named; anything else is
+            // worth breaking down, including every chat with one that has something waiting, since
+            // the total does not say which.
+            let one_named = !scope.conversations.is_empty() && report.conversations.len() == 1;
+            if !one_named {
+                for (id, summary) in &report.conversations {
+                    eprintln!("  {id}: {}", summary.line());
+                }
+            }
+            if report.total.count > 0 {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::from(NOTHING)

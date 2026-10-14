@@ -15,7 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     config::{Config, LogFormat, default_config_path},
     error::Result,
-    store::Policy,
+    store::{BacklogScope, Policy},
     watch::{WatchField, WatchMode},
 };
 
@@ -119,8 +119,16 @@ pub enum Command {
     /// answered. The three are distinct on purpose: a watcher that treats a failure as "nothing
     /// new" goes quiet exactly like a room that has, and stays quiet until somebody notices.
     Unseen {
-        /// Conversation id, for example `telegram:-1001234567890`. Omit to ask about every chat.
-        conversation: Option<String>,
+        /// Conversation ids, for example `telegram:-1001234567890`. Omit to ask about every chat.
+        #[arg(conflicts_with_all = ["exclude", "policy"])]
+        conversations: Vec<String>,
+        /// Leave this chat out of every chat. Repeat for several.
+        #[arg(long, value_name = "ID")]
+        exclude: Vec<String>,
+        /// Only the chats under this policy now. `mute` is exactly the chats that do not wake the
+        /// agent.
+        #[arg(long, value_enum)]
+        policy: Option<PolicyArg>,
     },
 
     /// Inspect or reset the agent's session.
@@ -368,11 +376,17 @@ impl Cli {
         // Answered before anything else, because its failures have to be told apart from its
         // answers. Everything below reports failure by returning `Err`, which the binary turns
         // into exit 1, and exit 1 is this command's way of saying "nothing new".
-        if let Some(Command::Unseen { conversation }) = &self.command {
-            return Ok(commands::unseen(
-                self.config.as_deref(),
-                conversation.as_deref(),
-            ));
+        if let Some(Command::Unseen {
+            conversations,
+            exclude,
+            policy,
+        }) = &self.command
+        {
+            return Ok(commands::unseen(self.config.as_deref(), &BacklogScope {
+                conversations: conversations.clone(),
+                exclude: exclude.clone(),
+                policy: policy.map(Policy::from),
+            }));
         }
         self.run_command().map(|()| ExitCode::SUCCESS)
     }
@@ -596,6 +610,55 @@ mod tests {
         );
         assert_eq!(cli.verbose, 2);
         assert!(matches!(cli.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn unseen_takes_the_same_scope_as_the_tool() {
+        let cli = Cli::try_parse_from(["mekabridge", "unseen", "telegram:1", "telegram:2"])
+            .expect("parses");
+        match cli.command {
+            Some(Command::Unseen { conversations, .. }) => {
+                assert_eq!(conversations, ["telegram:1", "telegram:2"]);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mekabridge",
+            "unseen",
+            "--exclude",
+            "telegram:3",
+            "--exclude",
+            "telegram:4",
+            "--policy",
+            "mute",
+        ])
+        .expect("parses");
+        match cli.command {
+            Some(Command::Unseen {
+                exclude, policy, ..
+            }) => {
+                assert_eq!(exclude, ["telegram:3", "telegram:4"]);
+                assert_eq!(policy, Some(PolicyArg::Mute));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        // Naming chats and narrowing every chat are refused together, as the tool refuses them.
+        assert!(
+            Cli::try_parse_from(["mekabridge", "unseen", "telegram:1", "--policy", "mute"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mekabridge",
+                "unseen",
+                "telegram:1",
+                "--exclude",
+                "telegram:2"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

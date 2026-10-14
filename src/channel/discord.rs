@@ -48,7 +48,7 @@ use twilight_model::{
         payload::outgoing::UpdatePresence,
         presence::{ActivityType, MinimalActivity, Status},
     },
-    guild::Permissions,
+    guild::{PartialMember, Permissions},
     http::attachment::Attachment as OutboundAttachment,
     id::{
         Id,
@@ -60,11 +60,11 @@ use twilight_util::{permission_calculator::PermissionCalculator, snowflake::Snow
 
 use crate::{
     channel::{
-        Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
-        ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, FoundMessage, InboundEvent,
-        InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberStatus,
-        Platform, Presence, ReplyContext, SendOptions, Sender, SentMessage,
+        Activity, Admission, Attachment, AttachmentKind, Backfill, CatchUp, Channel,
+        ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings,
+        ConversationId, ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, FoundMessage,
+        InboundEvent, InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing,
+        MemberStatus, Openings, Platform, Presence, ReplyContext, SendOptions, Sender, SentMessage,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -110,6 +110,16 @@ const SEARCH_NOT_INDEXED: &str = "Discord is still indexing this server, so its 
 /// one retry is the difference between a search that works a moment later and one that reports no
 /// results when there are plenty.
 const SEARCH_INDEX_ATTEMPTS: usize = 3;
+
+/// Messages per request when catching up, the most Discord will page at once.
+const BACKFILL_PAGE: u16 = 100;
+
+/// How long a fresh session waits for the servers it announced before asking what was missed.
+///
+/// They usually arrive within seconds of `READY`. One that has not after this is unavailable on
+/// Discord's side; its channels are asked about anyway, each looked up over HTTP since the cache
+/// cannot place them, and one that cannot be reached either is retried once and then left.
+const SERVERS_ARRIVE_WITHIN: Duration = Duration::from_secs(30);
 
 /// Gateway events this connector acts on.
 ///
@@ -159,6 +169,11 @@ pub struct DiscordChannel {
     identity: tokio::sync::OnceCell<Id<UserMarker>>,
     /// Direct-message channels already opened, so dialling the same person twice costs one call.
     dm_channels: RwLock<HashMap<Id<UserMarker>, Id<ChannelMarker>>>,
+    /// See [`DiscordConfig::backfill`].
+    backfill: Duration,
+    /// The fresh gateway sessions whose servers have all arrived and that nobody has caught up
+    /// from yet. See [`Channel::catch_up`].
+    openings: Arc<Openings>,
 }
 
 /// Pick rustls' crypto provider before anything opens a connection.
@@ -214,7 +229,51 @@ impl DiscordChannel {
             presences: Arc::new(PresenceCache::default()),
             identity: tokio::sync::OnceCell::new(),
             dm_channels: RwLock::new(HashMap::new()),
+            backfill: config.backfill,
+            openings: Arc::new(Openings::default()),
         })
+    }
+
+    /// Say that the fresh session opened at `opened` is ready to be asked what it missed.
+    fn session_ready(&self, opened: DateTime<Utc>) {
+        self.openings.record(opened);
+    }
+
+    /// Somebody's membership of a server, in the shape a gateway message carries it, or `None`
+    /// when they have left or cannot be looked up.
+    async fn partial_member(
+        &self,
+        guild_id: Id<GuildMarker>,
+        user_id: Id<UserMarker>,
+    ) -> Result<Option<PartialMember>, ChannelError> {
+        let member = match self.http.guild_member(guild_id, user_id).await {
+            Ok(response) => response
+                .model()
+                .await
+                .map_err(|error| self.decode_error("the server member", &error))?,
+            // Somebody who has left since. Their message is still taken when something other than
+            // a role admits it, under their account name; one admitted only by a role they no
+            // longer hold is refused, as it would be live.
+            Err(error) if is_not_found(&error) => return Ok(None),
+            // Anything else fails the catch-up for this chat, to be tried again, rather than
+            // refusing somebody whose role simply could not be read.
+            Err(error) => return Err(self.delivery_error("looking up a server member", &error)),
+        };
+        Ok(Some(PartialMember {
+            avatar: member.avatar,
+            avatar_decoration_data: member.avatar_decoration_data,
+            banner: member.banner,
+            communication_disabled_until: member.communication_disabled_until,
+            deaf: member.deaf,
+            flags: member.flags,
+            joined_at: member.joined_at,
+            mute: member.mute,
+            nick: member.nick,
+            permissions: None,
+            premium_since: member.premium_since,
+            roles: member.roles,
+            user: Some(member.user),
+        }))
     }
 
     /// The name cache, for `doctor` and for tests.
@@ -1258,6 +1317,22 @@ fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(timestamp.as_micros())
 }
 
+/// Whether Discord answered that the thing asked for does not exist.
+fn is_not_found(error: &twilight_http::Error) -> bool {
+    matches!(
+        error.kind(),
+        twilight_http::error::ErrorType::Response { status, .. } if status.get() == 404
+    )
+}
+
+/// The smallest snowflake Discord could have minted at `at`, so a time can bound a page of
+/// messages the way an id does. A time before Discord's epoch is zero, which bounds nothing.
+fn snowflake_at(at: DateTime<Utc>) -> u64 {
+    /// 2015-01-01, which is what a snowflake counts from.
+    const DISCORD_EPOCH_MILLIS: i64 = 1_420_070_400_000;
+    u64::try_from(at.timestamp_millis() - DISCORD_EPOCH_MILLIS).unwrap_or(0) << 22
+}
+
 /// Split message ids into those the bulk endpoint will take and those it will refuse.
 ///
 /// Discord rejects an entire bulk call with a 400 when one id in it is older than two weeks, so
@@ -1400,11 +1475,31 @@ impl Channel for DiscordChannel {
         tracing::info!(channel = %self.id, "connecting to the Discord gateway");
 
         let mut fatal: Option<CloseCode> = None;
+        // The servers a fresh session announced and has not sent yet, when to stop waiting for
+        // them, and when the session opened. Until they arrive the name cache cannot tell a server
+        // channel from a direct message, so asking what was missed any sooner would file server
+        // messages as DMs.
+        let mut arriving: Option<(
+            HashSet<Id<GuildMarker>>,
+            tokio::time::Instant,
+            DateTime<Utc>,
+        )> = None;
         loop {
+            let deadline = arriving.as_ref().map(|(_, deadline, _)| *deadline);
             let item = tokio::select! {
                 () = shutdown.cancelled() => {
                     tracing::info!(channel = %self.id, "shutting down the Discord gateway");
                     return Ok(());
+                }
+                // A server can stay unavailable through an outage of its own, and waiting on it
+                // for good would leave every other chat uncaught.
+                () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if deadline.is_some() =>
+                {
+                    if let Some((_, _, opened)) = arriving.take() {
+                        self.session_ready(opened);
+                    }
+                    continue;
                 }
                 item = shard.next_event(WANTED_EVENTS) => item,
             };
@@ -1418,7 +1513,42 @@ impl Channel for DiscordChannel {
                         fatal = Some(code);
                     }
                 }
-                Ok(event) => self.handle(event, &sink).await,
+                // Only a fresh session sends this; a resumed one replays what it missed instead.
+                Ok(Event::Ready(ready)) => {
+                    let opened = Utc::now();
+                    let pending: HashSet<Id<GuildMarker>> =
+                        ready.guilds.iter().map(|guild| guild.id).collect();
+                    if pending.is_empty() {
+                        self.session_ready(opened);
+                    } else {
+                        arriving = Some((
+                            pending,
+                            tokio::time::Instant::now() + SERVERS_ARRIVE_WITHIN,
+                            opened,
+                        ));
+                    }
+                }
+                Ok(event) => {
+                    // A server that goes unavailable instead will not arrive this session, so it is
+                    // not waited for either.
+                    let arrived = match &event {
+                        Event::GuildCreate(guild) => Some(guild.id()),
+                        Event::GuildDelete(guild) => Some(guild.id),
+                        _ => None,
+                    };
+                    // Handled first, so the server is in the name cache before anything asks it.
+                    self.handle(event, &sink).await;
+                    if let Some(guild) = arrived
+                        && let Some((pending, _, opened)) = &mut arriving
+                    {
+                        pending.remove(&guild);
+                        if pending.is_empty() {
+                            let opened = *opened;
+                            arriving = None;
+                            self.session_ready(opened);
+                        }
+                    }
+                }
                 Err(error) => {
                     // Recoverable by construction: the shard reconnects itself, and the next call
                     // continues the stream.
@@ -2335,6 +2465,152 @@ impl Channel for DiscordChannel {
         })
     }
 
+    async fn fetch_message(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+    ) -> Result<Option<FoundMessage>, ChannelError> {
+        let channel_id = self.target(conversation).await?;
+        // Not a snowflake is not a message Discord could have, which is an answer rather than an
+        // error: the id is the agent's to have got wrong.
+        let Some(id) = message_id
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(Id::<MessageMarker>::new_checked)
+        else {
+            return Ok(None);
+        };
+        let message = match self.http.message(channel_id, id).await {
+            Ok(response) => response
+                .model()
+                .await
+                .map_err(|error| self.decode_error("the message", &error))?,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(self.delivery_error("reading the message", &error)),
+        };
+        let Some(timestamp) = timestamp_to_chrono(message.timestamp) else {
+            return Err(ChannelError::Transport {
+                channel: self.id.as_str().to_string(),
+                message: "Discord returned a message with a time that cannot be read".to_string(),
+            });
+        };
+        let guild = message.guild_id.or_else(|| self.names.guild_of(channel_id));
+        Ok(Some(FoundMessage {
+            message_id: message.id.to_string(),
+            sender_name: message
+                .author
+                .global_name
+                .clone()
+                .unwrap_or_else(|| message.author.name.clone()),
+            text: self.demention(&message.content, &message.mentions, guild),
+            own: self.identity.get() == Some(&message.author.id),
+            timestamp,
+        }))
+    }
+
+    fn catch_up(&self) -> Option<CatchUp> {
+        (!self.backfill.is_zero()).then(|| CatchUp {
+            openings: Arc::clone(&self.openings),
+            window: self.backfill,
+        })
+    }
+
+    async fn backfill(
+        &self,
+        conversation: &ConversationId,
+        after: Option<&str>,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Backfill, ChannelError> {
+        let channel_id = self.target(conversation).await?;
+        // A message fetched here carries no server, which live delivery always has, so a channel
+        // the cache cannot place would be filed as a direct message. Server channels are in the
+        // cache by now; a DM never is, since Discord announces none, so it is looked up.
+        if self.names.kind_of(channel_id).is_none() {
+            let channel = self
+                .http
+                .channel(channel_id)
+                .await
+                .map_err(|error| self.delivery_error("reading the channel", &error))?
+                .model()
+                .await
+                .map_err(|error| self.decode_error("the channel", &error))?;
+            self.names.insert_channel(&channel);
+        }
+        let kind = self.names.kind_of(channel_id);
+        let guild = self.names.guild_of(channel_id);
+        // Nothing at or below this is fetched: the newest message already recorded, or the start
+        // of the window, whichever is later. Both are snowflakes, which order by time.
+        let floor = after
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or(0)
+            .max(snowflake_at(since));
+
+        // Paged backwards from now, so a cap that cuts in leaves behind the oldest of what was
+        // missed rather than the newest, which is what anybody waiting on a reply wrote.
+        let mut fetched: Vec<Message> = Vec::new();
+        let mut truncated = false;
+        let mut before: Option<Id<MessageMarker>> = None;
+        'pages: loop {
+            let request = self.http.channel_messages(channel_id).limit(BACKFILL_PAGE);
+            let mut page = match before {
+                Some(before) => request.before(before).await,
+                None => request.await,
+            }
+            .map_err(|error| self.delivery_error("reading the channel's messages", &error))?
+            .models()
+            .await
+            .map_err(|error| self.decode_error("the channel's messages", &error))?;
+            let last_page = page.len() < usize::from(BACKFILL_PAGE);
+            // Newest first is how Discord pages backwards. Sorted rather than trusted, since the
+            // cut below stops at the first message it reaches at or under the floor.
+            page.sort_by_key(|message| std::cmp::Reverse(message.id));
+            for message in page {
+                if message.id.get() <= floor {
+                    break 'pages;
+                }
+                if fetched.len() >= limit {
+                    truncated = true;
+                    break 'pages;
+                }
+                before = Some(message.id);
+                fetched.push(message);
+            }
+            if last_page {
+                break;
+            }
+        }
+        fetched.reverse();
+
+        // A fetched message lacks the sender's membership too, which is where their roles and
+        // server nickname come from: without it somebody admitted by a role would be refused, and
+        // every name would fall back to the account's. Looked up once per person in each chat.
+        let mut members: HashMap<Id<UserMarker>, Option<PartialMember>> = HashMap::new();
+        let mut events = Vec::new();
+        for mut message in fetched {
+            message.guild_id = message.guild_id.or(guild);
+            // Not for the bot's own messages, which `to_event` drops: in a chat it answers in,
+            // they are much of what comes back, and each would cost a lookup for nothing.
+            if let Some(guild_id) = message.guild_id
+                && message.member.is_none()
+                && self.identity.get() != Some(&message.author.id)
+            {
+                let author = message.author.id;
+                message.member = match members.entry(author) {
+                    std::collections::hash_map::Entry::Occupied(known) => known.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(unknown) => unknown
+                        .insert(self.partial_member(guild_id, author).await?)
+                        .clone(),
+                };
+            }
+            if let Some(event) = self.to_event(&message, kind) {
+                events.push(event);
+            }
+        }
+        Ok(Backfill { events, truncated })
+    }
+
     async fn search_messages(
         &self,
         conversation: &ConversationId,
@@ -2477,6 +2753,7 @@ mod tests {
             presence: false,
             mention_everyone: false,
             mention_roles: false,
+            backfill: Duration::from_secs(24 * 60 * 60),
         };
         DiscordChannel::new(ChannelId::new("discord"), &config).expect("constructs")
     }
@@ -3236,6 +3513,363 @@ mod tests {
                 .await
                 .expect("no lookup"),
             id
+        );
+    }
+
+    /// Discord's REST surface for catching up, served locally: messages by channel, a direct
+    /// message channel for anything the cache cannot place, and the members of server 900.
+    #[derive(Default)]
+    struct FakeApi {
+        messages: Vec<serde_json::Value>,
+        /// Role ids each member holds, by user id. Anybody else is not a member.
+        members: HashMap<String, Vec<String>>,
+        /// Users whose lookup fails with a server error rather than answering.
+        unreadable_members: Vec<String>,
+        /// Every page asked for, as the `before` it was asked with.
+        pages: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    fn snowflake_id(value: &serde_json::Value) -> u64 {
+        value["id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_default()
+    }
+
+    async fn serve_fake_api(api: Arc<FakeApi>) -> std::net::SocketAddr {
+        use axum::{
+            Json, Router,
+            extract::{Path, Query, State},
+            response::IntoResponse,
+            routing::get,
+        };
+
+        async fn messages(
+            State(api): State<Arc<FakeApi>>,
+            Path(channel): Path<String>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Vec<serde_json::Value>> {
+            api.pages
+                .lock()
+                .expect("not poisoned")
+                .push(query.get("before").cloned());
+            let limit = query
+                .get("limit")
+                .and_then(|limit| limit.parse().ok())
+                .unwrap_or(50);
+            let before = query
+                .get("before")
+                .and_then(|before| before.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            let mut page: Vec<serde_json::Value> = api
+                .messages
+                .iter()
+                .filter(|message| message["channel_id"] == channel.as_str())
+                .filter(|message| snowflake_id(message) < before)
+                .cloned()
+                .collect();
+            page.sort_by_key(|message| std::cmp::Reverse(snowflake_id(message)));
+            page.truncate(limit);
+            Json(page)
+        }
+
+        async fn channel(Path(channel): Path<String>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": channel, "type": 1 }))
+        }
+
+        async fn member(
+            State(api): State<Arc<FakeApi>>,
+            Path((_guild, user)): Path<(String, String)>,
+        ) -> axum::response::Response {
+            if api.unreadable_members.contains(&user) {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Internal Server Error", "code": 0 })),
+                )
+                    .into_response();
+            }
+            match api.members.get(&user) {
+                Some(roles) => Json(serde_json::json!({
+                    "user": {
+                        "id": user,
+                        "username": "erin",
+                        "discriminator": "0",
+                        "avatar": null,
+                    },
+                    "roles": roles,
+                    "nick": "Erin in the server",
+                    "joined_at": "2026-01-01T00:00:00+00:00",
+                    "deaf": false,
+                    "mute": false,
+                    "flags": 0,
+                    "communication_disabled_until": null,
+                }))
+                .into_response(),
+                None => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "message": "Unknown Member", "code": 10007 })),
+                )
+                    .into_response(),
+            }
+        }
+
+        let router = Router::new()
+            .route("/api/v10/channels/{channel}/messages", get(messages))
+            .route("/api/v10/channels/{channel}", get(channel))
+            .route("/api/v10/guilds/{guild}/members/{user}", get(member))
+            .with_state(api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        address
+    }
+
+    /// Point a channel's API client at the fake.
+    fn against(mut channel: DiscordChannel, address: std::net::SocketAddr) -> DiscordChannel {
+        channel.http = Arc::new(
+            Client::builder()
+                .token("fake.token".to_string())
+                .proxy(address.to_string(), true)
+                .ratelimiter(None)
+                .build(),
+        );
+        channel
+    }
+
+    /// A message as Discord's REST API returns it: with no server and no member, which only the
+    /// gateway adds.
+    fn fetched(id: u64, channel: &str, author: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "channel_id": channel,
+            "author": { "id": author, "username": "alice", "discriminator": "0", "avatar": null },
+            "content": format!("message {id}"),
+            "timestamp": "2026-08-12T14:03:11.427000+00:00",
+            "edited_timestamp": null,
+            "tts": false,
+            "mention_everyone": false,
+            "mentions": [],
+            "mention_roles": [],
+            "attachments": [],
+            "embeds": [],
+            "pinned": false,
+            "type": 0,
+        })
+    }
+
+    /// Channel 2000, a text channel in server 900, as the gateway would have announced it.
+    fn with_server_channel(channel: DiscordChannel) -> DiscordChannel {
+        let mut announced: twilight_model::channel::Channel =
+            serde_json::from_value(serde_json::json!({ "id": "2000", "type": 0 }))
+                .expect("channel");
+        announced.guild_id = Some(Id::new(900));
+        announced.name = Some("general".to_string());
+        channel.names.insert_channel(&announced);
+        channel
+    }
+
+    fn fetched_ids(backfill: &Backfill) -> Vec<String> {
+        backfill
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                InboundEvent::Message(message) => Some(message.message_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn long_ago() -> DateTime<Utc> {
+        DateTime::<Utc>::MIN_UTC
+    }
+
+    #[tokio::test]
+    async fn catching_up_fetches_what_came_after_the_newest_recorded_message() {
+        let api = Arc::new(FakeApi {
+            messages: (5001..=5250).map(|id| fetched(id, "2000", "1")).collect(),
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let backfill = channel
+            .backfill(&conversation, Some("5100"), long_ago(), 500)
+            .await
+            .expect("catches up");
+
+        let ids = fetched_ids(&backfill);
+        assert_eq!(
+            ids.len(),
+            150,
+            "everything after the anchor and nothing at it"
+        );
+        assert_eq!(ids.first().map(String::as_str), Some("5101"));
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some("5250"),
+            "oldest first, the order it was said in"
+        );
+        assert!(!backfill.truncated);
+        assert_eq!(
+            api.pages.lock().expect("not poisoned").len(),
+            2,
+            "a second page is asked for, and it is where the anchor turns up"
+        );
+        let InboundEvent::Message(first) = &backfill.events[0] else {
+            panic!("a message");
+        };
+        assert_eq!(
+            first.chat_kind,
+            ChatKind::Group,
+            "a server channel stays one, though the fetched message names no server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cap_keeps_the_newest_of_what_was_missed() {
+        // The newest is what anybody still waiting wrote, so it is the oldest that is given up.
+        let api = Arc::new(FakeApi {
+            messages: (5001..=5250).map(|id| fetched(id, "2000", "1")).collect(),
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(api).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let backfill = channel
+            .backfill(&conversation, None, long_ago(), 120)
+            .await
+            .expect("catches up");
+
+        let ids = fetched_ids(&backfill);
+        assert_eq!(ids.len(), 120);
+        assert_eq!(ids.first().map(String::as_str), Some("5131"));
+        assert_eq!(ids.last().map(String::as_str), Some("5250"));
+        assert!(backfill.truncated, "and it says some was left behind");
+    }
+
+    #[tokio::test]
+    async fn the_window_bounds_how_far_back_catching_up_reaches() {
+        let start = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let minute = |minute: i64| start + chrono::Duration::minutes(minute);
+        let api = Arc::new(FakeApi {
+            messages: (0..10)
+                .map(|index| fetched(snowflake_at(minute(index)) + 1, "2000", "1"))
+                .collect(),
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(api).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let backfill = channel
+            .backfill(&conversation, None, minute(7), 500)
+            .await
+            .expect("catches up");
+
+        assert_eq!(
+            fetched_ids(&backfill),
+            [7, 8, 9].map(|index| (snowflake_at(minute(index)) + 1).to_string()),
+            "nothing sent before the window opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn somebody_admitted_by_a_role_is_heard_in_what_is_fetched_back() {
+        // A fetched message carries no member, so no roles. Without looking the member up, a
+        // server that admits people by role would have every one of their messages refused.
+        let api = Arc::new(FakeApi {
+            messages: vec![fetched(5001, "2000", "5"), fetched(5002, "2000", "6")],
+            members: HashMap::from([("5".to_string(), vec!["777".to_string()])]),
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(api).await;
+        let channel = channel_with(vec![], vec![], vec![], vec![777], false);
+        channel
+            .identity
+            .set(Id::new(99))
+            .expect("the identity is unset");
+        let channel = with_server_channel(against(channel, address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let backfill = channel
+            .backfill(&conversation, None, long_ago(), 500)
+            .await
+            .expect("catches up");
+
+        assert_eq!(
+            fetched_ids(&backfill),
+            ["5001"],
+            "the role holder is heard, and the non-member is not"
+        );
+        let InboundEvent::Message(message) = &backfill.events[0] else {
+            panic!("a message");
+        };
+        assert_eq!(message.admission, Admission::Role);
+        assert_eq!(
+            message.sender.display_name, "Erin in the server",
+            "named as the server knows them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_that_cannot_be_looked_up_fails_the_catch_up_rather_than_their_message() {
+        // Read as "not a member", a lookup Discord fumbled would quietly refuse somebody admitted
+        // by a role. Failing the chat instead gets it asked again.
+        let api = Arc::new(FakeApi {
+            messages: vec![fetched(5001, "2000", "5")],
+            unreadable_members: vec!["5".to_string()],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(api).await;
+        let channel = channel_with(vec![], vec![], vec![], vec![777], false);
+        channel
+            .identity
+            .set(Id::new(99))
+            .expect("the identity is unset");
+        let channel = with_server_channel(against(channel, address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let caught = channel.backfill(&conversation, None, long_ago(), 500).await;
+        assert!(caught.is_err(), "got {caught:?}");
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_is_placed_by_asking_for_its_channel() {
+        // Discord announces no DM over the gateway, so the cache has never heard of one.
+        let api = Arc::new(FakeApi {
+            messages: vec![fetched(5001, "3000", "1")],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(api).await;
+        let channel = against(identified(), address);
+        let conversation = ConversationId::parse("discord:3000").expect("id");
+
+        let backfill = channel
+            .backfill(&conversation, None, long_ago(), 500)
+            .await
+            .expect("catches up");
+
+        let InboundEvent::Message(message) = &backfill.events[0] else {
+            panic!("a message");
+        };
+        assert_eq!(message.chat_kind, ChatKind::Direct);
+        assert_eq!(message.admission, Admission::User);
+    }
+
+    #[test]
+    fn a_time_becomes_the_smallest_snowflake_minted_at_it() {
+        let at = DateTime::from_timestamp_millis(1_420_070_400_000 + 1_000).expect("time");
+        assert_eq!(snowflake_at(at), 1_000 << 22);
+        assert_eq!(
+            snowflake_at(DateTime::<Utc>::MIN_UTC),
+            0,
+            "before Discord existed bounds nothing"
         );
     }
 }

@@ -95,7 +95,7 @@ mekabridge conversations list       # who the agent can message
 mekabridge policy list              # what reaches the agent, and from where
 mekabridge policy clear <id>        # undo a decision the agent made about a chat
 mekabridge history <id>             # what was said, including what the agent never saw
-mekabridge unseen [<id>]            # what is waiting unread, as an exit code a job can gate on
+mekabridge unseen [<id>...]         # what is waiting unread, as an exit code a job can gate on
 mekabridge session show
 mekabridge cancel                   # stop the running turn
 ```

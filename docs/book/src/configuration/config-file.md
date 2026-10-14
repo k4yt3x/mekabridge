@@ -222,6 +222,7 @@ One table per bot, in its own array. Ids here are **strings**, because Discord s
 | `presence` | `false` | Track who is online, which needs the privileged Presence Intent. Off by default: it cannot be reached over HTTP, so an ungranted intent closes the gateway at startup |
 | `mention_everyone` | `false` | Let a message the agent writes ping `@everyone` or `@here` |
 | `mention_roles` | `false` | Let a message the agent writes ping a role |
+| `backfill` | `"24h"` | How far back to fetch what was said while the gateway was not connected, each time it connects afresh: after a restart, or a session Discord would not resume. Never further than `[storage].history_retention`. `"0s"` turns it off. See [Crash recovery](../usage/operations.md#crash-recovery) |
 
 At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direct messages, which is not optional: anybody sharing a server with the bot can open one. It grants nothing inside a server, so a config naming only people is reachable by DM alone; startup warns when that is the case.
 

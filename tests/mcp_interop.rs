@@ -23,9 +23,10 @@ use mekabridge::{
     channel::MemberStatus,
     config::{McpConfig, McpTransport},
     mcp::{
-        ChatSettings, ConversationSummary, DownloadedAttachment, HistoryEntry, MemberAction,
-        MemberCoverage, MemberInfo, MemberListing, MemberRight, OutboundSink, Policy, SendOptions,
-        SinkError, ToolSurface, UnseenSummary, ViewedAttachment, WatchOutcome, WatchRecord, serve,
+        BacklogReport, BacklogScope, ChatSettings, ConversationSummary, DownloadedAttachment,
+        HistoryEntry, HistoryLookup, MemberAction, MemberCoverage, MemberInfo, MemberListing,
+        MemberRight, OutboundSink, Policy, SendOptions, SinkError, ToolSurface, ViewedAttachment,
+        WatchOutcome, WatchRecord, serve,
     },
     watch::{WatchField, WatchMode},
 };
@@ -53,6 +54,8 @@ struct RecordingSink {
     watches: Mutex<Vec<WatchRecord>>,
     /// The session each `attachment_view` named, in call order.
     viewers: Mutex<Vec<Option<String>>>,
+    /// Every scope `backlog_check` was asked about, in call order.
+    backlog_scopes: Mutex<Vec<BacklogScope>>,
 }
 
 fn summary(id: &str) -> ConversationSummary {
@@ -313,12 +316,21 @@ impl OutboundSink for RecordingSink {
         Ok(previous)
     }
 
-    async fn backlog_check(&self, _conversation: Option<&str>) -> Result<UnseenSummary, SinkError> {
-        Ok(UnseenSummary {
-            count: 0,
-            newest: None,
-            latest: None,
-        })
+    async fn history_lookup(
+        &self,
+        _conversation: &str,
+        _message_ids: &[String],
+        _session: Option<&str>,
+    ) -> Result<HistoryLookup, SinkError> {
+        Ok(HistoryLookup::default())
+    }
+
+    async fn backlog_check(&self, scope: &BacklogScope) -> Result<BacklogReport, SinkError> {
+        self.backlog_scopes
+            .lock()
+            .expect("not poisoned")
+            .push(scope.clone());
+        Ok(BacklogReport::default())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -387,6 +399,7 @@ impl OutboundSink for RecordingSink {
         _limit: usize,
         _before: Option<i64>,
         _after: Option<i64>,
+        _session: Option<&str>,
     ) -> Result<Vec<HistoryEntry>, SinkError> {
         Ok(vec![HistoryEntry {
             conversation: conversation.to_string(),
@@ -397,6 +410,7 @@ impl OutboundSink for RecordingSink {
             notes: None,
             attachments: Vec::new(),
             addressed: false,
+            unseen: false,
             own: false,
             session: None,
             deleted: false,
@@ -941,7 +955,7 @@ async fn the_backlog_result_is_a_document_a_gate_can_point_into() {
     let result = client
         .call_tool(tool_params(
             "backlog_check",
-            serde_json::json!({"conversation": "telegram:1"}),
+            serde_json::json!({"exclude": ["telegram:2"], "policy": "mute"}),
         ))
         .await
         .expect("the call must succeed");
@@ -954,6 +968,20 @@ async fn the_backlog_result_is_a_document_a_gate_can_point_into() {
     let parsed: serde_json::Value =
         serde_json::from_str(text.trim()).expect("a gate has to be able to parse this");
     assert!(parsed.get("unseen").is_some(), "got: {text}");
+    assert_eq!(
+        harness
+            .sink
+            .backlog_scopes
+            .lock()
+            .expect("not poisoned")
+            .as_slice(),
+        [BacklogScope {
+            conversations: Vec::new(),
+            exclude: vec!["telegram:2".to_string()],
+            policy: Some(Policy::Mute),
+        }],
+        "the list and the policy crossed the wire as sent"
+    );
 }
 
 #[tokio::test]

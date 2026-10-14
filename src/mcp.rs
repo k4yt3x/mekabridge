@@ -9,6 +9,7 @@
 pub mod serve;
 
 use std::{
+    collections::BTreeMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -29,7 +30,7 @@ pub use crate::{
         ChannelCapabilities, ChatSettings, FileOptions, MemberAction, MemberCoverage, MemberInfo,
         MemberListing, MemberRight, SendOptions,
     },
-    store::{Policy, UnseenSummary, WatchOutcome, WatchRecord},
+    store::{BacklogReport, BacklogScope, Policy, UnseenSummary, WatchOutcome, WatchRecord},
     watch::{WatchField, WatchMode},
 };
 
@@ -203,10 +204,9 @@ pub trait OutboundSink: Send + Sync + 'static {
         reason: Option<&str>,
     ) -> Result<Option<Policy>, SinkError>;
 
-    /// How much is recorded that the agent has not been shown, without spending any of it.
-    ///
-    /// `conversation` narrows to one chat; `None` asks about everything the bridge holds.
-    async fn backlog_check(&self, conversation: Option<&str>) -> Result<UnseenSummary, SinkError>;
+    /// How much is recorded that the agent has not been shown, without spending any of it, across
+    /// the chats `scope` covers and chat by chat.
+    async fn backlog_check(&self, scope: &BacklogScope) -> Result<BacklogReport, SinkError>;
 
     /// Create a named watch, or replace what the one by that name holds.
     #[allow(clippy::too_many_arguments)]
@@ -232,6 +232,9 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// `before` reads the page older than a cursor; `after` reads what has arrived since one. At
     /// most one is ever set, which the tool enforces before calling. `sender_ids` narrows to those
     /// senders when it is not empty.
+    ///
+    /// `session` names the meka session reading. What it returns counts as seen only when that is
+    /// the bridge's own session, or none is named.
     async fn history_read(
         &self,
         conversation: &str,
@@ -239,7 +242,17 @@ pub trait OutboundSink: Send + Sync + 'static {
         limit: usize,
         before: Option<i64>,
         after: Option<i64>,
+        session: Option<&str>,
     ) -> Result<Vec<HistoryEntry>, SinkError>;
+
+    /// Particular messages in one conversation, by id: from what the bridge recorded, and for the
+    /// rest from the platform where it can be asked. What neither has is reported with why.
+    async fn history_lookup(
+        &self,
+        conversation: &str,
+        message_ids: &[String],
+        session: Option<&str>,
+    ) -> Result<HistoryLookup, SinkError>;
 
     /// Search recorded messages, best matches first. `conversation` narrows to one chat, and
     /// `sender_ids` to a set of senders.
@@ -284,7 +297,8 @@ pub struct ConversationSummary {
     /// lapses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_until: Option<String>,
-    /// Messages recorded here that the agent has not been shown. Only ever non-zero under `mute`.
+    /// Messages recorded here that the agent has not been shown. Zero for a blocked chat, which
+    /// owes nothing.
     #[serde(skip_serializing_if = "is_zero")]
     pub unseen: u64,
 }
@@ -348,19 +362,54 @@ impl From<WatchRecord> for WatchSummary {
 /// [`UnseenSummary::marker`] for why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Backlog {
-    /// Echoed back so a result read on its own says what it is about. Absent when the question was
-    /// about every chat at once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation: Option<String>,
-    /// Recorded messages the agent has not been shown. What to read; the wrong thing to gate on.
+    /// Every chat the question covers, taken together. The top level is what a gate points at,
+    /// whichever chats the arguments chose.
+    #[serde(flatten)]
+    pub total: ChatBacklog,
+    /// The same, chat by chat: each one named in the question, and otherwise each with something
+    /// unseen, keyed by conversation id. Present even when empty, so the shape never changes under
+    /// a gate. A conversation id has no `/`, so a JSON pointer names one exactly as it is written.
+    pub conversations: BTreeMap<String, ChatBacklog>,
+}
+
+impl From<BacklogReport> for Backlog {
+    fn from(report: BacklogReport) -> Self {
+        Self {
+            total: ChatBacklog::from(&report.total),
+            conversations: report
+                .conversations
+                .iter()
+                .map(|(id, summary)| (id.clone(), ChatBacklog::from(summary)))
+                .collect(),
+        }
+    }
+}
+
+/// What one chat, or several taken together, is holding for the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatBacklog {
+    /// Recorded messages the agent has not been shown. What to read, and nothing to gate on: it
+    /// falls whenever the agent reads, and a gate counts even 0 as present.
     pub unseen: u64,
-    /// When the most recent of those arrived.
+    /// When the most recent of those arrived. Absent when nothing is unseen, which is what makes
+    /// it the field to test for presence: "is anything still unread".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest: Option<String>,
-    /// When somebody else last said something that still stands, shown or not. The field to gate
-    /// on: it moves when, and only when, the chat does.
+    /// When somebody else last said something that still stands, shown or not. The field to watch
+    /// for change: it moves when somebody speaks, when a message is deleted, and at the top level
+    /// when a chat joins or leaves the chats asked about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
+}
+
+impl From<&UnseenSummary> for ChatBacklog {
+    fn from(summary: &UnseenSummary) -> Self {
+        Self {
+            unseen: summary.count,
+            newest: summary.newest.map(|at| at.to_rfc3339()),
+            latest: summary.latest.map(|at| at.to_rfc3339()),
+        }
+    }
 }
 
 /// One recorded message, as the history tools hand it back.
@@ -384,6 +433,12 @@ pub struct HistoryEntry {
     pub attachments: Vec<String>,
     /// Whether this one was aimed at the agent.
     pub addressed: bool,
+    /// Whether nothing had accounted for this to the agent before now: no hand-over carried it or
+    /// counted it in the backlog it reported, nothing queued it, and no earlier `history_read` by
+    /// the bridge's own session returned it. Omitted otherwise, and never set on a message the
+    /// platform supplied, which the bridge has no record of.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unseen: bool,
     /// Whether the agent sent this rather than received it.
     ///
     /// Omitted on everything else, so an ordinary entry is no larger than it was. The sender name
@@ -415,6 +470,22 @@ pub struct HistoryEntry {
     pub timestamp: String,
     /// Opaque marker for paging. Pass the oldest one back as `before` to read further back.
     pub cursor: i64,
+}
+
+/// What a lookup of particular messages found, and what it could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryLookup {
+    /// Oldest first, from the bridge's record and, for what it never recorded, the platform's.
+    pub entries: Vec<HistoryEntry>,
+    /// Each id found in neither.
+    pub missing: Vec<MissingMessage>,
+}
+
+/// A message a lookup asked for and could not find, with why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingMessage {
+    pub message_id: String,
+    pub reason: String,
 }
 
 const fn is_false(flag: &bool) -> bool {
@@ -484,7 +555,8 @@ pub enum SinkError {
 pub struct ReadHistoryArgs {
     /// Conversation to read, for example `telegram:-1001234567890`.
     pub conversation: String,
-    /// How many messages to return, most recent first. Defaults to 20.
+    /// How many messages, in the order they were said: the most recent ones, or with `after` the
+    /// oldest past the cursor. Defaults to 20, at most 100. Does not apply to `message_ids`.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Read further back instead of the most recent: pass the `cursor` of the oldest message you
@@ -492,15 +564,20 @@ pub struct ReadHistoryArgs {
     /// timestamp and paging on that would skip them.
     #[serde(default)]
     pub before: Option<i64>,
-    /// Read forwards instead: everything said since the `cursor` you pass, oldest first. Keep the
-    /// newest `cursor` you were given and pass it back next time to follow a conversation without
-    /// reading anything twice or missing anything in between.
+    /// Read forwards instead: the oldest `limit` messages said since the `cursor` you pass. Keep
+    /// the newest `cursor` you were given and pass it back next time to follow a conversation
+    /// without reading anything twice or missing anything in between.
     #[serde(default)]
     pub after: Option<i64>,
     /// Only messages from these people, by the numeric id on a header's `from:` line. Omit for
     /// everyone. Display names are not matched, since several people can share one.
     #[serde(default)]
     pub sender_ids: Vec<String>,
+    /// Fetch these messages instead, by the ids on their `message:` lines: from this bridge's
+    /// record, and on Discord from Discord itself for any it never recorded. Takes no cursor and
+    /// no `sender_ids`.
+    #[serde(default)]
+    pub message_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -824,10 +901,41 @@ pub struct WatchDeleteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct UnseenArgs {
-    /// Conversation to ask about. Omit to ask about every chat this bridge knows.
+pub struct BacklogArgs {
+    /// Only these chats, each answered for even when nothing is waiting. Omit for every chat this
+    /// bridge has a record of. Not combined with `exclude` or `policy`.
     #[serde(default)]
-    pub conversation: Option<String>,
+    pub conversations: Vec<String>,
+    /// Chats to leave out when `conversations` is omitted.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Only the chats under this policy now, when `conversations` is omitted. `mute` is the chats
+    /// that wake you just for a mention, a reply or a watch, including ones muted later.
+    #[serde(default)]
+    pub policy: Option<BacklogPolicy>,
+    /// The single chat this took before 0.20.0, refused by name rather than ignored: a gate still
+    /// passing it would otherwise be read as asking about every chat, and fire on all of them.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub conversation: Option<serde_json::Value>,
+}
+
+/// The policies a backlog question can narrow to. Not `block`: a blocked chat records nothing new,
+/// so there is nothing in it to watch for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BacklogPolicy {
+    Active,
+    Mute,
+}
+
+impl From<BacklogPolicy> for Policy {
+    fn from(policy: BacklogPolicy) -> Self {
+        match policy {
+            BacklogPolicy::Active => Self::Active,
+            BacklogPolicy::Mute => Self::Mute,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2011,13 +2119,25 @@ impl BridgeMcpServer {
 
     /// Report what is waiting without spending it.
     #[tool(
-        description = "How much you have not been shown, and when the chat last moved. Asking does \
-                       not count as having seen anything, so history_read still returns it \
-                       afterwards. Built to be gated on: `latest` changes only when somebody else \
-                       says something new, so a scheduled job pointed at it spends a turn only \
-                       once the chat has actually moved, while `unseen` is the backlog and falls \
-                       to zero whenever an ordinary turn sweeps it. Omit `conversation` to ask \
-                       about every chat at once.",
+        description = "How much you have not been shown, across every chat or the ones you choose, \
+                       and chat by chat. Asking does not count as having seen anything; reading \
+                       a chat with history_read does. Built to be gated on at the top level, \
+                       which covers whichever chats the arguments chose: `conversations` names \
+                       particular ones, or else every chat is narrowed by `exclude`, to leave \
+                       some out, and `policy: \"mute\"`, to keep only the chats that wake you \
+                       just for a mention, a reply or a watch, including ones muted later. \
+                       `exclude` alone still covers active chats, which wake you anyway. \
+                       `latest` moves when somebody else says something new, and also when a \
+                       message is deleted or a chat joins or leaves the chats asked about, so a \
+                       scheduled job watching `/latest` for a change spends a turn only then. \
+                       `newest` is present only while something is unseen, so watching \
+                       `/newest` for `not_empty` fires until every unseen message has been read, \
+                       every page of it. Never gate on `unseen`: it falls whenever you read, and \
+                       a gate counts even 0 as present. The answer's `conversations` lists every \
+                       chat you named, even at zero, and otherwise only the chats with something \
+                       unseen, so point a gate into it only at a chat you named. A blocked chat \
+                       is left out unless named. For when every chat was last active, use \
+                       conversation_list.",
         annotations(
             title = "Check backlog",
             read_only_hint = true,
@@ -2026,30 +2146,55 @@ impl BridgeMcpServer {
     )]
     async fn backlog_check(
         &self,
-        Parameters(args): Parameters<UnseenArgs>,
+        Parameters(args): Parameters<BacklogArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.sink.backlog_check(args.conversation.as_deref()).await {
-            Ok(summary) => Ok(json_result(&Backlog {
-                conversation: args.conversation,
-                unseen: summary.count,
-                newest: summary.newest.map(|at| at.to_rfc3339()),
-                latest: summary.latest.map(|at| at.to_rfc3339()),
-            })),
+        if let Some(old) = &args.conversation {
+            let id = old.as_str().unwrap_or("<id>");
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "`conversation` was replaced by `conversations`, a list, in mekabridge 0.20.0: \
+                 pass `conversations: [\"{id}\"]` for that chat, or leave both out for every \
+                 chat. A scheduled job's gate keeps the arguments it was created with, so a \
+                 job passing `conversation` has to be recreated with the new one."
+            ))]));
+        }
+        // Refused rather than combined. Naming chats promises each one an entry, and a filter
+        // that took a named chat back out would break that promise for whichever gate pointed at
+        // it, the moment its policy changed.
+        if !args.conversations.is_empty() && (!args.exclude.is_empty() || args.policy.is_some()) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Name the chats with `conversations`, or narrow every chat with `exclude` and \
+                 `policy`; not both.",
+            )]));
+        }
+        let scope = BacklogScope {
+            conversations: args.conversations,
+            exclude: args.exclude,
+            policy: args.policy.map(Policy::from),
+        };
+        match self.sink.backlog_check(&scope).await {
+            Ok(report) => Ok(json_result(&Backlog::from(report))),
             Err(error) => Ok(sink_failure(&error)),
         }
     }
 
     /// Read a conversation back.
     #[tool(
-        description = "Read recent messages from a conversation, oldest first, including ones you \
-                       were never woken for. This is how you catch up on a muted chat: somebody \
-                       mentions you halfway through a discussion, and this is the discussion. Pass \
-                       sender_ids to read only what particular people said, which is how you \
-                       gather one person's messages before deleting them. It \
-                       reads what this bridge recorded, so it does not go back before the bridge \
-                       was installed or past the configured retention. A block stops a chat being \
-                       recorded from that point on; whatever was recorded before it is still \
-                       here. It holds both sides: your own messages are recorded too, marked \
+        description = "Read a conversation's recent messages, oldest first, or particular ones by \
+                       id, including ones you were never woken for. This is how you catch up on a \
+                       muted chat: somebody mentions you halfway through a discussion, and this \
+                       is the discussion. Pass sender_ids to read only what particular people \
+                       said, which is how you gather one person's messages before deleting them. \
+                       Pass message_ids instead to fetch particular messages, such as one \
+                       somebody linked; on Discord, any this bridge never recorded are asked of \
+                       Discord itself. Apart from that it reads only what this bridge recorded, \
+                       so it does not go back before the bridge was installed or past the \
+                       configured retention. A block stops a chat being recorded from that point \
+                       on; whatever was recorded before it is still here. Reading is seeing: \
+                       what this returns stops counting as unseen in backlog_check and \
+                       conversation_list. An entry marked `unseen` had not reached you in any \
+                       form before, neither through a read nor through a wake-up, which counts \
+                       every message it says you missed whether or not it quotes them. It holds \
+                       both sides: your own messages are recorded too, marked \
                        `own`, so you can check what you already told somebody even if another \
                        session said it. An entry marked `deleted` was retracted by whoever sent \
                        it, and one marked `superseded` is the wording a later edit replaced, with \
@@ -2063,6 +2208,18 @@ impl BridgeMcpServer {
     async fn history_read(
         &self,
         Parameters(args): Parameters<ReadHistoryArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.history_read_inner(args, calling_session(&context))
+            .await
+    }
+
+    /// The body of [`Self::history_read`], separated from the protocol plumbing the same way
+    /// [`Self::message_send_inner`] is.
+    async fn history_read_inner(
+        &self,
+        args: ReadHistoryArgs,
+        session: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args
             .limit
@@ -2076,6 +2233,36 @@ impl BridgeMcpServer {
                 "`before` reads older messages and `after` reads newer ones; set one, not both.",
             )]));
         }
+        if !args.message_ids.is_empty() {
+            // Refused rather than combined: a cursor pages and a sender filter narrows, and a
+            // list of particular messages does neither, so a caller setting both meant one.
+            if args.before.is_some() || args.after.is_some() || !args.sender_ids.is_empty() {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "`message_ids` asks for particular messages, so it takes no `before`, \
+                     `after` or `sender_ids`.",
+                )]));
+            }
+            let mut message_ids: Vec<String> = Vec::new();
+            for id in &args.message_ids {
+                if !message_ids.contains(id) {
+                    message_ids.push(id.clone());
+                }
+            }
+            if message_ids.len() > MAX_HISTORY_LIMIT {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "At most {MAX_HISTORY_LIMIT} message ids at once; {} were given.",
+                    message_ids.len()
+                ))]));
+            }
+            return match self
+                .sink
+                .history_lookup(&args.conversation, &message_ids, session.as_deref())
+                .await
+            {
+                Ok(lookup) => Ok(lookup_result(&args.conversation, &lookup)),
+                Err(error) => Ok(sink_failure(&error)),
+            };
+        }
         match self
             .sink
             .history_read(
@@ -2084,6 +2271,7 @@ impl BridgeMcpServer {
                 limit,
                 args.before,
                 args.after,
+                session.as_deref(),
             )
             .await
         {
@@ -2133,7 +2321,8 @@ impl BridgeMcpServer {
                        that point on; what was recorded before it is still searchable. Your own \
                        messages are searchable too, marked `own`, which makes this the way to \
                        answer \"have I already said this?\" across every session sharing this \
-                       account. Deleted and superseded messages still match, and say so.",
+                       account. Deleted and superseded messages still match, and say so. Unlike \
+                       history_read, a search marks nothing as seen.",
         annotations(
             title = "Search history",
             read_only_hint = true,
@@ -2341,6 +2530,34 @@ fn is_process_proc_entry(path: &Path) -> bool {
     })
 }
 
+/// A lookup's answer: what was found as the same JSON every read returns, and what was not as a
+/// line each, since every one of those was asked for by name.
+fn lookup_result(conversation: &str, lookup: &HistoryLookup) -> CallToolResult {
+    let mut blocks = Vec::new();
+    if !lookup.entries.is_empty() {
+        match serde_json::to_string_pretty(&lookup.entries) {
+            Ok(rendered) => blocks.push(ContentBlock::text(rendered)),
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "failed to serialize the result: {error}"
+                ))]);
+            }
+        }
+    }
+    if !lookup.missing.is_empty() {
+        let lines: Vec<String> = lookup
+            .missing
+            .iter()
+            .map(|missing| format!("{}: {}", missing.message_id, missing.reason))
+            .collect();
+        blocks.push(ContentBlock::text(format!(
+            "Not found in `{conversation}`:\n{}",
+            lines.join("\n")
+        )));
+    }
+    CallToolResult::success(blocks)
+}
+
 /// Serialize a value as the tool's text payload.
 fn json_result<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
@@ -2410,6 +2627,8 @@ mod tests {
         /// Forced outcome for the next `watch_write`, for the capacity path that would otherwise
         /// need five hundred rows to reach.
         watches_full: Option<usize>,
+        /// Every scope `backlog_check` was asked about, in call order.
+        backlog_scopes: Mutex<Vec<BacklogScope>>,
     }
 
     fn summary(id: &str) -> ConversationSummary {
@@ -2729,31 +2948,75 @@ mod tests {
             Ok(previous)
         }
 
-        async fn backlog_check(
+        async fn history_lookup(
             &self,
-            conversation: Option<&str>,
-        ) -> Result<UnseenSummary, SinkError> {
+            conversation: &str,
+            message_ids: &[String],
+            _session: Option<&str>,
+        ) -> Result<HistoryLookup, SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            let matching: Vec<&HistoryEntry> = self
+            let entries: Vec<HistoryEntry> = self
                 .history
                 .iter()
-                .filter(|entry| conversation.is_none_or(|id| entry.conversation == id))
+                .filter(|entry| {
+                    entry.conversation == conversation && message_ids.contains(&entry.message_id)
+                })
+                .cloned()
                 .collect();
-            Ok(UnseenSummary {
-                count: matching.len() as u64,
-                latest: matching
-                    .iter()
-                    .filter_map(|entry| chrono::DateTime::parse_from_rfc3339(&entry.timestamp).ok())
-                    .map(|at| at.with_timezone(&chrono::Utc))
-                    .max(),
-                newest: matching
-                    .iter()
-                    .filter_map(|entry| chrono::DateTime::parse_from_rfc3339(&entry.timestamp).ok())
-                    .map(|at| at.with_timezone(&chrono::Utc))
-                    .max(),
-            })
+            let missing = message_ids
+                .iter()
+                .filter(|id| !entries.iter().any(|entry| &entry.message_id == *id))
+                .map(|id| MissingMessage {
+                    message_id: id.clone(),
+                    reason: "not recorded".to_string(),
+                })
+                .collect();
+            Ok(HistoryLookup { entries, missing })
+        }
+
+        async fn backlog_check(&self, scope: &BacklogScope) -> Result<BacklogReport, SinkError> {
+            if let Some(reason) = self.fail_with {
+                return Err(SinkError::Delivery(reason.to_string()));
+            }
+            self.backlog_scopes
+                .lock()
+                .expect("lock")
+                .push(scope.clone());
+            // Every entry counts as unseen here; the store's own tests own what `seen` means.
+            let mut per_chat: BTreeMap<String, UnseenSummary> = BTreeMap::new();
+            for entry in &self.history {
+                let at = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                    .ok()
+                    .map(|at| at.with_timezone(&chrono::Utc));
+                per_chat
+                    .entry(entry.conversation.clone())
+                    .or_default()
+                    .absorb(&UnseenSummary {
+                        count: 1,
+                        newest: at,
+                        latest: at,
+                    });
+            }
+            let named = !scope.conversations.is_empty();
+            let candidates: Vec<String> = if named {
+                scope.conversations.clone()
+            } else {
+                per_chat.keys().cloned().collect()
+            };
+            let mut report = BacklogReport::default();
+            for id in candidates {
+                if scope.exclude.contains(&id) {
+                    continue;
+                }
+                let summary = per_chat.get(&id).copied().unwrap_or_default();
+                report.total.absorb(&summary);
+                if named || summary.count > 0 {
+                    report.conversations.insert(id, summary);
+                }
+            }
+            Ok(report)
         }
 
         async fn watch_write(
@@ -2853,6 +3116,7 @@ mod tests {
             limit: usize,
             _before: Option<i64>,
             after: Option<i64>,
+            _session: Option<&str>,
         ) -> Result<Vec<HistoryEntry>, SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
@@ -3864,6 +4128,7 @@ mod tests {
             notes: None,
             attachments: Vec::new(),
             addressed: false,
+            unseen: false,
             own: false,
             session: None,
             deleted: false,
@@ -4068,13 +4333,17 @@ mod tests {
         // them. Picking one silently answers a question nobody asked.
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
-            .history_read(Parameters(ReadHistoryArgs {
-                conversation: "telegram:1".to_string(),
-                limit: None,
-                before: Some(10),
-                after: Some(20),
-                sender_ids: Vec::new(),
-            }))
+            .history_read_inner(
+                ReadHistoryArgs {
+                    conversation: "telegram:1".to_string(),
+                    limit: None,
+                    before: Some(10),
+                    after: Some(20),
+                    sender_ids: Vec::new(),
+                    message_ids: Vec::new(),
+                },
+                None,
+            )
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(true));
@@ -4090,13 +4359,17 @@ mod tests {
             ..FakeSink::default()
         });
         let result = server
-            .history_read(Parameters(ReadHistoryArgs {
-                conversation: "telegram:1".to_string(),
-                limit: None,
-                before: None,
-                after: Some(9_000),
-                sender_ids: Vec::new(),
-            }))
+            .history_read_inner(
+                ReadHistoryArgs {
+                    conversation: "telegram:1".to_string(),
+                    limit: None,
+                    before: None,
+                    after: Some(9_000),
+                    sender_ids: Vec::new(),
+                    message_ids: Vec::new(),
+                },
+                None,
+            )
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
@@ -4108,33 +4381,163 @@ mod tests {
         );
     }
 
+    fn read_args(arguments: serde_json::Value) -> ReadHistoryArgs {
+        serde_json::from_value(arguments).expect("arguments parse")
+    }
+
+    fn texts_of(result: &CallToolResult) -> Vec<String> {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn particular_messages_come_back_and_the_ones_not_found_are_named() {
+        let (server, _sink) = server_with(FakeSink {
+            history: vec![history_entry("telegram:1", "41", "the one asked for")],
+            ..FakeSink::default()
+        });
+        let result = server
+            .history_read_inner(
+                read_args(serde_json::json!({
+                    "conversation": "telegram:1",
+                    "message_ids": ["41", "99", "41"],
+                })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+        let texts = texts_of(&result);
+        assert_eq!(
+            texts.len(),
+            2,
+            "what was found, then what was not: {texts:?}"
+        );
+        let found: serde_json::Value =
+            serde_json::from_str(&texts[0]).expect("the found ones are the usual JSON");
+        assert_eq!(
+            found.as_array().map(Vec::len),
+            Some(1),
+            "asked twice, given once"
+        );
+        assert_eq!(found[0]["message_id"], "41");
+        assert!(
+            texts[1].contains("99"),
+            "the missing one is named: {}",
+            texts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn particular_messages_take_no_cursor_or_sender_filter() {
+        let (server, _sink) = server_with(FakeSink::default());
+        for extra in [
+            serde_json::json!({ "before": 5 }),
+            serde_json::json!({ "after": 5 }),
+            serde_json::json!({ "sender_ids": ["42"] }),
+        ] {
+            let mut arguments = serde_json::json!({
+                "conversation": "telegram:1",
+                "message_ids": ["41"],
+            });
+            if let (Some(arguments), serde_json::Value::Object(extra)) =
+                (arguments.as_object_mut(), extra)
+            {
+                arguments.extend(extra);
+            }
+            let result = server
+                .history_read_inner(read_args(arguments), None)
+                .await
+                .expect("tool runs");
+            assert_eq!(result.is_error, Some(true), "{:?}", texts_of(&result));
+        }
+    }
+
+    #[tokio::test]
+    async fn particular_messages_stop_at_a_page() {
+        let (server, _sink) = server_with(FakeSink::default());
+        let too_many: Vec<String> = (0..=MAX_HISTORY_LIMIT).map(|id| id.to_string()).collect();
+        let result = server
+            .history_read_inner(
+                read_args(serde_json::json!({
+                    "conversation": "telegram:1",
+                    "message_ids": too_many,
+                })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains(&MAX_HISTORY_LIMIT.to_string()));
+
+        // Counted after duplicates collapse, so a repeated id is not held against the caller.
+        let repeated = vec!["7".to_string(); MAX_HISTORY_LIMIT + 1];
+        let result = server
+            .history_read_inner(
+                read_args(serde_json::json!({
+                    "conversation": "telegram:1",
+                    "message_ids": repeated,
+                })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn history_read_offers_particular_messages_as_a_list() {
+        let router = BridgeMcpServer::tool_router();
+        let tools = router.list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "history_read")
+            .expect("history_read is registered");
+        let schema = serde_json::to_value(&tool.input_schema).expect("schema serializes");
+        assert_eq!(
+            schema["properties"]["message_ids"]["type"], "array",
+            "got: {schema}"
+        );
+    }
+
+    fn backlog_args(arguments: serde_json::Value) -> BacklogArgs {
+        serde_json::from_value(arguments).expect("arguments parse")
+    }
+
     #[tokio::test]
     async fn the_backlog_answers_with_the_field_a_gate_points_at() {
         // The shape is the contract. meka's scheduler gates a job by pointing a JSON pointer into
         // this result, so `latest` has to be a field it can name rather than prose to parse, and
-        // it has to be separate from `unseen`: the backlog falls to zero every time an ordinary
-        // turn sweeps the chat, so a gate on that fires on the sweep.
+        // it has to be separate from `unseen`: the backlog falls every time the agent reads, so a
+        // gate watching that for a change fires on the reading.
         let (server, _sink) = server_with(FakeSink {
             history: vec![history_entry("telegram:1", "1", "the deploy is stuck")],
             ..FakeSink::default()
         });
         let result = server
-            .backlog_check(Parameters(UnseenArgs {
-                conversation: Some("telegram:1".to_string()),
-            }))
+            .backlog_check(Parameters(backlog_args(
+                serde_json::json!({ "conversations": ["telegram:1"] }),
+            )))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
         let parsed: serde_json::Value =
             serde_json::from_str(&text_of(&result)).expect("the result must be JSON");
-        assert_eq!(parsed["conversation"], "telegram:1");
         assert_eq!(parsed["unseen"], 1);
         assert!(parsed["latest"].is_string(), "got: {parsed}");
         assert!(parsed["newest"].is_string(), "got: {parsed}");
+        assert_eq!(
+            parsed.pointer("/conversations/telegram:1/unseen"),
+            Some(&serde_json::json!(1)),
+            "a chat is reachable by the pointer a gate would write: {parsed}"
+        );
     }
 
     #[tokio::test]
-    async fn asking_what_is_unseen_with_no_conversation_covers_everything() {
+    async fn asking_about_no_chat_in_particular_covers_and_names_every_one() {
         let (server, _sink) = server_with(FakeSink {
             history: vec![
                 history_entry("telegram:1", "1", "one"),
@@ -4143,15 +4546,51 @@ mod tests {
             ..FakeSink::default()
         });
         let result = server
-            .backlog_check(Parameters(UnseenArgs { conversation: None }))
+            .backlog_check(Parameters(backlog_args(serde_json::json!({}))))
             .await
             .expect("tool runs");
         let parsed: serde_json::Value =
             serde_json::from_str(&text_of(&result)).expect("the result must be JSON");
         assert_eq!(parsed["unseen"], 2);
-        // Absent rather than null, so a question about every chat cannot read as one about a chat
-        // called nothing.
-        assert!(parsed.get("conversation").is_none(), "got: {parsed}");
+        assert_eq!(parsed["conversations"]["telegram:1"]["unseen"], 1);
+        assert_eq!(parsed["conversations"]["telegram:2"]["unseen"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_chats_the_arguments_choose_are_the_ones_counted() {
+        // "Any of these rooms" can only be gated on if the top level covers exactly those rooms:
+        // a gate watches one pointer, so a per-chat breakdown alone gives it nothing to watch.
+        let (server, sink) = server_with(FakeSink {
+            history: vec![
+                history_entry("telegram:1", "1", "one"),
+                history_entry("telegram:2", "2", "two"),
+                history_entry("telegram:3", "3", "three"),
+            ],
+            ..FakeSink::default()
+        });
+        let result = server
+            .backlog_check(Parameters(backlog_args(serde_json::json!({
+                "exclude": ["telegram:2"],
+                "policy": "mute",
+            }))))
+            .await
+            .expect("tool runs");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text_of(&result)).expect("the result must be JSON");
+        assert_eq!(
+            parsed["unseen"], 2,
+            "everything but the excluded chat: {parsed}"
+        );
+        assert!(parsed["conversations"].get("telegram:2").is_none());
+        assert_eq!(
+            sink.backlog_scopes.lock().expect("lock").as_slice(),
+            [BacklogScope {
+                conversations: Vec::new(),
+                exclude: vec!["telegram:2".to_string()],
+                policy: Some(Policy::Mute),
+            }],
+            "the policy reaches the sink as the policy it names"
+        );
     }
 
     #[tokio::test]
@@ -4160,9 +4599,9 @@ mod tests {
         // here would look to the caller exactly like the bridge being down.
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
-            .backlog_check(Parameters(UnseenArgs {
-                conversation: Some("telegram:1".to_string()),
-            }))
+            .backlog_check(Parameters(backlog_args(
+                serde_json::json!({ "conversations": ["telegram:1"] }),
+            )))
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
@@ -4172,6 +4611,69 @@ mod tests {
         // Nothing has ever been said, so there is no marker. A gate comparing this sees "never"
         // and stays quiet rather than firing on a null that changed shape.
         assert!(parsed.get("latest").is_none(), "got: {parsed}");
+        // Named, so present at zero: a gate pointing into it must not see the field come and go.
+        assert_eq!(parsed["conversations"]["telegram:1"]["unseen"], 0);
+    }
+
+    #[tokio::test]
+    async fn naming_chats_and_narrowing_every_chat_are_not_combined() {
+        let (server, sink) = server_with(FakeSink::default());
+        for arguments in [
+            serde_json::json!({ "conversations": ["telegram:1"], "policy": "mute" }),
+            serde_json::json!({ "conversations": ["telegram:1"], "exclude": ["telegram:2"] }),
+        ] {
+            let result = server
+                .backlog_check(Parameters(backlog_args(arguments)))
+                .await
+                .expect("tool runs");
+            assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+        }
+        assert!(sink.backlog_scopes.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_single_chat_argument_from_before_0_20_is_refused_by_name() {
+        // Ignored, it would leave a gate that asked about one chat asking about every chat, and
+        // firing on all of them, with nothing to say why.
+        let (server, sink) = server_with(FakeSink::default());
+        let result = server
+            .backlog_check(Parameters(backlog_args(
+                serde_json::json!({ "conversation": "telegram:1" }),
+            )))
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text_of(&result).contains("`conversations`"),
+            "{}",
+            text_of(&result)
+        );
+        assert!(
+            sink.backlog_scopes.lock().expect("lock").is_empty(),
+            "refused before anything was asked"
+        );
+    }
+
+    #[test]
+    fn the_backlog_schema_offers_the_new_arguments_and_hides_the_old_one() {
+        let router = BridgeMcpServer::tool_router();
+        let tools = router.list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "backlog_check")
+            .expect("backlog_check is registered");
+        let schema = serde_json::to_value(&tool.input_schema).expect("schema serializes");
+        let properties = &schema["properties"];
+        for argument in ["conversations", "exclude", "policy"] {
+            assert!(
+                properties.get(argument).is_some(),
+                "{argument} missing: {schema}"
+            );
+        }
+        assert!(
+            properties.get("conversation").is_none(),
+            "the old name must not be offered: {schema}"
+        );
     }
 
     #[tokio::test]
@@ -4186,6 +4688,7 @@ mod tests {
                 notes: None,
                 attachments: vec!["7".to_string()],
                 addressed: false,
+                unseen: false,
                 own: false,
                 session: None,
                 deleted: false,
@@ -4197,13 +4700,17 @@ mod tests {
             ..FakeSink::default()
         });
         let result = server
-            .history_read(Parameters(ReadHistoryArgs {
-                conversation: "telegram:-100".to_string(),
-                limit: None,
-                before: None,
-                after: None,
-                sender_ids: Vec::new(),
-            }))
+            .history_read_inner(
+                ReadHistoryArgs {
+                    conversation: "telegram:-100".to_string(),
+                    limit: None,
+                    before: None,
+                    after: None,
+                    sender_ids: Vec::new(),
+                    message_ids: Vec::new(),
+                },
+                None,
+            )
             .await
             .expect("tool runs");
         let text = text_of(&result);
@@ -4219,13 +4726,17 @@ mod tests {
     async fn an_empty_history_says_why_it_might_be_empty() {
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
-            .history_read(Parameters(ReadHistoryArgs {
-                conversation: "telegram:-100".to_string(),
-                limit: None,
-                before: None,
-                after: None,
-                sender_ids: Vec::new(),
-            }))
+            .history_read_inner(
+                ReadHistoryArgs {
+                    conversation: "telegram:-100".to_string(),
+                    limit: None,
+                    before: None,
+                    after: None,
+                    sender_ids: Vec::new(),
+                    message_ids: Vec::new(),
+                },
+                None,
+            )
             .await
             .expect("tool runs");
         assert_eq!(result.is_error, Some(false));
@@ -4590,6 +5101,7 @@ mod tests {
                 notes: None,
                 attachments: Vec::new(),
                 addressed: false,
+                unseen: false,
                 own: false,
                 session: None,
                 deleted: false,
@@ -4601,13 +5113,17 @@ mod tests {
             ..FakeSink::default()
         });
         let result = server
-            .history_read(Parameters(ReadHistoryArgs {
-                conversation: "telegram:-100".to_string(),
-                limit: None,
-                before: None,
-                after: None,
-                sender_ids: Vec::new(),
-            }))
+            .history_read_inner(
+                ReadHistoryArgs {
+                    conversation: "telegram:-100".to_string(),
+                    limit: None,
+                    before: None,
+                    after: None,
+                    sender_ids: Vec::new(),
+                    message_ids: Vec::new(),
+                },
+                None,
+            )
             .await
             .expect("tool runs");
         let text = text_of(&result);

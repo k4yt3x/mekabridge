@@ -308,7 +308,7 @@ pub struct SessionInfo {
     pub title: String,
     /// Omitted by meka when the session has no working directory of its own.
     #[serde(default)]
-    pub cwd: Option<String>,
+    pub working_directory: Option<String>,
     /// The profile the session runs on, which a request may move it off, so it is not always the
     /// one marked [`Profile::active`].
     pub profile: String,
@@ -508,7 +508,11 @@ impl MekaClient {
 
     /// `POST /v1/sessions`. Never retried: a retry after an ambiguous failure would leave an orphan
     /// session holding a conversation the bridge no longer tracks.
-    pub async fn create_session(&self, cwd: Option<&Path>, permission: Permission) -> Result<Uuid> {
+    pub async fn create_session(
+        &self,
+        working_directory: Option<&Path>,
+        permission: Permission,
+    ) -> Result<Uuid> {
         #[derive(Deserialize)]
         struct CreateResponse {
             id: Uuid,
@@ -525,12 +529,12 @@ impl MekaClient {
                 "supports_permission_prompts": false,
             },
         });
-        if let Some(cwd) = cwd
+        if let Some(working_directory) = working_directory
             && let Some(object) = body.as_object_mut()
         {
             object.insert(
-                "cwd".to_string(),
-                serde_json::Value::String(cwd.to_string_lossy().into_owned()),
+                "working_directory".to_string(),
+                serde_json::Value::String(working_directory.to_string_lossy().into_owned()),
             );
         }
 
@@ -1222,11 +1226,11 @@ mod tests {
     /// scope checks with it.
     #[test]
     fn server_info_reads_every_meka_this_bridge_supports() {
-        let body = r#"{"version":"0.71.0","default_permission":"read",
+        let body = r#"{"version":"0.76.0","default_permission":"read",
                        "enabled_permissions":["read","workspace"],
                        "scopes":["sessions:r","sessions:w"]}"#;
-        let info: ServerInfo = serde_json::from_str(body).expect("0.71 must deserialize");
-        assert_eq!(info.version, "0.71.0");
+        let info: ServerInfo = serde_json::from_str(body).expect("0.76 must deserialize");
+        assert_eq!(info.version, "0.76.0");
         assert_eq!(info.enabled_permissions, ["read", "workspace"]);
         assert_eq!(info.scopes, ["sessions:r", "sessions:w"]);
 
@@ -1248,6 +1252,17 @@ mod tests {
                        "mcp_servers_healthy":true}"#;
         let ready: ReadyStatus = serde_json::from_str(body).expect("must deserialize");
         assert!(ready.profile_configured);
+    }
+
+    /// meka 0.76 renamed the field from `cwd`. Read under the old name it is an absent `Option`, so
+    /// every session would show no directory rather than fail to decode.
+    #[test]
+    fn a_session_reads_its_working_directory_under_the_name_meka_sends() {
+        let body = r#"{"id":"6f1a4b9c-0000-4000-8000-000000000000","title":"",
+                       "working_directory":"/srv/agent","profile":"work",
+                       "turn_in_flight":false}"#;
+        let info: SessionInfo = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(info.working_directory.as_deref(), Some("/srv/agent"));
     }
 
     /// meka omits the level for a row that records none. A required field here would turn `doctor`

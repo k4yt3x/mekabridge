@@ -47,7 +47,7 @@ All three work for replying. The bridge's send tools are annotated read-only, be
 nothing on your machine, so replying sits at meka's `read` level:
 
 - `read`: the agent can answer messages, run commands, and browse, but cannot modify files.
-- `workspace`: it can also write, confined to the session's roots.
+- `workspace`: it can also write, confined to the session's workspace.
 - `unrestricted`: no boundary, and the only level that reaches the five moderation tools.
 
 > **`permission = "none"` cannot reply**, and `doctor` reports it as a failure: no tool is

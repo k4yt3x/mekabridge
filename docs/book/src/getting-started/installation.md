@@ -2,9 +2,9 @@
 
 ## Requirements
 
-- A working `meka serve` with a configured provider. See meka's [HTTP API docs](https://docs.meka.so/usage/http-api.html).
-- A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- Rust 1.88 or newer if building from source.
+- meka 0.76 or later, running as `meka serve` with a configured provider. See meka's [HTTP API docs](https://docs.meka.so/usage/http-api.html).
+- A bot token for each platform you connect: a Telegram one from [@BotFather](https://t.me/BotFather), a Discord one from the [Developer Portal](https://discord.com/developers/applications).
+- Rust 1.89 or newer if building from source.
 
 ## Pre-built binaries
 

@@ -258,4 +258,4 @@ The other two causes are the agent having muted or blocked the chat itself (same
 
 **A file was not downloaded.** It exceeded `attachment_max_bytes`. The `attachment:` line says so, and the agent can tell the user.
 
-**The agent cannot read a file it downloaded.** meka's `[permissions].confine_reads` is on, and `[storage].attachment_dir` is outside what it lets the session read. See [Attachments](./meka-integration.md#attachments).
+**The agent cannot read a file it downloaded.** `[storage].attachment_dir` is outside what meka lets the reader see, which happens only below `unrestricted`: meka's `[permissions].confine_reads` is on, or the reader is a sub-agent whose `agent_spawn` call named a `working_directory`. See [Attachments](./meka-integration.md#attachments).

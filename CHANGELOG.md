@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-10-15
+
+### Changed
+
+- **Breaking:** meka 0.76 or later is required; `doctor` fails against anything older.
+
+### Fixed
+
+- A session can be created with `[session].cwd` set again: meka 0.76 refuses the old `cwd` name.
+- `mekabridge session show` names the session's directory again on meka 0.76.
+
+### Security
+
+- RUSTSEC-2026-0285, 0346, 0348 and 0349: `rustls` moves to 0.23.46, past four TLS advisories.
+- RUSTSEC-2026-0258: `h2` moves to 0.4.20, which bounds a peer sending empty DATA frames.
+
 ## [0.20.0] - 2026-10-14
 
 ### Added
@@ -554,7 +570,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...HEAD
+[0.21.0]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...0.20.0
 [0.19.1]: https://github.com/k4yt3x/mekabridge/compare/0.19.0...0.19.1
 [0.19.0]: https://github.com/k4yt3x/mekabridge/compare/0.18.2...0.19.0

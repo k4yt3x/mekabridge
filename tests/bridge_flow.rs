@@ -242,6 +242,8 @@ impl Feed {
 /// What the stub meka observed, so tests can assert on what the agent would have been handed.
 #[derive(Default)]
 struct MekaRecorder {
+    /// Every body `POST /v1/sessions` accepted, in order.
+    sessions_created: Mutex<Vec<serde_json::Value>>,
     /// Every inbox post that was accepted, as `(key, body)`, in order. A refusal never lands here,
     /// so a test asserting that a batch was handed over cannot be satisfied by one that was turned
     /// away.
@@ -432,8 +434,60 @@ impl MekaRecorder {
     }
 }
 
-async fn create_session() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "id": uuid::Uuid::new_v4() }))
+/// `POST /v1/sessions`, refusing a field it does not know with a 422 as meka does for every request
+/// body. That refusal is how meka 0.76 renaming `cwd` to `working_directory` reached a bridge still
+/// sending the old name.
+async fn create_session(
+    State(recorder): State<Arc<MekaRecorder>>,
+    body: String,
+) -> impl IntoResponse {
+    const FIELDS: [&str; 5] = [
+        "working_directory",
+        "permission",
+        "approvals",
+        "profile",
+        "capabilities",
+    ];
+    const CAPABILITIES: [&str; 2] = ["supports_reasoning_stream", "supports_permission_prompts"];
+    let refuse = |what: String| {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+            serde_json::json!({
+                "type": "https://meka.run/errors/invalid-body",
+                "title": "Invalid request body",
+                "status": 422,
+                "detail": format!("invalid session creation request body: {what}"),
+            })
+            .to_string(),
+        )
+            .into_response()
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(parsed) if parsed.is_object() => parsed,
+        _ => return refuse("not a JSON object".to_string()),
+    };
+    let unknown = |value: Option<&serde_json::Value>, known: &[&str]| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .and_then(|object| {
+                object
+                    .keys()
+                    .find(|key| !known.contains(&key.as_str()))
+                    .cloned()
+            })
+    };
+    let refused = unknown(Some(&parsed), &FIELDS)
+        .or_else(|| unknown(parsed.get("capabilities"), &CAPABILITIES));
+    if let Some(field) = refused {
+        return refuse(format!("unknown field `{field}`"));
+    }
+    recorder
+        .sessions_created
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(parsed);
+    axum::Json(serde_json::json!({ "id": uuid::Uuid::new_v4() })).into_response()
 }
 
 /// `POST /v1/sessions/{id}/inbox`: the door every message goes through.
@@ -1610,6 +1664,10 @@ token = "test-token"
 batch_max_messages = 32
 max_queue_depth = 64
 typing_indicator = {typing}
+
+[session]
+cwd = "/srv/agent"
+
 [storage]
 path = "{}"
 
@@ -2139,6 +2197,33 @@ async fn an_inbound_message_becomes_a_turn_carrying_its_routing_header() {
         envelope.contains("[mekabridge] You are @mockbot on mock."),
         "got:\n{envelope}"
     );
+}
+
+#[tokio::test]
+async fn the_session_is_created_in_the_configured_working_directory() {
+    let harness = Harness::start().await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn to be submitted", |harness| {
+            !harness.items().is_empty()
+        })
+        .await;
+
+    let created = harness
+        .recorder
+        .sessions_created
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let [body] = created.as_slice() else {
+        panic!("one session is created: {created:?}");
+    };
+    assert_eq!(body["working_directory"], "/srv/agent", "{body}");
+    assert_eq!(body["permission"], "read", "{body}");
 }
 
 #[tokio::test]

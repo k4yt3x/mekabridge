@@ -17,8 +17,8 @@ token = "${MEKA_BRIDGE_TOKEN}"
 
 # "read", "workspace" or "unrestricted". The send tools are read-only as far as your machine is
 # concerned, so at "read" the agent can reply to messages but cannot modify files; "workspace" adds
-# writes confined to the session's roots. Only "unrestricted" reaches the moderation tools, because
-# meka cannot sandbox an MCP server and will not pretend otherwise. Leave meka's
+# writes confined to the session's workspace. Only "unrestricted" reaches the moderation tools,
+# because meka cannot sandbox an MCP server and will not pretend otherwise. Leave meka's
 # [permissions].approvals off, since this bridge has nobody to put an approval to.
 permission = "read"
 

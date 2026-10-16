@@ -67,7 +67,7 @@ required = true
 eager_load_tools = ["message_send", "conversation_list"]
 ```
 
-`eager_load_tools` matters. Without it meka ships MCP tools deferred, and the agent pays a `tool_load` round trip before every single reply.
+`eager_load_tools` matters. Without it meka ships MCP tools deferred, and the agent spends a round trip loading `message_send` before it can reply; see [Eager loading](../usage/meka-integration.md#eager-loading).
 
 ## 4. Start, bridge first
 

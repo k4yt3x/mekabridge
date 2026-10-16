@@ -212,7 +212,7 @@ no longer count what a blocked chat recorded before the block.
 
 ## Eager loading
 
-meka ships MCP tools **deferred** by default: the agent has to call `tool_load` before it can use one. For a bridge that is exactly backwards, because `message_send` is used on almost every turn.
+meka ships MCP tools **deferred** by default: the agent sees a summary of each and spends a round trip loading the schema before it can rely on one. For a bridge that is exactly backwards, because `message_send` is used on almost every turn.
 
 ```toml
 eager_load_tools = ["message_send", "conversation_list"]
@@ -220,9 +220,13 @@ eager_load_tools = ["message_send", "conversation_list"]
 
 Leave the rest deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip. `history_read` is the one worth reconsidering if the agent lives in busy groups, since a muted conversation waking on a mention often needs it immediately.
 
+A load lasts the rest of the session, so a deferred tool costs its round trip once rather than on every turn. The exception arrived with meka 0.77: on a profile whose `deferred_tools` is `native`, the default on the official Anthropic and OpenAI endpoints and on both subscriptions, a compaction forgets every load, and the next turn that needs the tool pays again.
+
 An eager tool buys more than that round trip. A deferred tool appears in the agent's `[Tool discovery]` index as a name and a one-line summary, and the whole index is capped at 8 KB across every MCP server at once. Past the cap the whole section drops a tier: every tool keeps its name and loses its summary, on every server, not just the one that overran. Nothing becomes unreachable and `tool_search` still finds a tool by keyword, but the summaries are what tell the agent when to reach for `backlog_check` rather than `history_read`, and they stop arriving.
 
 Measured against meka 0.61's own renderer, this bridge's 26 tools render to 5.1 KB, and 7.0 KB alongside meka's built-in MCP-resource tools. That is inside the cap with roughly four more described tools of headroom; 0.15.1's 23 longer-winded tools took 6.0 KB and left room for one. **Attaching a second server of any real size will still drop the tier**, so if its summaries matter, put this bridge's most-used tools in `eager_load_tools`: an eager tool is not in the index at all, so it keeps its full schema whatever else is attached, and it stops consuming the shared budget.
+
+From meka 0.77 a server entry also takes `deferral`, and `[mcp].deferral` sets it for every server: `eager` ships every tool of the server from the first request, and `hidden` drops every tool its `eager_load_tools` does not name. Either takes a server out of the index, so a second server set that way no longer costs this bridge its summaries. **Do not let this bridge inherit `hidden`**: it would leave the agent `message_send` and `conversation_list` and nothing to read history, download an attachment or mute a chat with. If the install-wide setting is `hidden`, give this entry `deferral = "deferred"`. meka 0.76 refuses a config that names `deferral` at all.
 
 A test (`the_tool_index_stays_inside_this_bridges_share`) holds the bridge's own entries under 6 KB by reproducing meka's packing rule, so a tool added later trips the suite rather than the deployment.
 

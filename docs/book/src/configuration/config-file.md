@@ -99,7 +99,7 @@ Two things follow from where the signal comes from. On a provider backend that d
 
 How often the indicator is renewed is not configurable: Telegram clears the status after about five seconds and Discord after ten, so the interval is fixed at four to look continuous on both.
 
-> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for as long as its `[serve] inbox_retry_ceiling` allows, an hour by default, and the bridge posts one it has not accepted for an hour on the same schedule, so the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
+> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for as long as its `[serve] inbox_retry_ceiling` allows, an hour by default, and the bridge posts one it has not accepted for an hour on the same schedule, so with meka's default the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
 
 A message that could not be delivered produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
 

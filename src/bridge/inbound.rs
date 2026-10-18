@@ -802,6 +802,9 @@ pub struct SessionContext {
     /// Which profile served the session's last turn, so the owner hears when turns move to a
     /// fallback and when they come back.
     pub serving: ServingProfile,
+    /// Whether the owner was told meka is retrying a failing turn and has not heard it recover,
+    /// so the first delivery after an outage can say it is over.
+    pub outage_reported: std::sync::atomic::AtomicBool,
     /// The session the feed follows. Published once bound, and again on a rebind, so the reader
     /// opens the right feed.
     pub session: watch::Sender<Option<Uuid>>,
@@ -839,6 +842,15 @@ pub async fn session_loop(
         ),
         Err(error) => tracing::error!("failed to recover the queue: {}", error),
     }
+    // What the owner was last told about fallbacks outlives a restart, or a fallback announced
+    // before it would never be reported over.
+    match context.store.fallback_told().await {
+        Ok(told) => context.serving.restore(told),
+        Err(error) => tracing::error!(
+            "failed to read what the owner was told of fallbacks: {}",
+            error
+        ),
+    }
     let mut turns: HashMap<String, TurnTally> = HashMap::new();
     // Nothing is due at startup: `recover` has just run, and the feed opening reconciles everything
     // handed over before it.
@@ -846,6 +858,12 @@ pub async fn session_loop(
     loop {
         if swept.elapsed() >= context.config.bridge.straggler_sweep {
             settle_stragglers(&context, session_id).await;
+            // A move held for the notice window is said once the window is out, whether or not a
+            // turn comes along to say it: a chat that went quiet would otherwise leave the owner
+            // believing the fallback still answers.
+            if let Some(change) = context.serving.flush(Utc::now()) {
+                tell_owner_of_move(&context, &change).await;
+            }
             swept = tokio::time::Instant::now();
         }
         let next_due = work_queue(&context, &mut session_id, &shutdown).await;
@@ -1917,6 +1935,17 @@ async fn apply(
                     typist.expect(turn, BTreeSet::from([conversation]));
                 }
             }
+            if !item_ids.is_empty() && context.outage_reported.swap(false, Ordering::SeqCst) {
+                tracing::info!("turns on this bridge's messages get through again");
+                if let Some(owner) = owner_of(context) {
+                    notify(
+                        context,
+                        &owner,
+                        "mekabridge: meka's turns on this bridge's messages get through again.",
+                    )
+                    .await;
+                }
+            }
             false
         }
         TurnEvent::InboxFailed {
@@ -2582,15 +2611,21 @@ async fn deferred(
     if rows.is_empty() {
         return;
     }
-    let next = not_before
+    let next_at = not_before
         .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-        .map(|at| clock(at.with_timezone(&Utc)));
+        .map(|at| at.with_timezone(&Utc));
+    let next = next_at.map(clock);
     tracing::warn!(
         messages = rows.len(),
         next_attempt = next.as_deref().unwrap_or("unknown"),
         "a turn on this bridge's messages failed and meka will try again: {}",
         error
     );
+    // One replayed after a restart, whose next attempt has been and gone. A later deferral, or the
+    // message's delivery or give-up, follows it in the replay and says where things stand now.
+    if next_at.is_some_and(|at| at < Utc::now()) {
+        return;
+    }
     let Some(owner) = owner_of(context) else {
         return;
     };
@@ -2606,18 +2641,19 @@ async fn deferred(
          Until a turn gets through, nobody in these chats hears back.",
         next.map(|next| format!(" at {next}")).unwrap_or_default()
     );
-    // Every row of one deferral was enqueued around the same moment, so the earliest deadline is
-    // the one that matters. meka stops at the last attempt that would land before it, which can be
-    // a few minutes sooner, so it is a bound rather than a time.
+    // A turn can carry items enqueued at different times, a fresh one beside one already retried,
+    // so the earliest deadline is the one that matters: it is when meka starts giving up. meka
+    // stops at the last attempt that would land before it, which can be a few minutes sooner, so
+    // it is a bound rather than a time.
     match rows.iter().filter_map(|row| row.retry_until).min() {
         Some(deadline) => text.push_str(&format!(
-            " If it is still failing by {}, meka gives up on them and this bridge reports them \
-             undelivered.",
+            " If it is still failing by {}, meka starts giving up on them, and this bridge reports \
+             each one undelivered as it does.",
             clock(deadline)
         )),
         None => text.push_str(
-            " If it is still failing once meka's retry ceiling passes, meka gives up on them and \
-             this bridge reports them undelivered.",
+            " If it is still failing once meka's retry ceiling passes, meka starts giving up on \
+             them, and this bridge reports each one undelivered as it does.",
         ),
     }
     if error.title.is_empty() && error.detail.is_empty() {
@@ -2625,18 +2661,19 @@ async fn deferred(
     } else {
         text.push_str(&format!("\n\nError: {error}"));
     }
-    if context.serving.fallbacks_failed() {
-        text.push_str(
-            "\nThe agent's profile has fallbacks, and none of them could serve this turn either.",
-        );
-    } else if matches!(
+    if matches!(
         error.kind(),
         ProblemKind::ProviderExhausted | ProblemKind::ProviderUnavailable
     ) {
-        text.push_str(
-            "\nThe agent's profile cannot be served right now. Naming `fallbacks` on it in meka's \
-             config lets another profile answer while it cannot.",
-        );
+        // The bridge sees a fallback only when a turn ends on one, and a turn whose fallbacks
+        // refused it too can still end on the session's own profile, so their absence is never
+        // asserted.
+        text.push_str(if context.serving.fallbacks_failed() {
+            "\nThe agent's profile has fallbacks, and none of them could serve this turn either."
+        } else {
+            "\nIf the agent's profile has no `fallbacks`, naming some in meka's config lets another \
+             profile answer while it cannot."
+        });
     }
     let affected = conversations_of(&rows);
     let ids: Vec<&str> = affected.iter().map(ConversationId::as_str).collect();
@@ -2646,6 +2683,7 @@ async fn deferred(
             "\n{suppressed} further failed attempt(s) since the last notice were not reported."
         ));
     }
+    context.outage_reported.store(true, Ordering::SeqCst);
     notify(context, &owner, &text).await;
 }
 
@@ -2686,31 +2724,68 @@ struct ProfileMove {
     moves: u32,
 }
 
+/// What one ended turn did to [`ServingProfile`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Observed {
+    /// Where turns moved, when they did: a fallback, or `None` for the session's own profile.
+    moved: Option<Option<String>>,
+    /// The move to tell the owner of now, when one is due.
+    notice: Option<ProfileMove>,
+}
+
 impl ServingProfile {
-    /// Record which profile served a turn that ended, and say whether that is worth a notice.
+    /// Pick up what the owner was last told before a restart.
+    ///
+    /// Taken as where turns run too, since nothing has said otherwise yet: the first turn that
+    /// says otherwise is then a move, and a fallback announced before the restart is reported
+    /// over once it is.
+    fn restore(&self, told: Option<String>) {
+        let mut serving = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        serving.current.clone_from(&told);
+        serving.told = told;
+    }
+
+    /// Record which profile served a turn that ended.
     ///
     /// Only a finished turn says where the session's turns run. A failed one names the last
     /// profile meka tried before giving up, which served nothing.
-    fn observe(
-        &self,
-        fallback: Option<&str>,
-        finished: bool,
-        now: DateTime<Utc>,
-    ) -> Option<ProfileMove> {
+    fn observe(&self, fallback: Option<&str>, finished: bool, now: DateTime<Utc>) -> Observed {
         let mut serving = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !finished {
             serving.fallbacks_failed = fallback.is_some();
-            return None;
+            return Observed::default();
         }
         serving.fallbacks_failed = false;
         let next = fallback.map(str::to_string);
-        if next != serving.current {
+        let moved = (next != serving.current).then(|| next.clone());
+        if moved.is_some() {
             serving.current = next;
             serving.moves += 1;
         }
+        Observed {
+            moved,
+            notice: Self::due(&mut serving, now),
+        }
+    }
+
+    /// A move held for the notice window, once the window is out.
+    fn flush(&self, now: DateTime<Utc>) -> Option<ProfileMove> {
+        let mut serving = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::due(&mut serving, now)
+    }
+
+    /// The move to report, when where turns run is not what the owner was told and the last
+    /// notice is far enough back.
+    fn due(serving: &mut Serving, now: DateTime<Utc>) -> Option<ProfileMove> {
         if serving.current == serving.told {
             return None;
         }
@@ -2742,7 +2817,7 @@ impl ServingProfile {
     }
 }
 
-/// Tell the owner when the session's turns run on a different profile than they were last told.
+/// Note which profile served a turn that ended, and tell the owner when that is news.
 ///
 /// A fallback answers with another model and may bill another account, and a server full of people
 /// talking to the bot is not going to mention either. The log line is not enough on its own: an
@@ -2753,29 +2828,39 @@ async fn note_serving(
     fallback: Option<&str>,
     finished: bool,
 ) {
-    let Some(change) = context.serving.observe(fallback, finished, Utc::now()) else {
-        return;
-    };
+    let observed = context.serving.observe(fallback, finished, Utc::now());
+    match &observed.moved {
+        Some(Some(profile)) => {
+            tracing::warn!(turn, profile = %profile, "meka moved the agent's turns to a fallback profile");
+        }
+        Some(None) => tracing::info!(turn, "the agent's turns are back on its own profile"),
+        None => {}
+    }
+    if let Some(change) = observed.notice {
+        tell_owner_of_move(context, &change).await;
+    }
+}
+
+/// Tell the owner where the session's turns run now, and write down that they were told.
+async fn tell_owner_of_move(context: &SessionContext, change: &ProfileMove) {
+    if let Err(error) = context.store.set_fallback_told(change.to.as_deref()).await {
+        tracing::error!(
+            "failed to record what the owner was told of fallbacks: {}",
+            error
+        );
+    }
     let mut text = match (&change.to, &change.from) {
-        (Some(profile), _) => {
-            tracing::warn!(turn, profile = %profile, "meka is serving turns from a fallback profile");
-            format!(
-                "mekabridge: meka could not serve the agent's turns on its own profile, so they run \
-                 on the fallback profile \"{profile}\", which may answer with another model and bill \
-                 another account. meka moves them back once the agent's own profile answers again, \
-                 and this bridge reports that here too."
-            )
-        }
-        (None, from) => {
-            tracing::info!(turn, "turns run on the session's own profile again");
-            match from {
-                Some(from) => format!(
-                    "mekabridge: the agent's turns run on its own profile again, no longer on the \
-                     fallback profile \"{from}\"."
-                ),
-                None => "mekabridge: the agent's turns run on its own profile again.".to_string(),
-            }
-        }
+        (Some(profile), _) => format!(
+            "mekabridge: meka could not serve the agent's turns on its own profile, so they run on \
+             the fallback profile \"{profile}\", which may answer with another model and bill \
+             another account. meka moves them back once the agent's own profile answers again, and \
+             this bridge reports that here too."
+        ),
+        (None, Some(from)) => format!(
+            "mekabridge: the agent's turns run on its own profile again, no longer on the fallback \
+             profile \"{from}\"."
+        ),
+        (None, None) => "mekabridge: the agent's turns run on its own profile again.".to_string(),
     };
     if change.moves > 1 {
         text.push_str(&format!(
@@ -3338,34 +3423,62 @@ mod tests {
                 moves,
             })
         };
+        let notice = |observed: Observed| observed.notice;
         // The session's own profile, as every turn starts out.
-        assert_eq!(serving.observe(None, true, at(0)), None);
-        assert_eq!(
-            serving.observe(Some("backup"), true, at(0)),
-            moved(Some("backup"), None, 1)
-        );
+        assert_eq!(serving.observe(None, true, at(0)), Observed::default());
+        let observed = serving.observe(Some("backup"), true, at(0));
+        assert_eq!(observed.moved, Some(Some("backup".to_string())));
+        assert_eq!(observed.notice, moved(Some("backup"), None, 1));
         // An outage sends every turn there for an hour, which is one fact rather than a hundred.
-        assert_eq!(serving.observe(Some("backup"), true, at(1)), None);
+        assert_eq!(
+            serving.observe(Some("backup"), true, at(1)),
+            Observed::default()
+        );
         // A failed turn names the last profile meka tried, which served nothing, but says the
         // fallbacks were tried and refused too.
-        assert_eq!(serving.observe(Some("last-resort"), false, at(2)), None);
+        assert_eq!(
+            notice(serving.observe(Some("last-resort"), false, at(2))),
+            None
+        );
         assert!(serving.fallbacks_failed());
         // A provider that keeps failing and recovering moves turns back and forth every few
-        // minutes. Inside the window that is held, and a return to what the owner was told needs
-        // no notice at all.
-        assert_eq!(serving.observe(None, true, at(3)), None);
+        // minutes. Inside the window each move is logged and held, and a return to what the owner
+        // was told needs no notice at all.
+        let observed = serving.observe(None, true, at(3));
+        assert_eq!(observed.moved, Some(None));
+        assert_eq!(observed.notice, None);
         assert!(!serving.fallbacks_failed());
-        assert_eq!(serving.observe(Some("backup"), true, at(5)), None);
-        assert_eq!(serving.observe(None, true, at(8)), None);
-        // Once the window is out, the first turn says where things stand, counting the moves.
-        assert_eq!(
-            serving.observe(None, true, at(20)),
-            moved(None, Some("backup"), 3)
-        );
-        assert_eq!(serving.observe(None, true, at(21)), None);
+        assert_eq!(notice(serving.observe(Some("backup"), true, at(5))), None);
+        assert_eq!(notice(serving.observe(None, true, at(8))), None);
+        // Nothing has said otherwise by the time the window is out, and the sweep says it, with
+        // the moves in between counted, whether or not another turn comes along.
+        assert_eq!(serving.flush(at(10)), None, "still inside the window");
+        assert_eq!(serving.flush(at(20)), moved(None, Some("backup"), 3));
+        assert_eq!(serving.flush(at(40)), None);
+        assert_eq!(serving.observe(None, true, at(41)), Observed::default());
         // A failed turn on the session's own profile moves nothing.
-        assert_eq!(serving.observe(None, false, at(40)), None);
+        assert_eq!(serving.observe(None, false, at(42)), Observed::default());
         assert!(!serving.fallbacks_failed());
+    }
+
+    #[test]
+    fn a_fallback_announced_before_a_restart_is_reported_over_after_it() {
+        // The owner was told turns run on the fallback, and the bridge restarted. The first turn
+        // back on the session's own profile is news to the owner, though not to this process.
+        let serving = ServingProfile::default();
+        serving.restore(Some("backup".to_string()));
+        assert_eq!(
+            serving.observe(None, true, Utc::now()).notice,
+            Some(ProfileMove {
+                to: None,
+                from: Some("backup".to_string()),
+                moves: 1,
+            })
+        );
+        // And nothing at all when nothing was announced and nothing moved.
+        let quiet = ServingProfile::default();
+        quiet.restore(None);
+        assert_eq!(quiet.observe(None, true, Utc::now()), Observed::default());
     }
 
     #[test]
@@ -3391,10 +3504,11 @@ mod tests {
         // Its reason for running out of time does not, so the whole error follows it.
         assert_eq!(
             given_up_reason(
-                "no turn could deliver it in 7 attempt(s) over the last hour",
+                "no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour",
                 Some(&error)
             ),
-            "no turn could deliver it in 7 attempt(s) over the last hour: Unauthorized (401): the \
+            "no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour: \
+             Unauthorized (401): the \
              credential was rejected. The provider said: 401 invalid x-api-key"
         );
         assert_eq!(given_up_reason("withdrawn", None), "withdrawn");

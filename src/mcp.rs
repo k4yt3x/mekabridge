@@ -2450,7 +2450,7 @@ impl ServerHandler for BridgeMcpServer {
         // client. meka pins its own rmcp, ahead of this crate's or behind it as releases go, and
         // negotiation is what keeps the two interoperable across upgrades.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(Implementation::new("mekabridge", env!("CARGO_PKG_VERSION")))
             .with_instructions(SERVER_INSTRUCTIONS)
     }
 

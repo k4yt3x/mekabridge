@@ -534,11 +534,13 @@ mod tests {
         assert_eq!(
             event(
                 "inbox.failed",
-                r#"{"item_id":"i1","session_id":"s","reason":"no turn could deliver it in 7 attempt(s) over the last hour"}"#
+                r#"{"item_id":"i1","session_id":"s","reason":"no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour"}"#
             ),
             TurnEvent::InboxFailed {
                 item_id: "i1".to_string(),
-                reason: "no turn could deliver it in 7 attempt(s) over the last hour".to_string(),
+                reason:
+                    "no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour"
+                        .to_string(),
                 error: None,
             }
         );

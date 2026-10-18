@@ -77,9 +77,10 @@ const POLL_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs
 
 /// Most forum topic names held at once, across every chat.
 ///
-/// Past it the lot is dropped rather than tracked for age: a name is relearned from the next
-/// message posted in its topic that replies to nothing, so losing one costs a message or two that
-/// name only their group.
+/// Past it the lot is dropped rather than tracked for age. A name is relearned from the next
+/// message posted in its topic that replies to nothing, but that message carries the name the topic
+/// was opened with, so one renamed since reads by its first name until it is renamed again; a
+/// restart costs the same.
 const TOPIC_NAMES_MAX: usize = 4096;
 
 /// Who the bot is, as far as deciding whether a message was aimed at it.

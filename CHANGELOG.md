@@ -5,13 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.22.0] - 2026-10-18
 
 ### Added
 
 - Discord messages give the server's id as `server:`, and a thread its channel's as `parent:`.
 - A Telegram forum topic is named on the `chat:` line after its group, once its name has been seen.
-- The owner hears of a turn meka is still retrying, with the error and when meka will give up.
+- The owner hears of a turn meka is still retrying, with the error and deadline, and of recovery.
 - The owner hears when meka moves the agent's turns to a fallback profile, and when they come back.
 
 ### Changed
@@ -20,14 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Discord chat reads outermost first, `Acme Corp › #deploys › rollback`, in headers and titles.
 - The owner's notice for a message meka gave up on names the error, not only the attempts made.
 - A hand-over is asked about once meka's own `retry_until` passes, rather than after a fixed hour.
-- rmcp logs at `warn` unless `[log].level` names it; it logs every request since MCP 2026-07-28.
+- rmcp is held at `warn` where `[log].level` lets `info` through, since it logs every request now.
 
 ### Fixed
 
 - A Discord thread in a channel the bot was granted after joining is no longer unnamed or dropped.
 - A message in a Telegram forum topic no longer reads as a reply to whoever opened the topic.
 - A message meka gave up on after a failed turn while the bridge was away fails, not re-sent.
-- meka's `subscriptions/listen` is acknowledged, so rmcp no longer warns on every meka connect.
+- meka's notification stream is acknowledged and ended cleanly, with no rmcp warning or error.
+- The MCP server names itself to meka as mekabridge, not as the rmcp library it is built on.
+- `[mcp].path = "/"` is refused at startup, rather than stopping the MCP server as it starts.
 
 ## [0.21.0] - 2026-10-15
 
@@ -594,7 +596,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...HEAD
+[0.22.0]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...0.20.0
 [0.19.1]: https://github.com/k4yt3x/mekabridge/compare/0.19.0...0.19.1

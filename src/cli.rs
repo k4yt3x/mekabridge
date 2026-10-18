@@ -553,12 +553,14 @@ pub fn exit_quietly_on_broken_pipe() {
 /// `rmcp=info` or `rmcp::service=debug` say, is the operator's to keep. `RUST_LOG` and `-vv` are
 /// left as they are.
 fn quiet_rmcp(directive: String) -> String {
-    let names_rmcp = directive.split(',').map(str::trim).any(|part| {
+    // Read as `EnvFilter` reads it: parts are not trimmed, so ` info` after a comma is a target
+    // rather than a level, and `3` to `5` are `info` to `trace` as surely as their names.
+    let names_rmcp = directive.split(',').any(|part| {
         part.strip_prefix("rmcp")
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(['=', ':', '[']))
     });
-    let lets_info_through = directive.split(',').map(str::trim).any(|part| {
-        ["info", "debug", "trace"]
+    let lets_info_through = directive.split(',').any(|part| {
+        ["info", "debug", "trace", "3", "4", "5"]
             .iter()
             .any(|level| part.eq_ignore_ascii_case(level))
     });
@@ -567,6 +569,64 @@ fn quiet_rmcp(directive: String) -> String {
     } else {
         format!("{directive},rmcp=warn")
     }
+}
+
+/// Drops the one line rmcp writes at `error` when the client it was answering has already gone.
+///
+/// meka holds a notification stream open on every connection and closes it when it restarts or
+/// replaces the connection. rmcp is then left with the stream's final result to send into a channel
+/// the closed request took with it, and reports that, as `failed to send pending response during
+/// drain` or `fail to response message` depending on which of its loops gets there first, with
+/// `channel closed`: an error on this bridge for every meka restart, about nothing that went wrong.
+/// Matched on rmcp's own words and nothing broader, so a change in them lets the line through again
+/// rather than hiding anything else.
+struct QuietClosedPeer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QuietClosedPeer {
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let metadata = event.metadata();
+        if *metadata.level() != tracing::Level::ERROR || !metadata.target().starts_with("rmcp") {
+            return true;
+        }
+        let mut fields = EventText::default();
+        event.record(&mut fields);
+        !is_send_to_closed_peer(&fields.message, &fields.error)
+    }
+}
+
+/// The two fields of an event [`QuietClosedPeer`] reads.
+#[derive(Default)]
+struct EventText {
+    message: String,
+    error: String,
+}
+
+impl tracing::field::Visit for EventText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "error" => self.error = format!("{value:?}"),
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "message" => value.clone_into(&mut self.message),
+            "error" => value.clone_into(&mut self.error),
+            _ => {}
+        }
+    }
+}
+
+fn is_send_to_closed_peer(message: &str, error: &str) -> bool {
+    (message == "failed to send pending response during drain"
+        || message == "fail to response message")
+        && error.contains("channel closed")
 }
 
 /// Build the tracing subscriber.
@@ -586,7 +646,9 @@ fn init_logging(config: &Config, verbose: u8, format_override: Option<LogFormatA
         }
     };
     let format = format_override.map_or(config.log.format, LogFormat::from);
-    let registry = tracing_subscriber::registry().with(filter);
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(QuietClosedPeer);
     match format {
         LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
         LogFormat::Json => registry
@@ -614,11 +676,18 @@ mod tests {
             "mekabridge=debug,info,rmcp=warn"
         );
         assert_eq!(quiet_rmcp("DEBUG".to_string()), "DEBUG,rmcp=warn");
+        assert_eq!(quiet_rmcp("3".to_string()), "3,rmcp=warn");
         // An operator who asked for it gets it, at whatever level they named.
         assert_eq!(quiet_rmcp("info,rmcp=debug".to_string()), "info,rmcp=debug");
         assert_eq!(
-            quiet_rmcp("info, rmcp::service=info".to_string()),
-            "info, rmcp::service=info"
+            quiet_rmcp("info,rmcp::service=info".to_string()),
+            "info,rmcp::service=info"
+        );
+        // `EnvFilter` does not trim, so ` info` after a comma names a target, and this directive
+        // has no catch-all level for rmcp's `info` to get through.
+        assert_eq!(
+            quiet_rmcp("mekabridge=debug, info".to_string()),
+            "mekabridge=debug, info"
         );
         // Another crate whose name merely starts the same way is not rmcp.
         assert_eq!(
@@ -628,9 +697,64 @@ mod tests {
         // A quieter directive is never made louder: appending `rmcp=warn` to `error` would show
         // rmcp's warnings, to `off` would break the silence asked for, and to an empty directive
         // would leave rmcp the only thing logged at all.
-        for quiet in ["error", "warn", "off", "", "mekabridge=debug,teloxide=warn"] {
+        for quiet in [
+            "error",
+            "warn",
+            "off",
+            "",
+            "2",
+            "mekabridge=debug,teloxide=warn",
+        ] {
             assert_eq!(quiet_rmcp(quiet.to_string()), quiet, "{quiet:?}");
         }
+    }
+
+    #[test]
+    fn rmcp_s_error_for_a_client_already_gone_is_dropped_and_nothing_else() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::Layer as _;
+
+        /// Every event that got through, by its message.
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = EventText::default();
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(fields.message);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(QuietClosedPeer)
+            .with(Seen(Arc::clone(&seen)).with_filter(tracing::level_filters::LevelFilter::TRACE));
+        tracing::subscriber::with_default(subscriber, || {
+            let closed = "channel closed";
+            tracing::error!(target: "rmcp::service", error = %closed, "failed to send pending response during drain");
+            tracing::error!(target: "rmcp::service", error = %closed, "fail to response message");
+            // The same words for any other cause are an error worth seeing.
+            let other = "broken pipe";
+            tracing::error!(target: "rmcp::service", error = %other, "failed to send pending response during drain");
+            // As is anything else rmcp says at error, and anybody else's line in those words.
+            tracing::error!(target: "rmcp::service", error = %closed, "failed to serve a request");
+            tracing::error!(target: "mekabridge", error = %closed, "failed to send pending response during drain");
+        });
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [
+                "failed to send pending response during drain",
+                "failed to serve a request",
+                "failed to send pending response during drain",
+            ]
+        );
     }
 
     #[test]

@@ -159,7 +159,7 @@ The line running through all of it: a hand-over is spent when the feed says the 
 |---------|----------|
 | meka unreachable, 5xx, 429, or another process holding the session | The same bytes are posted again under the same key, waiting 10s and doubling to 5m. Past an hour from when the item was rendered it is given up on, put back among what the agent has not seen, and both the chat and the owner are told |
 | An error only an operator can clear (auth, a malformed request, a context overflow) | Given up on at once rather than spending the hour on attempts that cannot succeed |
-| A turn on the item fails in a way waiting can change (`inbox.deferred`) | Nothing settles: meka has put the item back and tries again. The owner is told at once, with the error and when meka gives up |
+| A turn on the item fails in a way waiting can change (`inbox.deferred`) | Nothing settles: meka has put the item back and tries again. The owner is told, with the error and when meka gives up, at most once every fifteen minutes, and again when a message gets through |
 | meka gives up on the item (`inbox.failed`) | A turn failed in a way no retry changes, or retries ran past meka's own ceiling. The messages are owed to the agent again and both the chat and the owner are told, the owner with the error |
 | The item is taken back unread (`inbox.withdrawn`), as cancelling the turn it opened does | Nothing was read, so the messages go back into the queue and are handed over afresh, a bounded number of times |
 | A turn fails or is cancelled after the model read the messages | Not handed over again: the work is done and a second run would repeat it with the agent unable to remember the first. The owner is told; the chats are told only where the agent had not got a word in |
@@ -180,4 +180,4 @@ Unit tests cover config resolution, the queue state machine, item rendering and 
 Two integration suites:
 
 - `bridge_flow` runs the real session task and feed reader against a stub meka that speaks the real inbox and feed wire formats, drains its inbox into one turn the way meka does, and a mock channel, covering batching, deduplication, the hand-over's whole lifecycle, restart recovery, and outbound delivery.
-- `mcp_interop` runs a real rmcp 2.x client, one major version behind the server's own, against the real MCP server, so the protocol version skew is checked on every test run.
+- `mcp_interop` runs a real rmcp 2.x client, one major version behind the server's own, against the real MCP server, so the protocol version skew is checked on every test run. It also drives the server in the 2026-07-28 era meka speaks to it, with no handshake and every call carrying its own `_meta`.

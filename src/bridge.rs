@@ -393,6 +393,7 @@ pub async fn run(config: Config) -> Result<()> {
             pending_session: Arc::default(),
             notices: inbound::NoticeLog::default(),
             serving: inbound::ServingProfile::default(),
+            outage_reported: std::sync::atomic::AtomicBool::new(false),
             session: session_sender,
             position,
         };

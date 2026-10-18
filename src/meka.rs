@@ -436,10 +436,13 @@ pub struct InboxReceipt {
     /// cannot parse costs the owner's notice a time rather than costing the post its receipt.
     #[serde(default)]
     pub retry_until: Option<String>,
-    /// On a replayed key, the error a failed turn gave the item up on.
+    /// On a replayed key, the last failed turn's error: on an item waiting for its next attempt,
+    /// and on one meka gave up on because a turn failed.
     ///
-    /// The one field that tells meka giving up apart from an item taken back unread: a cancelled
-    /// turn and a `DELETE` withdraw it too, and leave this empty.
+    /// What tells such a give-up apart from an item taken back unread, since a cancelled turn and
+    /// a `DELETE` withdraw it too and leave this empty. A give-up with no failed turn behind it,
+    /// a session held by another process for the whole ceiling say, leaves it empty as well and
+    /// reads as one of those.
     #[serde(default)]
     pub last_error: Option<ProblemDetail>,
     /// On a replayed key, meka's sentence for why the item was withdrawn.

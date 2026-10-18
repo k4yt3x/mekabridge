@@ -91,6 +91,10 @@ const META_LAST_TURN: &str = "last_turn_at";
 /// the feed from there. Keyed by session because ids start again on a new one.
 const META_FEED_POSITION: &str = "feed_position:";
 
+/// The fallback profile the owner was last told the session's turns run on. Absent when they were
+/// last told the session's own profile, or told nothing.
+const META_FALLBACK_TOLD: &str = "fallback_told";
+
 /// The `kind` recorded for a conversation nothing has arrived from yet.
 const KIND_UNKNOWN: &str = "unknown";
 
@@ -910,6 +914,28 @@ impl Store {
             })
             .await?;
         Ok(())
+    }
+
+    /// The fallback profile the owner was last told the agent's turns run on, if one.
+    pub async fn fallback_told(&self) -> Result<Option<String>> {
+        self.meta_get(META_FALLBACK_TOLD).await
+    }
+
+    /// Write down what the owner was told: a fallback, or `None` for the session's own profile.
+    pub async fn set_fallback_told(&self, profile: Option<&str>) -> Result<()> {
+        match profile {
+            Some(profile) => self.meta_set(META_FALLBACK_TOLD, profile.to_string()).await,
+            None => {
+                self.connection
+                    .call(|connection| {
+                        connection
+                            .execute("DELETE FROM meta WHERE key = ?1", [META_FALLBACK_TOLD])?;
+                        Ok(())
+                    })
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     /// The meka session this bridge owns, if one has been created.
@@ -5976,6 +6002,22 @@ mod tests {
             Some("Alice"),
             "a missing title must not erase a known one"
         );
+    }
+
+    #[tokio::test]
+    async fn what_the_owner_was_told_of_fallbacks_is_kept() {
+        let store = Store::open_in_memory().await.expect("opens");
+        assert_eq!(store.fallback_told().await.expect("read"), None);
+        store
+            .set_fallback_told(Some("backup"))
+            .await
+            .expect("write");
+        assert_eq!(
+            store.fallback_told().await.expect("read").as_deref(),
+            Some("backup")
+        );
+        store.set_fallback_told(None).await.expect("clear");
+        assert_eq!(store.fallback_told().await.expect("read"), None);
     }
 
     #[tokio::test]

@@ -798,6 +798,16 @@ impl FileConfig {
                 self.mcp.path
             )));
         }
+        // Refused here rather than met at startup, where the router cannot mount a service at the
+        // root beside the health routes and the MCP server would die while the rest of the bridge
+        // ran on without it.
+        if self.mcp.path == "/" {
+            return Err(BridgeError::config(
+                "[mcp].path cannot be \"/\"; give the endpoint a path of its own, such as \
+                 \"/mcp\""
+                    .to_string(),
+            ));
+        }
         let mcp = McpConfig {
             transport: self.mcp.transport,
             bind: self.mcp.bind,
@@ -1776,6 +1786,18 @@ allowed_users = [1]
 "#;
         let error = parse(raw).expect_err("':' would corrupt conversation ids");
         assert!(error.to_string().contains("may only contain"));
+    }
+
+    #[test]
+    fn the_mcp_endpoint_cannot_be_the_root() {
+        let raw = format!("{MINIMAL}\n[mcp]\npath = \"/\"\n");
+        let error = parse(&raw).expect_err("a root path must be rejected");
+        assert!(error.to_string().contains("[mcp].path"), "{error}");
+        let raw = format!("{MINIMAL}\n[mcp]\npath = \"/agent/mcp\"\n");
+        assert_eq!(
+            parse(&raw).expect("a nested path is fine").mcp.path,
+            "/agent/mcp"
+        );
     }
 
     #[test]

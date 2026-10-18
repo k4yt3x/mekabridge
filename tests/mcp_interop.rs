@@ -2,11 +2,13 @@
 //! against.
 //!
 //! The two are separate processes, each free to link whatever rmcp it likes, and the protocol
-//! negotiates a mutually supported version at `initialize`. What this bridge owes is a surface that
-//! survives that negotiation rather than one that happens to match a crate version: meka has moved
-//! its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, and each move is the kind of thing that
-//! breaks quietly. So these tests drive the real server over a real socket with a real rmcp 2.x
-//! client, one major behind the server's own, on every `cargo test`.
+//! negotiates a mutually supported version, at `initialize` in the older era and by a
+//! `server/discover` probe in 2026-07-28, which meka speaks from 0.79. What this bridge owes is a
+//! surface that survives that negotiation rather than one that happens to match a crate version:
+//! meka has moved its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, and each move is the kind of
+//! thing that breaks quietly. So these tests drive the real server over a real socket with a real
+//! rmcp 2.x client, one major behind the server's own, on every `cargo test`; the 2026-07-28 tests
+//! at the end use this crate's own rmcp, since no older one speaks that era.
 //!
 //! The client is deliberately not the version meka pins today, which is the same major as the
 //! server's. Pinning the test to whatever meka currently links would make it agree with the server
@@ -532,6 +534,9 @@ async fn handshake_succeeds_across_the_version_gap() {
         instructions.contains("`admitted:`"),
         "instructions should explain the envelope headers, got: {instructions}"
     );
+    // The server names itself, not the SDK it is built on, which is what meka's server list shows.
+    assert_eq!(info.server_info.name, "mekabridge");
+    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
 
     client.cancel().await.expect("clean shutdown");
 }

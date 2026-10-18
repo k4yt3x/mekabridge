@@ -232,12 +232,18 @@ impl NameCache {
             let channels = self.channels.read().ok()?;
             let entry = channels.get(&channel_id)?;
             let name = entry.name.clone()?;
-            let located = match entry.parent.and_then(|parent| channels.get(&parent)) {
+            let parent_name = entry
+                .parent
+                .and_then(|parent| channels.get(&parent))
+                .and_then(|parent| parent.name.as_deref());
+            let located = match parent_name {
                 // A thread's own name is the topic; the parent names the room it was started in.
-                Some(parent) if is_thread(entry.kind) => match &parent.name {
-                    Some(parent_name) => format!("#{parent_name} \u{203a} {name}"),
-                    None => format!("#{name}"),
-                },
+                Some(parent_name) if is_thread(entry.kind) => {
+                    format!("#{parent_name} \u{203a} {name}")
+                }
+                // A thread whose room is not known yet, named without the `#` that would make it
+                // read as a channel of its own.
+                _ if is_thread(entry.kind) => name,
                 _ => format!("#{name}"),
             };
             (located, entry.guild)
@@ -350,8 +356,13 @@ mod tests {
             cache.describe(Id::new(4)).as_deref(),
             Some("Acme Corp \u{203a} #help \u{203a} login fails")
         );
-        // A parent nobody announced might be either, so nothing is offered.
+        // A parent nobody announced might be either, so nothing is offered, and the thread is not
+        // dressed up as a channel of its own.
         assert_eq!(cache.sendable_parent_of(Id::new(5)), None);
+        assert_eq!(
+            cache.describe(Id::new(5)).as_deref(),
+            Some("Acme Corp \u{203a} orphan")
+        );
         // And a channel hangs off nothing, whatever its `parent_id` says about its category.
         let mut categorized = channel(7, "releases", ChannelType::GuildText);
         categorized.parent_id = Some(Id::new(1));

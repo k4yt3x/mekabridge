@@ -473,24 +473,14 @@ impl DiscordChannel {
 
     /// Fetch a channel and keep it, for one the gateway never announced.
     async fn learn_channel(&self, channel_id: Id<ChannelMarker>) -> Result<(), ChannelError> {
-        let fetch = async {
-            self.http
-                .channel(channel_id)
-                .await
-                .map_err(|error| self.delivery_error("reading the channel", &error))?
-                .model()
-                .await
-                .map_err(|error| self.decode_error("the channel", &error))
-        };
-        let channel = tokio::time::timeout(CHANNEL_LOOKUP_TIMEOUT, fetch)
+        let channel = self
+            .http
+            .channel(channel_id)
             .await
-            .map_err(|_elapsed| ChannelError::Transport {
-                channel: self.id.as_str().to_string(),
-                message: format!(
-                    "Discord did not answer a channel lookup within {}s",
-                    CHANNEL_LOOKUP_TIMEOUT.as_secs()
-                ),
-            })??;
+            .map_err(|error| self.delivery_error("reading the channel", &error))?
+            .model()
+            .await
+            .map_err(|error| self.decode_error("the channel", &error))?;
         self.names.insert_channel(&channel);
         Ok(())
     }
@@ -498,8 +488,8 @@ impl DiscordChannel {
     /// Make sure the cache can place a channel and, for a thread, the channel it hangs off.
     ///
     /// Both are asked for at most once, since the answer is kept. Only the channel itself is
-    /// required: a thread whose parent cannot be read is still placed, and loses only the parent's
-    /// name and the standing it would inherit, which a server or role grant does not need.
+    /// required. A thread's entry carries its parent's id, which is all its admission reads, so a
+    /// parent that cannot be looked up costs only its name and the `parent:` line.
     async fn place(&self, channel_id: Id<ChannelMarker>) -> Result<(), ChannelError> {
         if self.names.kind_of(channel_id).is_none() {
             self.learn_channel(channel_id).await?;
@@ -522,9 +512,11 @@ impl DiscordChannel {
     /// lookup says.
     ///
     /// The gateway should have announced the channel already, and nearly always has. A miss is not
-    /// cosmetic: the message would read as an `unknown` room with no name, and a thread admitted
-    /// only through its parent's allowlist would be dropped, because the parent is found through
-    /// the same cache.
+    /// cosmetic: the message would read as an `unknown` room with no name, and a thread whose own
+    /// entry is missing has no parent to inherit its allowlist standing from, so a message
+    /// admitted only that way is dropped. Each lookup is bounded, and any failure, the parent's
+    /// included, pauses the rest: this runs inside the gateway loop, which handles nothing else
+    /// while it waits.
     async fn place_arrival(&self, message: &Message) {
         // A direct message needs no lookup: Discord announces none of them, and the missing server
         // already says what it is. The bot's own messages are dropped unread, so they need none
@@ -542,7 +534,19 @@ impl DiscordChannel {
                 return;
             }
         }
-        if let Err(error) = self.place(message.channel_id).await {
+        let failed = async {
+            if self.names.kind_of(message.channel_id).is_none() {
+                self.bounded_lookup(message.channel_id).await?;
+            }
+            if let Some(parent) = self.names.parent_of(message.channel_id)
+                && self.names.kind_of(parent).is_none()
+            {
+                self.bounded_lookup(parent).await?;
+            }
+            Ok::<(), (Id<ChannelMarker>, ChannelError)>(())
+        }
+        .await;
+        if let Err((looked_up, error)) = failed {
             *self
                 .lookups_paused_until
                 .lock()
@@ -550,11 +554,30 @@ impl DiscordChannel {
                 Some(now + CHANNEL_LOOKUP_PAUSE);
             tracing::warn!(
                 channel = %self.id,
-                discord_channel = %message.channel_id,
+                discord_channel = %looked_up,
                 pause = ?CHANNEL_LOOKUP_PAUSE,
-                "could not look up the channel a message arrived in, so lookups pause: {}",
+                "could not look up a channel a message arrived in, so lookups pause; until they \
+                 resume, a message in a channel this bridge has not been told about reads as an \
+                 unknown room, and one in a thread admitted only through its parent is dropped: {}",
                 error
             );
+        }
+    }
+
+    /// [`Self::learn_channel`] within [`CHANNEL_LOOKUP_TIMEOUT`], naming the channel on failure.
+    async fn bounded_lookup(
+        &self,
+        channel_id: Id<ChannelMarker>,
+    ) -> Result<(), (Id<ChannelMarker>, ChannelError)> {
+        match tokio::time::timeout(CHANNEL_LOOKUP_TIMEOUT, self.learn_channel(channel_id)).await {
+            Ok(result) => result.map_err(|error| (channel_id, error)),
+            Err(_elapsed) => Err((channel_id, ChannelError::Transport {
+                channel: self.id.as_str().to_string(),
+                message: format!(
+                    "Discord did not answer a channel lookup within {}s",
+                    CHANNEL_LOOKUP_TIMEOUT.as_secs()
+                ),
+            })),
         }
     }
 
@@ -681,13 +704,21 @@ impl DiscordChannel {
             None => ChatKind::Unknown,
         };
         let sender_allowlisted = self.allowed_users.contains(&message.author.id);
-        let admission = self.admission(
+        let Some(admission) = self.admission(
             message.author.id,
             message.channel_id,
             message.guild_id,
             &roles,
             chat_kind == ChatKind::Direct,
-        )?;
+        ) else {
+            tracing::debug!(
+                channel = %self.id,
+                discord_channel = %message.channel_id,
+                user_id = %message.author.id,
+                "dropping a message from outside the allowlist"
+            );
+            return None;
+        };
 
         let conversation = ConversationId::new(&self.id, &message.channel_id.to_string(), None);
         let display_name = message
@@ -2644,7 +2675,7 @@ impl Channel for DiscordChannel {
         // A message fetched here carries no server, which live delivery always has, so a channel
         // the cache cannot place would be filed as a direct message. Server channels are in the
         // cache by now; a DM never is, since Discord announces none, so it is looked up, and so is
-        // a thread's parent, which its admission and its `parent:` line both read.
+        // a thread's parent, which its name and its `parent:` line read.
         self.place(channel_id).await?;
         let kind = self.names.kind_of(channel_id);
         let guild = self.names.guild_of(channel_id);
@@ -3932,6 +3963,31 @@ mod tests {
             ["2100"],
             "one failure pauses the lookups"
         );
+    }
+
+    #[tokio::test]
+    async fn a_parent_that_cannot_be_read_pauses_lookups_and_still_admits_the_thread() {
+        // The thread's own entry names its parent, which is all its admission reads, so the
+        // message is heard. But the failed lookup has to pause the next ones like any other, or
+        // every message in the thread would ask again inside the gateway loop.
+        let api = Arc::new(FakeApi {
+            unreadable_channels: vec!["2000".to_string()],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = against(admitting_deploys(), address);
+        channel.names.insert_channel(&announced(rollback_thread()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        for _ in 0..3 {
+            channel.handle(message_create("2100"), &sender).await;
+            let message = delivered(&mut receiver);
+            assert_eq!(message.admission, Admission::Chat);
+            assert_eq!(
+                message.parent, None,
+                "an unread parent offers no id to send to"
+            );
+        }
+        assert_eq!(*api.channel_lookups.lock().expect("not poisoned"), ["2000"]);
     }
 
     #[tokio::test]

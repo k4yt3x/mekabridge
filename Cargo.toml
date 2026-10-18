@@ -1,6 +1,6 @@
 [package]
 name = "mekabridge"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -31,7 +31,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
-rmcp = { version = "3", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.5", features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 schemars = "1"
@@ -58,7 +58,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 libc = "0.2"
 
 [dev-dependencies]
-rmcp = { version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }
 rmcp2 = { package = "rmcp", version = "2.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

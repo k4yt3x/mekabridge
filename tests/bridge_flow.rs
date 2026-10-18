@@ -661,7 +661,8 @@ async fn enqueue_item(
 const RETRY_UNTIL: &str = "2099-01-01T00:00:00Z";
 
 /// meka's sentence for an item it ran out of time on.
-const GIVE_UP_REASON: &str = "no turn could deliver it in 7 attempt(s) over the last hour";
+const GIVE_UP_REASON: &str =
+    "no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour";
 
 /// An error as meka keeps it on an item it gave up on, which is what a replayed key answers with:
 /// the Problem Detail's `type`, `title`, `status` and `detail`, without the upstream's own text the
@@ -2272,6 +2273,7 @@ fn spawn_session(
             pending_session: Arc::default(),
             notices: inbound::NoticeLog::default(),
             serving: inbound::ServingProfile::default(),
+            outage_reported: std::sync::atomic::AtomicBool::new(false),
             session: session_sender,
             position,
         };
@@ -2830,6 +2832,96 @@ async fn a_give_up_after_a_deferral_still_reaches_the_owner() {
     let notices = owner_notices(&harness);
     assert!(notices[0].contains("will try again"), "{notices:?}");
     assert!(notices[1].contains("could not deliver"), "{notices:?}");
+}
+
+#[tokio::test]
+async fn the_owner_told_of_an_outage_hears_when_it_is_over() {
+    // Told that nobody hears back until a turn gets through, the owner is owed the moment one does.
+    let harness = Harness::start_script_with(TurnScript::Defer, Setup::with_owner()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    let owner_notices = |harness: &Harness| -> Vec<String> {
+        harness
+            .channel
+            .sent()
+            .into_iter()
+            .filter(|(conversation, _)| conversation == "mock:99")
+            .map(|(_, text)| text)
+            .collect()
+    };
+    harness
+        .wait_for("the deferral notice", |harness| {
+            !owner_notices(harness).is_empty()
+        })
+        .await;
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.mark(&item, "delivered");
+    harness.recorder.feed.push(
+        "inbox.delivered",
+        Some("t9"),
+        serde_json::json!({ "item_ids": [item] }),
+    );
+    harness
+        .wait_for("the recovery notice", |harness| {
+            owner_notices(harness).len() >= 2
+        })
+        .await;
+    assert!(
+        owner_notices(&harness)[1].contains("get through again"),
+        "{:?}",
+        owner_notices(&harness)
+    );
+}
+
+#[tokio::test]
+async fn a_deferral_whose_next_attempt_has_passed_is_not_reported() {
+    // One replayed after a restart: the attempt it announces has been and gone, and what came of
+    // it follows in the replay. Quoted to the owner, it would name a time already past and spend
+    // the window the current one needs.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup::with_owner()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the hand-over", |harness| !harness.items().is_empty())
+        .await;
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.feed.push(
+        "inbox.deferred",
+        None,
+        serde_json::json!({
+            "item_ids": [item],
+            "not_before": "2000-01-01T00:00:00Z",
+            "error": quota_error(),
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.channel.sent().is_empty(),
+        "{:?}",
+        harness.channel.sent()
+    );
 }
 
 #[tokio::test]

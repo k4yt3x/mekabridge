@@ -111,19 +111,25 @@ async fn serve_stdio(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let server = BridgeMcpServer::new(sink, surface).closing_with(shutdown.clone());
-    let running = server.serve(stdio()).await.map_err(|error| {
+    // Under the shutdown token from the start rather than raced against it once running: a client
+    // that has only run discovery leaves the service waiting on its first request, a wait nothing
+    // else would end. Run under the token, the service also stops itself on shutdown, and waiting
+    // for it lets a notification stream's final result go out first.
+    let started = tokio::select! {
+        started = server.serve_with_ct(stdio(), shutdown.child_token()) => started,
+        () = shutdown.cancelled() => {
+            tracing::info!("MCP server shutting down");
+            return Ok(());
+        }
+    };
+    let running = started.map_err(|error| {
         BridgeError::config(format!("failed to start the stdio MCP server: {error}"))
     })?;
     tracing::info!("MCP server listening on stdio");
-    tokio::select! {
-        result = running.waiting() => {
-            if let Err(error) = result {
-                tracing::warn!("stdio MCP server stopped: {}", error);
-            }
-        }
-        () = shutdown.cancelled() => {
-            tracing::info!("MCP server shutting down");
-        }
+    match running.waiting().await {
+        Ok(_) if shutdown.is_cancelled() => tracing::info!("MCP server shutting down"),
+        Ok(reason) => tracing::info!("stdio MCP server stopped: {:?}", reason),
+        Err(error) => tracing::warn!("stdio MCP server stopped: {}", error),
     }
     Ok(())
 }

@@ -46,6 +46,10 @@ User=meka
 ExecStart=/usr/local/bin/meka serve
 Restart=always
 RestartSec=5s
+MemoryMax=75%
+MemorySwapMax=0
+OOMPolicy=continue
+OOMScoreAdjust=-900
 
 [Install]
 WantedBy=multi-user.target
@@ -53,11 +57,13 @@ WantedBy=multi-user.target
 
 `Restart=always` rather than `on-failure`, because `on-failure` does not cover every way a process can stop. systemd counts an exit on SIGHUP, SIGINT, SIGTERM or SIGPIPE as a success, so a daemon killed by one of those is left dead with `Result=success` and nothing in the journal to say the chat went quiet. `always` still honours `systemctl stop`, which is the only stop an operator asked for.
 
+The four memory lines are meka's own advice for running it under systemd. meka runs every command it starts at the highest `oom_score_adj`, so when one takes every byte there is, the kernel kills that command; `OOMPolicy=continue` keeps the unit running when it does, where the default would stop meka too, and with it every conversation the bridge has open. `MemoryMax=75%` gives the unit a ceiling relative to the machine, and `OOMScoreAdjust=-900` ranks meka below everything else the host runs. See meka's own documentation on the shell tool for the details.
+
 `Requires=` plus `After=` means meka starts after the bridge and is stopped if the bridge is. meka does recover on its own from a bridge that was missing at boot, retrying in the background with backoff, so this is about avoiding the window rather than avoiding a permanent break: while the server is disconnected, `required = true` makes meka refuse turns rather than run them with no way to reply.
 
 The bridge recovers from the opposite order on its own too, and waits rather than failing: it cannot bind a session or open a feed until meka answers, so it retries both with backoff and starts handing messages over the moment it can. Messages that arrive meanwhile wait in the queue.
 
-Restarting the bridge alone is safe at any point, but meka's reconnect is lazy: it is driven by the next tool call that finds the transport closed, not by the restart.
+Restarting the bridge is safe at any point. With the units above, `systemctl restart mekabridge` restarts meka as well, since `Requires=` carries a restart to the units that depend on it, and that stops any turn meka is running. A bridge restarted on its own costs meka nothing: meka speaks MCP 2026-07-28 to it, which keeps no session, so the first tool call after the restart is answered like any other. What meka logs is its notification stream to the bridge ending and being opened again, with a warning if the bridge is still down when it first tries.
 
 ## Shutdown
 
@@ -104,7 +110,10 @@ That is what the restart policy is for. Both platforms now cover an outage of up
 | `meka did not accept a message (...); trying again` | The post did not get through. `retry_in` says how long it waits, doubling from 10s to 5m |
 | `giving up on a message meka never accepted` | An hour of posts, none of which got through. The message goes back among what the agent has not seen and both the chat and the owner are told |
 | `meka refused a message` | A refusal no wait can clear: a rejected token, a malformed request, a context overflow. Given up on at once, so this arrives seconds after the message rather than an hour later |
-| `meka gave up on a message` | meka spent its own hour on the item. Same outcome as the line above, decided on the other side |
+| `meka gave up on a message` | meka gave the item up: a turn on it failed in a way no retry changes, or its retries ran past meka's `[serve] inbox_retry_ceiling`. The line carries the error it was given up on. Same outcome as the line above, decided on the other side |
+| `a turn on this bridge's messages failed and meka will try again` | meka put the messages back after a turn failed in a way waiting can change: an outage, a spent quota, a required MCP server not yet up. `next_attempt` says when. The owner is told at once; the chats only if meka gives up |
+| `meka served a turn from a fallback profile` | The agent's own profile could not serve the turn and meka used one of its `fallbacks`. Logged and told to the owner once when it starts, not on every turn |
+| `turns run on the session's own profile again` | The fallback is over. The owner is told this too |
 | `a message did not reach the agent (...); it is offered again` | Its item was taken back unread, or the turn that read it produced nothing at all. It is handed over afresh under a new key |
 | `the turn ended after the agent had read this bridge's messages` | Not offered again, and the messages are marked delivered. meka only retries an upstream failure while nothing has reached its frontend, so one that gets this far may have a sent message and a shell command behind it |
 | `the agent's session no longer fits the model's context window` | Not something a retry fixes, and the next message will fail the same way. The one failure that is about the session rather than the message |
@@ -116,7 +125,7 @@ That is what the restart policy is for. Both platforms now cover an outage of up
 | `the session feed has a hole; asking what became of every hand-over still out` | Some events are gone, from a reconnect meka's replay no longer reached or a read that fell too far behind; `dropped` says how many when meka can count them. Every hand-over still out is asked about under its own key, so nothing is waiting on an outcome that has already passed |
 | `meka notice: checklist: N open items, continuing, nudge K of 3` | At info. The agent tried to end a turn with [checklist](./meka-integration.md#the-checklist) items open, and meka sent it back to them |
 | `meka notice: checklist: N items left open after K nudges` | At warn. meka stopped sending the agent back, so the items are still open, and the end of the next turn, whoever it answers, asks again |
-| `meka has had a message longer than an outcome can take; asking what became of it` | An outcome that arrived and could not be written down. meka gives up on an item within the hour, so anything older has an answer waiting; the bridge asks rather than leaving the message with meka |
+| `meka has had a message longer than an outcome can take; asking what became of it` | An outcome that arrived and could not be written down. meka gives an item it kept failing on up by the `retry_until` it answered the post with, so anything past that has an answer waiting, and the bridge asks rather than leaving the message with meka. An item meka never got to try is still waiting for a turn, and is asked about once a sweep until it gets one |
 | `meka had no record of a message it had accepted` | meka's store was replaced, `[meka].token` was rotated, which changes the scope of the key, or meka's `[session].turn_retention` deleted the item after the bridge missed its outcome for longer than that window. It is handed over afresh, and after a rotation or a deletion the agent may read it twice |
 | `skipping a feed frame this build cannot read` | One event this version does not understand. Skipped rather than reconnected over, since a reconnect would replay it and fail identically |
 | `logged in` | Which account a channel resolved to at startup, which is what every message it records is keyed on |
@@ -179,9 +188,13 @@ says which:
 
 - meka could not be reached for an hour from when the item was rendered. The posts are spaced 10s, 20s
   and so on up to 5m apart, so this arrives long after the message rather than straight away.
-- meka had the item and spent its own hour on it, then gave up. Same wait, decided on the other side.
-- The error was one no wait could fix, such as a rejected token or a context overflow. Given up on
-  immediately, so this one arrives seconds after the message.
+- meka had the item and kept failing to run a turn on it until its `[serve] inbox_retry_ceiling`, an
+  hour by default, then gave up. When a turn kept failing, the owner was told at the first failed
+  attempt, with the error and when meka would give up, so this is the second time they hear of it.
+  A session meka could not run at all, held by another process for the whole ceiling say, gives no
+  such warning.
+- The error was one no wait could fix, such as a rejected token or a context overflow, on either
+  side. Given up on immediately, so this one arrives seconds after the message.
 - The turn failed *after* the model had read the messages. Not handed over again, and the chat is
   told it may not have finished rather than that its message never arrived. A chat the agent had
   already answered is told nothing at all, since an apology would contradict what it just said.
@@ -196,7 +209,9 @@ since the same text names it. `mekabridge queue list` shows the rows as `failed`
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
 
-**Every message suddenly fails, in every chat at once.** Look for `the agent's session no longer fits the model's context window`. One permanent session carries every conversation, so a window it has outgrown refuses the next message too, and no number of attempts changes that. Shorten the conversation on meka's side, with `POST /v1/sessions/{id}/compact` or `/rewind` in its REPL. `mekabridge session reset --yes` also clears it, at the price of the agent's memory of every conversation; anything handed over is closed and put back among what the agent has not seen, so the new session meets it as a backlog.
+**The owner was told meka will try again, and the chats are quiet.** A turn on the waiting messages failed in a way that may pass: an upstream outage, a spent quota or subscription window, or a required MCP server that is not up. The notice carries the error, when meka tries next and when it gives up. For a spent quota nothing changes before the provider's reset; naming `fallbacks` on the agent's profile in meka's config lets another profile answer meanwhile, and the owner is told when turns move to it and when they come back. Fix nothing and meka gives up by the time the notice named, and the messages are reported undelivered then.
+
+**Every message suddenly fails, in every chat at once.** If the error names images, the session has an image in its history and was moved to a profile with `vision = false`, which meka refuses to send it to. Move it back to a profile that can see, or reset it. Otherwise look for `the agent's session no longer fits the model's context window`. One permanent session carries every conversation, so a window it has outgrown refuses the next message too, and no number of attempts changes that. Shorten the conversation on meka's side, with `POST /v1/sessions/{id}/compact` or `/rewind` in its REPL. `mekabridge session reset --yes` also clears it, at the price of the agent's memory of every conversation; anything handed over is closed and put back among what the agent has not seen, so the new session meets it as a backlog.
 
 **Messages are piling up and nothing is being handed over.** `mekabridge queue list` shows the hand-overs as well as the rows. A hand-over `waiting on meka` with a rising post count and a `last error` is meka being unreachable or refusing; one `with meka` that never settles means the feed is not open, which the log says with `could not open the session feed`. One waiting hand-over holds the queue behind it deliberately: nothing overtakes it, since whatever is refusing the first will refuse the second, and releasing the later one would hand the agent the second half of a morning before the first.
 

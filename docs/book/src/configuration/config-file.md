@@ -99,7 +99,7 @@ Two things follow from where the signal comes from. On a provider backend that d
 
 How often the indicator is renewed is not configurable: Telegram clears the status after about five seconds and Discord after ten, so the interval is fixed at four to look continuous on both.
 
-> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for an hour, and the bridge posts one it has not accepted on the same schedule, so the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
+> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for as long as its `[serve] inbox_retry_ceiling` allows, an hour by default, and the bridge posts one it has not accepted for an hour on the same schedule, so the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
 
 A message that could not be delivered produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
 
@@ -107,7 +107,9 @@ Both are rate limited to one message per conversation per fifteen minutes, and t
 
 A chat is told only where the agent had not already answered it. A turn that sent something and then died has left work half done, which is worth telling the owner about, but an apology in a chat the agent had just replied in would contradict what it said there.
 
-Those two are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the first. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
+`owner_conversation` hears two more things the chats never do. A turn meka is still retrying is reported at its first failed attempt, with the error, when meka tries next and when it gives up, so an outage reaches the owner before an hour of silence does; it is limited to one every fifteen minutes too, on a window of its own so it never holds back the failure notice that may follow. And turns served from one of the agent's profile `fallbacks` are reported when they move to the fallback and when they come back, at most once every fifteen minutes, since another model may be answering and another account paying.
+
+Those are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the chats' share. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
 
 `owner_conversation` names a chat, not a person, and startup can only check the shape of the id, never whether anything answers to it. Discord makes that gap sharp, because a user id and a channel id are both snowflakes: the wrong one is accepted here and then answered with `Unknown Channel` on every send, and nothing says so. Write `discord:@<user id>` to be reached by direct message and the bridge opens the channel itself. `mekabridge doctor` asks the platform whether the configured id resolves, which is the only way to settle it short of sending.
 
@@ -182,6 +184,8 @@ The default matches `attachment_retention` so a message and the picture attached
 | `format` | `text` | `text` or `json` |
 
 `RUST_LOG` overrides `level`, and `-v` / `-vv` override both.
+
+Where `level` lets `info` through for everything, as the default does, rmcp, the MCP library, is held at `warn` unless `level` names it. meka speaks a protocol to this bridge with no session to log once, so rmcp logs every request it serves as it starts and ends, three lines a tool call. Add `rmcp=info` to `level` to see them. A quieter `level` is left as it is, and `RUST_LOG` and `-vv` are not capped.
 
 ## `[[channels.telegram]]`
 

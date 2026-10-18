@@ -12,8 +12,9 @@
 pub mod render;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -74,6 +75,13 @@ const REPLY_EXCERPT_CHARS: usize = 160;
 /// The margin covers writing the empty response back over a slow link, not a retry.
 const POLL_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Most forum topic names held at once, across every chat.
+///
+/// Past it the lot is dropped rather than tracked for age: a name is relearned from the next
+/// message posted in its topic that replies to nothing, so losing one costs a message or two that
+/// name only their group.
+const TOPIC_NAMES_MAX: usize = 4096;
+
 /// Who the bot is, as far as deciding whether a message was aimed at it.
 ///
 /// Resolved once at startup rather than per message. Telegram identifies a bot in message text by
@@ -100,6 +108,12 @@ pub struct TelegramChannel {
     poll_timeout: std::time::Duration,
     /// Filled by [`Channel::run`] before the first update is read.
     identity: tokio::sync::OnceCell<BotIdentity>,
+    /// Forum topic names by chat id and topic id, as [`TelegramChannel::learn_topic_name`] found
+    /// them.
+    ///
+    /// Kept because the Bot API has no call that names a topic by its id. In memory only: after a
+    /// restart a topic goes unnamed until it is named again.
+    topic_names: Mutex<HashMap<(i64, i32), String>>,
 }
 
 impl TelegramChannel {
@@ -125,6 +139,7 @@ impl TelegramChannel {
             parse_mode: config.parse_mode,
             poll_timeout: config.poll_timeout,
             identity: tokio::sync::OnceCell::new(),
+            topic_names: Mutex::new(HashMap::new()),
         })
     }
 
@@ -153,8 +168,7 @@ impl TelegramChannel {
         };
 
         // Replying to something the agent said is addressing it, and needs no mention.
-        if message
-            .reply_to_message()
+        if replied_to(message)
             .and_then(|replied| replied.from.as_ref())
             .is_some_and(|user| user.id == me.id)
         {
@@ -206,6 +220,66 @@ impl TelegramChannel {
             }
         }
         false
+    }
+
+    /// Remember the name of the forum topic a message belongs to, from whichever part of it carries
+    /// one.
+    ///
+    /// Three places do: the service message that creates a topic, the one that renames it, and
+    /// [`topic_root`] on every message posted in it that replies to nothing. The last is what names
+    /// a topic again after a restart without waiting for anybody to rename it, but it is the
+    /// creation message, and so carries the name the topic was created with. It only fills a gap:
+    /// letting it overwrite would undo every rename at the next message.
+    fn learn_topic_name(&self, message: &Message) {
+        if let Some(created) = message.forum_topic_created() {
+            // A topic's id is the id of the message that created it.
+            self.remember_topic(message.chat.id, ThreadId(message.id), &created.name, true);
+            return;
+        }
+        let Some(thread) = topic_of(message) else {
+            return;
+        };
+        if let Some(name) = message
+            .forum_topic_edited()
+            .and_then(|edited| edited.name.as_deref())
+        {
+            self.remember_topic(message.chat.id, thread, name, true);
+        } else if let Some(created) = topic_root(message).and_then(Message::forum_topic_created) {
+            self.remember_topic(message.chat.id, thread, &created.name, false);
+        }
+    }
+
+    /// Record a topic's name; `current` is whether it is the topic's name now rather than the one
+    /// it was created with, which may since have changed.
+    fn remember_topic(&self, chat: ChatId, thread: ThreadId, name: &str, current: bool) {
+        let mut names = self
+            .topic_names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (chat.0, thread.0.0);
+        if !current && names.contains_key(&key) {
+            return;
+        }
+        if names.len() >= TOPIC_NAMES_MAX && !names.contains_key(&key) {
+            names.clear();
+        }
+        names.insert(key, name.to_string());
+    }
+
+    /// A chat's title, followed by its forum topic's name where the conversation is a topic whose
+    /// name is known: `Deploy Crew › Releases`, the same outermost-first path Discord gets.
+    fn locate(&self, chat: ChatId, thread: Option<ThreadId>, title: &str) -> String {
+        let topic = thread.and_then(|thread| {
+            self.topic_names
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&(chat.0, thread.0.0))
+                .cloned()
+        });
+        match topic {
+            Some(topic) => format!("{title} \u{203a} {topic}"),
+            None => title.to_string(),
+        }
     }
 
     /// Whether a message may reach the agent, and on what basis.
@@ -497,11 +571,14 @@ impl TelegramChannel {
             return None;
         };
 
-        let thread = message
-            .thread_id
-            .filter(|_| message.is_topic_message)
-            .map(|thread| thread.0.0.to_string());
-        let conversation = ConversationId::new(&self.id, &chat_id.0.to_string(), thread.as_deref());
+        // Before the service messages are dropped below, since two of them carry nothing else.
+        self.learn_topic_name(message);
+        let thread = topic_of(message);
+        let conversation = ConversationId::new(
+            &self.id,
+            &chat_id.0.to_string(),
+            thread.map(|thread| thread.0.0.to_string()).as_deref(),
+        );
 
         let chat_kind = if message.chat.is_private() {
             ChatKind::Direct
@@ -533,7 +610,7 @@ impl TelegramChannel {
             on_behalf_of_chat,
         };
 
-        let reply_to = message.reply_to_message().map(|replied| ReplyContext {
+        let reply_to = replied_to(message).map(|replied| ReplyContext {
             message_id: replied.id.0.to_string(),
             sender_name: replied.from.as_ref().map(display_name),
             excerpt: replied
@@ -560,7 +637,13 @@ impl TelegramChannel {
             conversation,
             message_id: message.id.0.to_string(),
             chat_kind,
-            chat_title: message.chat.title().map(str::to_string),
+            chat_title: message
+                .chat
+                .title()
+                .map(|title| self.locate(chat_id, thread, title)),
+            // A topic's group is no parent to send to: its bare id posts in General.
+            parent: None,
+            server: None,
             sender,
             admission,
             sender_allowlisted,
@@ -1295,7 +1378,7 @@ impl Channel for TelegramChannel {
         &self,
         conversation: &ConversationId,
     ) -> Result<ConversationInfo, ChannelError> {
-        let (chat, _thread) = self.target(conversation)?;
+        let (chat, thread) = self.target(conversation)?;
         let info = self
             .bot
             .get_chat(Recipient::Id(chat))
@@ -1317,7 +1400,7 @@ impl Channel for TelegramChannel {
             // A private chat has no title, and is named by whoever is on the other end.
             title: info
                 .title()
-                .map(str::to_string)
+                .map(|title| self.locate(chat, thread, title))
                 .or_else(|| info.first_name().map(str::to_string))
                 .or_else(|| info.username().map(|username| format!("@{username}"))),
         })
@@ -1585,6 +1668,35 @@ impl Shape {
             duration_secs: Some(duration_secs),
         }
     }
+}
+
+/// The forum topic a message was posted in, or `None` outside one.
+///
+/// `message_thread_id` alone is not enough: a discussion group linked to a channel threads its
+/// comments under the post they answer, and those are no topic. General, the topic every forum
+/// starts with, has no id on its messages either, so it reads as the group itself.
+fn topic_of(message: &Message) -> Option<ThreadId> {
+    message.thread_id.filter(|_| message.is_topic_message)
+}
+
+/// The topic's creation message, where Telegram filled it in as the message replied to.
+///
+/// Every message posted in a forum topic without replying to anything carries the message that
+/// created the topic in `reply_to_message`. Nobody wrote that reply, but it names the topic.
+fn topic_root(message: &Message) -> Option<&Message> {
+    let thread = topic_of(message)?;
+    message
+        .reply_to_message()
+        .filter(|replied| replied.id == thread.0)
+}
+
+/// What a message replies to, leaving out the reply to its topic's creation message.
+///
+/// Taken at face value that one made every message in a topic read as a reply to whoever opened
+/// it, and as addressed to the bot in a topic the bot opened.
+fn replied_to(message: &Message) -> Option<&Message> {
+    let replied = message.reply_to_message()?;
+    topic_root(message).is_none().then_some(replied)
 }
 
 fn display_name(user: &teloxide::types::User) -> String {
@@ -2328,6 +2440,185 @@ mod tests {
             base_map.insert(key.clone(), value.clone());
         }
         base
+    }
+
+    /// A message in forum topic 77 of the "Ops" group, from Alice unless `extra` says otherwise.
+    fn topic_message(extra: serde_json::Value) -> serde_json::Value {
+        let mut message = group_message(serde_json::json!({
+            "message_thread_id": 77,
+            "is_topic_message": true,
+        }));
+        let (Some(base_map), Some(extra_map)) = (message.as_object_mut(), extra.as_object()) else {
+            panic!("both must be objects");
+        };
+        for (key, value) in extra_map {
+            base_map.insert(key.clone(), value.clone());
+        }
+        message
+    }
+
+    /// The service message that opened topic 77, which the bot itself did here.
+    fn topic_77_opened_by_the_bot() -> serde_json::Value {
+        topic_message(serde_json::json!({
+            "message_id": 77,
+            "from": {"id": 4242, "is_bot": true, "first_name": "Mica", "username": "mekabot"},
+            "forum_topic_created": {"name": "Releases", "icon_color": 7_322_096},
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_forum_topic_is_named_and_its_opening_is_not_taken_for_a_reply() {
+        // Telegram points every message in a topic that replies to nothing at the message that
+        // opened the topic. That is where the topic's name comes from, and it is not a reply.
+        let channel = identified();
+        let message = inbound(
+            channel
+                .to_event(&wire_message(topic_message(serde_json::json!({
+                    "message_id": 4471,
+                    "reply_to_message": topic_77_opened_by_the_bot(),
+                    "text": "did 2.4 ship?",
+                }))))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(message.conversation.as_str(), "telegram:-1001234:77");
+        assert_eq!(message.chat_title.as_deref(), Some("Ops \u{203a} Releases"));
+        assert!(message.reply_to.is_none(), "{:?}", message.reply_to);
+        // The bot opened this topic, which must not make everything said in it a reply to the bot.
+        assert!(!message.addressed);
+        // A topic's group is not where a reply to the topic goes.
+        assert!(message.parent.is_none());
+
+        // A real reply in the same topic keeps its reply, and the name learned above.
+        let reply = inbound(
+            channel
+                .to_event(&wire_message(topic_message(serde_json::json!({
+                    "message_id": 4472,
+                    "reply_to_message": topic_message(serde_json::json!({
+                        "message_id": 4471,
+                        "text": "did 2.4 ship?",
+                    })),
+                    "text": "yes, this morning",
+                }))))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(reply.chat_title.as_deref(), Some("Ops \u{203a} Releases"));
+        assert_eq!(
+            reply.reply_to.map(|replied| replied.message_id).as_deref(),
+            Some("4471")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_topic_is_named_by_its_opening_and_renamed_by_its_edit() {
+        let channel = identified();
+        // Both are service messages, which carry nothing for the agent; they only teach the name.
+        assert!(
+            channel
+                .to_event(&wire_message(topic_77_opened_by_the_bot()))
+                .await
+                .is_none()
+        );
+        let a_reply_in_the_topic = |id: i32| {
+            topic_message(serde_json::json!({
+                "message_id": id,
+                "reply_to_message": topic_message(serde_json::json!({
+                    "message_id": 4400,
+                    "text": "earlier",
+                })),
+                "text": "and now",
+            }))
+        };
+        let named = inbound(
+            channel
+                .to_event(&wire_message(a_reply_in_the_topic(4471)))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(named.chat_title.as_deref(), Some("Ops \u{203a} Releases"));
+
+        assert!(
+            channel
+                .to_event(&wire_message(topic_message(serde_json::json!({
+                    "message_id": 4480,
+                    "forum_topic_edited": {"name": "Shipping"},
+                }))))
+                .await
+                .is_none()
+        );
+        let renamed = inbound(
+            channel
+                .to_event(&wire_message(a_reply_in_the_topic(4481)))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(renamed.chat_title.as_deref(), Some("Ops \u{203a} Shipping"));
+
+        // The next message that replies to nothing carries the topic's creation message, which
+        // still says "Releases". That is the name the topic was created with, not its name now.
+        let after = inbound(
+            channel
+                .to_event(&wire_message(topic_message(serde_json::json!({
+                    "message_id": 4482,
+                    "reply_to_message": topic_77_opened_by_the_bot(),
+                    "text": "still here",
+                }))))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(after.chat_title.as_deref(), Some("Ops \u{203a} Shipping"));
+    }
+
+    #[tokio::test]
+    async fn a_topic_whose_name_was_never_seen_is_named_by_its_group_alone() {
+        // After a restart, until a message names it again. Guessing would be worse than the
+        // conversation id, which still says which topic this is.
+        let channel = identified();
+        let message = inbound(
+            channel
+                .to_event(&wire_message(topic_message(serde_json::json!({
+                    "message_id": 4471,
+                    "reply_to_message": topic_message(serde_json::json!({
+                        "message_id": 4400,
+                        "text": "earlier",
+                    })),
+                    "text": "and now",
+                }))))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(message.conversation.as_str(), "telegram:-1001234:77");
+        assert_eq!(message.chat_title.as_deref(), Some("Ops"));
+    }
+
+    #[tokio::test]
+    async fn a_comment_thread_is_no_topic_and_its_reply_stands() {
+        // A discussion group threads comments under the channel post they answer, with a thread id
+        // and no topic. That reply is real: it is the post being commented on.
+        let channel = identified();
+        let message = inbound(
+            channel
+                .to_event(&wire_message(group_message(serde_json::json!({
+                    "message_id": 4471,
+                    "message_thread_id": 300,
+                    "reply_to_message": group_message(serde_json::json!({
+                        "message_id": 300,
+                        "text": "release notes for 2.4",
+                    })),
+                    "text": "nice",
+                }))))
+                .await
+                .expect("event"),
+        );
+        assert_eq!(message.conversation.as_str(), "telegram:-1001234");
+        assert_eq!(
+            message
+                .reply_to
+                .map(|replied| replied.message_id)
+                .as_deref(),
+            Some("300")
+        );
     }
 
     #[tokio::test]

@@ -544,6 +544,31 @@ pub fn exit_quietly_on_broken_pipe() {
     }
 }
 
+/// Hold rmcp at `warn` where the directive would let its `info` through.
+///
+/// meka 0.79 speaks MCP 2026-07-28 to this bridge, which has no session, so rmcp serves every
+/// request on its own and logs each at `info` as it starts and ends: three lines a tool call, which
+/// buried everything else at the default level. Only a directive whose catch-all level is `info`
+/// or more verbose is touched, so a quieter one stays exactly as quiet, and one that names rmcp,
+/// `rmcp=info` or `rmcp::service=debug` say, is the operator's to keep. `RUST_LOG` and `-vv` are
+/// left as they are.
+fn quiet_rmcp(directive: String) -> String {
+    let names_rmcp = directive.split(',').map(str::trim).any(|part| {
+        part.strip_prefix("rmcp")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['=', ':', '[']))
+    });
+    let lets_info_through = directive.split(',').map(str::trim).any(|part| {
+        ["info", "debug", "trace"]
+            .iter()
+            .any(|level| part.eq_ignore_ascii_case(level))
+    });
+    if names_rmcp || !lets_info_through {
+        directive
+    } else {
+        format!("{directive},rmcp=warn")
+    }
+}
+
 /// Build the tracing subscriber.
 ///
 /// Precedence is `RUST_LOG`, then `-v` repetitions, then `[log].level`. Logging is initialised
@@ -553,8 +578,8 @@ fn init_logging(config: &Config, verbose: u8, format_override: Option<LogFormatA
         Ok(filter) => filter,
         Err(_) => {
             let directive = match verbose {
-                0 => config.log.level.clone(),
-                1 => "mekabridge=debug,info".to_string(),
+                0 => quiet_rmcp(config.log.level.clone()),
+                1 => quiet_rmcp("mekabridge=debug,info".to_string()),
                 _ => "mekabridge=trace,debug".to_string(),
             };
             EnvFilter::new(directive)
@@ -579,6 +604,33 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn rmcp_is_held_at_warn_only_where_its_info_would_get_through() {
+        assert_eq!(quiet_rmcp("info".to_string()), "info,rmcp=warn");
+        assert_eq!(
+            quiet_rmcp("mekabridge=debug,info".to_string()),
+            "mekabridge=debug,info,rmcp=warn"
+        );
+        assert_eq!(quiet_rmcp("DEBUG".to_string()), "DEBUG,rmcp=warn");
+        // An operator who asked for it gets it, at whatever level they named.
+        assert_eq!(quiet_rmcp("info,rmcp=debug".to_string()), "info,rmcp=debug");
+        assert_eq!(
+            quiet_rmcp("info, rmcp::service=info".to_string()),
+            "info, rmcp::service=info"
+        );
+        // Another crate whose name merely starts the same way is not rmcp.
+        assert_eq!(
+            quiet_rmcp("info,rmcp_macros=debug".to_string()),
+            "info,rmcp_macros=debug,rmcp=warn"
+        );
+        // A quieter directive is never made louder: appending `rmcp=warn` to `error` would show
+        // rmcp's warnings, to `off` would break the silence asked for, and to an empty directive
+        // would leave rmcp the only thing logged at all.
+        for quiet in ["error", "warn", "off", "", "mekabridge=debug,teloxide=warn"] {
+            assert_eq!(quiet_rmcp(quiet.to_string()), quiet, "{quiet:?}");
+        }
     }
 
     #[test]

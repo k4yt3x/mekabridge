@@ -59,6 +59,8 @@ A sender who is another bot is marked `[bot]`. An anonymous group admin, who pos
 
 Group messages work the same as direct ones. Forum topics get their own conversation id with a third segment (`telegram:-1001234567890:77`), so the agent replies into the right topic rather than the group's General.
 
+The `chat` line names a topic after its group, `group "Deploy Crew › Releases"`, once the bridge has seen the topic's name. Telegram has no way to look one up: the name comes only with the message that opened or renamed the topic, and with every message in it that replies to nothing, which carries the name the topic was opened with. So after a restart a topic reads as its group alone until the next such message, and one renamed since it was opened reads by its first name until it is renamed again. General has no id of its own and reads as the group.
+
 **Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `history_read` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `mekabridge doctor` warns while privacy mode is on.
 
 Being added to or removed from a group is logged. If the group is not allowlisted the log line is a warning, because from the outside that state looks identical to a broken bot.

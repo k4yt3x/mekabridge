@@ -235,6 +235,14 @@ impl Item<'_> {
             (_, false) => "; sender not individually allowlisted",
         });
         let _ = writeln!(out, "chat: {}", format_chat(message));
+        // Ids only: the names they belong to are on the `chat:` line, which is also the title the
+        // conversation is listed under, so it has to read whole on its own.
+        if let Some(parent) = &message.parent {
+            let _ = writeln!(out, "parent: {parent}");
+        }
+        if let Some(server) = &message.server {
+            let _ = writeln!(out, "server: {}", one_line(server));
+        }
         let _ = writeln!(out, "at: {}", message.timestamp.to_rfc3339());
 
         // Stated on every message from a chat that is not one-to-one, including the ones
@@ -591,6 +599,8 @@ mod tests {
             message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
+            parent: None,
+            server: None,
             sender: Sender {
                 id: "123456789".to_string(),
                 display_name: "Alice".to_string(),
@@ -1440,6 +1450,31 @@ mod tests {
             rendered.contains("chat: group \"Deploy Crew\""),
             "got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn a_thread_gives_the_ids_of_its_channel_and_server_under_the_path() {
+        // The names are on the `chat:` line; what the agent cannot get anywhere else is the id it
+        // would pass to post in the channel the thread came out of.
+        let mut event = message("rolled back");
+        event.chat_kind = ChatKind::Group;
+        event.chat_title =
+            Some("Acme Corp \u{203a} #deploys \u{203a} rollback tonight".to_string());
+        event.parent = Some(ConversationId::parse("discord:1183429847290374144").expect("valid"));
+        event.server = Some("900123456789012345".to_string());
+        let rendered = render(event);
+        assert!(
+            rendered.contains(
+                "chat: group \"Acme Corp \u{203a} #deploys \u{203a} rollback tonight\"\nparent: \
+                 discord:1183429847290374144\nserver: 900123456789012345\nat: "
+            ),
+            "got:\n{rendered}"
+        );
+
+        // Neither line appears where there is nothing to say.
+        let rendered = render(message("hi"));
+        assert!(!rendered.contains("parent:"), "got:\n{rendered}");
+        assert!(!rendered.contains("server:"), "got:\n{rendered}");
     }
 
     #[test]

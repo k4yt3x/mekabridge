@@ -58,6 +58,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+rmcp = { version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
 rmcp2 = { package = "rmcp", version = "2.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

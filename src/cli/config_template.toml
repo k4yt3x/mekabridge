@@ -23,9 +23,11 @@ token = "${MEKA_BRIDGE_TOKEN}"
 permission = "read"
 
 [bridge]
-# Where operator notices go when a message cannot be delivered to the agent at all: which chats lost
-# something, how many attempts were made, and the error itself. Optional, but without it the only
-# detailed record is the logs.
+# Where operator notices go: when a message cannot be delivered to the agent at all, which chats
+# lost something, how many attempts were made, and the error itself; when meka is still retrying a
+# turn that failed, so an outage is heard of before it is given up on; and when meka moves the
+# agent's turns to a fallback profile and back. Optional, but without it the only record is the
+# logs.
 #
 # This wants a chat id, not a person's account id. The two look identical on Discord, where a user
 # id in this position is accepted here and then rejected by Discord on every send. To be reached by

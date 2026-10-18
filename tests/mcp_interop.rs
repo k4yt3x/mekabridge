@@ -43,6 +43,8 @@ const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
 #[derive(Default)]
 struct RecordingSink {
     sent: Mutex<Vec<(String, String)>>,
+    /// The meka session each send named, in the order they arrived.
+    sessions: Mutex<Vec<Option<String>>>,
     reactions: Mutex<Vec<(String, Option<String>)>>,
     edits: Mutex<Vec<(String, String, String)>>,
     deletes: Mutex<Vec<String>>,
@@ -80,8 +82,12 @@ impl OutboundSink for RecordingSink {
         conversation: &str,
         markdown: &str,
         _options: SendOptions,
-        _session: Option<&str>,
+        session: Option<&str>,
     ) -> Result<Vec<String>, SinkError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(session.map(str::to_string));
         if conversation != "telegram:1" {
             return Err(SinkError::UnknownConversation(conversation.to_string()));
         }
@@ -448,6 +454,8 @@ struct Harness {
     url: String,
     shutdown: CancellationToken,
     sink: Arc<RecordingSink>,
+    /// The server itself, so a test can see it stop.
+    server: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Harness {
@@ -477,7 +485,7 @@ async fn start_with(surface: ToolSurface) -> Harness {
     let local_addr = server.local_addr().expect("http server has an address");
     let shutdown = CancellationToken::new();
 
-    tokio::spawn({
+    let server = tokio::spawn({
         let sink = Arc::clone(&sink);
         let shutdown = shutdown.clone();
         async move {
@@ -492,6 +500,7 @@ async fn start_with(surface: ToolSurface) -> Harness {
         url: format!("http://{local_addr}/mcp"),
         shutdown,
         sink,
+        server,
     }
 }
 
@@ -1323,4 +1332,108 @@ async fn bearer_token_gates_the_endpoint() {
     assert_eq!(health.status(), reqwest::StatusCode::OK);
 
     shutdown.cancel();
+}
+
+// The 2026-07-28 era.
+//
+// meka 0.79 opens every connect with `server/discover`, and since this server answers it, the two
+// speak 2026-07-28: no `initialize`, no session, every request carrying its own `_meta`. The tests
+// above drive the older era across a version gap; these drive the newer one, which is what meka
+// speaks to this bridge now. The client is this crate's own rmcp, so they make no claim about a
+// version gap, only about the era.
+
+async fn connect_2026(
+    harness: &Harness,
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt as _};
+    let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(harness.url.clone());
+    rmcp::model::ClientConfig::default()
+        .serve_with_lifecycle(transport, ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        })
+        .await
+        .expect("a 2026-07-28 client must complete discovery")
+}
+
+#[tokio::test]
+async fn a_2026_07_28_call_still_names_the_session_it_came_from() {
+    // Every message the agent sends is recorded with the meka session that asked, and the vision
+    // check reads the same field. In this era there is no session on the connection to fall back
+    // on, so `_meta` on each request is the only place it can arrive.
+    let harness = start().await;
+    let client = connect_2026(&harness).await;
+
+    let mut params = rmcp::model::CallToolRequestParams::new("message_send");
+    params.arguments = serde_json::json!({ "conversation": "telegram:1", "text": "hello" })
+        .as_object()
+        .cloned();
+    let mut meta = rmcp::model::RequestMetaObject::new();
+    meta.0.insert(
+        "meka/sessionId".to_string(),
+        serde_json::json!("a242cb60-68fc-417b-ae5b-b0f6fc4cb56f"),
+    );
+    params.meta = Some(meta);
+    let result = client
+        .call_tool(params)
+        .await
+        .expect("the call is answered");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(
+        *harness
+            .sink
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        [Some("a242cb60-68fc-417b-ae5b-b0f6fc4cb56f".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn the_notification_stream_is_acknowledged_empty_and_ends_with_the_server() {
+    // meka opens one `subscriptions/listen` per connection. Refused, rmcp logs a warning on the
+    // bridge for each; acknowledged with nothing in it, the stream idles. Idling must not hold up
+    // a shutdown, since the server waits for open requests to finish and this one never would on
+    // its own. And the end has to say it was meant: a stream cut off without its final result is
+    // one meka warns about as ending abruptly. The acknowledgment itself is empty whatever the
+    // bridge answers, since rmcp trims it to what the server advertises; the graceful end is what
+    // this asserts.
+    let mut harness = start().await;
+    let client = connect_2026(&harness).await;
+
+    let mut subscription = client
+        .listen(
+            rmcp::model::SubscriptionFilter::builder()
+                .tools_list_changed()
+                .prompts_list_changed()
+                .resources_list_changed()
+                .build(),
+        )
+        .await
+        .expect("the stream is acknowledged rather than refused");
+    assert_eq!(
+        *subscription.acknowledged(),
+        rmcp::model::SubscriptionFilter::default(),
+        "nothing here ever changes, so nothing is promised"
+    );
+
+    harness.shutdown.cancel();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), subscription.next())
+        .await
+        .expect("the stream ends with the server");
+    assert!(
+        matches!(ended, Ok(None)),
+        "nothing was ever promised: {ended:?}"
+    );
+    assert!(
+        matches!(
+            subscription.end(),
+            Some(rmcp::service::SubscriptionEnd::Graceful(_))
+        ),
+        "the stream must end with its final result: {:?}",
+        subscription.end()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), &mut harness.server)
+        .await
+        .expect("the server stops with a notification stream open")
+        .expect("the server task ends cleanly");
 }

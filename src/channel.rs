@@ -509,8 +509,22 @@ pub struct InboundMessage {
     /// that received it.
     pub message_id: String,
     pub chat_kind: ChatKind,
+    /// Where the chat is, written outermost first: `Acme Corp › #deploys › rollback tonight`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_title: Option<String>,
+    /// The room a thread hangs off, as a conversation the agent can send to.
+    ///
+    /// Set only where sending there reaches that room: a Discord thread's channel, but never a
+    /// forum, which takes no message of its own, and never a Telegram topic's group, whose bare id
+    /// lands in General.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ConversationId>,
+    /// The server the chat belongs to, by id, on a platform that has servers.
+    ///
+    /// The name is already in [`Self::chat_title`]; the id is what survives a rename and tells two
+    /// servers of the same name apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
     pub sender: Sender,
     /// Why this message was allowed through.
     pub admission: Admission,
@@ -1540,6 +1554,8 @@ mod tests {
             message_id: "42".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
+            parent: None,
+            server: None,
             sender: Sender {
                 id: "123".to_string(),
                 display_name: "Alice".to_string(),

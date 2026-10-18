@@ -141,6 +141,9 @@ enum TurnScript {
     Withdraw,
     /// meka gives up on the item after its retry ceiling.
     GiveUp,
+    /// A turn on the item fails before the model reads anything, in a way waiting can change, so
+    /// meka puts it back and says when it tries again.
+    Defer,
     /// A turn that writes a send call's arguments slowly, so the composing window has real
     /// duration on the wire. The tool it calls is [`MekaRecorder::compose_tool`].
     Compose,
@@ -179,6 +182,8 @@ struct Feed {
     /// Closes every live connection, which is what a dropped socket looks like from the reader's
     /// side. Notified rather than flagged, so a stream parked on the broadcast wakes for it.
     cut: Arc<Notify>,
+    /// The fallback profile serving turns, which every `turn.finished` names while it is set.
+    fallback: Mutex<Option<String>>,
 }
 
 impl Default for Feed {
@@ -190,6 +195,7 @@ impl Default for Feed {
             turns: AtomicU64::new(0),
             sender,
             cut: Arc::new(Notify::new()),
+            fallback: Mutex::new(None),
         }
     }
 }
@@ -260,6 +266,12 @@ struct MekaRecorder {
     by_key: Mutex<HashMap<String, String>>,
     /// Each item's state, which is what a replayed key reports.
     states: Mutex<HashMap<String, String>>,
+    /// The error each item meka gave up on was given up on with, which a replayed key reports as
+    /// its `last_error`. An item withdrawn without one was taken back unread instead.
+    given_up: Mutex<HashMap<String, serde_json::Value>>,
+    /// The `retry_until` every answer to a post carries, or none at all, which is how a row posted
+    /// before the bridge kept meka's deadline reads.
+    deadline: Mutex<Option<String>>,
     /// Posts to refuse before accepting anything.
     fail_first: Mutex<usize>,
     /// What those refusals look like, which is what decides what the bridge may do next.
@@ -362,12 +374,17 @@ impl MekaRecorder {
     }
 
     fn state_of(&self, item_id: &str) -> String {
-        self.states
+        match self
+            .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(item_id)
-            .cloned()
-            .unwrap_or_else(|| "pending".to_string())
+        {
+            // Put back to wait out its next attempt, which meka reports as waiting like any other.
+            Some(state) if state == "deferred" => "pending".to_string(),
+            Some(state) => state.clone(),
+            None => "pending".to_string(),
+        }
     }
 
     /// Note that `turn` read these items, which is what a batching assertion is really about.
@@ -570,17 +587,31 @@ async fn enqueue_item(
         .cloned();
     if let Some(item_id) = replayed {
         let state = recorder.state_of(&item_id);
-        return (
-            axum::http::StatusCode::ACCEPTED,
-            axum::Json(serde_json::json!({
-                "item_id": item_id,
-                "session_id": "s",
-                "class": "steer",
-                "state": state,
-                "replayed": true,
-            })),
-        )
-            .into_response();
+        let mut answer = serde_json::json!({
+            "item_id": item_id,
+            "session_id": "s",
+            "class": "steer",
+            "state": state,
+            "replayed": true,
+        });
+        if let Some(deadline) = recorder
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            answer["retry_until"] = serde_json::json!(deadline);
+        }
+        if let Some(error) = recorder
+            .given_up
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&item_id)
+        {
+            answer["failure"] = serde_json::json!(GIVE_UP_REASON);
+            answer["last_error"] = error.clone();
+        }
+        return (axum::http::StatusCode::ACCEPTED, axum::Json(answer)).into_response();
     }
 
     let item_id = format!("item-{}", uuid::Uuid::new_v4());
@@ -608,17 +639,52 @@ async fn enqueue_item(
     {
         run_turn(Arc::clone(&recorder)).await;
     }
-    (
-        axum::http::StatusCode::ACCEPTED,
-        axum::Json(serde_json::json!({
-            "item_id": item_id,
-            "session_id": "s",
-            "class": "steer",
-            "state": "pending",
-            "replayed": false,
-        })),
-    )
-        .into_response()
+    let mut answer = serde_json::json!({
+        "item_id": item_id,
+        "session_id": "s",
+        "class": "steer",
+        "state": "pending",
+        "replayed": false,
+    });
+    if let Some(deadline) = recorder
+        .deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        answer["retry_until"] = serde_json::json!(deadline);
+    }
+    (axum::http::StatusCode::ACCEPTED, axum::Json(answer)).into_response()
+}
+
+/// A `retry_until` for a test that needs one far off.
+const RETRY_UNTIL: &str = "2099-01-01T00:00:00Z";
+
+/// meka's sentence for an item it ran out of time on.
+const GIVE_UP_REASON: &str = "no turn could deliver it in 7 attempt(s) over the last hour";
+
+/// An error as meka keeps it on an item it gave up on, which is what a replayed key answers with:
+/// the Problem Detail's `type`, `title`, `status` and `detail`, without the upstream's own text the
+/// feed's copy carries.
+fn as_recorded(error: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": error["type"],
+        "title": error["title"],
+        "status": error["status"],
+        "detail": error["detail"],
+    })
+}
+
+/// What the stub's turns fail with when the provider is out of credit.
+fn quota_error() -> serde_json::Value {
+    serde_json::json!({
+        "type": "https://meka.run/errors/provider-exhausted",
+        "title": "Provider quota exhausted",
+        "status": 502,
+        "detail": "the provider refused for quota or billing",
+        "provider_response": "402 insufficient credits",
+        "retry_after": 600,
+    })
 }
 
 /// meka's inbox drain: the turn everything waiting is read into, and what the feed says about it.
@@ -648,15 +714,54 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
         }
         TurnScript::GiveUp => {
             for item_id in recorder.take_waiting("withdrawn") {
+                recorder
+                    .given_up
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(item_id.clone(), as_recorded(&quota_error()));
                 feed.push(
                     "inbox.failed",
                     None,
                     serde_json::json!({
                         "item_id": item_id,
-                        "reason": "no turn could deliver it in 7 attempt(s) over the last hour",
+                        "reason": GIVE_UP_REASON,
+                        "error": quota_error(),
                     }),
                 );
             }
+            return;
+        }
+        TurnScript::Defer => {
+            // The items are put back for an attempt that never comes in a test, and the turn that
+            // opened on them ends with nothing from the model.
+            let waiting = recorder.take_waiting("deferred");
+            if waiting.is_empty() {
+                return;
+            }
+            let turn = feed.next_turn();
+            feed.push(
+                "turn.started",
+                Some(&turn),
+                serde_json::json!({
+                    "started_at": Utc::now().to_rfc3339(),
+                    "source": "inbox",
+                    "item_ids": waiting.clone(),
+                }),
+            );
+            feed.push(
+                "turn.failed",
+                Some(&turn),
+                serde_json::json!({ "error": quota_error(), "message_withdrawn": true }),
+            );
+            feed.push(
+                "inbox.deferred",
+                None,
+                serde_json::json!({
+                    "item_ids": waiting,
+                    "not_before": "2098-12-31T23:10:00Z",
+                    "error": quota_error(),
+                }),
+            );
             return;
         }
         _ => {}
@@ -886,21 +991,29 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
             tokio::time::sleep(window).await;
             finish(&feed, &turn, "end_turn");
         }
-        TurnScript::Hold | TurnScript::Withdraw | TurnScript::GiveUp => unreachable!(),
+        TurnScript::Hold | TurnScript::Withdraw | TurnScript::GiveUp | TurnScript::Defer => {
+            unreachable!()
+        }
     }
     recorder.set(&recorder.phase, 3);
     recorder.set(&recorder.in_turn, None);
 }
 
 fn finish(feed: &Feed, turn: &str, stop_reason: &str) {
-    feed.push(
-        "turn.finished",
-        Some(turn),
-        serde_json::json!({
-            "stop_reason": stop_reason,
-            "usage": { "input_tokens": 1, "output_tokens": 1 },
-        }),
-    );
+    let mut data = serde_json::json!({
+        "stop_reason": stop_reason,
+        "usage": { "input_tokens": 1, "output_tokens": 1 },
+    });
+    // Named only when a fallback served the turn, as meka does.
+    if let Some(profile) = feed
+        .fallback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        data["profile"] = serde_json::json!(profile);
+    }
+    feed.push("turn.finished", Some(turn), data);
 }
 
 /// `GET /v1/sessions/{id}/stream`: the session feed, which does not end with a turn.
@@ -1692,6 +1805,8 @@ fn message(text: &str, message_id: &str) -> InboundEvent {
         message_id: message_id.to_string(),
         chat_kind: ChatKind::Direct,
         chat_title: None,
+        parent: None,
+        server: None,
         sender: Sender {
             id: "1".to_string(),
             display_name: "Alice".to_string(),
@@ -2156,6 +2271,7 @@ fn spawn_session(
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             pending_session: Arc::default(),
             notices: inbound::NoticeLog::default(),
+            serving: inbound::ServingProfile::default(),
             session: session_sender,
             position,
         };
@@ -2587,6 +2703,13 @@ async fn the_owner_hears_what_the_chat_is_spared() {
         "the owner needs meka's own reason: {:?}",
         owner.1
     );
+    // And the cause behind it, which the reason alone does not name: seven attempts read the same
+    // whether the quota ran out or a credential was revoked.
+    assert!(
+        owner.1.contains("402 insufficient credits"),
+        "the owner needs the error meka gave it up on: {:?}",
+        owner.1
+    );
     assert!(
         owner.1.contains("mock:1"),
         "and which conversation lost something: {:?}",
@@ -2596,6 +2719,307 @@ async fn the_owner_hears_what_the_chat_is_spared() {
         sent.iter()
             .any(|(conversation, _)| conversation == "mock:1"),
         "the chat itself must still be told, vaguely"
+    );
+}
+
+#[tokio::test]
+async fn the_owner_hears_of_a_failing_turn_while_meka_is_still_retrying_it() {
+    // meka keeps trying a turn an outage or a spent quota fails, for as long as its retry ceiling
+    // allows. Told only when it gives up, an owner learned of an outage an hour after the chats
+    // went quiet, which from where they sit looked like nothing at all.
+    let harness = Harness::start_script_with(TurnScript::Defer, Setup::with_owner()).await;
+    *harness
+        .recorder
+        .deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RETRY_UNTIL.to_string());
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+
+    harness
+        .wait_for("the owner to be told", |harness| {
+            harness
+                .channel
+                .sent()
+                .iter()
+                .any(|(conversation, _)| conversation == "mock:99")
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let sent = harness.channel.sent();
+    let owner = &sent
+        .iter()
+        .find(|(conversation, _)| conversation == "mock:99")
+        .expect("told")
+        .1;
+    for expected in [
+        // When meka tries next, and when it stops, both in meka's own words.
+        "try again at 2098-12-31 23:10:00 UTC",
+        "still failing by 2099-01-01 00:00:00 UTC",
+        // What is wrong, which is the part the owner can act on.
+        "402 insufficient credits",
+        // And the lever that would have carried the agent through it.
+        "fallbacks",
+        "mock:1",
+    ] {
+        assert!(owner.contains(expected), "missing {expected:?}: {owner:?}");
+    }
+    // The chat is not apologised to for a message that may yet get through.
+    assert!(
+        sent.iter()
+            .all(|(conversation, _)| conversation == "mock:99"),
+        "only the owner hears of a turn meka is still retrying: {sent:?}"
+    );
+    assert_eq!(
+        harness.store.queue_stats().await.expect("stats").failed,
+        0,
+        "nothing is given up on while meka still has it"
+    );
+}
+
+#[tokio::test]
+async fn a_give_up_after_a_deferral_still_reaches_the_owner() {
+    // meka gives an item up minutes after the last deferral it reports. Sharing one notice window,
+    // the deferral would have silenced the give-up, leaving the owner told "will try again" and
+    // never told that it stopped.
+    let harness = Harness::start_script_with(TurnScript::Defer, Setup::with_owner()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    let owner_notices = |harness: &Harness| -> Vec<String> {
+        harness
+            .channel
+            .sent()
+            .into_iter()
+            .filter(|(conversation, _)| conversation == "mock:99")
+            .map(|(_, text)| text)
+            .collect()
+    };
+    harness
+        .wait_for("the deferral notice", |harness| {
+            !owner_notices(harness).is_empty()
+        })
+        .await;
+
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.mark(&item, "withdrawn");
+    harness.recorder.feed.push(
+        "inbox.failed",
+        None,
+        serde_json::json!({ "item_id": item, "reason": GIVE_UP_REASON, "error": quota_error() }),
+    );
+    harness
+        .wait_for("the give-up notice", |harness| {
+            owner_notices(harness).len() >= 2
+        })
+        .await;
+    let notices = owner_notices(&harness);
+    assert!(notices[0].contains("will try again"), "{notices:?}");
+    assert!(notices[1].contains("could not deliver"), "{notices:?}");
+}
+
+#[tokio::test]
+async fn a_deferral_for_a_message_already_settled_is_not_reported() {
+    // A deferral replayed after a restart can name a message the reconnect has settled since.
+    // Reported, it would tell the owner about an outage that is over.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup::with_owner()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the hand-over", |harness| !harness.items().is_empty())
+        .await;
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.mark(&item, "delivered");
+    harness.recorder.feed.push(
+        "inbox.delivered",
+        Some("t1"),
+        serde_json::json!({ "item_ids": [item.clone()] }),
+    );
+    harness
+        .wait_for_queue("the delivery", |stats| stats.done == 1)
+        .await;
+    harness.recorder.feed.push(
+        "inbox.deferred",
+        None,
+        serde_json::json!({
+            "item_ids": [item],
+            "not_before": "2098-12-31T23:10:00Z",
+            "error": quota_error(),
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        harness.channel.sent().is_empty(),
+        "{:?}",
+        harness.channel.sent()
+    );
+}
+
+#[tokio::test]
+async fn a_message_meka_gave_up_on_unheard_meets_the_end_it_would_have_met_live() {
+    // meka gave the item up while the feed was down, so the `inbox.failed` saying so was missed.
+    // Asked about it on the reconnect, meka answers with the error it gave the item up on. Taken
+    // for an item withdrawn unread, the message used to be posted afresh into the same failure;
+    // it now fails the way the missed event would have failed it, and the owner hears why.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup::with_owner()).await;
+    harness
+        .sender
+        .send(message("hello", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the hand-over", |harness| !harness.items().is_empty())
+        .await;
+
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.mark(&item, "withdrawn");
+    harness
+        .recorder
+        .given_up
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(item, as_recorded(&quota_error()));
+    harness.recorder.feed.cut();
+
+    harness
+        .wait_for_queue("the reconnect to fail it", |stats| stats.failed == 1)
+        .await;
+    harness
+        .wait_for("the owner to be told", |harness| {
+            harness
+                .channel
+                .sent()
+                .iter()
+                .any(|(conversation, _)| conversation == "mock:99")
+        })
+        .await;
+    let sent = harness.channel.sent();
+    let owner = &sent
+        .iter()
+        .find(|(conversation, _)| conversation == "mock:99")
+        .expect("told")
+        .1;
+    // The error as meka recorded it on the item, which keeps its own sentence but not the
+    // provider's words: those ride the feed's `inbox.failed` alone.
+    assert!(
+        owner.contains("the provider refused for quota or billing"),
+        "{owner:?}"
+    );
+    assert_eq!(
+        harness.items().len(),
+        1,
+        "the message must not be handed over again into the same failure"
+    );
+}
+
+#[tokio::test]
+async fn the_owner_hears_when_turns_move_to_a_fallback_and_when_they_come_back() {
+    // A fallback answers with another model and may bill another account, and nobody in a chat is
+    // going to mention it. Told on every turn, though, an hour's outage is a hundred notices; it
+    // is one fact, said when it starts and when it ends.
+    let harness = Harness::start_script_with(TurnScript::Answer, Setup::with_owner()).await;
+    let owner_notices = |harness: &Harness| -> Vec<String> {
+        harness
+            .channel
+            .sent()
+            .into_iter()
+            .filter(|(conversation, _)| conversation == "mock:99")
+            .map(|(_, text)| text)
+            .collect()
+    };
+    *harness
+        .recorder
+        .feed
+        .fallback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("backup".to_string());
+
+    for (index, text) in ["one", "two"].into_iter().enumerate() {
+        harness
+            .sender
+            .send(message(text, &index.to_string()))
+            .await
+            .expect("queued");
+        harness
+            .wait_for_queue("the turn to finish", |stats| stats.done == index as u64 + 1)
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notices = owner_notices(&harness);
+    assert_eq!(
+        notices.len(),
+        1,
+        "two turns on the fallback are one move: {notices:?}"
+    );
+    assert!(
+        notices[0].contains("fallback profile \"backup\""),
+        "{notices:?}"
+    );
+
+    // Back again minutes later, which a provider that keeps failing and recovering does every few
+    // minutes. That is held for the notice window rather than said at once, and the unit tests
+    // cover what is said once it is out.
+    *harness
+        .recorder
+        .feed
+        .fallback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    harness
+        .sender
+        .send(message("three", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("the turn to finish", |stats| stats.done == 3)
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        owner_notices(&harness).len(),
+        1,
+        "{:?}",
+        owner_notices(&harness)
+    );
+    // And nothing reached the chats, which are not the ones to tell.
+    assert!(
+        harness
+            .channel
+            .sent()
+            .iter()
+            .all(|(conversation, _)| conversation == "mock:99")
     );
 }
 
@@ -7583,4 +8007,50 @@ async fn a_batch_meka_has_held_too_long_is_asked_about_without_a_reconnect() {
         0,
         "the rows were left in flight with nothing able to move them"
     );
+}
+
+#[tokio::test]
+async fn a_batch_past_the_deadline_meka_gave_for_it_is_asked_about() {
+    // meka's ceiling is its own setting, so the hour this bridge assumes is only a fallback. A row
+    // carries the deadline meka answered its post with, and past that deadline the outcome has been
+    // and gone whatever the bridge's own `hand_over_within` says, which is held at an hour here so
+    // the deadline is the only thing that can make the row due.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup {
+        hand_over_within: Duration::from_secs(60 * 60),
+        ..Setup::default()
+    })
+    .await;
+    *harness
+        .recorder
+        .deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some("2000-01-01T00:00:00Z".to_string());
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the hand-over", |harness| !harness.items().is_empty())
+        .await;
+    let item = harness
+        .recorder
+        .by_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .next()
+        .cloned()
+        .expect("one item");
+    harness.recorder.mark(&item, "delivered");
+
+    harness
+        .sender
+        .send(message_elsewhere("unrelated", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("the straggler to be settled", |stats| stats.done >= 1)
+        .await;
 }

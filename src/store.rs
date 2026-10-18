@@ -55,6 +55,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_010.sql"),
     include_str!("store/schema_011.sql"),
     include_str!("store/schema_012.sql"),
+    include_str!("store/schema_013.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -544,6 +545,8 @@ pub struct QueuedMessage {
     pub held_at: Option<DateTime<Utc>>,
     /// When meka accepted it.
     pub posted_at: Option<DateTime<Utc>>,
+    /// When meka stops retrying the item, as its answer to the post said.
+    pub retry_until: Option<DateTime<Utc>>,
 }
 
 impl QueuedMessage {
@@ -1138,6 +1141,11 @@ impl Store {
 
     /// Insert or refresh a conversation. `created_at` is preserved across updates so the address
     /// book keeps a stable notion of when a contact was first seen.
+    ///
+    /// A title is a path written outermost first, and one that stops a segment short of the stored
+    /// one comes from a message that knew less rather than from a rename: a Telegram topic whose
+    /// name the bridge has not learned since a restart is titled by its group alone. Keeping the
+    /// longer title stops every such message from shortening the topic's entry to its group's.
     pub async fn upsert_conversation(&self, record: ConversationRecord) -> Result<()> {
         self.connection
             .call(move |connection| {
@@ -1148,7 +1156,13 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(address) DO UPDATE SET
                          platform = excluded.platform,
-                         title = COALESCE(excluded.title, conversations.title),
+                         title = CASE
+                             WHEN excluded.title IS NULL THEN conversations.title
+                             WHEN substr(conversations.title, 1, length(excluded.title) + 3)
+                                  = excluded.title || ' \u{203a} '
+                                 THEN conversations.title
+                             ELSE excluded.title
+                         END,
                          kind = excluded.kind,
                          last_inbound_at = COALESCE(
                              excluded.last_inbound_at, conversations.last_inbound_at),
@@ -2131,18 +2145,21 @@ impl Store {
         session_id: Uuid,
         item_id: &str,
         at: DateTime<Utc>,
+        retry_until: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let session_id = session_id.to_string();
         let item_id = item_id.to_string();
         let at = to_rfc3339(at);
+        let retry_until = retry_until.map(to_rfc3339);
         self.connection
             .call(move |connection| {
                 connection.execute(
                     "UPDATE inbound_queue
                      SET state = 'posted', session_id = ?2, item_id = ?3, posted_at = ?4,
-                         posts = posts + 1, not_before = NULL, last_error = NULL
+                         posts = posts + 1, not_before = NULL, last_error = NULL,
+                         retry_until = ?5
                      WHERE seq = ?1 AND state IN ('in_flight', 'posted')",
-                    rusqlite::params![seq, session_id, item_id, at],
+                    rusqlite::params![seq, session_id, item_id, at, retry_until],
                 )?;
                 Ok(())
             })
@@ -3248,7 +3265,7 @@ const CONVERSATION_ID_OF_2: &str = "(SELECT id FROM conversations WHERE address 
 /// The columns [`row_to_queued`] reads, over [`QUEUE_FROM`].
 const QUEUE_COLUMNS: &str = "q.seq, c.address, q.account_id, q.message_id, q.revision, q.payload,
      q.received_at, q.state, q.key, q.body, q.session_id, q.item_id, q.dropped, q.attempts,
-     q.posts, q.not_before, q.last_error, q.held_at, q.posted_at";
+     q.posts, q.not_before, q.last_error, q.held_at, q.posted_at, q.retry_until";
 
 const QUEUE_FROM: &str = "inbound_queue q JOIN conversations c ON c.id = q.conversation_id";
 
@@ -3257,7 +3274,8 @@ const QUEUE_FROM: &str = "inbound_queue q JOIN conversations c ON c.id = q.conve
 /// `last_error` is deliberately not in it: why the last offer came apart is the one thing worth
 /// still being able to read on a row that is waiting to be tried again.
 const QUEUE_CLEARED: &str = "key = NULL, body = NULL, session_id = NULL, item_id = NULL,
-     dropped = 0, posts = 0, held_at = NULL, posted_at = NULL, completed_at = NULL";
+     dropped = 0, posts = 0, held_at = NULL, posted_at = NULL, completed_at = NULL,
+     retry_until = NULL";
 
 /// The columns [`row_to_message`] reads, in the order it reads them, over [`MESSAGE_FROM`].
 ///
@@ -3543,6 +3561,7 @@ fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
     let not_before: Option<String> = row.get(15)?;
     let held_at: Option<String> = row.get(17)?;
     let posted_at: Option<String> = row.get(18)?;
+    let retry_until: Option<String> = row.get(19)?;
     Ok(QueuedMessage {
         seq: row.get(0)?,
         conversation: row.get(1)?,
@@ -3575,6 +3594,7 @@ fn row_to_queued(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
         last_error: row.get(16)?,
         held_at: held_at.as_deref().map(parse_rfc3339).transpose()?,
         posted_at: posted_at.as_deref().map(parse_rfc3339).transpose()?,
+        retry_until: retry_until.as_deref().map(parse_rfc3339).transpose()?,
     })
 }
 
@@ -5850,7 +5870,7 @@ mod tests {
         assert_eq!(rendered.message_id, "a");
 
         store
-            .posted(held[0].seq, Uuid::nil(), "item-1", now())
+            .posted(held[0].seq, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         let recovered = store.recover().await.expect("recover");
@@ -5959,6 +5979,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_title_that_knows_less_does_not_shorten_the_stored_one() {
+        let store = Store::open_in_memory().await.expect("opens");
+        let titled = |title: &str| {
+            let mut record = conversation("telegram:-1001234:77");
+            record.title = Some(title.to_string());
+            record
+        };
+        let title = async |store: &Store| {
+            store
+                .conversation("telegram:-1001234:77")
+                .await
+                .expect("read")
+                .expect("present")
+                .title
+        };
+        store
+            .upsert_conversation(titled("Ops \u{203a} Releases"))
+            .await
+            .expect("insert");
+        // A message in the topic after a restart, before its name is learned again.
+        store
+            .upsert_conversation(titled("Ops"))
+            .await
+            .expect("update");
+        assert_eq!(
+            title(&store).await.as_deref(),
+            Some("Ops \u{203a} Releases")
+        );
+        // A rename is a different path, and takes over.
+        store
+            .upsert_conversation(titled("Ops \u{203a} Shipping"))
+            .await
+            .expect("update");
+        assert_eq!(
+            title(&store).await.as_deref(),
+            Some("Ops \u{203a} Shipping")
+        );
+        // So is a group renamed, even one whose new name happens to share a beginning.
+        store
+            .upsert_conversation(titled("Op"))
+            .await
+            .expect("update");
+        assert_eq!(title(&store).await.as_deref(), Some("Op"));
+    }
+
+    #[tokio::test]
     async fn a_row_carries_its_own_key_and_what_its_item_stated() {
         let (store, account) = seeded(&["telegram:123", "telegram:456"]).await;
         for (conversation, id) in [("telegram:123", "a"), ("telegram:456", "b")] {
@@ -6026,7 +6092,7 @@ mod tests {
 
         // And the 202 moves it on, clearing what the failed post left.
         store
-            .posted(first, session, "item-9", now())
+            .posted(first, session, "item-9", now(), None)
             .await
             .expect("post");
         let posted = store.row(first).await.expect("read").expect("present");
@@ -6057,7 +6123,7 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
         let seq = held[0].seq;
         store
-            .posted(seq, Uuid::nil(), "item-1", now())
+            .posted(seq, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
 
@@ -6088,7 +6154,7 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
         let seq = held[0].seq;
         store
-            .posted(seq, Uuid::nil(), "item-1", now())
+            .posted(seq, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         store.delivered(seq, now()).await.expect("deliver");
@@ -6372,7 +6438,7 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
         let seq = held[0].seq;
         store
-            .posted(seq, Uuid::nil(), "item-1", now())
+            .posted(seq, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         assert_eq!(store.clear_queue().await.expect("clear"), 1);
@@ -6432,7 +6498,7 @@ mod tests {
         )
         .await;
         store
-            .posted(seq, Uuid::nil(), "item-1", now())
+            .posted(seq, Uuid::nil(), "item-1", now(), None)
             .await
             .expect("post");
         assert_eq!(

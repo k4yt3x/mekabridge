@@ -465,6 +465,8 @@ mod tests {
             message_id: "1".to_string(),
             chat_kind: ChatKind::Group,
             chat_title: None,
+            parent: None,
+            server: None,
             sender: Sender {
                 id: sender_id.to_string(),
                 display_name: name.to_string(),

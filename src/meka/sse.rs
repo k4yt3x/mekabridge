@@ -98,10 +98,22 @@ pub enum TurnEvent {
     InboxDelivered {
         item_ids: Vec<String>,
     },
-    /// meka gave up on an inbox item after its retry ceiling and withdrew it.
+    /// A turn on these items failed in a way waiting can change, so meka put them back and tries
+    /// again at `not_before`. Nothing has reached the model; the items are still meka's to deliver
+    /// or give up on.
+    InboxDeferred {
+        item_ids: Vec<String>,
+        not_before: Option<String>,
+        /// The failed turn's Problem Detail.
+        error: serde_json::Value,
+    },
+    /// meka gave up on an inbox item and withdrew it: its retry ceiling passed, or its turn failed
+    /// in a way no retry would change.
     InboxFailed {
         item_id: String,
         reason: String,
+        /// The Problem Detail of the failure that decided it, when a failed turn did.
+        error: Option<serde_json::Value>,
     },
     /// An inbox item was taken back before the model read it: a `DELETE`, or the cancellation of
     /// the turn it opened.
@@ -121,9 +133,14 @@ pub enum TurnEvent {
         stop_reason: String,
         refusal_text: Option<String>,
         usage: Usage,
+        /// The fallback profile that served the turn, when the session's own could not. Absent
+        /// when the session's own profile did.
+        profile: Option<String>,
     },
     Failed {
         error: serde_json::Value,
+        /// As on [`TurnEvent::Finished`]: the fallback the turn ended on.
+        profile: Option<String>,
     },
     Cancelled {
         reason: String,
@@ -272,9 +289,18 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
         "inbox.delivered" => TurnEvent::InboxDelivered {
             item_ids: strings("item_ids"),
         },
+        "inbox.deferred" => TurnEvent::InboxDeferred {
+            item_ids: strings("item_ids"),
+            not_before: optional_string("not_before"),
+            error: value
+                .get("error")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        },
         "inbox.failed" => TurnEvent::InboxFailed {
             item_id: string("item_id"),
             reason: string("reason"),
+            error: value.get("error").filter(|error| !error.is_null()).cloned(),
         },
         "inbox.withdrawn" => TurnEvent::InboxWithdrawn {
             item_id: string("item_id"),
@@ -292,12 +318,14 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
                 .transpose()
                 .unwrap_or_default()
                 .unwrap_or_default(),
+            profile: optional_string("profile"),
         },
         "turn.failed" => TurnEvent::Failed {
             error: value
                 .get("error")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            profile: optional_string("profile"),
         },
         "turn.canceled" => TurnEvent::Cancelled {
             reason: string("reason"),
@@ -338,15 +366,35 @@ mod tests {
                 stop_reason,
                 usage,
                 refusal_text,
+                profile,
             } => {
                 assert_eq!(stop_reason, "end_turn");
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 3);
                 assert_eq!(usage.cache_read_input_tokens, 0);
                 assert_eq!(refusal_text, None);
+                // The session's own profile served it, which meka says by leaving this out.
+                assert_eq!(profile, None);
             }
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_terminal_names_the_fallback_that_served_its_turn() {
+        let finished = event(
+            "turn.finished",
+            r#"{"stop_reason":"end_turn","usage":{},"profile":"backup"}"#,
+        );
+        assert!(
+            matches!(&finished, TurnEvent::Finished { profile: Some(profile), .. } if profile == "backup"),
+            "{finished:?}"
+        );
+        let failed = event("turn.failed", r#"{"error":{},"profile":"backup"}"#);
+        assert!(
+            matches!(&failed, TurnEvent::Failed { profile: Some(profile), .. } if profile == "backup"),
+            "{failed:?}"
+        );
     }
 
     #[test]
@@ -491,6 +539,34 @@ mod tests {
             TurnEvent::InboxFailed {
                 item_id: "i1".to_string(),
                 reason: "no turn could deliver it in 7 attempt(s) over the last hour".to_string(),
+                error: None,
+            }
+        );
+        // The error a failed turn decided it with, when one did.
+        let failed = event(
+            "inbox.failed",
+            r#"{"item_id":"i1","session_id":"s","reason":"the provider refused it",
+                "error":{"type":"https://meka.run/errors/auth","title":"Unauthorized","status":401}}"#,
+        );
+        assert!(
+            matches!(&failed, TurnEvent::InboxFailed { error: Some(error), .. }
+                if error["type"] == "https://meka.run/errors/auth"),
+            "{failed:?}"
+        );
+        // A turn that failed in a way waiting can change, with the items put back for later.
+        assert_eq!(
+            event(
+                "inbox.deferred",
+                r#"{"item_ids":["i1","i2"],"session_id":"s","not_before":"2026-10-18T15:02:11Z",
+                    "error":{"type":"https://meka.run/errors/provider-exhausted","status":502}}"#
+            ),
+            TurnEvent::InboxDeferred {
+                item_ids: vec!["i1".to_string(), "i2".to_string()],
+                not_before: Some("2026-10-18T15:02:11Z".to_string()),
+                error: serde_json::json!({
+                    "type": "https://meka.run/errors/provider-exhausted",
+                    "status": 502,
+                }),
             }
         );
         assert_eq!(

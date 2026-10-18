@@ -89,7 +89,8 @@ message: 1287733441209827329
 from: Ali (@alice_dev, id 245119312739729408)
 roles: Moderators, Release Team
 admitted: server allowlist (the server this was said in is allowed); sender not individually allowlisted
-chat: group "#deploys in Acme Corp"
+chat: group "Acme Corp › #deploys"
+server: 1029384756473829101
 at: 2026-08-12T14:03:11.427+00:00
 woke you: you were named, or this replies to something you said
 in reply to a message from Ali (id 1287733441209827300): "rollback is done"
@@ -102,7 +103,9 @@ a19f4c>>>
 
 - **`from`** uses the sender's nickname in that server when they have one, falling back to their display name and then their handle.
 - **`roles`** is what they hold in this server, which is the difference between a stranger and a moderator. Discord supplies it on every message, so it costs nothing.
-- **`chat`** names the channel and the server. A thread reads `#deploys › rollback tonight in Acme Corp`, so the agent can tell a tangent from the room it came out of.
+- **`chat`** says where the message was said as one path, outermost first. A thread reads `Acme Corp › #deploys › rollback tonight`, so the agent can tell a tangent from the room it came out of. The same text is the conversation's title in `conversation_list`.
+- **`parent`** appears on a message in a thread, and is the conversation id of the channel the thread was started in, so the agent can post there, read it or mute it. A post in a forum or media channel has none, since those take posts rather than messages, and neither does a thread whose channel the bridge could not look up.
+- **`server`** is the server's id, on every message from one. Its name is already in `chat`; the id is what tells two servers of the same name apart and survives a rename.
 - **`woke you`** appears on every message from a channel rather than a direct message, including ones nothing addressed, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest.
 - **`admitted`** gains two grants on Discord. `role allowlist` means the sender holds a role you allowed, so an operator granted access deliberately but nobody looked at the account. `server allowlist` means neither the person nor the channel was allowlisted, only the server they are both in. The clause after the semicolon is a separate fact: whether the sender is on `allowed_users`, which on Discord admits direct messages only and so never appears as the grant here.
 

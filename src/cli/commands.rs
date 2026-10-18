@@ -23,17 +23,22 @@ const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
 /// The oldest meka this bridge can drive, as `(major, minor)`.
 ///
-/// A floor rather than a recommendation. meka 0.76 renamed a session's `cwd` to `working_directory`
-/// and refuses a field it does not know, so an older meka refuses to create the session this bridge
-/// asks for whenever `[session].cwd` is set. meka 0.71 reports a hole in the session feed as a
-/// `feed.gap` event, which is the only way this bridge hears of one; an older meka says it in a
-/// notice, so a hole opened while the feed is read slowly is found only when the hand-overs it left
-/// waiting are asked about, an hour or so later. Before 0.70 meka did not report `vision` per
-/// profile, which is where this bridge reads it, so `attachment_view` never shows the agent an
-/// image. Before 0.55 nothing works at all: messages are handed over through the session inbox,
-/// which an older meka answers with a 404, and a session's stream was a view of one turn that
-/// closed at its terminal rather than a feed of every turn.
-const MEKA_MINIMUM: (u64, u64) = (0, 76);
+/// A floor rather than a recommendation. meka 0.80 runs every process it starts at the highest
+/// `oom_score_adj`, which the `meka.service` unit in the book relies on to keep a runaway command
+/// from taking meka down. meka 0.79 speaks MCP 2026-07-28 to this bridge, which keeps no session,
+/// so a bridge restart costs no reconnect: every tool call stands alone. meka 0.78 reports a failed
+/// attempt at an item as `inbox.deferred` and the error it gave an item up on, which is how the
+/// owner hears of an outage while meka is still retrying rather than when it stops. meka 0.76
+/// renamed a session's `cwd` to `working_directory` and refuses a field it does not know, so an
+/// older meka refuses to create the session this bridge asks for whenever `[session].cwd` is set.
+/// meka 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way this
+/// bridge hears of one; an older meka says it in a notice, so a hole opened while the feed is read
+/// slowly is found only when the hand-overs it left waiting are asked about, an hour or so later.
+/// Before 0.70 meka did not report `vision` per profile, which is where this bridge reads it, so
+/// `attachment_view` never shows the agent an image. Before 0.55 nothing works at all: messages are
+/// handed over through the session inbox, which an older meka answers with a 404, and a session's
+/// stream was a view of one turn that closed at its terminal rather than a feed of every turn.
+const MEKA_MINIMUM: (u64, u64) = (0, 80);
 
 /// Whose profile `doctor` judges vision on.
 enum VisionSubject {
@@ -365,7 +370,10 @@ pub async fn doctor(config: &Config) -> Result<()> {
                 // Ahead of everything else this block reports, which assumes a meka this bridge can
                 // drive and is misleading about one it cannot.
                 println!(
-                    "  fail   this bridge needs meka {}.{} or later. An older one refuses to \
+                    "  fail   this bridge needs meka {}.{} or later. Before 0.80 a runaway shell \
+                     command can take meka down with it under the book's meka.service, before \
+                     0.79 a bridge restart leaves meka to reconnect, before 0.78 the owner hears \
+                     of an outage only once meka stops retrying, before 0.76 meka refuses to \
                      create a session in [session].cwd, before 0.71 it reports a hole in the \
                      session feed in a way this bridge no longer reads, before 0.70 \
                      attachment_view never shows the agent an image, and before 0.55 no message \
@@ -1905,19 +1913,23 @@ mod tests {
 
     #[test]
     fn a_meka_below_the_floor_is_caught_before_the_first_message() {
-        // The failure it prevents is quiet until it is not: a meka from 0.71 to 0.75 runs a bridge
-        // that already has its session, and refuses the next one it is asked to create in a working
-        // directory. From 0.55 to 0.70 a hole in the feed also goes unheard and, before 0.70, every
-        // image the agent asks to see comes back as a description, while the deployment looks
-        // healthy. Older than that, nothing reaches the agent at all.
+        // The failure it prevents is quiet until it is not: a meka before 0.80 can be taken down by
+        // a runaway command the book's unit expects it to survive, one before 0.79 reconnects to
+        // the bridge after its every restart, one before 0.78 keeps the owner in the dark for the
+        // hour it retries a turn, one from 0.71 to 0.75 refuses the next session it is asked to
+        // create in a working directory, from 0.55 to 0.70 a hole in the feed goes unheard and,
+        // before 0.70, every image the agent asks to see comes back as a description, all while
+        // the deployment looks healthy. Older than that, nothing reaches the agent.
+        assert_eq!(meka_is_too_old("0.79.2"), Some(true));
+        assert_eq!(meka_is_too_old("0.77.0"), Some(true));
         assert_eq!(meka_is_too_old("0.75.0"), Some(true));
         assert_eq!(meka_is_too_old("0.70.1"), Some(true));
         assert_eq!(meka_is_too_old("0.54.1"), Some(true));
-        assert_eq!(meka_is_too_old("0.76.0"), Some(false));
-        assert_eq!(meka_is_too_old("0.77.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.80.0"), Some(false));
+        assert_eq!(meka_is_too_old("0.81.0"), Some(false));
         assert_eq!(meka_is_too_old("1.0.0"), Some(false));
         // The patch component is never compared, so a pre-release riding it is read as its minor.
-        assert_eq!(meka_is_too_old("0.76.0-rc1"), Some(false));
+        assert_eq!(meka_is_too_old("0.80.0-rc1"), Some(false));
         // No opinion beats a wrong one: a build that does not report a version this can read must
         // not fail an otherwise healthy deployment.
         for unreadable in ["", "dev", "0", "nightly.1", "0.x.0"] {

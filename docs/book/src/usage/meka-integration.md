@@ -2,7 +2,7 @@
 
 meka and mekabridge are each other's client. Getting the two configurations to agree is most of the setup.
 
-**meka 0.76.0 or later is required.** 0.76 renamed a session's `cwd` to `working_directory`, and this bridge sends only the new name, which an older meka refuses as a field it does not know: with `[session].cwd` set, no session can be created. It cuts the other way too: a bridge older than 0.21.0 with `[session].cwd` set cannot create one on meka 0.76. A session already bound keeps working on either mix, so the two can be upgraded one after the other. 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way the bridge hears of one, so against an older meka a hole opened while the feed is read slowly is found an hour or so later rather than at once. 0.70 moved `vision` from `GET /v1/info` onto each entry of `GET /v1/profiles`, and the bridge reads it only there, so before 0.70 `attachment_view` describes every image instead of showing it while everything else looks healthy. Before 0.55 nothing works at all, in both directions at once: messages are handed over through the session inbox, `POST /v1/sessions/{id}/inbox`, which an older meka has no route for and answers with a 404; and their outcome is read from the session feed, `GET /v1/sessions/{id}/stream`, which before 0.55 was a view of one turn that closed at its terminal rather than the session's own feed. `mekabridge doctor` fails on the version for all of these reasons.
+**meka 0.80.0 or later is required.** 0.80 runs every process meka starts at the highest `oom_score_adj`, which the [`meka.service` unit](./operations.md#systemd) relies on to keep a runaway command from taking meka down with it. 0.79 speaks MCP 2026-07-28 to this bridge, which keeps no session, so a bridge restart costs no reconnect. 0.78 reports a turn that failed on the bridge's messages as `inbox.deferred` while it still means to retry them, and the error it gives one up on, which is how the owner hears of an outage while meka is still trying rather than once it stops. 0.76 renamed a session's `cwd` to `working_directory`, and this bridge sends only the new name, which an older meka refuses as a field it does not know: with `[session].cwd` set, no session can be created. It cuts the other way too: a bridge older than 0.21.0 with `[session].cwd` set cannot create one on meka 0.76. A session already bound keeps working on either mix, so the two can be upgraded one after the other. 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way the bridge hears of one, so against an older meka a hole opened while the feed is read slowly is found an hour or so later rather than at once. 0.70 moved `vision` from `GET /v1/info` onto each entry of `GET /v1/profiles`, and the bridge reads it only there, so before 0.70 `attachment_view` describes every image instead of showing it while everything else looks healthy. Before 0.55 nothing works at all, in both directions at once: messages are handed over through the session inbox, `POST /v1/sessions/{id}/inbox`, which an older meka has no route for and answers with a 404; and their outcome is read from the session feed, `GET /v1/sessions/{id}/stream`, which before 0.55 was a view of one turn that closed at its terminal rather than the session's own feed. `mekabridge doctor` fails on the version for all of these reasons.
 
 ## How a message gets to the agent
 
@@ -62,10 +62,14 @@ Three events settle a hand-over, and the bridge acts on each differently:
 | Event | What it means | What the bridge does |
 |-------|---------------|----------------------|
 | `inbox.delivered` | The model read it | The message is delivered |
-| `inbox.failed` | meka spent its own hour of retries and gave up | The message is owed to the agent again, with whatever its item stated, and the chat and the owner are told |
+| `inbox.failed` | meka gave up on it: a turn failed in a way no retry changes, or retrying ran past meka's `[serve] inbox_retry_ceiling`, an hour by default | The message is owed to the agent again, with whatever its item stated, and the chat and the owner are told, the owner with the error meka gave it up on |
 | `inbox.withdrawn` | It was taken back unread, as cancelling the turn it opened does | The message goes back into the queue and is handed over afresh, a bounded number of times |
 
-A turn that fails or is cancelled *after* `inbox.delivered` is a fourth case and not a delivery
+A fourth, `inbox.deferred`, settles nothing: a turn on the messages failed before the model read them, in a way waiting can change (an outage, a spent quota, a required MCP server not yet up), and meka has put them back to try again. The owner is told then, with the error, when meka tries next and when it will give up, because nobody waiting hears back until a turn gets through and the chats are told only once meka stops. The owner's notice is rate limited to one every fifteen minutes, on a window of its own, so it never holds back the notice that meka gave up.
+
+A message whose fate meka settled while the bridge was not listening is asked about on the next connect, and meka's answer carries most of what the missed event would have. A message it gave up on after a failed turn fails as the event would have failed it, with the same notices, rather than being handed over again into the same failure; the owner's notice has meka's error but not the provider's own words, which only the event carried. One meka gave up on without a failed turn behind it, its session held by another process for the whole ceiling say, cannot be told from one a cancelled turn took back, and is handed over again.
+
+A turn that fails or is cancelled *after* `inbox.delivered` is another case again, and not a delivery
 failure: the model read the messages, so a second run would repeat whatever it did with them. The
 owner is told, and the chats only where the agent had not got a word in.
 
@@ -220,13 +224,13 @@ eager_load_tools = ["message_send", "conversation_list"]
 
 Leave the rest deferred; they are used rarely enough that keeping the tools array lean is worth the occasional round trip. `history_read` is the one worth reconsidering if the agent lives in busy groups, since a muted conversation waking on a mention often needs it immediately.
 
-A load lasts the rest of the session, so a deferred tool costs its round trip once rather than on every turn. The exception arrived with meka 0.77: on a profile whose `deferred_tools` is `native`, the default on the official Anthropic and OpenAI endpoints and on both subscriptions, a compaction forgets every load, and the next turn that needs the tool pays again.
+A load lasts the rest of the session, so a deferred tool costs its round trip once rather than on every turn. The exception is a profile whose `deferred_tools` is `native`, the default on the official Anthropic and OpenAI endpoints and on both subscriptions: there a compaction forgets every load, and the next turn that needs the tool pays again.
 
 An eager tool buys more than that round trip. A deferred tool appears in the agent's `[Tool discovery]` index as a name and a one-line summary, and the whole index is capped at 8 KB across every MCP server at once. Past the cap the whole section drops a tier: every tool keeps its name and loses its summary, on every server, not just the one that overran. Nothing becomes unreachable and `tool_search` still finds a tool by keyword, but the summaries are what tell the agent when to reach for `backlog_check` rather than `history_read`, and they stop arriving.
 
 Measured against meka 0.61's own renderer, this bridge's 26 tools render to 5.1 KB, and 7.0 KB alongside meka's built-in MCP-resource tools. That is inside the cap with roughly four more described tools of headroom; 0.15.1's 23 longer-winded tools took 6.0 KB and left room for one. **Attaching a second server of any real size will still drop the tier**, so if its summaries matter, put this bridge's most-used tools in `eager_load_tools`: an eager tool is not in the index at all, so it keeps its full schema whatever else is attached, and it stops consuming the shared budget.
 
-From meka 0.77 a server entry also takes `deferral`, and `[mcp].deferral` sets it for every server: `eager` ships every tool of the server from the first request, and `hidden` drops every tool its `eager_load_tools` does not name. Either takes a server out of the index, so a second server set that way no longer costs this bridge its summaries. **Do not let this bridge inherit `hidden`**: it would leave the agent `message_send` and `conversation_list` and nothing to read history, download an attachment or mute a chat with. If the install-wide setting is `hidden`, give this entry `deferral = "deferred"`. meka 0.76 refuses a config that names `deferral` at all.
+A server entry also takes `deferral`, and `[mcp].deferral` sets it for every server: `eager` ships every tool of the server from the first request, and `hidden` drops every tool its `eager_load_tools` does not name. Either takes a server out of the index, so a second server set that way no longer costs this bridge its summaries. **Do not let this bridge inherit `hidden`**: it would leave the agent `message_send` and `conversation_list` and nothing to read history, download an attachment or mute a chat with. If the install-wide setting is `hidden`, give this entry `deferral = "deferred"`.
 
 A test (`the_tool_index_stays_inside_this_bridges_share`) holds the bridge's own entries under 6 KB by reproducing meka's packing rule, so a tool added later trips the suite rather than the deployment.
 
@@ -440,7 +444,22 @@ bridge screens for both rather than discovering them from a placeholder:
 
 Telegram photos are JPEG, stickers are WebP, and video stills are JPEG, so all of them pass.
 
-When the session asking runs on a profile that reports `vision = false` on `GET /v1/profiles`, `attachment_view` returns a description rather than an image. An image shown to a session whose profile has no vision stays in its history, where the provider refuses it on every later request, so the profile that decides is the calling session's, which meka names in each call's `_meta`. That is not always the bridge's own session or meka's default: a sub-agent can run on a profile of its own, and any session can be moved to another, by `/profile` on a meka screen opened on it or by a `PATCH`. A call made outside any turn names no session, and the bridge's own answers for it, or before one exists, the default profile it will get. The answer is asked for on every call rather than cached, since a profile can change while both processes run. When meka cannot be asked, the agent is told the check failed rather than that its model has no vision.
+When the session asking runs on a profile that reports `vision = false` on `GET /v1/profiles`, `attachment_view` returns a description rather than an image. An image shown to a session whose profile has no vision stays in its history, where meka refuses every later turn while it is there, so the profile that decides is the calling session's, which meka names in each call's `_meta`. That is not always the bridge's own session or meka's default: a sub-agent can run on a profile of its own, and any session can be moved to another, by `/profile` on a meka screen opened on it or by a `PATCH`. A call made outside any turn names no session, and the bridge's own answers for it, or before one exists, the default profile it will get. The answer is asked for on every call rather than cached, since a profile can change while both processes run. When meka cannot be asked, the agent is told the check failed rather than that its model has no vision.
+
+A profile's `fallbacks` do not change that answer. A fallback serves one turn while the profile cannot, and meka refuses a fallback whose `vision` differs from the profile it stands in for, so an image the profile can see is one every fallback that may serve its session can see too.
+
+## Fallback profiles
+
+The bridge's session is permanent and everyone talks to the same one, so a provider outage or a spent quota silences every chat at once. Naming `fallbacks` on the session's profile in meka's config lets another profile serve turns while it cannot:
+
+```toml
+[profiles.main]
+account   = "anthropic"
+model     = "claude-opus-5-5"
+fallbacks = ["backup"]
+```
+
+meka moves a turn to the next profile listed when the upstream is still failing after its retries, or refuses for quota or billing, and goes back to the session's own profile as soon as it answers again. The owner is told when turns move to a fallback and when they come back, rather than on every turn: another model is answering, and another account may be paying. A provider that keeps failing and recovering moves turns back and forth every few minutes, so moves are reported at most once every fifteen minutes, and the next notice says how many there were. Without a fallback, the owner is told of the failed turns themselves while meka retries them; see [Delivery accounting](#delivery-accounting).
 
 ## What the agent is told
 
@@ -455,6 +474,7 @@ meka captures an MCP server's `instructions` from the handshake and surfaces the
 > Header lines that do not explain themselves:
 >
 > - `admitted:` says why this message was let through.
+> - `parent:` is the channel a thread was started in, as a conversation you can send to.
 > - `roles:` is what the sender holds in that chat.
 > - `forwarded from:` means the text is somebody else's words, not the sender's.
 

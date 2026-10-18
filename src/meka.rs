@@ -17,6 +17,7 @@ pub mod sse;
 
 use std::{path::Path, time::Duration};
 
+use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use url::Url;
@@ -51,7 +52,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDER_RESPONSE_PREVIEW_CHARS: usize = 400;
 
 /// Problem Detail (RFC 9457) as returned by every meka error response.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ProblemDetail {
     #[serde(rename = "type")]
@@ -98,6 +99,7 @@ impl ProblemDetail {
             "stream-detached" => ProblemKind::StreamDetached,
             "provider" => ProblemKind::Provider,
             "provider-unavailable" => ProblemKind::ProviderUnavailable,
+            "provider-exhausted" => ProblemKind::ProviderExhausted,
             "context-overflow" => ProblemKind::ContextOverflow,
             "invalid-body" => ProblemKind::InvalidBody,
             "payload-too-large" => ProblemKind::PayloadTooLarge,
@@ -108,17 +110,15 @@ impl ProblemDetail {
     }
 }
 
-impl std::fmt::Display for ProblemDetail {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.detail.is_empty() {
-            write!(formatter, "{} ({})", self.title, self.status)?;
+impl ProblemDetail {
+    /// The problem as one line, with or without meka's `detail`: without it for a reader that
+    /// already has that sentence, as a give-up's own reason does.
+    pub fn summary(&self, with_detail: bool) -> String {
+        let mut line = if with_detail && !self.detail.is_empty() {
+            format!("{} ({}): {}", self.title, self.status, self.detail)
         } else {
-            write!(
-                formatter,
-                "{} ({}): {}",
-                self.title, self.status, self.detail
-            )?;
-        }
+            format!("{} ({})", self.title, self.status)
+        };
         // Appended rather than replacing `detail`, which stays meka's own sentence. This reaches
         // the owner's notice, which is the reader meka relayed it for; the affected chat is told
         // one line carrying none of it.
@@ -132,9 +132,15 @@ impl std::fmt::Display for ProblemDetail {
             } else {
                 ""
             };
-            write!(formatter, ". The provider said: {preview}{elided}")?;
+            line.push_str(&format!(". The provider said: {preview}{elided}"));
         }
-        Ok(())
+        line
+    }
+}
+
+impl std::fmt::Display for ProblemDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary(true))
     }
 }
 
@@ -163,6 +169,10 @@ pub enum ProblemKind {
     /// separating the two and most of these carry none, so the 529 a bridge sees most often
     /// arrived byte-identical to a dead credential.
     ProviderUnavailable,
+    /// The upstream refused for quota or billing, by a signal it documents: a 402, a quota code on
+    /// a 429, a subscription's spent usage window. Nothing changes until its reset, which rides as
+    /// `retry_after` when the upstream stated one.
+    ProviderExhausted,
     /// The conversation no longer fits the model's window and meka could not compact it far
     /// enough. A 502 like [`Self::Provider`], and deliberately a separate type: the same
     /// conversation will not fit on the next attempt either, so this is the one upstream failure
@@ -222,6 +232,10 @@ impl MekaError {
                 | ProblemKind::Internal
                 | ProblemKind::Provider
                 | ProblemKind::ProviderUnavailable
+                // Plausibly, once the reset passes, and the queue waits for `retry_after`. Only a
+                // turn ends this way, so it arrives on the feed rather than on a request this
+                // retries, and meka decides there how long the item is tried.
+                | ProblemKind::ProviderExhausted
                 | ProblemKind::SessionLocked
                 // Both arrive only as a turn's terminal on the feed, where nothing here retries
                 // anything: what a hand-over is owed is decided by the inbox events, not by how
@@ -373,8 +387,8 @@ pub struct Profile {
     /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
     /// provider whatever the setting says. So this check is not belt and braces over one of
     /// meka's, it is the only thing standing between a non-vision profile and an image block
-    /// committed to the session's history, which the provider then rejects on every later request
-    /// in that session.
+    /// committed to the session's history, after which meka refuses every later turn in that
+    /// session while the profile cannot see it.
     pub vision: bool,
     /// Whether a session naming no profile gets this one. The bridge never names one, so this is
     /// the profile its session starts on.
@@ -406,7 +420,7 @@ pub struct ReadyStatus {
 }
 
 /// What `POST /v1/sessions/{id}/inbox` answered.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct InboxReceipt {
     pub item_id: String,
     /// `pending` on a fresh item. On a replayed `Idempotency-Key`, whatever the earlier item has
@@ -416,6 +430,31 @@ pub struct InboxReceipt {
     /// Whether the `Idempotency-Key` had been used before, so the item is the earlier one.
     #[serde(default)]
     pub replayed: bool,
+    /// When meka stops retrying the item: its enqueue plus `[serve] inbox_retry_ceiling`.
+    ///
+    /// Kept as meka wrote it and read through [`Self::retry_until`], so a timestamp this build
+    /// cannot parse costs the owner's notice a time rather than costing the post its receipt.
+    #[serde(default)]
+    pub retry_until: Option<String>,
+    /// On a replayed key, the error a failed turn gave the item up on.
+    ///
+    /// The one field that tells meka giving up apart from an item taken back unread: a cancelled
+    /// turn and a `DELETE` withdraw it too, and leave this empty.
+    #[serde(default)]
+    pub last_error: Option<ProblemDetail>,
+    /// On a replayed key, meka's sentence for why the item was withdrawn.
+    #[serde(default)]
+    pub failure: Option<String>,
+}
+
+impl InboxReceipt {
+    /// [`Self::retry_until`] as a time, or `None` when meka sent none this build can read.
+    pub fn retry_until(&self) -> Option<DateTime<Utc>> {
+        self.retry_until
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc))
+    }
 }
 
 /// Where an inbox item is in its life, as meka names it.
@@ -1205,6 +1244,57 @@ mod tests {
         assert_eq!(InboxState::Delivered.to_string(), "delivered");
     }
 
+    /// meka 0.78 answers a post with when it stops retrying the item and, on a replay, what it gave
+    /// the item up on. The deadline is what the owner's notice quotes; the error is the only thing
+    /// that tells a give-up apart from an item a cancelled turn took back.
+    #[test]
+    fn an_inbox_receipt_carries_its_deadline_and_what_it_was_given_up_on() {
+        let fresh = r#"{"item_id":"i1","session_id":"s","class":"steer","state":"pending",
+                        "replayed":false,"retry_until":"2026-10-18T20:08:19.824392722+00:00"}"#;
+        let receipt: InboxReceipt = serde_json::from_str(fresh).expect("parses");
+        assert_eq!(
+            receipt.retry_until().map(|at| at.to_rfc3339()).as_deref(),
+            Some("2026-10-18T20:08:19.824392722+00:00")
+        );
+        assert_eq!(receipt.last_error, None);
+
+        let given_up = r#"{"item_id":"i1","session_id":"s","class":"steer","state":"withdrawn",
+            "replayed":true,"retry_until":"2026-10-18T20:08:19Z",
+            "failure":"its turn failed in a way no retry would change",
+            "last_error":{"type":"https://meka.run/errors/auth","title":"Unauthorized",
+                          "status":401,"detail":"the credential was rejected"}}"#;
+        let receipt: InboxReceipt = serde_json::from_str(given_up).expect("parses");
+        assert_eq!(receipt.state, InboxState::Withdrawn);
+        assert_eq!(
+            receipt.last_error.as_ref().map(ProblemDetail::kind),
+            Some(ProblemKind::Auth)
+        );
+        assert_eq!(
+            receipt.failure.as_deref(),
+            Some("its turn failed in a way no retry would change")
+        );
+
+        // A deadline this build cannot read costs the notice its time, never the post its receipt.
+        let odd = r#"{"item_id":"i1","state":"pending","retry_until":"tomorrow-ish"}"#;
+        let receipt: InboxReceipt = serde_json::from_str(odd).expect("still parses");
+        assert_eq!(receipt.retry_until(), None);
+    }
+
+    #[test]
+    fn a_spent_quota_is_its_own_kind_and_waits_for_its_reset() {
+        let mut detail = problem("https://meka.run/errors/provider-exhausted");
+        detail.retry_after = Some(600.0);
+        assert_eq!(detail.kind(), ProblemKind::ProviderExhausted);
+        assert_eq!(
+            MekaError::Problem(detail).retry_after(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            problem("https://meka.run/errors/provider").kind(),
+            ProblemKind::Provider
+        );
+    }
+
     /// The count is reported for a loaded session only, so both "not sent" and "sent as zero" have
     /// to read back as what they are.
     #[test]
@@ -1226,11 +1316,11 @@ mod tests {
     /// scope checks with it.
     #[test]
     fn server_info_reads_every_meka_this_bridge_supports() {
-        let body = r#"{"version":"0.76.0","default_permission":"read",
+        let body = r#"{"version":"0.80.0","default_permission":"read",
                        "enabled_permissions":["read","workspace"],
                        "scopes":["sessions:r","sessions:w"]}"#;
-        let info: ServerInfo = serde_json::from_str(body).expect("0.76 must deserialize");
-        assert_eq!(info.version, "0.76.0");
+        let info: ServerInfo = serde_json::from_str(body).expect("0.80 must deserialize");
+        assert_eq!(info.version, "0.80.0");
         assert_eq!(info.enabled_permissions, ["read", "workspace"]);
         assert_eq!(info.scopes, ["sessions:r", "sessions:w"]);
 

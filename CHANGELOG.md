@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Discord messages give the server's id as `server:`, and a thread its channel's as `parent:`.
+- A Telegram forum topic is named on the `chat:` line after its group, once its name has been seen.
+- The owner hears of a turn meka is still retrying, with the error and when meka will give up.
+- The owner hears when meka moves the agent's turns to a fallback profile, and when they come back.
+
+### Changed
+
+- **Breaking:** meka 0.80 or later is required; `doctor` fails against anything older.
+- A Discord chat reads outermost first, `Acme Corp › #deploys › rollback`, in headers and titles.
+- The owner's notice for a message meka gave up on names the error, not only the attempts made.
+- A hand-over is asked about once meka's own `retry_until` passes, rather than after a fixed hour.
+- rmcp logs at `warn` unless `[log].level` names it; it logs every request since MCP 2026-07-28.
+
+### Fixed
+
+- A Discord thread in a channel the bot was granted after joining is no longer unnamed or dropped.
+- A message in a Telegram forum topic no longer reads as a reply to whoever opened the topic.
+- A message meka gave up on after a failed turn while the bridge was away fails, not re-sent.
+- meka's `subscriptions/listen` is acknowledged, so rmcp no longer warns on every meka connect.
+
 ## [0.21.0] - 2026-10-15
 
 ### Changed

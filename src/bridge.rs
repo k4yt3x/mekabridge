@@ -392,6 +392,7 @@ pub async fn run(config: Config) -> Result<()> {
             permission_checked: Arc::new(tokio::sync::OnceCell::new()),
             pending_session: Arc::default(),
             notices: inbound::NoticeLog::default(),
+            serving: inbound::ServingProfile::default(),
             session: session_sender,
             position,
         };

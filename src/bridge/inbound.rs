@@ -35,7 +35,7 @@ use crate::{
     channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
     config::Config,
     meka::{
-        InboxState, MekaClient, MekaError, ProblemDetail, StreamItem,
+        InboxReceipt, InboxState, MekaClient, MekaError, ProblemDetail, ProblemKind, StreamItem,
         sse::{TurnEvent, TurnSource},
     },
     store::{
@@ -799,6 +799,9 @@ pub struct SessionContext {
     /// Who has already been told that something failed, so an outage is reported once rather than
     /// once per batch.
     pub notices: NoticeLog,
+    /// Which profile served the session's last turn, so the owner hears when turns move to a
+    /// fallback and when they come back.
+    pub serving: ServingProfile,
     /// The session the feed follows. Published once bound, and again on a rebind, so the reader
     /// opens the right feed.
     pub session: watch::Sender<Option<Uuid>>,
@@ -1153,7 +1156,13 @@ async fn post(
         Ok(receipt) => {
             if let Err(error) = context
                 .store
-                .posted(row.seq, *session_id, &receipt.item_id, now)
+                .posted(
+                    row.seq,
+                    *session_id,
+                    &receipt.item_id,
+                    now,
+                    receipt.retry_until(),
+                )
                 .await
             {
                 tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
@@ -1168,7 +1177,7 @@ async fn post(
             // A replayed key answers with the item's current state, which for a message posted
             // before a restart may already be its fate.
             if receipt.replayed {
-                settle_replayed(context, row, receipt.state).await;
+                settle_replayed(context, row, &receipt).await;
             }
             true
         }
@@ -1299,7 +1308,8 @@ async fn rebind(
     *session_id = replacement;
     if replacement == old {
         tracing::error!(
-            "the binding to session {old} could not be cleared, so meka's replacement for it              cannot be bound; nothing can be handed over until the store takes a write"
+            "the binding to session {old} could not be cleared, so meka's replacement for it \
+             cannot be bound; nothing can be handed over until the store takes a write"
         );
         return false;
     }
@@ -1480,17 +1490,25 @@ async fn offer_again(
 }
 
 /// Act on what a replayed key said the item had become.
-async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, state: InboxState) {
-    match state {
+async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, receipt: &InboxReceipt) {
+    match &receipt.state {
         InboxState::Delivered => {
             deliver(context, row).await;
         }
+        // Given up on while this bridge was not listening. The receipt carries what the
+        // `inbox.failed` it missed would have, so the message meets the same end it would have met
+        // live, rather than a fresh item meeting the same failure.
+        InboxState::Withdrawn if receipt.last_error.is_some() => {
+            let reason = given_up_reason(
+                receipt.failure.as_deref().unwrap_or("meka gave up on it"),
+                receipt.last_error.as_ref(),
+            );
+            tracing::error!(seq = row.seq, "meka gave up on a message: {}", reason);
+            fail(context, row, &reason, Retry::Undelivered).await;
+        }
         InboxState::Withdrawn => {
-            // meka stamps the same state whether the item was cancelled unread or given up on after
-            // its own hour of retries, and the receipt does not say which, so the reason claims
-            // only what is known. Offering the message again is right for the first and
-            // harmless for the second, where a fresh item is a fresh hour and the
-            // offers are bounded either way.
+            // Taken back unread with no failure behind it: a cancelled turn, or a `DELETE`. The
+            // message is still owed, so it is offered again.
             offer_again(
                 context,
                 row,
@@ -1499,7 +1517,7 @@ async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, state: I
             )
             .await;
         }
-        InboxState::Pending | InboxState::Appended => {
+        state @ (InboxState::Pending | InboxState::Appended) => {
             tracing::debug!(seq = row.seq, state = %state, "a message is still with meka");
         }
         InboxState::Other(name) => tracing::warn!(
@@ -1519,10 +1537,11 @@ async fn settle_replayed(context: &SessionContext, row: &QueuedMessage, state: I
 /// would sit with meka for as long as the connection lasts, counting against the queue depth and
 /// reaching nobody.
 ///
-/// meka gives up on an item within the hour, so one older than that has an outcome that has been
-/// and gone -- or is one meka is holding for the next turn, which asking will not hurry.
-/// Rate-limited by `[bridge].straggler_sweep` for that second case, and normally over an empty
-/// list.
+/// An item meka tried and kept failing is given up on by the `retry_until` meka answered its post
+/// with, so one past that has had its outcome. One never tried is still waiting for a turn, which
+/// asking will not hurry, and costs a request each sweep until it gets one. A row posted before the
+/// deadline was written down is judged by `hand_over_within`, meka's default ceiling. Rate-limited
+/// by `[bridge].straggler_sweep`, and normally over an empty list.
 async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
     let posted = match context.store.rows_in(QueueState::Posted).await {
         Ok(posted) => posted,
@@ -1531,10 +1550,14 @@ async fn settle_stragglers(context: &SessionContext, session_id: Uuid) {
             return;
         }
     };
-    let stale = Utc::now()
-        - chrono::Duration::from_std(context.config.bridge.hand_over_within).unwrap_or_default();
+    let now = Utc::now();
+    let within =
+        chrono::Duration::from_std(context.config.bridge.hand_over_within).unwrap_or_default();
     for row in posted {
-        if row.posted_at.is_none_or(|posted| posted > stale) {
+        let deadline = row
+            .retry_until
+            .or_else(|| row.posted_at.map(|posted| posted + within));
+        if deadline.is_none_or(|deadline| deadline > now) {
             continue;
         }
         tracing::warn!(
@@ -1618,13 +1641,19 @@ async fn ask_about(context: &SessionContext, session_id: Uuid, row: &QueuedMessa
             );
             if let Err(error) = context
                 .store
-                .posted(row.seq, session_id, &receipt.item_id, Utc::now())
+                .posted(
+                    row.seq,
+                    session_id,
+                    &receipt.item_id,
+                    Utc::now(),
+                    receipt.retry_until(),
+                )
                 .await
             {
                 tracing::error!(seq = row.seq, "failed to record a hand-over: {}", error);
             }
         }
-        Ok(receipt) => settle_replayed(context, row, receipt.state).await,
+        Ok(receipt) => settle_replayed(context, row, &receipt).await,
         Err(error) => tracing::warn!(
             seq = row.seq,
             "could not ask meka about a message ({}); it is asked about again later",
@@ -1749,6 +1778,7 @@ async fn handle_feed(
                     TurnEvent::InboxDelivered { .. }
                         | TurnEvent::InboxFailed { .. }
                         | TurnEvent::InboxWithdrawn { .. }
+                        | TurnEvent::InboxDeferred { .. }
                         | TurnEvent::Finished { .. }
                         | TurnEvent::Failed { .. }
                         | TurnEvent::Cancelled { .. }
@@ -1889,11 +1919,29 @@ async fn apply(
             }
             false
         }
-        TurnEvent::InboxFailed { item_id, reason } => {
+        TurnEvent::InboxFailed {
+            item_id,
+            reason,
+            error,
+        } => {
             if let Some(row) = row_for(context, item_id).await {
+                let problem = error
+                    .clone()
+                    .map(serde_json::from_value::<ProblemDetail>)
+                    .and_then(Result::ok);
+                let reason = given_up_reason(reason, problem.as_ref());
                 tracing::error!(seq = row.seq, "meka gave up on a message: {}", reason);
-                fail(context, &row, reason, Retry::Undelivered).await;
+                fail(context, &row, &reason, Retry::Undelivered).await;
             }
+            false
+        }
+        TurnEvent::InboxDeferred {
+            item_ids,
+            not_before,
+            error,
+        } => {
+            let problem: ProblemDetail = serde_json::from_value(error.clone()).unwrap_or_default();
+            deferred(context, item_ids, not_before.as_deref(), &problem).await;
             false
         }
         TurnEvent::InboxWithdrawn { item_id } => {
@@ -1908,10 +1956,15 @@ async fn apply(
             }
             true
         }
-        TurnEvent::Finished { stop_reason, .. } => {
+        TurnEvent::Finished {
+            stop_reason,
+            profile,
+            ..
+        } => {
             let Some(turn) = turn else {
                 return false;
             };
+            note_serving(context, turn, profile.as_deref(), true).await;
             let tally = turns.remove(turn);
             finish(
                 context,
@@ -1922,10 +1975,11 @@ async fn apply(
             )
             .await
         }
-        TurnEvent::Failed { error } => {
+        TurnEvent::Failed { error, profile } => {
             let Some(turn) = turn else {
                 return false;
             };
+            note_serving(context, turn, profile.as_deref(), false).await;
             let tally = turns.remove(turn);
             let problem: ProblemDetail = serde_json::from_value(error.clone()).unwrap_or_default();
             finish(context, turn, tally, typist, Ending::Failed(problem)).await
@@ -2078,9 +2132,9 @@ async fn finish(
             let error = MekaError::Problem(problem);
             // Worth saying differently because it is the one failure here that is not about the
             // message that hit it. One permanent session carries every conversation, so a window
-            // it has outgrown refuses the next message too. meka retries an item it has accepted
-            // for an hour, so this is logged on each of those attempts, and the item is given up
-            // on with `inbox.failed` at the end of them.
+            // it has outgrown refuses the next message too. meka gives such an item up at once,
+            // since no attempt fixes it, and says so with `inbox.failed`, which is what tells the
+            // chat and the owner.
             if error.is_context_overflow() {
                 tracing::error!(
                     "the agent's session no longer fits the model's context window, so every \
@@ -2372,16 +2426,7 @@ async fn announce(
     failure: &Failure<'_>,
     lost: Lost,
 ) {
-    let configured = context.config.bridge.owner_conversation.as_deref();
-    let owner = configured.and_then(ConversationId::parse);
-    if let Some(configured) = configured
-        && owner.is_none()
-    {
-        // Startup validation only checks the channel prefix, so an id missing its chat segment gets
-        // this far. Silence here would drop every operator notice this bridge ever tries to send
-        // and leave nothing anywhere saying why.
-        tracing::error!("[bridge].owner_conversation {configured:?} is not a valid id");
-    }
+    let owner = owner_of(context);
 
     let mut told = Vec::new();
     if context.config.bridge.notify_failures && !failure.answered {
@@ -2474,6 +2519,273 @@ async fn announce(
         ));
     }
     notify(context, &owner, &text).await;
+}
+
+/// The conversation operator notices go to, or `None` when none is configured.
+fn owner_of(context: &SessionContext) -> Option<ConversationId> {
+    let configured = context.config.bridge.owner_conversation.as_deref()?;
+    let owner = ConversationId::parse(configured);
+    if owner.is_none() {
+        // Startup validation only checks the channel prefix, so an id missing its chat segment gets
+        // this far. Silence here would drop every operator notice this bridge ever tries to send
+        // and leave nothing anywhere saying why.
+        tracing::error!("[bridge].owner_conversation {configured:?} is not a valid id");
+    }
+    owner
+}
+
+/// Why meka gave an item up, with the error that decided it when a failed turn did.
+///
+/// The reason alone is meka's account of the decision, "no turn could deliver it in 7 attempts",
+/// which is not the cause: a spent quota and a revoked credential read the same in it.
+fn given_up_reason(reason: &str, error: Option<&ProblemDetail>) -> String {
+    match error {
+        // meka's reason for giving an item up at once already ends with the error's own sentence,
+        // which is the Problem Detail's `detail`, so only what it does not say is added.
+        Some(error) if !error.detail.is_empty() && reason.contains(&error.detail) => {
+            format!("{reason} ({})", error.summary(false))
+        }
+        Some(error) => format!("{reason}: {error}"),
+        None => reason.to_string(),
+    }
+}
+
+/// A time as an owner reads it, to the second and in UTC.
+fn clock(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+/// meka put items back after a turn on them failed, and will try them again.
+///
+/// The moment to tell the owner. Nothing has failed for good yet, but nobody waiting is hearing
+/// back, and meka may go on trying for an hour before it gives up. A spent quota or an upstream
+/// outage would otherwise look like a quiet chat to everyone, the one person who could act on it
+/// included. The chats themselves are told nothing here: a message that gets through after all
+/// needs no apology.
+async fn deferred(
+    context: &SessionContext,
+    item_ids: &[String],
+    not_before: Option<&str>,
+    error: &ProblemDetail,
+) {
+    let mut rows = Vec::with_capacity(item_ids.len());
+    for item_id in item_ids {
+        // Only what meka still has. A deferral replayed after the bridge restarted can name a
+        // message whose fate the reconnect has settled since, and reporting it as still being
+        // retried would be telling the owner about an outage that is over.
+        if let Some(row) = row_for(context, item_id).await
+            && row.state == QueueState::Posted
+        {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let next = not_before
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| clock(at.with_timezone(&Utc)));
+    tracing::warn!(
+        messages = rows.len(),
+        next_attempt = next.as_deref().unwrap_or("unknown"),
+        "a turn on this bridge's messages failed and meka will try again: {}",
+        error
+    );
+    let Some(owner) = owner_of(context) else {
+        return;
+    };
+    // A key of its own, so a deferral does not spend the window the give-up that may follow it
+    // needs: meka gives an item up minutes after the last deferral it reports, and a shared
+    // window would leave the owner told "will try again" and never told it stopped.
+    let Some(suppressed) = context.notices.due(&format!("{}#deferred", owner.as_str())) else {
+        return;
+    };
+    let count = rows.len();
+    let mut text = format!(
+        "mekabridge: meka could not run the agent's turn on {count} message(s) and will try again{}. \
+         Until a turn gets through, nobody in these chats hears back.",
+        next.map(|next| format!(" at {next}")).unwrap_or_default()
+    );
+    // Every row of one deferral was enqueued around the same moment, so the earliest deadline is
+    // the one that matters. meka stops at the last attempt that would land before it, which can be
+    // a few minutes sooner, so it is a bound rather than a time.
+    match rows.iter().filter_map(|row| row.retry_until).min() {
+        Some(deadline) => text.push_str(&format!(
+            " If it is still failing by {}, meka gives up on them and this bridge reports them \
+             undelivered.",
+            clock(deadline)
+        )),
+        None => text.push_str(
+            " If it is still failing once meka's retry ceiling passes, meka gives up on them and \
+             this bridge reports them undelivered.",
+        ),
+    }
+    if error.title.is_empty() && error.detail.is_empty() {
+        text.push_str("\n\nError: meka sent no detail.");
+    } else {
+        text.push_str(&format!("\n\nError: {error}"));
+    }
+    if context.serving.fallbacks_failed() {
+        text.push_str(
+            "\nThe agent's profile has fallbacks, and none of them could serve this turn either.",
+        );
+    } else if matches!(
+        error.kind(),
+        ProblemKind::ProviderExhausted | ProblemKind::ProviderUnavailable
+    ) {
+        text.push_str(
+            "\nThe agent's profile cannot be served right now. Naming `fallbacks` on it in meka's \
+             config lets another profile answer while it cannot.",
+        );
+    }
+    let affected = conversations_of(&rows);
+    let ids: Vec<&str> = affected.iter().map(ConversationId::as_str).collect();
+    text.push_str(&format!("\nConversations: {}", ids.join(", ")));
+    if suppressed > 0 {
+        text.push_str(&format!(
+            "\n{suppressed} further failed attempt(s) since the last notice were not reported."
+        ));
+    }
+    notify(context, &owner, &text).await;
+}
+
+/// Which profile serves the session's turns, as far as the feed has said, and what the owner was
+/// last told about it.
+///
+/// Kept so a fallback is reported when it starts and when it ends rather than on every turn: an
+/// outage that sends every turn to the fallback for an hour is one fact, and an owner told it a
+/// hundred times stops reading the notices that matter. A provider that keeps failing and
+/// recovering would still move turns back and forth every few minutes, since meka retries the
+/// profile after a cooldown, so moves are reported at most once per notice window and the next
+/// notice counts the ones in between.
+#[derive(Debug, Default)]
+pub struct ServingProfile(std::sync::Mutex<Serving>);
+
+#[derive(Debug, Default)]
+struct Serving {
+    /// The fallback the last finished turn ran on; `None` is the session's own profile.
+    current: Option<String>,
+    /// What the owner was last told: a fallback, or `None` for the session's own profile.
+    told: Option<String>,
+    told_at: Option<DateTime<Utc>>,
+    /// Moves since the owner was last told.
+    moves: u32,
+    /// Whether the last failed turn ended on a fallback, which means the profile has fallbacks
+    /// and every one meka tried refused the turn too.
+    fallbacks_failed: bool,
+}
+
+/// A change in which profile serves the session, worth telling the owner about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileMove {
+    /// The fallback turns run on now, or `None` for the session's own profile.
+    to: Option<String>,
+    /// What the owner was last told.
+    from: Option<String>,
+    /// How many times turns changed profile since then, this move included.
+    moves: u32,
+}
+
+impl ServingProfile {
+    /// Record which profile served a turn that ended, and say whether that is worth a notice.
+    ///
+    /// Only a finished turn says where the session's turns run. A failed one names the last
+    /// profile meka tried before giving up, which served nothing.
+    fn observe(
+        &self,
+        fallback: Option<&str>,
+        finished: bool,
+        now: DateTime<Utc>,
+    ) -> Option<ProfileMove> {
+        let mut serving = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !finished {
+            serving.fallbacks_failed = fallback.is_some();
+            return None;
+        }
+        serving.fallbacks_failed = false;
+        let next = fallback.map(str::to_string);
+        if next != serving.current {
+            serving.current = next;
+            serving.moves += 1;
+        }
+        if serving.current == serving.told {
+            return None;
+        }
+        let recent = serving.told_at.is_some_and(|at| {
+            (now - at)
+                .to_std()
+                .is_ok_and(|since| since < NOTICE_INTERVAL)
+        });
+        if recent {
+            return None;
+        }
+        let change = ProfileMove {
+            to: serving.current.clone(),
+            from: serving.told.clone(),
+            moves: std::mem::take(&mut serving.moves),
+        };
+        serving.told = change.to.clone();
+        serving.told_at = Some(now);
+        Some(change)
+    }
+
+    /// Whether the last turn that failed had already fallen back, so `fallbacks` exist and could
+    /// not help.
+    fn fallbacks_failed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fallbacks_failed
+    }
+}
+
+/// Tell the owner when the session's turns run on a different profile than they were last told.
+///
+/// A fallback answers with another model and may bill another account, and a server full of people
+/// talking to the bot is not going to mention either. The log line is not enough on its own: an
+/// operator has no reason to read logs while the bot is answering.
+async fn note_serving(
+    context: &SessionContext,
+    turn: &str,
+    fallback: Option<&str>,
+    finished: bool,
+) {
+    let Some(change) = context.serving.observe(fallback, finished, Utc::now()) else {
+        return;
+    };
+    let mut text = match (&change.to, &change.from) {
+        (Some(profile), _) => {
+            tracing::warn!(turn, profile = %profile, "meka is serving turns from a fallback profile");
+            format!(
+                "mekabridge: meka could not serve the agent's turns on its own profile, so they run \
+                 on the fallback profile \"{profile}\", which may answer with another model and bill \
+                 another account. meka moves them back once the agent's own profile answers again, \
+                 and this bridge reports that here too."
+            )
+        }
+        (None, from) => {
+            tracing::info!(turn, "turns run on the session's own profile again");
+            match from {
+                Some(from) => format!(
+                    "mekabridge: the agent's turns run on its own profile again, no longer on the \
+                     fallback profile \"{from}\"."
+                ),
+                None => "mekabridge: the agent's turns run on its own profile again.".to_string(),
+            }
+        }
+    };
+    if change.moves > 1 {
+        text.push_str(&format!(
+            " They changed profile {} times since the last notice.",
+            change.moves
+        ));
+    }
+    if let Some(owner) = owner_of(context) {
+        notify(context, &owner, &text).await;
+    }
 }
 
 /// Write one line of the bridge's own into a conversation.
@@ -2769,6 +3081,8 @@ mod tests {
             message_id: "1".to_string(),
             chat_kind: ChatKind::Direct,
             chat_title: None,
+            parent: None,
+            server: None,
             sender: Sender {
                 id: "1".to_string(),
                 display_name: "Alice".to_string(),
@@ -3010,6 +3324,80 @@ mod tests {
             retry_delay(base, 0, Some(Duration::from_secs(3600))),
             RETRY_DELAY_MAX
         );
+    }
+
+    #[test]
+    fn a_fallback_is_reported_when_it_starts_and_when_it_ends_and_not_between() {
+        let serving = ServingProfile::default();
+        let start = Utc::now();
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        let moved = |to: Option<&str>, from: Option<&str>, moves: u32| {
+            Some(ProfileMove {
+                to: to.map(str::to_string),
+                from: from.map(str::to_string),
+                moves,
+            })
+        };
+        // The session's own profile, as every turn starts out.
+        assert_eq!(serving.observe(None, true, at(0)), None);
+        assert_eq!(
+            serving.observe(Some("backup"), true, at(0)),
+            moved(Some("backup"), None, 1)
+        );
+        // An outage sends every turn there for an hour, which is one fact rather than a hundred.
+        assert_eq!(serving.observe(Some("backup"), true, at(1)), None);
+        // A failed turn names the last profile meka tried, which served nothing, but says the
+        // fallbacks were tried and refused too.
+        assert_eq!(serving.observe(Some("last-resort"), false, at(2)), None);
+        assert!(serving.fallbacks_failed());
+        // A provider that keeps failing and recovering moves turns back and forth every few
+        // minutes. Inside the window that is held, and a return to what the owner was told needs
+        // no notice at all.
+        assert_eq!(serving.observe(None, true, at(3)), None);
+        assert!(!serving.fallbacks_failed());
+        assert_eq!(serving.observe(Some("backup"), true, at(5)), None);
+        assert_eq!(serving.observe(None, true, at(8)), None);
+        // Once the window is out, the first turn says where things stand, counting the moves.
+        assert_eq!(
+            serving.observe(None, true, at(20)),
+            moved(None, Some("backup"), 3)
+        );
+        assert_eq!(serving.observe(None, true, at(21)), None);
+        // A failed turn on the session's own profile moves nothing.
+        assert_eq!(serving.observe(None, false, at(40)), None);
+        assert!(!serving.fallbacks_failed());
+    }
+
+    #[test]
+    fn a_give_up_names_its_cause_once() {
+        let error = ProblemDetail {
+            type_uri: "https://meka.run/errors/auth".to_string(),
+            title: "Unauthorized".to_string(),
+            status: 401,
+            detail: "the credential was rejected".to_string(),
+            retry_after: None,
+            provider_response: Some("401 invalid x-api-key".to_string()),
+        };
+        // meka's reason for giving up at once already ends with the error's sentence.
+        assert_eq!(
+            given_up_reason(
+                "the turn opened on it failed, and waiting would not change that: the credential \
+                 was rejected",
+                Some(&error)
+            ),
+            "the turn opened on it failed, and waiting would not change that: the credential was \
+             rejected (Unauthorized (401). The provider said: 401 invalid x-api-key)"
+        );
+        // Its reason for running out of time does not, so the whole error follows it.
+        assert_eq!(
+            given_up_reason(
+                "no turn could deliver it in 7 attempt(s) over the last hour",
+                Some(&error)
+            ),
+            "no turn could deliver it in 7 attempt(s) over the last hour: Unauthorized (401): the \
+             credential was rejected. The provider said: 401 invalid x-api-key"
+        );
+        assert_eq!(given_up_reason("withdrawn", None), "withdrawn");
     }
 
     #[test]

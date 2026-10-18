@@ -6,7 +6,7 @@
 //! that boots first recovers on its own; until it does, a server entry marked `required` refuses
 //! turns rather than running them toolless, which is why coming up promptly still matters.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -110,7 +110,7 @@ async fn serve_stdio(
     surface: ToolSurface,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let server = BridgeMcpServer::new(sink, surface);
+    let server = BridgeMcpServer::new(sink, surface).closing_with(shutdown.clone());
     let running = server.serve(stdio()).await.map_err(|error| {
         BridgeError::config(format!("failed to start the stdio MCP server: {error}"))
     })?;
@@ -136,10 +136,30 @@ async fn serve_http(
     surface: ToolSurface,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // rmcp's own token closes every open response the moment it fires, a notification stream's
+    // included, which would cut that stream's final result off before it was written. So the
+    // streams are ended first, on `shutdown`, and the transport only after a grace that covers
+    // writing their results; it still ends whatever else is open, which an MCP Inspector's stream
+    // of the older era would otherwise hold open for good.
+    let transport = CancellationToken::new();
+    let grace = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let transport = transport.clone();
+        async move {
+            shutdown.cancelled().await;
+            tokio::time::sleep(STREAM_CLOSE_GRACE).await;
+            transport.cancel();
+        }
+    });
     let service = StreamableHttpService::new(
-        move || Ok(BridgeMcpServer::new(Arc::clone(&sink), surface)),
+        {
+            let shutdown = shutdown.clone();
+            move || {
+                Ok(BridgeMcpServer::new(Arc::clone(&sink), surface).closing_with(shutdown.clone()))
+            }
+        },
         Arc::new(LocalSessionManager::default()),
-        streamable_config(config, &shutdown),
+        streamable_config(config, &transport),
     );
 
     let mut router = Router::new().nest_service(&config.path, service);
@@ -173,20 +193,30 @@ async fn serve_http(
         );
     }
 
-    axum::serve(listener, router)
+    let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
-        .map_err(BridgeError::Io)
+        .map_err(BridgeError::Io);
+    // Every connection is closed by now, so whatever rmcp still runs behind them, an older-era
+    // session's worker say, has nothing left to flush and is stopped at once. The grace would
+    // otherwise wait on a shutdown that a server stopping on its own never sees.
+    transport.cancel();
+    grace.abort();
+    served
 }
+
+/// How long a shutdown waits for the notification streams it ended to write their final results
+/// before the transport closes whatever is left.
+const STREAM_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 fn streamable_config(
     config: &McpConfig,
-    shutdown: &CancellationToken,
+    transport: &CancellationToken,
 ) -> StreamableHttpServerConfig {
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so it has to be built by mutating the
     // default rather than with a struct literal.
     let mut streamable = StreamableHttpServerConfig::default();
-    streamable.cancellation_token = shutdown.child_token();
+    streamable.cancellation_token = transport.child_token();
     // rmcp defaults to accepting loopback `Host` values only, as a DNS-rebinding guard. A bind on a
     // routable address needs the operator to name the hosts meka will use.
     if !config.allowed_hosts.is_empty() {

@@ -208,11 +208,25 @@ impl NameCache {
         entry.name.as_ref().map(|name| format!("#{name}"))
     }
 
-    /// Where a conversation is, as a person would say it.
+    /// The channel a thread hangs off, when a message sent there reaches that channel.
     ///
-    /// `#deploys in Acme Corp` for a channel, `#deploys › rollback tonight in Acme Corp` for a
+    /// `None` for a forum or media channel, which holds posts but takes no message of its own, and
+    /// for a parent the cache has not been told about, whose kind it cannot vouch for.
+    pub fn sendable_parent_of(&self, channel_id: Id<ChannelMarker>) -> Option<Id<ChannelMarker>> {
+        let channels = self.channels.read().ok()?;
+        let entry = channels.get(&channel_id)?;
+        let parent = is_thread(entry.kind).then_some(entry.parent).flatten()?;
+        let kind = channels.get(&parent)?.kind;
+        (!matches!(kind, ChannelType::GuildForum | ChannelType::GuildMedia)).then_some(parent)
+    }
+
+    /// Where a conversation is, as one path written outermost first.
+    ///
+    /// `Acme Corp › #deploys` for a channel, `Acme Corp › #deploys › rollback tonight` for a
     /// thread, and `None` for a direct message or anything the cache has not been told about, so
-    /// the caller can say nothing rather than something wrong.
+    /// the caller can say nothing rather than something wrong. One notation for every level, and
+    /// every name once, because the ids that go with them are stated beside it rather than inside
+    /// it.
     pub fn describe(&self, channel_id: Id<ChannelMarker>) -> Option<String> {
         let (located, guild) = {
             let channels = self.channels.read().ok()?;
@@ -229,7 +243,7 @@ impl NameCache {
             (located, entry.guild)
         };
         match guild.and_then(|guild| self.guild_name(guild)) {
-            Some(guild) => Some(format!("{located} in {guild}")),
+            Some(guild) => Some(format!("{guild} \u{203a} {located}")),
             None => Some(located),
         }
     }
@@ -285,7 +299,7 @@ mod tests {
         cache.insert_channel(&channel(1, "deploys", ChannelType::GuildText));
         assert_eq!(
             cache.describe(Id::new(1)).as_deref(),
-            Some("#deploys in Acme Corp")
+            Some("Acme Corp \u{203a} #deploys")
         );
     }
 
@@ -298,8 +312,51 @@ mod tests {
         cache.insert_channel(&thread);
         assert_eq!(
             cache.describe(Id::new(2)).as_deref(),
-            Some("#deploys \u{203a} rollback tonight in Acme Corp")
+            Some("Acme Corp \u{203a} #deploys \u{203a} rollback tonight")
         );
+    }
+
+    #[test]
+    fn a_thread_offers_its_parent_only_where_a_message_can_be_sent() {
+        let cache = cache_with_guild();
+        cache.insert_channel(&channel(1, "deploys", ChannelType::GuildText));
+        cache.insert_channel(&channel(3, "help", ChannelType::GuildForum));
+        let mut thread = channel(2, "rollback tonight", ChannelType::PublicThread);
+        thread.parent_id = Some(Id::new(1));
+        cache.insert_channel(&thread);
+        let mut post = channel(4, "login fails", ChannelType::PublicThread);
+        post.parent_id = Some(Id::new(3));
+        cache.insert_channel(&post);
+        let mut stray = channel(5, "orphan", ChannelType::PublicThread);
+        stray.parent_id = Some(Id::new(6));
+        cache.insert_channel(&stray);
+
+        assert_eq!(cache.sendable_parent_of(Id::new(2)), Some(Id::new(1)));
+        // A forum takes posts, not messages, so its id would only send the agent into a refusal,
+        // and so does a media channel.
+        assert_eq!(cache.sendable_parent_of(Id::new(4)), None);
+        cache.insert_channel(&channel(8, "clips", ChannelType::GuildMedia));
+        let mut clip = channel(9, "launch", ChannelType::PublicThread);
+        clip.parent_id = Some(Id::new(8));
+        cache.insert_channel(&clip);
+        assert_eq!(cache.sendable_parent_of(Id::new(9)), None);
+        // An announcement channel takes messages, so a thread on one of its posts names it.
+        cache.insert_channel(&channel(10, "news", ChannelType::GuildAnnouncement));
+        let mut discussion = channel(11, "v2 is out", ChannelType::AnnouncementThread);
+        discussion.parent_id = Some(Id::new(10));
+        cache.insert_channel(&discussion);
+        assert_eq!(cache.sendable_parent_of(Id::new(11)), Some(Id::new(10)));
+        assert_eq!(
+            cache.describe(Id::new(4)).as_deref(),
+            Some("Acme Corp \u{203a} #help \u{203a} login fails")
+        );
+        // A parent nobody announced might be either, so nothing is offered.
+        assert_eq!(cache.sendable_parent_of(Id::new(5)), None);
+        // And a channel hangs off nothing, whatever its `parent_id` says about its category.
+        let mut categorized = channel(7, "releases", ChannelType::GuildText);
+        categorized.parent_id = Some(Id::new(1));
+        cache.insert_channel(&categorized);
+        assert_eq!(cache.sendable_parent_of(Id::new(7)), None);
     }
 
     #[test]

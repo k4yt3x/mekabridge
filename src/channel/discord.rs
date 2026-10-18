@@ -121,6 +121,13 @@ const BACKFILL_PAGE: u16 = 100;
 /// cannot place them, and one that cannot be reached either is retried once and then left.
 const SERVERS_ARRIVE_WITHIN: Duration = Duration::from_secs(30);
 
+/// Longest a channel lookup may take, well under twilight's own timeout because the gateway loop
+/// waits on it for an arriving message.
+const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long arriving messages go without a channel lookup after one failed.
+const CHANNEL_LOOKUP_PAUSE: Duration = Duration::from_secs(60);
+
 /// Gateway events this connector acts on.
 ///
 /// Passed to `next_event` so everything else is discarded before it is deserialized. The intents
@@ -140,6 +147,7 @@ const WANTED_EVENTS: EventTypeFlags = EventTypeFlags::READY
     .union(EventTypeFlags::THREAD_CREATE)
     .union(EventTypeFlags::THREAD_UPDATE)
     .union(EventTypeFlags::THREAD_DELETE)
+    .union(EventTypeFlags::THREAD_LIST_SYNC)
     .union(EventTypeFlags::ROLE_CREATE)
     .union(EventTypeFlags::ROLE_UPDATE)
     .union(EventTypeFlags::ROLE_DELETE)
@@ -169,6 +177,12 @@ pub struct DiscordChannel {
     identity: tokio::sync::OnceCell<Id<UserMarker>>,
     /// Direct-message channels already opened, so dialling the same person twice costs one call.
     dm_channels: RwLock<HashMap<Id<UserMarker>, Id<ChannelMarker>>>,
+    /// Until when an arriving message's channel is not looked up, after a lookup failed.
+    ///
+    /// The lookup runs inside the gateway loop, which handles nothing else while it waits, so a
+    /// REST API that is failing must not be asked again for every message: a few slow answers in a
+    /// row would hold up the heartbeat the connection depends on.
+    lookups_paused_until: std::sync::Mutex<Option<tokio::time::Instant>>,
     /// See [`DiscordConfig::backfill`].
     backfill: Duration,
     /// The fresh gateway sessions whose servers have all arrived and that nobody has caught up
@@ -229,6 +243,7 @@ impl DiscordChannel {
             presences: Arc::new(PresenceCache::default()),
             identity: tokio::sync::OnceCell::new(),
             dm_channels: RwLock::new(HashMap::new()),
+            lookups_paused_until: std::sync::Mutex::new(None),
             backfill: config.backfill,
             openings: Arc::new(Openings::default()),
         })
@@ -454,6 +469,93 @@ impl DiscordChannel {
                          header"
                     .to_string(),
             })
+    }
+
+    /// Fetch a channel and keep it, for one the gateway never announced.
+    async fn learn_channel(&self, channel_id: Id<ChannelMarker>) -> Result<(), ChannelError> {
+        let fetch = async {
+            self.http
+                .channel(channel_id)
+                .await
+                .map_err(|error| self.delivery_error("reading the channel", &error))?
+                .model()
+                .await
+                .map_err(|error| self.decode_error("the channel", &error))
+        };
+        let channel = tokio::time::timeout(CHANNEL_LOOKUP_TIMEOUT, fetch)
+            .await
+            .map_err(|_elapsed| ChannelError::Transport {
+                channel: self.id.as_str().to_string(),
+                message: format!(
+                    "Discord did not answer a channel lookup within {}s",
+                    CHANNEL_LOOKUP_TIMEOUT.as_secs()
+                ),
+            })??;
+        self.names.insert_channel(&channel);
+        Ok(())
+    }
+
+    /// Make sure the cache can place a channel and, for a thread, the channel it hangs off.
+    ///
+    /// Both are asked for at most once, since the answer is kept. Only the channel itself is
+    /// required: a thread whose parent cannot be read is still placed, and loses only the parent's
+    /// name and the standing it would inherit, which a server or role grant does not need.
+    async fn place(&self, channel_id: Id<ChannelMarker>) -> Result<(), ChannelError> {
+        if self.names.kind_of(channel_id).is_none() {
+            self.learn_channel(channel_id).await?;
+        }
+        if let Some(parent) = self.names.parent_of(channel_id)
+            && self.names.kind_of(parent).is_none()
+            && let Err(error) = self.learn_channel(parent).await
+        {
+            tracing::warn!(
+                channel = %self.id,
+                discord_channel = %parent,
+                "could not look up the channel a thread hangs off: {}",
+                error
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Self::place`] for a message arriving over the gateway, which is delivered whatever the
+    /// lookup says.
+    ///
+    /// The gateway should have announced the channel already, and nearly always has. A miss is not
+    /// cosmetic: the message would read as an `unknown` room with no name, and a thread admitted
+    /// only through its parent's allowlist would be dropped, because the parent is found through
+    /// the same cache.
+    async fn place_arrival(&self, message: &Message) {
+        // A direct message needs no lookup: Discord announces none of them, and the missing server
+        // already says what it is. The bot's own messages are dropped unread, so they need none
+        // either.
+        if message.guild_id.is_none() || self.identity.get() == Some(&message.author.id) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        {
+            let paused = self
+                .lookups_paused_until
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if paused.is_some_and(|until| now < until) {
+                return;
+            }
+        }
+        if let Err(error) = self.place(message.channel_id).await {
+            *self
+                .lookups_paused_until
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(now + CHANNEL_LOOKUP_PAUSE);
+            tracing::warn!(
+                channel = %self.id,
+                discord_channel = %message.channel_id,
+                pause = ?CHANNEL_LOOKUP_PAUSE,
+                "could not look up the channel a message arrived in, so lookups pause: {}",
+                error
+            );
+        }
     }
 
     /// The server a conversation is in, which every moderation call needs and a direct message has
@@ -682,6 +784,11 @@ impl DiscordChannel {
             message_id: message.id.to_string(),
             chat_kind,
             chat_title: self.names.describe(message.channel_id),
+            parent: self
+                .names
+                .sendable_parent_of(message.channel_id)
+                .map(|parent| ConversationId::new(&self.id, &parent.to_string(), None)),
+            server: message.guild_id.map(|guild_id| guild_id.to_string()),
             sender: Sender {
                 id: message.author.id.to_string(),
                 display_name,
@@ -946,10 +1053,19 @@ impl DiscordChannel {
             Event::ThreadCreate(thread) => self.names.insert_channel(&thread),
             Event::ThreadUpdate(thread) => self.names.insert_channel(&thread),
             Event::ThreadDelete(thread) => self.names.remove_channel(thread.id),
+            // The threads already active in a channel the bot has just been let into. No thread
+            // create announces them, and `GUILD_CREATE` only carried what the bot could see then.
+            Event::ThreadListSync(sync) => {
+                for mut thread in sync.threads {
+                    thread.guild_id.get_or_insert(sync.guild_id);
+                    self.names.insert_channel(&thread);
+                }
+            }
             Event::RoleCreate(role) => self.names.insert_role(role.guild_id, &role.role),
             Event::RoleUpdate(role) => self.names.insert_role(role.guild_id, &role.role),
             Event::RoleDelete(role) => self.names.remove_role(role.guild_id, role.role_id),
             Event::MessageCreate(message) => {
+                self.place_arrival(&message.0).await;
                 let kind = self.names.kind_of(message.channel_id);
                 if let Some(event) = self.to_event(&message.0, kind) {
                     self.deliver(event, sink).await;
@@ -961,6 +1077,7 @@ impl DiscordChannel {
                 if message.edited_timestamp.is_none() {
                     return;
                 }
+                self.place_arrival(&message.0).await;
                 let kind = self.names.kind_of(message.channel_id);
                 if let Some(event) = self.to_event(&message.0, kind) {
                     self.deliver(event, sink).await;
@@ -2526,18 +2643,9 @@ impl Channel for DiscordChannel {
         let channel_id = self.target(conversation).await?;
         // A message fetched here carries no server, which live delivery always has, so a channel
         // the cache cannot place would be filed as a direct message. Server channels are in the
-        // cache by now; a DM never is, since Discord announces none, so it is looked up.
-        if self.names.kind_of(channel_id).is_none() {
-            let channel = self
-                .http
-                .channel(channel_id)
-                .await
-                .map_err(|error| self.delivery_error("reading the channel", &error))?
-                .model()
-                .await
-                .map_err(|error| self.decode_error("the channel", &error))?;
-            self.names.insert_channel(&channel);
-        }
+        // cache by now; a DM never is, since Discord announces none, so it is looked up, and so is
+        // a thread's parent, which its admission and its `parent:` line both read.
+        self.place(channel_id).await?;
         let kind = self.names.kind_of(channel_id);
         let guild = self.names.guild_of(channel_id);
         // Nothing at or below this is fetched: the newest message already recorded, or the start
@@ -3521,6 +3629,12 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         messages: Vec<serde_json::Value>,
+        /// Channels it answers for by id. Anything else is a direct message.
+        channels: HashMap<String, serde_json::Value>,
+        /// Channels whose lookup fails with a server error rather than answering.
+        unreadable_channels: Vec<String>,
+        /// Every channel looked up, in order.
+        channel_lookups: std::sync::Mutex<Vec<String>>,
         /// Role ids each member holds, by user id. Anybody else is not a member.
         members: HashMap<String, Vec<String>>,
         /// Users whose lookup fails with a server error rather than answering.
@@ -3573,8 +3687,28 @@ mod tests {
             Json(page)
         }
 
-        async fn channel(Path(channel): Path<String>) -> Json<serde_json::Value> {
-            Json(serde_json::json!({ "id": channel, "type": 1 }))
+        async fn channel(
+            State(api): State<Arc<FakeApi>>,
+            Path(channel): Path<String>,
+        ) -> axum::response::Response {
+            api.channel_lookups
+                .lock()
+                .expect("not poisoned")
+                .push(channel.clone());
+            if api.unreadable_channels.contains(&channel) {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Internal Server Error", "code": 0 })),
+                )
+                    .into_response();
+            }
+            Json(
+                api.channels
+                    .get(&channel)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "id": channel, "type": 1 })),
+            )
+            .into_response()
         }
 
         async fn member(
@@ -3636,6 +3770,235 @@ mod tests {
                 .build(),
         );
         channel
+    }
+
+    fn announced(value: serde_json::Value) -> twilight_model::channel::Channel {
+        serde_json::from_value(value).expect("a channel fixture deserializes")
+    }
+
+    /// `#deploys` (2000) in Acme Corp (900), with the thread "rollback tonight" (2100) started in
+    /// it.
+    fn deploys() -> serde_json::Value {
+        serde_json::json!({ "id": "2000", "type": 0, "guild_id": "900", "name": "deploys" })
+    }
+
+    fn rollback_thread() -> serde_json::Value {
+        serde_json::json!({
+            "id": "2100",
+            "type": 11,
+            "guild_id": "900",
+            "parent_id": "2000",
+            "name": "rollback tonight",
+        })
+    }
+
+    /// A channel that admits `#deploys` and nothing else, and so hears its threads only through
+    /// what it knows about their parent.
+    fn admitting_deploys() -> DiscordChannel {
+        let channel = channel_with(vec![], vec![], vec![2000], vec![], false);
+        channel
+            .identity
+            .set(Id::new(99))
+            .expect("the identity is unset");
+        channel.names.rename_guild(Id::new(900), "Acme Corp");
+        channel
+    }
+
+    fn message_create(channel_id: &str) -> Event {
+        Event::MessageCreate(Box::new(
+            twilight_model::gateway::payload::incoming::MessageCreate(message(
+                serde_json::json!({ "channel_id": channel_id }),
+            )),
+        ))
+    }
+
+    fn delivered(receiver: &mut mpsc::Receiver<InboundEvent>) -> InboundMessage {
+        match receiver.try_recv() {
+            Ok(InboundEvent::Message(message)) => *message,
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_names_its_place_as_one_path_and_gives_the_ids_beside_it() {
+        let channel = identified();
+        channel.names.rename_guild(Id::new(900), "Acme Corp");
+        channel.names.insert_channel(&announced(deploys()));
+        channel.names.insert_channel(&announced(rollback_thread()));
+        channel.names.insert_channel(&announced(serde_json::json!({
+            "id": "3000", "type": 15, "guild_id": "900", "name": "help",
+        })));
+        channel.names.insert_channel(&announced(serde_json::json!({
+            "id": "3100", "type": 11, "guild_id": "900", "parent_id": "3000", "name": "login fails",
+        })));
+        let event_in = |channel_id: &str| {
+            let message = message(serde_json::json!({ "channel_id": channel_id }));
+            match channel.to_event(&message, channel.names.kind_of(message.channel_id)) {
+                Some(InboundEvent::Message(event)) => *event,
+                other => panic!("expected a message, got {other:?}"),
+            }
+        };
+
+        let thread = event_in("2100");
+        assert_eq!(
+            thread.chat_title.as_deref(),
+            Some("Acme Corp \u{203a} #deploys \u{203a} rollback tonight")
+        );
+        assert_eq!(
+            thread.parent.as_ref().map(ConversationId::as_str),
+            Some("discord:2000")
+        );
+        assert_eq!(thread.server.as_deref(), Some("900"));
+
+        let room = event_in("2000");
+        assert_eq!(
+            room.chat_title.as_deref(),
+            Some("Acme Corp \u{203a} #deploys")
+        );
+        assert_eq!(room.parent, None);
+        assert_eq!(room.server.as_deref(), Some("900"));
+
+        // A forum takes posts, not messages, so a post names it but offers no id to send to.
+        let post = event_in("3100");
+        assert_eq!(
+            post.chat_title.as_deref(),
+            Some("Acme Corp \u{203a} #help \u{203a} login fails")
+        );
+        assert_eq!(post.parent, None);
+
+        let direct = message(serde_json::json!({ "channel_id": "4000", "guild_id": null }));
+        let Some(InboundEvent::Message(direct)) = channel.to_event(&direct, None) else {
+            panic!("a direct message is a message");
+        };
+        assert_eq!(direct.server, None);
+        assert_eq!(direct.parent, None);
+    }
+
+    #[tokio::test]
+    async fn threads_synced_for_a_channel_the_bot_was_let_into_are_heard() {
+        // Granting the bot a channel after it joined sends that channel's active threads as a
+        // list sync, and no thread create for any of them.
+        let api = Arc::new(FakeApi::default());
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = against(admitting_deploys(), address);
+        channel.names.insert_channel(&announced(deploys()));
+        let mut synced = announced(rollback_thread());
+        // A synced thread may come without its server, which the event carries once for all.
+        synced.guild_id = None;
+        let (sender, mut receiver) = mpsc::channel(4);
+        channel
+            .handle(
+                Event::ThreadListSync(twilight_model::gateway::payload::incoming::ThreadListSync {
+                    channel_ids: vec![Id::new(2000)],
+                    guild_id: Id::new(900),
+                    members: Vec::new(),
+                    threads: vec![synced],
+                }),
+                &sender,
+            )
+            .await;
+
+        channel.handle(message_create("2100"), &sender).await;
+        let message = delivered(&mut receiver);
+        assert_eq!(message.admission, Admission::Chat);
+        assert_eq!(
+            message.chat_title.as_deref(),
+            Some("Acme Corp \u{203a} #deploys \u{203a} rollback tonight")
+        );
+        assert!(
+            api.channel_lookups.lock().expect("not poisoned").is_empty(),
+            "the sync said everything; nothing needed looking up"
+        );
+        assert!(WANTED_EVENTS.contains(EventTypeFlags::THREAD_LIST_SYNC));
+    }
+
+    #[tokio::test]
+    async fn a_failing_lookup_pauses_lookups_rather_than_repeating_for_every_message() {
+        // The lookup runs inside the gateway loop. Asked again for every message while Discord's
+        // API is failing, a few slow answers in a row would hold up the heartbeat the connection
+        // depends on.
+        let api = Arc::new(FakeApi {
+            unreadable_channels: vec!["2100".to_string()],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = against(admitting_deploys(), address);
+        let (sender, _receiver) = mpsc::channel(4);
+        for _ in 0..3 {
+            channel.handle(message_create("2100"), &sender).await;
+        }
+        assert_eq!(
+            *api.channel_lookups.lock().expect("not poisoned"),
+            ["2100"],
+            "one failure pauses the lookups"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bots_own_messages_are_not_looked_up() {
+        // They are dropped unread a moment later, and in a chat the agent answers in they are much
+        // of what arrives.
+        let api = Arc::new(FakeApi::default());
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = against(admitting_deploys(), address);
+        let (sender, mut receiver) = mpsc::channel(4);
+        let own = message(serde_json::json!({
+            "channel_id": "2100",
+            "author": {
+                "id": "99",
+                "username": "mekabot",
+                "discriminator": "0",
+                "avatar": null,
+                "bot": true,
+            },
+        }));
+        channel
+            .handle(
+                Event::MessageCreate(Box::new(
+                    twilight_model::gateway::payload::incoming::MessageCreate(own),
+                )),
+                &sender,
+            )
+            .await;
+        assert!(receiver.try_recv().is_err());
+        assert!(api.channel_lookups.lock().expect("not poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_thread_the_gateway_never_announced_is_looked_up_once() {
+        // Without the lookup this message read as an unnamed `unknown` room, and since its parent
+        // is found through the same cache, a thread admitted only by its parent was dropped.
+        let api = Arc::new(FakeApi {
+            channels: HashMap::from([
+                ("2000".to_string(), deploys()),
+                ("2100".to_string(), rollback_thread()),
+            ]),
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = against(admitting_deploys(), address);
+        let (sender, mut receiver) = mpsc::channel(4);
+
+        channel.handle(message_create("2100"), &sender).await;
+        let message = delivered(&mut receiver);
+        assert_eq!(message.admission, Admission::Chat);
+        assert_eq!(message.chat_kind, ChatKind::Group);
+        assert_eq!(
+            message.chat_title.as_deref(),
+            Some("Acme Corp \u{203a} #deploys \u{203a} rollback tonight")
+        );
+        assert_eq!(
+            message.parent.as_ref().map(ConversationId::as_str),
+            Some("discord:2000")
+        );
+
+        channel.handle(message_create("2100"), &sender).await;
+        delivered(&mut receiver);
+        assert_eq!(
+            *api.channel_lookups.lock().expect("not poisoned"),
+            ["2100", "2000"],
+            "each is asked for once and then kept"
+        );
     }
 
     /// A message as Discord's REST API returns it: with no server and no member, which only the

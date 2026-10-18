@@ -18,12 +18,16 @@ use async_trait::async_trait;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig,
+        SubscriptionFilter,
+    },
     schemars,
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext},
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 pub use crate::{
     channel::{
@@ -64,6 +68,7 @@ does, is theirs too and arrives with no fence around it.
 Header lines that do not explain themselves:
 
 - `admitted:` says why this message was let through.
+- `parent:` is the channel a thread was started in, as a conversation you can send to.
 - `roles:` is what the sender holds in that chat.
 - `forwarded from:` means the text is somebody else's words, not the sender's.";
 
@@ -1047,6 +1052,9 @@ const ADMIN_TOOLS: &[&str] = &[
 pub struct BridgeMcpServer {
     sink: Arc<dyn OutboundSink>,
     tool_router: ToolRouter<Self>,
+    /// Fired when the bridge starts to shut down, ahead of the transport, so a notification stream
+    /// ends with its final result while there is still a connection to carry it.
+    closing: CancellationToken,
 }
 
 #[tool_router]
@@ -1069,7 +1077,19 @@ impl BridgeMcpServer {
                 tool_router.remove_route(name);
             }
         }
-        Self { sink, tool_router }
+        Self {
+            sink,
+            tool_router,
+            closing: CancellationToken::new(),
+        }
+    }
+
+    /// End every notification stream when `closing` fires, which has to come before the transport
+    /// closes for each stream's final result to reach the client.
+    #[must_use]
+    pub fn closing_with(mut self, closing: CancellationToken) -> Self {
+        self.closing = closing;
+        self
     }
 
     /// Shared body of mute, unmute, block, and unblock.
@@ -2425,13 +2445,43 @@ impl BridgeMcpServer {
 // `tools/list`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BridgeMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // The protocol version is deliberately left at the default so it is negotiated with the
-        // client. meka pins an older rmcp than this crate builds against, and negotiation is what
-        // keeps the two interoperable across upgrades.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        // client. meka pins its own rmcp, ahead of this crate's or behind it as releases go, and
+        // negotiation is what keeps the two interoperable across upgrades.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    /// Acknowledge the notification stream a 2026-07-28 client opens on every connection, with
+    /// nothing in it.
+    ///
+    /// meka asks for every list-changed kind and whatever resources the model subscribed to. Every
+    /// tool here is fixed when the server starts and there are no prompts or resources, so nothing
+    /// would ever be sent; at the SDK's default the method is answered "not found", which is the
+    /// same answer, logged by rmcp as a warning on every connect. The empty acknowledgment says it
+    /// without one, and the stream idles until meka closes it or the server shuts down.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(SubscriptionFilter::default())
+    }
+
+    /// Hold an acknowledged stream until meka closes it or the bridge begins to shut down.
+    ///
+    /// Returning is what sends the stream's final result, which tells meka the server ended it on
+    /// purpose. Ended by the transport going away instead, which is what the SDK's default does on
+    /// shutdown, the result never reaches meka and it warns that the stream ended abruptly. meka
+    /// opens another once the bridge is back either way, and says so if the bridge is still down
+    /// when it first tries.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        tokio::select! {
+            () = context.cancelled() => {}
+            () = self.closing.cancelled() => {}
+        }
+        Ok(())
     }
 }
 

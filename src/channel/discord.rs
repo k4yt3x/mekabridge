@@ -63,8 +63,9 @@ use crate::{
         Activity, Admission, Attachment, AttachmentKind, Backfill, CatchUp, Channel,
         ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings,
         ConversationId, ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, FoundMessage,
-        InboundEvent, InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing,
-        MemberStatus, Openings, Platform, Presence, ReplyContext, SendOptions, Sender, SentMessage,
+        HistoryRead, InboundEvent, InboundMessage, MemberAction, MemberCoverage, MemberInfo,
+        MemberListing, MemberStatus, Openings, Platform, Presence, ReplyContext, SendOptions,
+        Sender, SentMessage,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -113,6 +114,9 @@ const SEARCH_INDEX_ATTEMPTS: usize = 3;
 
 /// Messages per request when catching up, the most Discord will page at once.
 const BACKFILL_PAGE: u16 = 100;
+/// Most pages one `read_history` asks Discord for while looking for somebody speaking, in case a
+/// stretch of the channel is nothing but join and pin notices.
+const READ_HISTORY_PAGES: usize = 3;
 
 /// How long a fresh session waits for the servers it announced before asking what was missed.
 ///
@@ -372,6 +376,93 @@ impl DiscordChannel {
             return Some(Admission::Open);
         }
         None
+    }
+
+    /// What a message says, with mentions resolved to names and any forwarded text after it.
+    fn text_of(&self, message: &Message) -> String {
+        let mut text = self.demention(&message.content, &message.mentions, message.guild_id);
+        for snapshot in &message.message_snapshots {
+            // Against the snapshot's own resolved mentions, not the outer message's: a name that
+            // appears only in the forwarded text is not in the outer array and would come out as
+            // "@someone".
+            let quoted = self.demention(
+                &snapshot.message.content,
+                &snapshot.message.mentions,
+                message.guild_id,
+            );
+            if !quoted.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&quoted);
+            }
+        }
+        text
+    }
+
+    /// Descriptor lines for what a message carries that has no text of its own.
+    fn notes_of(&self, message: &Message) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.message_content && message.content.is_empty() && message.attachments.is_empty() {
+            notes.push(
+                "this message's text is hidden because the bot does not hold Discord's message \
+                 content intent"
+                    .to_string(),
+            );
+        }
+        for sticker in &message.sticker_items {
+            notes.push(match sticker.format_type {
+                StickerFormatType::Lottie => {
+                    format!("sticker {:?} (animated, not viewable)", sticker.name)
+                }
+                _ => format!("sticker {:?}", sticker.name),
+            });
+        }
+        if message.poll.is_some() {
+            notes.push("a poll, which the bridge cannot read the options of".to_string());
+        }
+        notes
+    }
+
+    /// A message read from Discord's own record, as the history tools hand one back.
+    ///
+    /// Its files are named rather than attached: the bridge never downloaded them, so it has no
+    /// handle that `attachment_view` would take.
+    fn found(&self, message: &Message) -> Result<FoundMessage, ChannelError> {
+        let mut notes = self.notes_of(message);
+        for attachment in &message.attachments {
+            notes.push(match &attachment.content_type {
+                Some(media_type) => format!(
+                    "file {:?} ({media_type}), which this bridge never recorded and cannot open",
+                    attachment.filename
+                ),
+                None => format!(
+                    "file {:?}, which this bridge never recorded and cannot open",
+                    attachment.filename
+                ),
+            });
+        }
+        // The snowflake's own time rather than the timestamp field, since a read is paged by
+        // snowflake and the two must agree to the millisecond for a page to end cleanly.
+        let Some(timestamp) = DateTime::from_timestamp_millis(message.id.timestamp()) else {
+            return Err(ChannelError::Transport {
+                channel: self.id.as_str().to_string(),
+                message: "Discord returned a message with a time that cannot be read".to_string(),
+            });
+        };
+        Ok(FoundMessage {
+            message_id: message.id.to_string(),
+            sender_name: message
+                .author
+                .global_name
+                .clone()
+                .unwrap_or_else(|| message.author.name.clone()),
+            sender_id: Some(message.author.id.to_string()),
+            text: self.text_of(message),
+            notes,
+            own: self.identity.get() == Some(&message.author.id),
+            timestamp,
+        })
     }
 
     /// Whether this message was aimed at the bot rather than merely said in front of it.
@@ -682,10 +773,7 @@ impl DiscordChannel {
         // Join notices, pin notices, boost announcements and the rest are Discord talking, not a
         // person. A forwarded message arrives as a DEFAULT with snapshots, so this does not lose
         // it.
-        if !matches!(
-            message.kind,
-            MessageType::Regular | MessageType::Reply | MessageType::ThreadStarterMessage
-        ) {
+        if !spoken_by_someone(message.kind) {
             return None;
         }
 
@@ -728,25 +816,7 @@ impl DiscordChannel {
             .or_else(|| message.author.global_name.clone())
             .unwrap_or_else(|| message.author.name.clone());
 
-        let mut notes = Vec::new();
-        if !self.message_content && message.content.is_empty() && message.attachments.is_empty() {
-            notes.push(
-                "this message's text is hidden because the bot does not hold Discord's message \
-                 content intent"
-                    .to_string(),
-            );
-        }
-        for sticker in &message.sticker_items {
-            notes.push(match sticker.format_type {
-                StickerFormatType::Lottie => {
-                    format!("sticker {:?} (animated, not viewable)", sticker.name)
-                }
-                _ => format!("sticker {:?}", sticker.name),
-            });
-        }
-        if message.poll.is_some() {
-            notes.push("a poll, which the bridge cannot read the options of".to_string());
-        }
+        let notes = self.notes_of(message);
 
         let forwarded_from = message.message_snapshots.first().map(|_| {
             // A snapshot deliberately excludes its author, so the honest answer is that this text
@@ -755,23 +825,7 @@ impl DiscordChannel {
                 name: "someone else (Discord does not name the author of a forward)".to_string(),
             }
         });
-        let mut text = self.demention(&message.content, &message.mentions, message.guild_id);
-        for snapshot in &message.message_snapshots {
-            // Against the snapshot's own resolved mentions, not the outer message's: a name that
-            // appears only in the forwarded text is not in the outer array and would come out as
-            // "@someone".
-            let quoted = self.demention(
-                &snapshot.message.content,
-                &snapshot.message.mentions,
-                message.guild_id,
-            );
-            if !quoted.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                text.push_str(&quoted);
-            }
-        }
+        let text = self.text_of(message);
 
         let reply_to = message.referenced_message.as_ref().map(|replied| {
             let sender_name = replied
@@ -1397,6 +1451,31 @@ impl DiscordChannel {
         let calculator = PermissionCalculator::new(guild_id, user_id, everyone, &held);
         Ok(calculator.in_channel(channel.kind, &overwrites))
     }
+
+    /// Whether the bot holds Read Message History in a server channel.
+    async fn may_read_history(
+        &self,
+        guild_id: Id<GuildMarker>,
+        channel_id: Id<ChannelMarker>,
+    ) -> Result<bool, ChannelError> {
+        // Set when the gateway is ready, which is before any tool call reaches the channel. Taken
+        // as yes otherwise, which leaves the empty read to speak for itself as it always has.
+        let Some(&me) = self.identity.get() else {
+            return Ok(true);
+        };
+        let member = self
+            .http
+            .guild_member(guild_id, me)
+            .await
+            .map_err(|error| self.delivery_error("reading the bot's own membership", &error))?
+            .model()
+            .await
+            .map_err(|error| self.decode_error("the bot's own membership", &error))?;
+        let permissions = self
+            .permissions_in(guild_id, channel_id, me, &member.roles)
+            .await?;
+        Ok(permissions.contains(Permissions::READ_MESSAGE_HISTORY))
+    }
 }
 
 /// Discord's channel type, as the bridge's notion of a chat's shape.
@@ -1465,6 +1544,52 @@ fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(timestamp.as_micros())
 }
 
+/// Whether a message is somebody speaking rather than Discord announcing something.
+fn spoken_by_someone(kind: MessageType) -> bool {
+    matches!(
+        kind,
+        MessageType::Regular | MessageType::Reply | MessageType::ThreadStarterMessage
+    )
+}
+
+/// How many of a read's messages make a page that can be paged back from without skipping any.
+///
+/// `stamps` is each message's millisecond, newest first. The next page is asked for by time, as
+/// everything before the oldest message's millisecond, so a message sharing that millisecond that
+/// the page left out would never be read. When one exists, or may, the oldest millisecond is left
+/// off the page for the next one to start with, or, where it is the whole page, the page runs on
+/// past `limit` to the end of it. `unfetched_from` is the millisecond of the oldest message fetched
+/// when Discord holds older ones, and `None` when the read reached the start of the channel.
+fn page_length(stamps: &[i64], limit: usize, unfetched_from: Option<i64>) -> usize {
+    let length = stamps.len().min(limit);
+    let Some(&oldest) = length.checked_sub(1).and_then(|last| stamps.get(last)) else {
+        return 0;
+    };
+    let left_out = match stamps.get(length) {
+        Some(&next) => next == oldest,
+        None => unfetched_from == Some(oldest),
+    };
+    if !left_out {
+        return length;
+    }
+    let shared = stamps[..length]
+        .iter()
+        .rev()
+        .take_while(|&&stamp| stamp == oldest)
+        .count();
+    if shared < length {
+        return length - shared;
+    }
+    // One millisecond throughout, so leaving it off would hand back nothing and stop the read.
+    // Handed back whole instead, past the limit, as far as it was fetched: only a millisecond
+    // holding more than a whole fetch of messages can still lose one.
+    length
+        + stamps[length..]
+            .iter()
+            .take_while(|&&stamp| stamp == oldest)
+            .count()
+}
+
 /// Whether Discord answered that the thing asked for does not exist.
 fn is_not_found(error: &twilight_http::Error) -> bool {
     matches!(
@@ -1530,7 +1655,12 @@ fn found_message(value: &serde_json::Value, me: Option<Id<UserMarker>>) -> Optio
     Some(FoundMessage {
         message_id: value.get("id")?.as_str()?.to_string(),
         sender_name,
+        sender_id: author
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         text,
+        notes: Vec::new(),
         own,
         timestamp,
     })
@@ -2637,24 +2767,120 @@ impl Channel for DiscordChannel {
             Err(error) if is_not_found(&error) => return Ok(None),
             Err(error) => return Err(self.delivery_error("reading the message", &error)),
         };
-        let Some(timestamp) = timestamp_to_chrono(message.timestamp) else {
-            return Err(ChannelError::Transport {
+        // A message fetched by id carries no server, and mentions of roles and channels are named
+        // from it.
+        let mut message = message;
+        message.guild_id = message.guild_id.or_else(|| self.names.guild_of(channel_id));
+        self.found(&message).map(Some)
+    }
+
+    async fn read_history(
+        &self,
+        conversation: &ConversationId,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<HistoryRead, ChannelError> {
+        let channel_id = self.target(conversation).await?;
+        // A fetched message carries no server, which is what mentions of roles and channels are
+        // named from. A DM is never in the cache, so `place` looks the channel up if need be.
+        self.place(channel_id).await?;
+        let guild = self.names.guild_of(channel_id);
+        // Without the intent Discord blanks every server message that does not mention the bot, so
+        // a read would hand back a page of names with nothing said. Direct messages are exempt.
+        if !self.message_content && guild.is_some() {
+            return Err(ChannelError::Unsupported {
                 channel: self.id.as_str().to_string(),
-                message: "Discord returned a message with a time that cannot be read".to_string(),
+                feature: "reading Discord's own history without the message content intent",
             });
+        }
+        let limit = limit.clamp(1, usize::from(BACKFILL_PAGE));
+        let before_millis = before.map(|before| before.timestamp_millis());
+        let mut anchor = match before {
+            Some(before) => match Id::<MessageMarker>::new_checked(snowflake_at(before)) {
+                Some(anchor) => Some(anchor),
+                // Before Discord's epoch, so before anything Discord holds.
+                None => return Ok(HistoryRead::default()),
+            },
+            None => None,
         };
-        let guild = message.guild_id.or_else(|| self.names.guild_of(channel_id));
-        Ok(Some(FoundMessage {
-            message_id: message.id.to_string(),
-            sender_name: message
-                .author
-                .global_name
-                .clone()
-                .unwrap_or_else(|| message.author.name.clone()),
-            text: self.demention(&message.content, &message.mentions, guild),
-            own: self.identity.get() == Some(&message.author.id),
-            timestamp,
-        }))
+
+        // Newest first, which is how Discord pages backwards. Whole pages are asked for whatever
+        // the limit, since one request costs the same at any size and the people speaking may be
+        // spread thin among join and pin notices.
+        let mut spoken: Vec<Message> = Vec::new();
+        let mut unfetched_from = None;
+        let mut fetched_any = false;
+        for _ in 0..READ_HISTORY_PAGES {
+            let request = self.http.channel_messages(channel_id).limit(BACKFILL_PAGE);
+            let mut page = match anchor {
+                Some(anchor) => request.before(anchor).await,
+                None => request.await,
+            }
+            .map_err(|error| self.delivery_error("reading the channel's messages", &error))?
+            .models()
+            .await
+            .map_err(|error| self.decode_error("the channel's messages", &error))?;
+            let last_page = page.len() < usize::from(BACKFILL_PAGE);
+            page.sort_by_key(|message| std::cmp::Reverse(message.id));
+            let Some(oldest) = page.last() else {
+                unfetched_from = None;
+                break;
+            };
+            fetched_any = true;
+            anchor = Some(oldest.id);
+            unfetched_from = (!last_page).then(|| oldest.id.timestamp());
+            spoken.extend(
+                page.into_iter()
+                    .filter(|message| spoken_by_someone(message.kind)),
+            );
+            if last_page || spoken.len() >= limit {
+                break;
+            }
+        }
+
+        // Discord answers a bot without Read Message History with an empty list rather than a
+        // refusal, which would tell the agent the channel had never been spoken in.
+        if !fetched_any
+            && let Some(guild_id) = guild
+            && !self.may_read_history(guild_id, channel_id).await?
+        {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: "the bot does not hold Read Message History in this channel, so Discord \
+                          shows it none of what was said there"
+                    .to_string(),
+            });
+        }
+
+        let stamps: Vec<i64> = spoken
+            .iter()
+            .map(|message| message.id.timestamp())
+            .collect();
+        spoken.truncate(page_length(&stamps, limit, unfetched_from));
+        // Nothing but notices as far as this read looked, and more beyond it. Picked up from the
+        // millisecond after the oldest one looked at, so nothing unfetched that shares it is lost,
+        // unless that would not move the read back at all.
+        let resume_before = match unfetched_from {
+            Some(oldest) if spoken.is_empty() => {
+                let after_oldest = oldest.saturating_add(1);
+                let resume = if before_millis.is_some_and(|before| after_oldest >= before) {
+                    oldest
+                } else {
+                    after_oldest
+                };
+                DateTime::from_timestamp_millis(resume)
+            }
+            _ => None,
+        };
+        let mut messages = Vec::with_capacity(spoken.len());
+        for mut message in spoken.into_iter().rev() {
+            message.guild_id = message.guild_id.or(guild);
+            messages.push(self.found(&message)?);
+        }
+        Ok(HistoryRead {
+            messages,
+            resume_before,
+        })
     }
 
     fn catch_up(&self) -> Option<CatchUp> {
@@ -3672,6 +3898,8 @@ mod tests {
         unreadable_members: Vec<String>,
         /// Every page asked for, as the `before` it was asked with.
         pages: std::sync::Mutex<Vec<Option<String>>>,
+        /// Server 900's roles.
+        roles: Vec<serde_json::Value>,
     }
 
     fn snowflake_id(value: &serde_json::Value) -> u64 {
@@ -3778,8 +4006,16 @@ mod tests {
             }
         }
 
+        async fn roles(
+            State(api): State<Arc<FakeApi>>,
+            Path(_guild): Path<String>,
+        ) -> Json<Vec<serde_json::Value>> {
+            Json(api.roles.clone())
+        }
+
         let router = Router::new()
             .route("/api/v10/channels/{channel}/messages", get(messages))
+            .route("/api/v10/guilds/{guild}/roles", get(roles))
             .route("/api/v10/channels/{channel}", get(channel))
             .route("/api/v10/guilds/{guild}/members/{user}", get(member))
             .with_state(api);
@@ -4290,5 +4526,309 @@ mod tests {
             0,
             "before Discord existed bounds nothing"
         );
+    }
+
+    /// A snowflake for the `sequence`th message in millisecond `millis` after Discord's epoch.
+    fn snowflake(millis: u64, sequence: u64) -> u64 {
+        (millis << 22) | sequence
+    }
+
+    /// When a message with the snowflake [`snowflake`] gives was said.
+    fn said_at(millis: u64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_420_070_400_000 + i64::try_from(millis).expect("small"))
+            .expect("in range")
+    }
+
+    #[test]
+    fn a_page_keeps_every_message_when_its_oldest_millisecond_is_whole() {
+        assert_eq!(page_length(&[30, 20, 10], 2, Some(10)), 2);
+        assert_eq!(
+            page_length(&[30, 20], 2, Some(20)),
+            1,
+            "Discord holds older messages that were not fetched and may share the millisecond"
+        );
+        assert_eq!(
+            page_length(&[30, 20], 2, Some(15)),
+            2,
+            "the oldest fetched is older than the page, so nothing unfetched can share it"
+        );
+        assert_eq!(
+            page_length(&[30, 20], 2, None),
+            2,
+            "the channel starts here"
+        );
+        assert_eq!(page_length(&[30, 20], 5, None), 2);
+        assert_eq!(page_length(&[], 5, None), 0);
+    }
+
+    #[test]
+    fn a_page_leaves_off_a_millisecond_it_cannot_hold_whole() {
+        assert_eq!(
+            page_length(&[30, 20, 20, 10], 2, Some(10)),
+            1,
+            "one of the messages said at 20 did not fit, so neither is handed back yet"
+        );
+        assert_eq!(
+            page_length(&[30, 30, 20], 1, Some(20)),
+            2,
+            "a page that is one millisecond throughout runs past the limit rather than split it"
+        );
+        assert_eq!(
+            page_length(&[20, 20, 20], 2, Some(20)),
+            3,
+            "as far as it was fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_back_hands_over_people_speaking_oldest_first() {
+        let mut join = fetched(snowflake(1_000, 0), "2000", "1");
+        join["type"] = serde_json::json!(7);
+        let mut own = fetched(snowflake(1_001, 0), "2000", "99");
+        own["content"] = serde_json::json!("on it");
+        let mut picture = fetched(snowflake(1_002, 0), "2000", "1");
+        picture["content"] = serde_json::json!("");
+        picture["attachments"] = serde_json::json!([{
+            "id": "1",
+            "filename": "plan.png",
+            "size": 10,
+            "url": "https://cdn.example/plan.png",
+            "proxy_url": "https://cdn.example/plan.png",
+            "content_type": "image/png",
+        }]);
+        let api = Arc::new(FakeApi {
+            messages: vec![fetched(snowflake(999, 0), "2000", "1"), join, own, picture],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let found = channel
+            .read_history(&conversation, None, 3)
+            .await
+            .expect("reads")
+            .messages;
+
+        assert_eq!(
+            found
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect::<Vec<_>>(),
+            [
+                snowflake(999, 0).to_string(),
+                snowflake(1_001, 0).to_string(),
+                snowflake(1_002, 0).to_string()
+            ],
+            "oldest first, and the join notice is not somebody speaking"
+        );
+        assert_eq!(found[0].sender_id.as_deref(), Some("1"));
+        assert_eq!(found[0].timestamp, said_at(999));
+        assert!(found[1].own, "the bot's own message is marked as its own");
+        assert!(!found[0].own);
+        assert_eq!(
+            found[2].notes,
+            ["file \"plan.png\" (image/png), which this bridge never recorded and cannot open"],
+            "a file is named, since there is no handle to give out"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_back_page_by_page_neither_skips_nor_repeats() {
+        // Two messages in one millisecond, and a limit that can only fit one of them: a page that
+        // ended between them would be followed by one asked for as everything before that
+        // millisecond, and the other would never be read.
+        let ids = [
+            snowflake(10, 0),
+            snowflake(20, 0),
+            snowflake(20, 1),
+            snowflake(30, 0),
+        ];
+        // Reading back to the start of the channel ends in an empty read, which is checked against
+        // the bot's permission, so the server it is in has to answer for that.
+        let api = Arc::new(FakeApi {
+            messages: ids.iter().map(|&id| fetched(id, "2000", "1")).collect(),
+            ..standing_api((Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits())
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let mut read = Vec::new();
+        let mut before = None;
+        for _ in 0..ids.len() {
+            let page = channel
+                .read_history(&conversation, before, 2)
+                .await
+                .expect("reads")
+                .messages;
+            let Some(oldest) = page.first() else {
+                break;
+            };
+            before = Some(oldest.timestamp);
+            read.splice(0..0, page.iter().map(|message| message.message_id.clone()));
+        }
+
+        assert_eq!(
+            read,
+            ids.iter().map(u64::to_string).collect::<Vec<_>>(),
+            "every message once, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_back_from_before_discord_began_asks_nothing() {
+        let api = Arc::new(FakeApi::default());
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let found = channel
+            .read_history(&conversation, Some(long_ago()), 20)
+            .await
+            .expect("reads");
+
+        assert!(found.messages.is_empty() && found.resume_before.is_none());
+        assert!(api.pages.lock().expect("not poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reading_back_needs_the_message_content_intent() {
+        // Without it Discord blanks every message that does not mention the bot, so the page
+        // would be names with nothing said.
+        let mut channel = with_server_channel(identified());
+        channel.message_content = false;
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let error = channel
+            .read_history(&conversation, None, 20)
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(error, ChannelError::Unsupported { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_stretch_of_notices_is_read_past_rather_than_taken_for_the_start() {
+        // More notices than one read looks through, so the first read finds nobody speaking. An
+        // empty page with nothing to carry on from would read as the start of the channel.
+        let mut messages: Vec<serde_json::Value> = (1_000..1_350)
+            .map(|millis| {
+                let mut join = fetched(snowflake(millis, 0), "2000", "1");
+                join["type"] = serde_json::json!(7);
+                join
+            })
+            .collect();
+        messages.push(fetched(snowflake(10, 0), "2000", "1"));
+        messages.push(fetched(snowflake(20, 0), "2000", "1"));
+        let api = Arc::new(FakeApi {
+            messages,
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let first = channel
+            .read_history(&conversation, None, 20)
+            .await
+            .expect("reads");
+        assert!(first.messages.is_empty());
+        let resume = first.resume_before.expect("somewhere to carry on from");
+
+        let second = channel
+            .read_history(&conversation, Some(resume), 20)
+            .await
+            .expect("reads");
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect::<Vec<_>>(),
+            [snowflake(10, 0).to_string(), snowflake(20, 0).to_string()]
+        );
+        assert!(second.resume_before.is_none());
+    }
+
+    /// Channel 2000 as a lookup returns it, and server 900's everyone role holding `permissions`.
+    fn standing_api(permissions: u64) -> FakeApi {
+        FakeApi {
+            channels: HashMap::from([(
+                "2000".to_string(),
+                serde_json::json!({
+                    "id": "2000",
+                    "type": 0,
+                    "guild_id": "900",
+                    "name": "general",
+                    "permission_overwrites": [],
+                }),
+            )]),
+            members: HashMap::from([("99".to_string(), Vec::new())]),
+            roles: vec![serde_json::json!({
+                "id": "900",
+                "name": "@everyone",
+                "color": 0,
+                "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null },
+                "hoist": false,
+                "managed": false,
+                "mentionable": false,
+                "permissions": permissions.to_string(),
+                "position": 0,
+                "flags": 0,
+            })],
+            ..FakeApi::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_read_without_read_message_history_says_so() {
+        // Discord answers a bot without the permission with an empty list, not a refusal, which
+        // would tell the agent nothing had ever been said there.
+        let view_channel = Permissions::VIEW_CHANNEL.bits();
+        let api = Arc::new(standing_api(view_channel));
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let conversation = ConversationId::parse("discord:2000").expect("id");
+
+        let error = channel
+            .read_history(&conversation, None, 20)
+            .await
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("Read Message History"),
+            "{error}"
+        );
+
+        let api = Arc::new(standing_api(
+            view_channel | Permissions::READ_MESSAGE_HISTORY.bits(),
+        ));
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let channel = with_server_channel(against(identified(), address));
+        let read = channel
+            .read_history(&conversation, None, 20)
+            .await
+            .expect("an empty channel the bot may read is just empty");
+        assert!(read.messages.is_empty() && read.resume_before.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_reads_back_without_the_message_content_intent() {
+        // Discord exempts direct messages from the intent, so there is nothing to refuse.
+        let api = Arc::new(FakeApi {
+            messages: vec![fetched(snowflake(10, 0), "7000", "1")],
+            ..FakeApi::default()
+        });
+        let address = serve_fake_api(Arc::clone(&api)).await;
+        let mut channel = against(identified(), address);
+        channel.message_content = false;
+        let conversation = ConversationId::parse("discord:7000").expect("id");
+
+        let read = channel
+            .read_history(&conversation, None, 20)
+            .await
+            .expect("reads");
+
+        assert_eq!(read.messages.len(), 1);
     }
 }

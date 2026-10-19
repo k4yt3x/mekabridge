@@ -33,8 +33,8 @@ use mekabridge::{
     channel::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChannelRegistry, ChatKind, ConversationId,
-        FetchedFile, FileOptions, FoundMessage, InboundEvent, InboundMessage, Platform,
-        SendOptions, Sender, SentMessage,
+        FetchedFile, FileOptions, FoundMessage, HistoryRead, InboundEvent, InboundMessage,
+        Platform, SendOptions, Sender, SentMessage,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
@@ -1291,6 +1291,13 @@ struct MockChannel {
     /// What `fetch_message` can find, by id. `None` stands in for a platform with no such lookup,
     /// as Telegram is.
     fetchable: Mutex<Option<std::collections::HashMap<String, FoundMessage>>>,
+    /// What `read_history` can read, in any order. `None` stands in for a platform with no such
+    /// read, as Telegram is.
+    readable: Mutex<Option<Vec<FoundMessage>>>,
+    /// Whether `read_history` fails as a platform refusing would.
+    refuse_reading: std::sync::atomic::AtomicBool,
+    /// Every `read_history` call, as the time it read from and how many it asked for.
+    history_reads: Mutex<Vec<(Option<chrono::DateTime<Utc>>, usize)>>,
 }
 
 impl MockChannel {
@@ -1323,7 +1330,25 @@ impl MockChannel {
             missed: Mutex::new(std::collections::HashMap::new()),
             backfills: Mutex::new(Vec::new()),
             fetchable: Mutex::new(None),
+            readable: Mutex::new(None),
+            refuse_reading: std::sync::atomic::AtomicBool::new(false),
+            history_reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Let `read_history` read `messages`, as Discord's own history would.
+    fn hold_history(&self, messages: Vec<FoundMessage>) {
+        *self
+            .readable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(messages);
+    }
+
+    fn history_reads(&self) -> Vec<(Option<chrono::DateTime<Utc>>, usize)> {
+        self.history_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Stand in for a fresh session, opened at `opened`, whose servers have all arrived.
@@ -1569,7 +1594,9 @@ impl Channel for MockChannel {
         Ok(vec![FoundMessage {
             message_id: "from-the-platform".to_string(),
             sender_name: "Mica".to_string(),
+            sender_id: Some("1".to_string()),
             text: "said long before this bridge existed".to_string(),
+            notes: Vec::new(),
             own: true,
             timestamp: Utc::now(),
         }])
@@ -1650,6 +1677,48 @@ impl Channel for MockChannel {
                 feature: "fetching a message by its id",
             }),
         }
+    }
+
+    async fn read_history(
+        &self,
+        _conversation: &ConversationId,
+        before: Option<chrono::DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<HistoryRead, ChannelError> {
+        self.history_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((before, limit));
+        if self
+            .refuse_reading
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ChannelError::Delivery {
+                channel: self.id.as_str().to_string(),
+                message: "Missing Access".to_string(),
+            });
+        }
+        let Some(readable) = self
+            .readable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return Err(ChannelError::Unsupported {
+                channel: self.id.as_str().to_string(),
+                feature: "reading the platform's own history",
+            });
+        };
+        let mut older: Vec<FoundMessage> = readable
+            .into_iter()
+            .filter(|message| before.is_none_or(|before| message.timestamp < before))
+            .collect();
+        older.sort_by_key(|message| message.timestamp);
+        let skip = older.len().saturating_sub(limit);
+        Ok(HistoryRead {
+            messages: older.split_off(skip),
+            resume_before: None,
+        })
     }
 
     fn catch_up(&self) -> Option<mekabridge::channel::CatchUp> {
@@ -6328,12 +6397,262 @@ async fn the_sender_filter_reaches_the_store_through_the_sink() {
         .expect("read runs");
     assert_eq!(
         entries
+            .entries
             .iter()
             .map(|entry| entry.message_id.as_str())
             .collect::<Vec<_>>(),
         ["b", "c"],
         "only the one sender's messages come back"
     );
+}
+
+/// A message in the mock's own history, said `minutes_ago`.
+fn platform_message(message_id: &str, minutes_ago: i64) -> FoundMessage {
+    FoundMessage {
+        message_id: message_id.to_string(),
+        sender_name: "Someone".to_string(),
+        sender_id: Some("42".to_string()),
+        text: format!("said before the bridge, {message_id}"),
+        notes: Vec::new(),
+        own: false,
+        timestamp: Utc::now() - chrono::Duration::minutes(minutes_ago),
+    }
+}
+
+/// Record `message_id` in `mock:1` as said `minutes_ago`.
+async fn record_said(
+    store: &Store,
+    account: mekabridge::store::AccountId,
+    message_id: &str,
+    minutes_ago: i64,
+) {
+    store
+        .record_message(mekabridge::store::MessageRecord {
+            id: 0,
+            conversation: "mock:1".to_string(),
+            account,
+            message_id: message_id.to_string(),
+            revision: 0,
+            sender_id: Some("42".to_string()),
+            sender_name: "Someone".to_string(),
+            text: "hello".to_string(),
+            notes: None,
+            attachments: Vec::new(),
+            addressed: false,
+            seen: true,
+            own: false,
+            session_id: None,
+            deleted_at: None,
+            superseded_at: None,
+            timestamp: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            previous_account: false,
+        })
+        .await
+        .expect("record");
+}
+
+fn ids_of(page: &mekabridge::mcp::HistoryPage) -> Vec<&str> {
+    page.entries
+        .iter()
+        .map(|entry| entry.message_id.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn reading_back_past_the_record_carries_on_into_the_platforms_history() {
+    // The bot was let into a channel an hour ago, so the record starts there. What was said before
+    // is on the platform, and a read that asks for more than the record holds goes and gets it.
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    record_said(&store, account, "r1", 60).await;
+    record_said(&store, account, "r2", 30).await;
+    channel.hold_history(vec![
+        platform_message("p1", 300),
+        platform_message("p2", 200),
+        platform_message("p3", 100),
+    ]);
+
+    let page = sink
+        .history_read("mock:1", &[], 4, None, None, None)
+        .await
+        .expect("read runs");
+
+    assert_eq!(
+        ids_of(&page),
+        ["p2", "p3", "r1", "r2"],
+        "the record's two, and the platform's newest two before them, oldest first"
+    );
+    assert!(page.platform_read);
+    let oldest_recorded = store
+        .oldest_message_time("mock:1")
+        .await
+        .expect("read")
+        .expect("something is recorded");
+    assert_eq!(
+        channel.history_reads(),
+        [(Some(oldest_recorded), 2)],
+        "asked from where the record starts, for only what the record could not supply"
+    );
+    let platform = &page.entries[0];
+    assert!(platform.unrecorded && !page.entries[2].unrecorded);
+    assert_eq!(platform.sender_id.as_deref(), Some("42"));
+    assert!(
+        page.entries
+            .windows(2)
+            .all(|pair| pair[0].cursor < pair[1].cursor),
+        "the oldest cursor is still the smallest: {page:?}"
+    );
+
+    // Paging back from the oldest reads the platform alone, from that message's time.
+    let older = sink
+        .history_read("mock:1", &[], 4, Some(platform.cursor), None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(ids_of(&older), ["p1"]);
+    let platform_time =
+        mekabridge::mcp::platform_cursor_time(platform.cursor).expect("a platform cursor");
+    assert_eq!(
+        channel.history_reads().last(),
+        Some(&(Some(platform_time), 4))
+    );
+
+    let start = sink
+        .history_read("mock:1", &[], 4, Some(older.entries[0].cursor), None, None)
+        .await
+        .expect("read runs");
+    assert!(start.entries.is_empty() && start.platform_read);
+}
+
+#[tokio::test]
+async fn a_cursor_from_inside_the_record_reads_the_record() {
+    // A lookup or a search hands back an unrecorded entry from any time, and its cursor reads what
+    // led up to it. Where the record covers that time it answers, with what it knows of each
+    // message, rather than the platform's bare copy.
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    record_said(&store, account, "r1", 60).await;
+    record_said(&store, account, "r2", 30).await;
+    record_said(&store, account, "r3", 10).await;
+    channel.hold_history(vec![platform_message("p1", 300)]);
+    let found_by_search =
+        mekabridge::mcp::platform_cursor(Utc::now() - chrono::Duration::minutes(20));
+
+    let page = sink
+        .history_read("mock:1", &[], 2, Some(found_by_search), None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(ids_of(&page), ["r1", "r2"]);
+    assert!(page.entries.iter().all(|entry| !entry.unrecorded));
+    assert!(channel.history_reads().is_empty());
+
+    let page = sink
+        .history_read("mock:1", &[], 5, Some(found_by_search), None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(
+        ids_of(&page),
+        ["p1", "r1", "r2"],
+        "and past the record's start, the platform carries on as usual"
+    );
+}
+
+#[tokio::test]
+async fn a_read_the_record_fills_does_not_ask_the_platform() {
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    record_said(&store, account, "r1", 60).await;
+    record_said(&store, account, "r2", 30).await;
+    channel.hold_history(vec![platform_message("p1", 300)]);
+
+    let page = sink
+        .history_read("mock:1", &[], 2, None, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(ids_of(&page), ["r1", "r2"]);
+    assert!(!page.platform_read);
+
+    // Nor does a read narrowed to some senders, which a channel's history cannot be, or a read
+    // forwards, where everything said is recorded as it arrives.
+    sink.history_read("mock:1", &["42".to_string()], 20, None, None, None)
+        .await
+        .expect("read runs");
+    sink.history_read("mock:1", &[], 20, None, Some(0), None)
+        .await
+        .expect("read runs");
+    assert!(channel.history_reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_chat_with_nothing_recorded_reads_the_platforms_latest() {
+    let (sink, channel, store) = own_message_harness().await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    channel.hold_history(vec![platform_message("p1", 20), platform_message("p2", 10)]);
+
+    let page = sink
+        .history_read("mock:1", &[], 20, None, None, None)
+        .await
+        .expect("read runs");
+
+    assert_eq!(ids_of(&page), ["p1", "p2"]);
+    assert_eq!(channel.history_reads(), [(None, 20)]);
+
+    // A cursor into a record that has since been emptied places nothing, and reading the newest
+    // again would hand back what was already read.
+    let page = sink
+        .history_read("mock:1", &[], 20, Some(99), None, None)
+        .await
+        .expect("read runs");
+    assert!(page.entries.is_empty() && !page.platform_read);
+    assert_eq!(channel.history_reads().len(), 1);
+}
+
+#[tokio::test]
+async fn a_platform_that_will_not_be_read_leaves_the_record_standing() {
+    let (sink, channel, store) = own_message_harness().await;
+    let account = mock_account(&store).await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+
+    // Telegram's case: no such read, and the record is all there is.
+    record_said(&store, account, "r1", 60).await;
+    let page = sink
+        .history_read("mock:1", &[], 20, None, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(ids_of(&page), ["r1"]);
+    assert!(!page.platform_read);
+
+    // A refusal behind a page of the record is the record; behind nothing, it is the answer.
+    channel
+        .refuse_reading
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let page = sink
+        .history_read("mock:1", &[], 20, None, None, None)
+        .await
+        .expect("the record still stands");
+    assert_eq!(ids_of(&page), ["r1"]);
+    let error = sink
+        .history_read("mock:1", &[], 20, Some(page.entries[0].cursor), None, None)
+        .await
+        .expect_err("nothing older is recorded, so the refusal is all there is to say");
+    assert!(error.to_string().contains("Missing Access"), "{error}");
 }
 
 #[tokio::test]
@@ -6385,7 +6704,7 @@ async fn reading_a_chat_through_the_sink_clears_what_it_owed() {
         .await
         .expect("read runs");
     assert!(
-        newest.iter().all(|entry| entry.unseen),
+        newest.entries.iter().all(|entry| entry.unseen),
         "each entry says it was news: {newest:?}"
     );
     assert_eq!(owed().await, 1, "what was read stops counting");
@@ -6396,6 +6715,7 @@ async fn reading_a_chat_through_the_sink_clears_what_it_owed() {
         .expect("read runs");
     assert_eq!(
         everything
+            .entries
             .iter()
             .filter(|entry| entry.unseen)
             .map(|entry| entry.message_id.as_str())
@@ -6476,7 +6796,9 @@ async fn particular_messages_come_from_the_record_and_then_from_the_platform() {
         [("y".to_string(), FoundMessage {
             message_id: "y".to_string(),
             sender_name: "Someone".to_string(),
+            sender_id: Some("42".to_string()),
             text: "from before the bridge".to_string(),
+            notes: Vec::new(),
             own: false,
             timestamp: Utc::now() - chrono::Duration::days(400),
         })],

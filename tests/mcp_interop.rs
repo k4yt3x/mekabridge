@@ -26,9 +26,9 @@ use mekabridge::{
     config::{McpConfig, McpTransport},
     mcp::{
         BacklogReport, BacklogScope, ChatSettings, ConversationSummary, DownloadedAttachment,
-        HistoryEntry, HistoryLookup, MemberAction, MemberCoverage, MemberInfo, MemberListing,
-        MemberRight, OutboundSink, Policy, SendOptions, SinkError, ToolSurface, ViewedAttachment,
-        WatchOutcome, WatchRecord, serve,
+        HistoryEntry, HistoryLookup, HistoryPage, MemberAction, MemberCoverage, MemberInfo,
+        MemberListing, MemberRight, OutboundSink, Policy, SendOptions, SinkError, ToolSurface,
+        ViewedAttachment, WatchOutcome, WatchRecord, serve,
     },
     watch::{WatchField, WatchMode},
 };
@@ -408,8 +408,8 @@ impl OutboundSink for RecordingSink {
         _before: Option<i64>,
         _after: Option<i64>,
         _session: Option<&str>,
-    ) -> Result<Vec<HistoryEntry>, SinkError> {
-        Ok(vec![HistoryEntry {
+    ) -> Result<HistoryPage, SinkError> {
+        let entries = vec![HistoryEntry {
             conversation: conversation.to_string(),
             message_id: "41".to_string(),
             sender: "Alice".to_string(),
@@ -424,9 +424,15 @@ impl OutboundSink for RecordingSink {
             deleted: false,
             superseded: false,
             previous_account: false,
+            unrecorded: false,
             timestamp: "2026-08-11T09:30:00+00:00".to_string(),
             cursor: 41,
-        }])
+        }];
+        Ok(HistoryPage {
+            entries,
+            platform_read: false,
+            resume_cursor: None,
+        })
     }
 
     async fn history_search(

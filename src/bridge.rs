@@ -38,8 +38,8 @@ use crate::{
     config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
     mcp::{
-        ConversationSummary, DownloadedAttachment, HistoryEntry, HistoryLookup, MissingMessage,
-        OutboundSink, SinkError, ToolSurface, ViewedAttachment, serve,
+        ConversationSummary, DownloadedAttachment, HistoryEntry, HistoryLookup, HistoryPage,
+        MissingMessage, OutboundSink, SinkError, ToolSurface, ViewedAttachment, serve,
     },
     meka::{MekaClient, find_profile},
     store::{
@@ -1721,13 +1721,45 @@ impl OutboundSink for BridgeSink {
         before: Option<i64>,
         after: Option<i64>,
         session: Option<&str>,
-    ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
-        let conversation = self.resolve(conversation)?;
-        let records = self
-            .store
-            .history(conversation.as_str(), sender_ids, limit, before, after)
-            .await
-            .map_err(|error| SinkError::Internal(error.to_string()))?;
+    ) -> std::result::Result<HistoryPage, SinkError> {
+        let conversation = self.canonical(&self.resolve(conversation)?).await;
+        // A cursor below zero is a message read from the platform rather than the record: one read
+        // back past the record's oldest message, or one a lookup or a search turned up, which can
+        // be from any time. From before the record starts there is nothing to ask the record for.
+        // From inside it, the record is read back from that time, so what it holds comes back
+        // with everything the bridge knows of it rather than as the platform's bare copy.
+        let mut platform_before = None;
+        let mut record_before = before;
+        if let Some(at) = before.and_then(crate::mcp::platform_cursor_time) {
+            let oldest = self
+                .store
+                .oldest_message_time(conversation.as_str())
+                .await
+                .map_err(|error| SinkError::Internal(error.to_string()))?;
+            if oldest.is_some_and(|oldest| at > oldest) {
+                record_before = self
+                    .store
+                    .cursor_at(conversation.as_str(), at)
+                    .await
+                    .map_err(|error| SinkError::Internal(error.to_string()))?;
+            } else {
+                platform_before = Some(at);
+            }
+        }
+        let records = if platform_before.is_some() {
+            Vec::new()
+        } else {
+            self.store
+                .history(
+                    conversation.as_str(),
+                    sender_ids,
+                    limit,
+                    record_before,
+                    after,
+                )
+                .await
+                .map_err(|error| SinkError::Internal(error.to_string()))?
+        };
         // Reading is seeing. Left unmarked, a muted chat the agent kept up with through this tool
         // owed it the same messages for as long as they were kept, since only a hand-over marked
         // anything. Marked after the read, so each entry still says whether it was news.
@@ -1735,7 +1767,60 @@ impl OutboundSink for BridgeSink {
             let ids: Vec<i64> = records.iter().map(|record| record.id).collect();
             self.mark_read(&conversation, &ids).await;
         }
-        Ok(records.into_iter().map(history_entry).collect())
+        let mut page = HistoryPage {
+            entries: records.into_iter().map(history_entry).collect(),
+            platform_read: false,
+            resume_cursor: None,
+        };
+
+        // Where the record runs out reading backwards, the platform's own history carries on, so
+        // a channel the bot was let into yesterday reads back past yesterday. Not with a sender
+        // filter, which a platform's channel read cannot apply, and not forwards, where everything
+        // said is recorded as it arrives.
+        let wanted = limit.saturating_sub(page.entries.len());
+        if wanted == 0 || after.is_some() || !sender_ids.is_empty() {
+            return Ok(page);
+        }
+        let from = match platform_before {
+            Some(before) => Some(before),
+            None => self
+                .store
+                .oldest_message_time(conversation.as_str())
+                .await
+                .map_err(|error| SinkError::Internal(error.to_string()))?,
+        };
+        // A cursor into a record that retention has since emptied has nothing left to place it,
+        // and reading the newest messages again would hand back what was already read.
+        if from.is_none() && before.is_some() {
+            return Ok(page);
+        }
+        let channel = self
+            .channels
+            .resolve(&conversation)
+            .map_err(|error| SinkError::Internal(error.to_string()))?;
+        match channel.read_history(&conversation, from, wanted).await {
+            Ok(read) => {
+                page.platform_read = true;
+                page.resume_cursor = read.resume_before.map(crate::mcp::platform_cursor);
+                let mut entries: Vec<HistoryEntry> = read
+                    .messages
+                    .into_iter()
+                    .map(|message| platform_entry(&conversation, message))
+                    .collect();
+                entries.append(&mut page.entries);
+                page.entries = entries;
+            }
+            Err(ChannelError::Unsupported { .. }) => {}
+            // What the record held still stands, and paging back from its oldest message asks
+            // again, which is where the failure reaches the agent if it persists.
+            Err(error) if !page.entries.is_empty() => tracing::warn!(
+                conversation = %conversation,
+                "could not read further back in the platform's own history: {}",
+                error
+            ),
+            Err(error) => return Err(SinkError::Delivery(error.to_string())),
+        }
+        Ok(page)
     }
 
     async fn history_lookup(
@@ -1744,7 +1829,8 @@ impl OutboundSink for BridgeSink {
         message_ids: &[String],
         session: Option<&str>,
     ) -> std::result::Result<HistoryLookup, SinkError> {
-        let conversation = self.resolve(conversation)?;
+        // A dialling address is recorded under the chat it opens, so the record is asked by that.
+        let conversation = self.canonical(&self.resolve(conversation)?).await;
         let records = self
             .store
             .messages_by_id(conversation.as_str(), message_ids)
@@ -1813,7 +1899,10 @@ impl OutboundSink for BridgeSink {
         sender_ids: &[String],
         limit: usize,
     ) -> std::result::Result<Vec<HistoryEntry>, SinkError> {
-        let conversation = conversation.map(|id| self.resolve(id)).transpose()?;
+        let conversation = match conversation {
+            Some(id) => Some(self.canonical(&self.resolve(id)?).await),
+            None => None,
+        };
         let records = self
             .store
             .search_messages(
@@ -2256,17 +2345,17 @@ fn chat_kind(kind: &str) -> ChatKind {
 
 /// A message the platform supplied, as the history tools hand one back.
 ///
-/// The connector settles whether it was the bot's own from its account id. The rest is unknowable
-/// from a platform's record, which gives a message id, an author and a time and nothing the bridge
-/// recorded about it, so it is left at its defaults rather than guessed.
+/// The connector settles whether it was the bot's own from its account id. What only the bridge's
+/// record could say, such as whether it was seen, deleted or edited, is left at its defaults rather
+/// than guessed, and the entry is marked as unrecorded so that nobody takes the defaults for facts.
 fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> HistoryEntry {
     HistoryEntry {
         conversation: conversation.as_str().to_string(),
         message_id: message.message_id,
         sender: message.sender_name,
-        sender_id: None,
+        sender_id: message.sender_id,
         text: message.text,
-        notes: None,
+        notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
         attachments: Vec::new(),
         addressed: false,
         unseen: false,
@@ -2275,10 +2364,9 @@ fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> Histo
         deleted: false,
         superseded: false,
         previous_account: false,
+        unrecorded: true,
+        cursor: crate::mcp::platform_cursor(message.timestamp),
         timestamp: message.timestamp.to_rfc3339(),
-        // Not a row in the bridge's history, so there is nothing to page back from. Zero is the
-        // value `history_read` already treats as no cursor.
-        cursor: 0,
     }
 }
 
@@ -2299,6 +2387,7 @@ fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
         deleted: record.deleted_at.is_some(),
         superseded: record.superseded_at.is_some(),
         previous_account: record.previous_account,
+        unrecorded: false,
         timestamp: record.timestamp.to_rfc3339(),
         cursor: record.id,
     }

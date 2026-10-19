@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-10-19
+
+### Added
+
+- On Discord, `history_read` reads back past the bridge's record into Discord's own history.
+- Entries read from Discord rather than the record are marked `unrecorded`.
+
+### Changed
+
+- A Discord lookup shows forwarded text, names files, stickers and polls, and gives the sender's id.
+- A Discord search hit gives the sender's id, as a recorded message does.
+- A Discord lookup or search hit has a `cursor` that reads what led up to it, not `0`.
+
+### Fixed
+
+- The history tools given a `discord:@<user id>` address read what was recorded in that DM.
+
 ## [0.22.0] - 2026-10-18
 
 ### Added
@@ -596,7 +613,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...HEAD
+[0.23.0]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...0.21.0
 [0.20.0]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...0.20.0

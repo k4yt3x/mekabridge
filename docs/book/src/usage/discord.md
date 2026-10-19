@@ -145,13 +145,15 @@ An operator can undo any of it from the Discord client, and `mekabridge policy` 
 
 ## History
 
-The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds four things on top.
+The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds five things on top.
 
 **Deletions are honoured.** Discord tells the bridge when a message is deleted, so the recorded copy is marked `deleted` rather than removed: the agent is never handed it back as missed context, but `history_read` and `history_search` still reach it and say it was retracted. Telegram reports nothing, so its archive cannot do this.
 
 **`history_search` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
 
 **`history_read` asks Discord for a message it never recorded.** Given `message_ids`, it answers from the record first and asks Discord for the rest, one request each, so a message somebody linked from before the bot joined can still be read. Telegram gives a bot no such lookup.
+
+**`history_read` reads back past the record.** Reading backwards, once the recorded messages run out it carries on into Discord's own history, so a channel the bot was let into yesterday reads back past yesterday, as far as the channel goes. Those entries are marked `unrecorded` and are not kept. It needs the message content intent and Read Message History, and it does not apply with `sender_ids`. See [`history_read`](./mcp-tools.md#history_read-and-history_search).
 
 **What was said while disconnected is fetched back.** Discord replays a dropped connection only when the session resumes, so after a restart, or a session it would not resume, the bridge asks each chat it has recorded something in for what came after the newest message somebody else said there, up to `backfill` ago (a day by default, and never past `history_retention`) and 500 messages per chat. See [Crash recovery](./operations.md#crash-recovery) for what that does and does not reach.
 

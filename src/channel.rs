@@ -388,13 +388,20 @@ pub struct SentMessage {
 /// One message the platform found, from its own record rather than the bridge's.
 ///
 /// Deliberately thin. Anything the bridge recorded it can say more about, and anything it did not
-/// is reachable only through this, where the platform gives text, an author, and a time and nothing
-/// the bridge could have minted a handle for.
+/// is reachable only through this, where the platform gives what was said, by whom and when, and
+/// nothing the bridge could have minted a handle for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundMessage {
     pub message_id: String,
     pub sender_name: String,
+    /// The account id, so a message read from the platform can be narrowed to or acted on by
+    /// sender like a recorded one.
+    pub sender_id: Option<String>,
     pub text: String,
+    /// Descriptor lines for what the message carries besides text, matching
+    /// [`InboundMessage::notes`]. A file is named here rather than attached, since the bridge
+    /// never downloaded it and has no handle to give out.
+    pub notes: Vec<String>,
     /// Whether the bot itself wrote this.
     ///
     /// The one thing about a hit the connector can settle without the bridge's record, because it
@@ -469,6 +476,18 @@ pub struct Backfill {
     pub events: Vec<InboundEvent>,
     /// Whether more was said than the limit let through. What was left behind is the oldest of it.
     pub truncated: bool,
+}
+
+/// What [`Channel::read_history`] found.
+#[derive(Debug, Default)]
+pub struct HistoryRead {
+    /// Oldest first.
+    pub messages: Vec<FoundMessage>,
+    /// Where a further read picks up when nothing that was read was somebody speaking, but the
+    /// platform holds older messages: a stretch of nothing but join notices, say. `None`
+    /// otherwise, since a read that found messages carries on from its oldest, and one that
+    /// found nothing without this reached the start of the conversation.
+    pub resume_before: Option<DateTime<Utc>>,
 }
 
 /// A transient "something is coming" signal shown in a chat.
@@ -1332,6 +1351,27 @@ pub trait Channel: Send + Sync + 'static {
         Err(ChannelError::Unsupported {
             channel: self.id().as_str().to_string(),
             feature: "fetching a message by its id",
+        })
+    }
+
+    /// The newest `limit` messages said in a conversation before `before`, or the latest when it is
+    /// `None`, from the platform's own record.
+    ///
+    /// Where the bridge's history runs out, this carries a read on: past its oldest message, which
+    /// may be from before the bot joined. The caller pages back on the oldest returned message's
+    /// time, so every message the platform holds in that millisecond comes back with it, even past
+    /// `limit`. Most platforms give a bot no way to read a chat's history, Telegram among them,
+    /// hence the default.
+    async fn read_history(
+        &self,
+        conversation: &ConversationId,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<HistoryRead, ChannelError> {
+        let _ = (conversation, before, limit);
+        Err(ChannelError::Unsupported {
+            channel: self.id().as_str().to_string(),
+            feature: "reading the platform's own history",
         })
     }
 

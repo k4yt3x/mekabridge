@@ -2639,6 +2639,56 @@ impl Store {
         Ok(records)
     }
 
+    /// When the oldest message still recorded in a conversation was said, or `None` when nothing
+    /// is.
+    ///
+    /// By the platform's time rather than by row: a message fetched back after a disconnection is
+    /// recorded after ones said later, so the first row is not necessarily the earliest. Edits are
+    /// left out, since one carries the time its message was first said, and an edit to a message
+    /// from long before anything else here would place the start of the record there.
+    pub async fn oldest_message_time(&self, address: &str) -> Result<Option<DateTime<Utc>>> {
+        let address = address.to_string();
+        let oldest: Option<String> = self
+            .connection
+            .call(move |connection| {
+                // RFC 3339 at one offset sorts as text exactly as it does as time.
+                connection.query_row(
+                    "SELECT MIN(m.timestamp)
+                     FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                     WHERE c.address = ?1 AND m.revision = 0",
+                    rusqlite::params![address],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        oldest
+            .map(|oldest| parse_rfc3339(&oldest))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// The cursor that reads a conversation back from `at`: the first row recorded of what was said
+    /// then or later, or `None` when everything recorded is older, so that reading from the newest
+    /// already starts before it.
+    pub async fn cursor_at(&self, address: &str, at: DateTime<Utc>) -> Result<Option<i64>> {
+        let address = address.to_string();
+        let at = to_rfc3339(at);
+        let cursor = self
+            .connection
+            .call(move |connection| {
+                // RFC 3339 at one offset sorts as text exactly as it does as time.
+                connection.query_row(
+                    "SELECT MIN(m.id)
+                     FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                     WHERE c.address = ?1 AND m.timestamp >= ?2",
+                    rusqlite::params![address, at],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(cursor)
+    }
+
     /// Particular messages in one conversation, by their platform ids, oldest first.
     ///
     /// Every recorded row for each, so an edited message comes back with the wording it replaced
@@ -4433,6 +4483,73 @@ mod tests {
             .expect("search");
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].conversation, "telegram:2");
+    }
+
+    #[tokio::test]
+    async fn the_oldest_message_is_found_by_when_it_was_said_not_by_row() {
+        // A message fetched back after a disconnection is recorded after messages said later, so
+        // taking the first row would place a read of what came before at the wrong point.
+        let (store, account) = seeded(&["discord:1", "discord:2"]).await;
+        assert_eq!(
+            store.oldest_message_time("discord:1").await.expect("read"),
+            None,
+            "nothing recorded, nothing to place"
+        );
+        let now = Utc::now();
+        for (message_id, said) in [
+            ("2", now - chrono::Duration::minutes(5)),
+            ("1", now - chrono::Duration::hours(3)),
+        ] {
+            let mut record = message(account, "discord:1", message_id, "hello");
+            record.timestamp = said;
+            store.record_message(record).await.expect("record");
+        }
+        let mut elsewhere = message(account, "discord:2", "0", "older, but not here");
+        elsewhere.timestamp = now - chrono::Duration::days(3);
+        store.record_message(elsewhere).await.expect("record");
+        // An edit to a message from long before the record starts carries that message's time.
+        let mut edit = message(account, "discord:1", "0", "reworded");
+        edit.revision = now.timestamp_millis();
+        edit.timestamp = now - chrono::Duration::days(20);
+        store.record_message(edit).await.expect("record");
+
+        assert_eq!(
+            store.oldest_message_time("discord:1").await.expect("read"),
+            Some(now - chrono::Duration::hours(3)),
+            "the oldest message first recorded here, not the oldest an edit names"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_at_a_time_reads_back_what_was_said_before_it() {
+        let (store, account) = seeded(&["discord:1"]).await;
+        let now = Utc::now();
+        for (message_id, minutes_ago) in [("1", 30), ("2", 20), ("3", 10)] {
+            let mut record = message(account, "discord:1", message_id, "hello");
+            record.timestamp = now - chrono::Duration::minutes(minutes_ago);
+            store.record_message(record).await.expect("record");
+        }
+
+        let cursor = store
+            .cursor_at("discord:1", now - chrono::Duration::minutes(15))
+            .await
+            .expect("read");
+        let before = store
+            .history("discord:1", &[], 10, cursor, None)
+            .await
+            .expect("read");
+        assert_eq!(
+            before
+                .iter()
+                .map(|row| row.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(
+            store.cursor_at("discord:1", now).await.expect("read"),
+            None,
+            "everything recorded is older, so reading from the newest already starts before it"
+        );
     }
 
     #[tokio::test]

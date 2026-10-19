@@ -235,8 +235,12 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// Read a conversation back, oldest first.
     ///
     /// `before` reads the page older than a cursor; `after` reads what has arrived since one. At
-    /// most one is ever set, which the tool enforces before calling. `sender_ids` narrows to those
-    /// senders when it is not empty.
+    /// most one is ever set, which the tool enforces before calling, and `after` is never a
+    /// platform cursor. `sender_ids` narrows to those senders when it is not empty.
+    ///
+    /// Read backwards, a page the bridge's record cannot fill is filled from the platform's own
+    /// history where it has one, from before the oldest message recorded, and a platform cursor as
+    /// `before` reads the platform alone. Neither happens with `sender_ids`.
     ///
     /// `session` names the meka session reading. What it returns counts as seen only when that is
     /// the bridge's own session, or none is named.
@@ -248,7 +252,7 @@ pub trait OutboundSink: Send + Sync + 'static {
         before: Option<i64>,
         after: Option<i64>,
         session: Option<&str>,
-    ) -> Result<Vec<HistoryEntry>, SinkError>;
+    ) -> Result<HistoryPage, SinkError>;
 
     /// Particular messages in one conversation, by id: from what the bridge recorded, and for the
     /// rest from the platform where it can be asked. What neither has is reported with why.
@@ -472,9 +476,55 @@ pub struct HistoryEntry {
     /// to it, editing it, or deleting it from the current one will fail.
     #[serde(skip_serializing_if = "is_false")]
     pub previous_account: bool,
+    /// Whether this came from the platform's own history rather than this bridge's record: read
+    /// past the oldest message the bridge recorded, fetched by id, or found by the platform's
+    /// search. Nothing the bridge records is known of it, so it carries no attachment handles, is
+    /// never marked unseen, and its cursor pages back but not forward.
+    #[serde(skip_serializing_if = "is_false")]
+    pub unrecorded: bool,
     pub timestamp: String,
     /// Opaque marker for paging. Pass the oldest one back as `before` to read further back.
     pub cursor: i64,
+}
+
+/// One page of a conversation read back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryPage {
+    /// Oldest first.
+    pub entries: Vec<HistoryEntry>,
+    /// Whether the platform's own history was read where the bridge's record ran out, so that an
+    /// empty page means the conversation holds nothing there rather than that the bridge kept
+    /// nothing.
+    pub platform_read: bool,
+    /// Where to page back from when the platform's history was read and held nothing but its own
+    /// notices as far as the read looked, with more beyond. An empty page has no entry to take a
+    /// cursor from, so without this the read would stop there.
+    pub resume_cursor: Option<i64>,
+}
+
+/// Where the cursors of messages read from a platform, rather than from the bridge's record, start.
+///
+/// Such a cursor is the message's time in milliseconds offset by this, which keeps it below zero
+/// and so below every recorded message's cursor, rising with time as those do. It also keeps it
+/// within the integers a double holds exactly: a tool argument may pass through a JSON parser that
+/// reads every number as one, and a raw Discord snowflake would not survive that.
+const PLATFORM_CURSOR_BASE: i64 = 1 << 52;
+
+/// The cursor of a message read from a platform, said at `at`.
+pub fn platform_cursor(at: chrono::DateTime<chrono::Utc>) -> i64 {
+    at.timestamp_millis().clamp(0, PLATFORM_CURSOR_BASE - 1) - PLATFORM_CURSOR_BASE
+}
+
+/// The time a platform cursor stands for, or `None` when the cursor is not one.
+pub fn platform_cursor_time(cursor: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if cursor >= 0 {
+        return None;
+    }
+    let millis = cursor.checked_add(PLATFORM_CURSOR_BASE)?;
+    if millis < 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp_millis(millis)
 }
 
 /// What a lookup of particular messages found, and what it could not.
@@ -571,7 +621,8 @@ pub struct ReadHistoryArgs {
     pub before: Option<i64>,
     /// Read forwards instead: the oldest `limit` messages said since the `cursor` you pass. Keep
     /// the newest `cursor` you were given and pass it back next time to follow a conversation
-    /// without reading anything twice or missing anything in between.
+    /// without reading anything twice or missing anything in between. Not the cursor of a message
+    /// marked `unrecorded`.
     #[serde(default)]
     pub after: Option<i64>,
     /// Only messages from these people, by the numeric id on a header's `from:` line. Omit for
@@ -2206,10 +2257,13 @@ impl BridgeMcpServer {
                        said, which is how you gather one person's messages before deleting them. \
                        Pass message_ids instead to fetch particular messages, such as one \
                        somebody linked; on Discord, any this bridge never recorded are asked of \
-                       Discord itself. Apart from that it reads only what this bridge recorded, \
-                       so it does not go back before the bridge was installed or past the \
-                       configured retention. A block stops a chat being recorded from that point \
-                       on; whatever was recorded before it is still here. Reading is seeing: \
+                       Discord itself. On Discord, reading back past the oldest message this \
+                       bridge recorded carries on into Discord's own history, as far back as the \
+                       channel goes, except with sender_ids. Otherwise it reads only what this \
+                       bridge recorded, so it does not go back before the bridge was installed or \
+                       past the configured retention. A block stops a chat being recorded from \
+                       that point on; whatever was recorded before it is still here. Reading is \
+                       seeing: \
                        what this returns stops counting as unseen in backlog_check and \
                        conversation_list. An entry marked `unseen` had not reached you in any \
                        form before, neither through a read nor through a wake-up, which counts \
@@ -2221,8 +2275,11 @@ impl BridgeMcpServer {
                        the revision elsewhere in the list under the same `message_id`. One marked \
                        `previous_account` went through a bot account this channel no longer uses, \
                        so its `message_id` cannot be replied to, reacted to, edited or deleted. \
-                       Pass the oldest `cursor` you were given back as `before` to page further \
-                       back, or the newest as `after` to read only what has been said since.",
+                       One marked `unrecorded` came from Discord rather than this bridge's \
+                       record, so its files cannot be opened and its cursor cannot be passed as \
+                       `after`. Pass the oldest `cursor` you were given back as `before` to page \
+                       further back, or the newest as `after` to read only what has been said \
+                       since.",
         annotations(title = "Read history", read_only_hint = true, open_world_hint = false)
     )]
     async fn history_read(
@@ -2251,6 +2308,27 @@ impl BridgeMcpServer {
         if args.before.is_some() && args.after.is_some() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "`before` reads older messages and `after` reads newer ones; set one, not both.",
+            )]));
+        }
+        // Following forward is the bridge's record's job, since everything said from here on is
+        // recorded as it arrives, and an unrecorded message has no place in that order to follow
+        // on from.
+        if args.after.is_some_and(|cursor| cursor < 0) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "That cursor is from a message marked `unrecorded`, which pages back with `before` \
+                 but cannot be followed forward with `after`. To follow the conversation, keep the \
+                 cursor of a message without the mark.",
+            )]));
+        }
+        // A platform cursor is when its message was said, so one from the future was never given
+        // out; a day's grace covers a platform whose clock runs ahead of this one.
+        let latest_cursor_time = chrono::Utc::now() + chrono::Duration::days(1);
+        if args.before.is_some_and(|cursor| {
+            cursor < 0 && platform_cursor_time(cursor).is_none_or(|at| at > latest_cursor_time)
+        }) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "That is not a cursor this bridge gave out; pass the `cursor` of a message you \
+                 were given.",
             )]));
         }
         if !args.message_ids.is_empty() {
@@ -2295,25 +2373,39 @@ impl BridgeMcpServer {
             )
             .await
         {
-            Ok(entries) if entries.is_empty() => {
+            Ok(page) if page.entries.is_empty() => {
                 // Two different pieces of news, and the forward one is the common case: a watcher
                 // sweeping a quiet chat gets this every time, and telling it the retention might be
                 // at fault would send it investigating a room that simply has not moved.
                 // A filtered read that finds nothing is a different piece of news again: the chat
                 // may be busy and simply hold nothing from those people, so neither sentence below
-                // would be true of it.
-                let explanation = match (args.sender_ids.as_slice(), args.after) {
-                    ([], Some(cursor)) => format!(
+                // would be true of it. And where the platform was read too, nothing is the
+                // conversation's own answer rather than the record's.
+                let explanation = match (args.sender_ids.as_slice(), args.after, page.resume_cursor)
+                {
+                    ([], Some(cursor), _) => format!(
                         "Nothing has been said in {} since message {cursor}.",
                         args.conversation
                     ),
-                    ([], None) => format!(
+                    ([], None, Some(cursor)) => format!(
+                        "Nothing but the platform's own notices, such as joins and pins, in the \
+                         stretch of {} just read. Pass `before: {cursor}` to read further back.",
+                        args.conversation
+                    ),
+                    ([], None, None) if page.platform_read && args.before.is_some() => format!(
+                        "Nothing older in {}; that is where it starts.",
+                        args.conversation
+                    ),
+                    ([], None, None) if page.platform_read => {
+                        format!("Nothing has been said in {}.", args.conversation)
+                    }
+                    ([], None, None) => format!(
                         "Nothing recorded for {}. Either nothing has been said there since this \
                          bridge started, it is older than the retention period, or the \
                          conversation is blocked and nothing from it is kept.",
                         args.conversation
                     ),
-                    (senders, _) => format!(
+                    (senders, ..) => format!(
                         "Nothing recorded in {} from {}. They may have said nothing there, or \
                          their ids may not be the ones on the `from:` lines you want.",
                         args.conversation,
@@ -2324,7 +2416,7 @@ impl BridgeMcpServer {
                     explanation,
                 )]))
             }
-            Ok(entries) => Ok(json_result(&entries)),
+            Ok(page) => Ok(json_result(&page.entries)),
             Err(error) => Ok(sink_failure(&error)),
         }
     }
@@ -2335,9 +2427,11 @@ impl BridgeMcpServer {
                        one, and optionally only from particular people with sender_ids. Use it to \
                        find something you were told a while ago, or to check what a \
                        chat was discussing before it mentioned you. Matching is on whole words; \
-                       `a OR b`, `a NOT b`, and \"quoted phrases\" work. Same limits as \
-                       history_read: only what this bridge recorded, since it was installed and \
-                       within the configured retention. A block stops a chat being recorded from \
+                       `a OR b`, `a NOT b`, and \"quoted phrases\" work. It searches what this \
+                       bridge recorded, since it was installed and within the configured \
+                       retention; on Discord, a search within one conversation also asks \
+                       Discord's own search, which reaches further back, and its hits are marked \
+                       `unrecorded`. A block stops a chat being recorded from \
                        that point on; what was recorded before it is still searchable. Your own \
                        messages are searchable too, marked `own`, which makes this the way to \
                        answer \"have I already said this?\" across every session sharing this \
@@ -2662,6 +2756,10 @@ mod tests {
         deletes: Mutex<Vec<(String, Vec<String>)>>,
         policies: Mutex<Vec<RecordedPolicy>>,
         history: Vec<HistoryEntry>,
+        /// What `history_read` says of whether the platform was read too.
+        platform_read: bool,
+        /// What `history_read` gives to carry on from past a stretch of notices.
+        resume_cursor: Option<i64>,
         moderations: Mutex<Vec<RecordedModeration>>,
         promotions: Mutex<Vec<(String, Vec<MemberRight>)>>,
         pins: Mutex<Vec<(String, bool)>>,
@@ -3167,25 +3265,29 @@ mod tests {
             _before: Option<i64>,
             after: Option<i64>,
             _session: Option<&str>,
-        ) -> Result<Vec<HistoryEntry>, SinkError> {
+        ) -> Result<HistoryPage, SinkError> {
             if let Some(reason) = self.fail_with {
                 return Err(SinkError::Delivery(reason.to_string()));
             }
-            Ok(self
-                .history
-                .iter()
-                .filter(|entry| entry.conversation == conversation)
-                .filter(|entry| after.is_none_or(|cursor| entry.cursor > cursor))
-                .filter(|entry| {
-                    sender_ids.is_empty()
-                        || entry
-                            .sender_id
-                            .as_ref()
-                            .is_some_and(|sender_id| sender_ids.contains(sender_id))
-                })
-                .take(limit)
-                .cloned()
-                .collect())
+            Ok(HistoryPage {
+                entries: self
+                    .history
+                    .iter()
+                    .filter(|entry| entry.conversation == conversation)
+                    .filter(|entry| after.is_none_or(|cursor| entry.cursor > cursor))
+                    .filter(|entry| {
+                        sender_ids.is_empty()
+                            || entry
+                                .sender_id
+                                .as_ref()
+                                .is_some_and(|sender_id| sender_ids.contains(sender_id))
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+                platform_read: self.platform_read,
+                resume_cursor: self.resume_cursor,
+            })
         }
 
         async fn history_search(
@@ -4184,6 +4286,7 @@ mod tests {
             deleted: false,
             superseded: false,
             previous_account: false,
+            unrecorded: false,
             // Derived from the id so entries in one test are distinguishable by time.
             timestamp: format!("2026-08-11T09:3{message_id}:00+00:00"),
             cursor: 1,
@@ -4539,6 +4642,145 @@ mod tests {
     }
 
     #[test]
+    fn a_platform_cursor_sorts_below_the_record_and_survives_a_double() {
+        let earlier = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("time");
+        let later = earlier + chrono::Duration::milliseconds(1);
+        let (earlier_cursor, later_cursor) = (platform_cursor(earlier), platform_cursor(later));
+        assert!(later_cursor < 0, "below every recorded message's cursor");
+        assert!(
+            earlier_cursor < later_cursor,
+            "rising with time, so the oldest cursor is still the smallest"
+        );
+        assert_eq!(platform_cursor_time(earlier_cursor), Some(earlier));
+        // A tool argument may be parsed as a double on its way back.
+        assert_eq!(earlier_cursor as f64 as i64, earlier_cursor);
+        assert_eq!(
+            platform_cursor_time(7),
+            None,
+            "a recorded message's cursor is not one"
+        );
+        assert_eq!(platform_cursor_time(i64::MIN), None);
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_cursor_pages_back_but_not_forward() {
+        let (server, _sink) = server_with(FakeSink::default());
+        let cursor = platform_cursor(chrono::Utc::now());
+        let result = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "discord:1", "after": cursor })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text_of(&result).contains("unrecorded"),
+            "{}",
+            text_of(&result)
+        );
+
+        let result = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "discord:1", "before": cursor })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+
+        for made_up in [i64::MIN, -1] {
+            let result = server
+                .history_read_inner(
+                    read_args(
+                        serde_json::json!({ "conversation": "discord:1", "before": made_up }),
+                    ),
+                    None,
+                )
+                .await
+                .expect("tool runs");
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{made_up} is no cursor given out, below them all or far in the future, so it is \
+                 refused rather than read as some time"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_page_says_whether_the_platform_had_nothing_either() {
+        let (server, _sink) = server_with(FakeSink {
+            platform_read: true,
+            ..FakeSink::default()
+        });
+        let latest = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "discord:1" })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(text_of(&latest), "Nothing has been said in discord:1.");
+        let older = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "discord:1", "before": 7 })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert_eq!(
+            text_of(&older),
+            "Nothing older in discord:1; that is where it starts."
+        );
+
+        let (server, _sink) = server_with(FakeSink {
+            platform_read: true,
+            resume_cursor: Some(-42),
+            ..FakeSink::default()
+        });
+        let notices = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "discord:1" })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert!(
+            text_of(&notices).contains("`before: -42`"),
+            "a stretch of notices is not the start, and the way past it is given: {}",
+            text_of(&notices)
+        );
+
+        let (server, _sink) = server_with(FakeSink::default());
+        let recorded_only = server
+            .history_read_inner(
+                read_args(serde_json::json!({ "conversation": "telegram:1" })),
+                None,
+            )
+            .await
+            .expect("tool runs");
+        assert!(
+            text_of(&recorded_only).starts_with("Nothing recorded for telegram:1."),
+            "where only the record was read, only the record is answered for: {}",
+            text_of(&recorded_only)
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_entry_says_so_and_a_recorded_one_says_nothing() {
+        let recorded = history_entry("discord:1", "41", "hello");
+        let unrecorded = HistoryEntry {
+            unrecorded: true,
+            ..recorded.clone()
+        };
+        let recorded = serde_json::to_value(&recorded).expect("serializes");
+        let unrecorded = serde_json::to_value(&unrecorded).expect("serializes");
+        assert!(recorded.get("unrecorded").is_none(), "{recorded}");
+        assert_eq!(unrecorded["unrecorded"], true);
+    }
+
+    #[test]
     fn history_read_offers_particular_messages_as_a_list() {
         let router = BridgeMcpServer::tool_router();
         let tools = router.list_all();
@@ -4744,6 +4986,7 @@ mod tests {
                 deleted: false,
                 superseded: false,
                 previous_account: false,
+                unrecorded: false,
                 timestamp: "2026-08-11T09:30:00+00:00".to_string(),
                 cursor: 7,
             }],
@@ -5157,6 +5400,7 @@ mod tests {
                 deleted: false,
                 superseded: false,
                 previous_account: false,
+                unrecorded: false,
                 timestamp: "2026-08-11T09:30:00+00:00".to_string(),
                 cursor: 8_212,
             }],

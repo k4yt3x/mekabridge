@@ -172,7 +172,7 @@ A non-loopback `bind` without a `token` is a `doctor` failure: anyone who can re
 
 Every message the bridge is not blocking is recorded, not only the ones from muted conversations. A history that works in some chats and not others is a worse tool than one that behaves the same everywhere, and an agent whose session has been compacted has as much use for scroll-back in a chat it was listening to as in one it was not.
 
-That means the database holds the content of conversations the agent never read. Smaller a change than it sounds, since delivered queue payloads were already kept for seven days, but it goes from being a queue to being a chat log. `history_retention = "0s"` turns it off entirely; delivery is unaffected either way, and a muted conversation simply has nothing to show when it wakes the agent. See [Security](../usage/security.md).
+That means the database holds the content of conversations the agent never read. Smaller a change than it sounds, since delivered queue payloads were already kept for seven days, but it goes from being a queue to being a chat log. `history_retention = "0s"` turns it off entirely; delivery is unaffected either way, and a muted conversation simply has nothing to show when it wakes the agent. On Discord, `history_read` reads past what is kept from Discord itself, keeping none of it, so there this bounds the database rather than what the agent can read. See [Security](../usage/security.md).
 
 The default matches `attachment_retention` so a message and the picture attached to it fall out of reach together, rather than leaving the agent a description of a file it can no longer open.
 

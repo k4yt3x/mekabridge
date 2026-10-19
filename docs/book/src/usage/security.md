@@ -109,6 +109,8 @@ history_retention = "0s"   # record nothing
 
 Delivery is unaffected either way. What changes is that a muted conversation has nothing to show the agent when it wakes, so `mute` becomes closer to a quieter `block`. The database also carries no separate protection: it is as sensitive as the conversations in it, and `file_send` can read it (see below).
 
+Retention bounds what is on disk, not what the agent can read on Discord. There, `history_read` carries on into Discord's own history where the record runs out, and `history_search` and lookups by id ask Discord too, none of it kept. That reaches any channel the bot can see, back to its first message. The allowlists do not narrow it, because they decide who can wake the agent rather than where it can look, the same as for sending. What limits it is the bot's Read Message History permission, so withhold that wherever the agent should not read back.
+
 ## What the agent can reach on your machine
 
 The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` or `chat_set`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.

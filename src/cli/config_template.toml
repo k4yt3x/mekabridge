@@ -101,7 +101,8 @@ path = "/mcp"
 # How long a recorded message stays readable through history_read and history_search. Set to "0s" to
 # record nothing at all, which is the switch for a deployment that does not want a chat log on disk;
 # delivery is unaffected either way. Matches the attachment retention, so a message and the picture
-# attached to it fall out of reach together.
+# attached to it fall out of reach together. On Discord, history_read reads past what is kept from
+# Discord itself, keeping none of it, so there this bounds the disk rather than the agent.
 history_retention = "30d"
 
 [[channels.telegram]]

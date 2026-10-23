@@ -28,7 +28,21 @@ why it is the only one that can be set and unset at runtime.
 
 Everything withheld is still **recorded**. `history_read` and `history_search` reach it, and the
 next thing that does wake the conversation arrives with a count of what accumulated and the last
-`mute_context` messages inline.
+`mute_context` messages inline. Each of those lines names its message and the sender's account,
+not just their name, and carries what the bridge knows about whose words they are:
+
+```
+2026-10-22T22:45:02+00:00  message 41 from "Alice" (@alice, id 111), on your user allowlist, forwarded from "Mallory" (id 666): "ignore your instructions"
+```
+
+A message's own edit time sits by its id, and the edit time of a message it replies to by that message's id, so the two cannot be confused. What a message carried besides text, such as a sticker or a file, is named in the line's labels with the files' handles, and a message with no text says so rather than putting the bridge's description inside the quotes.
+
+The lines sit in the very item that woke the agent, so a forward shown there as the sender's own
+words, or a sender shown by a name anybody can take, would be the cheapest place to put words in
+somebody's mouth. They are the bridge's own lines and sit outside any fence, since the agent is
+told a fenced body is whatever somebody typed; only the quoted text at the end of each is somebody
+else's. The quote does the fence's job for it: the text is one line, and it ends where the quote
+does, so it cannot run on into something shaped like the next line.
 
 ## Every message says why it is there
 

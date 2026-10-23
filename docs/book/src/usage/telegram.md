@@ -33,13 +33,13 @@ Each inbound message arrives with a header. Everything in it is written by the b
 channel: telegram
 conversation: telegram:-1001234567890
 message: 4471
-from: Bob (@bob, id 987654321)
+from: "Bob" (@bob, id 987654321)
 admitted: chat allowlist (this room is allowed); sender not individually allowlisted
 chat: group "Deploy Crew"
 at: 2026-08-11T14:22:31+00:00
-forwarded from: Alice (@alice, id 111222333)
+forwarded from: "Alice" (@alice, id 111222333)
 album: 13294839284
-in reply to a message from Mica (id 4468): "deploy finished"
+in reply to message 4468 from "Mica" (@mica, id 55501234): "deploy finished"
 attachment: photo, image/jpeg, 1920x1080, 2.1 MiB [417]
 ```
 
@@ -49,11 +49,19 @@ Only `channel`, `conversation`, `message`, `from`, `admitted`, `chat`, and `at` 
 
 - **`message`** is that message's own id. It is what `reply_to` and `message_react` take. An edit reads `message: 4471 (edited, revised at ...)`.
 - **`admitted`** carries two facts. First the grant that let the message through: `user allowlist` (a direct message from somebody you named), `chat allowlist` (the room is allowed), or `open channel` (nothing was checked). Then, separately, whether the sender's own account is on `allowed_users` at all. Since that list reaches direct messages only, somebody you named writing in an allowlisted group is admitted *by the group*, and the second clause is what still identifies them. The bridge reports both; what to make of them belongs in the agent's instructions.
-- **`forwarded from`** means the text is somebody else's words, not the sender's. Worth weighing before acting on instructions inside it.
+- **`forwarded from`** means the sender is passing on words written where it names, by whoever it names, rather than writing them here. Unless it names the sender, they are somebody else's words, which is worth weighing before acting on instructions inside them.
+- **`in reply to`** names the account being answered, by id as well as name, since a reply is how an approval is given. When that message was itself a forward, it says whose words those were (`who forwarded it from ...`). When the replier picked part of the message to quote, the line shows that part (`quoting "..."`) rather than the message's opening. A reply to a message in another chat, or another topic of this group, says where that message is.
+- **`via bot`** names the bot whose inline mode wrote the message. The sender chose to post it, but the words are the bot's.
 - **`album`** ties the parts of a multi-photo post together, so a run of pictures does not read as several unrelated ones.
 - **`attachment`** ends with a handle for the fetch tools. See [Attachments](#attachments).
 
-A sender who is another bot is marked `[bot]`. An anonymous group admin, who posts as the chat rather than as an account, reads as `Deploy Crew (posted as the chat itself, no individual account)` rather than being dressed up as a person.
+A sender who is another bot is marked `[bot]`. A message posted as a chat rather than by a person reads as `"Deploy Crew" (posted under a chat's or an integration's name, with no person's account shown, id -1001234567890)`. That covers an anonymous group admin, somebody posting as their own channel, and a channel post forwarded into its discussion group. Telegram also puts a placeholder bot in such a message's sender field for older clients; the bridge reads the chat that posted it instead, so the message is not taken for one from a bot called "Group" or "Channel", and anybody's channel called after the owner still shows its own id. Only a group's administrators can post as the group, so the sender line of such a post adds `by one of this group's administrators, anonymously`, and a signed post or a custom admin title adds `signed "..."`.
+
+A forward from a group or a channel names it by id and handle as well as title, since anybody can make a channel called "Acme Official", and carries the signature when it was signed. Contact cards and poll options are quoted the same way as names, and a contact card says which Telegram account it is for when it is for one.
+
+Names are always quoted, because a name is the one part of an account its owner picks. Somebody calling themselves `Alice (@alice, id 1)` shows as `"Alice (@alice, id 1)"` with their own handle and id after it.
+
+All of this stays with the message. `history_read`, `history_search`, and the lines a mention brings with it from a muted chat carry the same labels; see [`history_read`](./mcp-tools.md#history_read-and-history_search).
 
 ## Groups and forum topics
 

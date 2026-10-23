@@ -1260,22 +1260,27 @@ pub async fn history_show(
         // agent's own history tools were fixed for; an operator scrolling this deserves the same
         // answer.
         let state = match (message.deleted_at, message.superseded_at) {
-            (Some(_), _) => "  [deleted]",
-            (None, Some(_)) => "  [superseded by a later edit]",
+            (Some(_), _) => ", deleted",
+            (None, Some(_)) => ", superseded by a later edit",
             (None, None) => "",
         };
         // A message id from a bot account this channel no longer uses cannot be acted on, and
         // nothing else in the line would say so.
         let account = if message.previous_account {
-            "  [previous bot account]"
+            ", through a previous bot account"
         } else {
             ""
         };
+        let timestamp = message.timestamp;
+        // Described the way the agent's missed-context lines are, labels first and the text last
+        // and quoted, so text ending in something shaped like a label cannot pass for one, and a
+        // control character in it cannot rewrite the terminal line.
+        let line = crate::bridge::envelope::MissedMessage::from_record(message);
         println!(
-            "{seen}{marker}{side} {}  {:<20} {}{state}{account}",
-            short_time(message.timestamp),
-            message.sender_name,
-            message.text.replace('\n', " ")
+            "{seen}{marker}{side} {}  {}{state}{account}{}",
+            short_time(timestamp),
+            line.describe(),
+            line.text_part()
         );
     }
     println!("\n* not yet shown to the agent, @ addressed to it, > sent by the agent");

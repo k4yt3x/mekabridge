@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-10-23
+
+### Added
+
+- History entries carry who forwarded a message, what it replied to, when it was edited, and more.
+- File and member results say whose they are: the file's message and sender, the member's handle.
+- Telegram replies show the quoted part and messages from other chats; inline-bot posts say so.
+
+### Changed
+
+- Names are quoted and accounts named by id wherever shown, so a name cannot pass for a label.
+- Missed-context lines name each sender's account and carry their labels, outside the fence.
+- A Discord app's answer to a command now reaches the agent, naming who used the command.
+
+### Fixed
+
+- A forward read back from history or missed context read as the forwarder's own words.
+- An edit read back from history showed only the original's time, hiding when it was made.
+- Telegram anonymous admins and channel posters showed as bots called Group or Channel.
+- Discord forwards read as replies, app answers as webhooks, and notices as somebody speaking.
+
 ## [0.23.0] - 2026-10-19
 
 ### Added
@@ -613,7 +634,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...HEAD
+[0.24.0]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...0.22.0
 [0.21.0]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...0.21.0

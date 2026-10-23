@@ -656,20 +656,7 @@ async fn missed_context(
             conversation: conversation.clone(),
             muted,
             count,
-            recent: recent
-                .into_iter()
-                .map(|record| MissedMessage {
-                    sender: record.sender_name,
-                    // Descriptor lines stand in for a message whose content is not text, so a photo
-                    // does not read back as somebody saying nothing.
-                    text: match (record.text.trim().is_empty(), record.notes) {
-                        (true, Some(notes)) => notes,
-                        (true, None) => "[no text]".to_string(),
-                        (false, _) => record.text,
-                    },
-                    timestamp: record.timestamp,
-                })
-                .collect(),
+            recent: recent.into_iter().map(MissedMessage::from_record).collect(),
         }),
         Some(Backlog { watermark, through }),
     )
@@ -721,6 +708,7 @@ async fn record_message(
             superseded_at: None,
             timestamp: message.timestamp,
             previous_account: false,
+            labels: crate::channel::MessageLabels::of(message),
         })
         .await?;
     // An edit is recorded as a row of its own, since the queue needs a distinct key to deliver it
@@ -764,10 +752,15 @@ async fn record_conversation(
             address: message.conversation.as_str().to_string(),
             channel: message.channel.as_str().to_string(),
             platform: message.platform.as_str().to_string(),
-            title: message
-                .chat_title
-                .clone()
-                .or_else(|| Some(message.sender.display_name.clone())),
+            // A direct chat is titled after the person in it, by account rather than by name: a
+            // Discord DM's address is not the person's id, so a stranger who took the owner's
+            // display name would otherwise be listed as a conversation with the owner.
+            // A room whose name is not known yet keeps whatever title it had, or none, rather than
+            // being named after whoever happened to speak first in it.
+            title: match message.chat_kind {
+                crate::channel::ChatKind::Direct => Some(message.sender.describe()),
+                _ => message.chat_title.clone(),
+            },
             kind: message.chat_kind.as_str().to_string(),
             created_at: message.timestamp,
             last_inbound_at: Some(message.timestamp),
@@ -3174,6 +3167,8 @@ mod tests {
                 username: None,
                 is_bot: false,
                 on_behalf_of_chat: false,
+                anonymous_admin: false,
+                signature: None,
             },
             admission: Admission::User,
             sender_allowlisted: true,
@@ -3188,6 +3183,8 @@ mod tests {
             notes: Vec::new(),
             attachments,
             timestamp: Utc::now(),
+            via_bot: None,
+            answering: None,
         }
     }
 

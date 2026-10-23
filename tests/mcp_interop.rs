@@ -170,6 +170,8 @@ impl OutboundSink for RecordingSink {
             path: std::path::PathBuf::from("/var/lib/mekabridge/attachments/q3.pdf"),
             bytes: 8_400_000,
             media_type: Some("application/pdf".to_string()),
+            source: "This file came with message 41 in telegram:111, sent by \"Alice\" (id 111)."
+                .to_string(),
         })
     }
 
@@ -286,6 +288,8 @@ impl OutboundSink for RecordingSink {
             status: MemberStatus::Administrator,
             rights: vec![MemberRight::RestrictMembers],
             presence: None,
+            username: None,
+            bot: false,
         })
     }
 
@@ -427,6 +431,7 @@ impl OutboundSink for RecordingSink {
             unrecorded: false,
             timestamp: "2026-08-11T09:30:00+00:00".to_string(),
             cursor: 41,
+            ..HistoryEntry::default()
         }];
         Ok(HistoryPage {
             entries,

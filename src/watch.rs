@@ -473,6 +473,8 @@ mod tests {
                 username: Some("handle".to_string()),
                 is_bot: false,
                 on_behalf_of_chat: false,
+                anonymous_admin: false,
+                signature: None,
             },
             admission: Admission::Chat,
             sender_allowlisted: false,
@@ -487,6 +489,8 @@ mod tests {
             notes: Vec::new(),
             attachments: Vec::new(),
             timestamp: Utc::now(),
+            via_bot: None,
+            answering: None,
         }
     }
 

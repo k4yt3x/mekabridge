@@ -44,11 +44,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     channel::{
-        Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
-        ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings, ConversationId,
-        ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, InboundEvent, InboundMessage,
-        MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberRight, MemberStatus,
-        Platform, ReplyContext, SendOptions, Sender, SentMessage,
+        AccountLabel, Activity, Admission, Attachment, AttachmentKind, Channel,
+        ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings,
+        ConversationId, ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, InboundEvent,
+        InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberRight,
+        MemberStatus, Platform, ReplyContext, SendOptions, Sender, SentMessage, describe_account,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -557,7 +557,7 @@ impl TelegramChannel {
     /// Convert one Telegram message into a bridge event, downloading any attachment it carries.
     async fn to_event(&self, message: &Message) -> Option<InboundEvent> {
         let chat_id = message.chat.id;
-        let user = message.from.as_ref();
+        let user = author_account(message);
         let user_id = user.map(|user| user.id.0 as i64);
         // Recognition is independent of where they wrote, unlike admission.
         let sender_allowlisted =
@@ -589,36 +589,8 @@ impl TelegramChannel {
             ChatKind::Group
         };
 
-        // A message with no `from` was posted as the chat itself: an anonymous group admin, or a
-        // channel post auto-forwarded into its discussion group.
-        let on_behalf_of_chat = user.is_none();
-        let sender = Sender {
-            id: user_id.map(|id| id.to_string()).unwrap_or_default(),
-            display_name: user.map_or_else(
-                || {
-                    message
-                        .sender_chat
-                        .as_ref()
-                        .and_then(|chat| chat.title())
-                        .or_else(|| message.chat.title())
-                        .unwrap_or("unknown sender")
-                        .to_string()
-                },
-                display_name,
-            ),
-            username: user.and_then(|user| user.username.clone()),
-            is_bot: user.is_some_and(|user| user.is_bot),
-            on_behalf_of_chat,
-        };
-
-        let reply_to = replied_to(message).map(|replied| ReplyContext {
-            message_id: replied.id.0.to_string(),
-            sender_name: replied.from.as_ref().map(display_name),
-            excerpt: replied
-                .text()
-                .or_else(|| replied.caption())
-                .map(|text| truncate(text, REPLY_EXCERPT_CHARS)),
-        });
+        let sender = sender_of(message);
+        let reply_to = reply_context(message);
 
         let text = message
             .text()
@@ -656,6 +628,10 @@ impl TelegramChannel {
             reply_to,
             edited_at,
             forwarded_from: message.forward_origin().map(forward_origin),
+            via_bot: message.via_bot.as_ref().map(handle_of),
+            // A bot's inline answer is `via_bot`; Telegram has no app answering a command on
+            // somebody's behalf the way Discord does.
+            answering: None,
             group_id: message
                 .media_group_id()
                 .map(|group| group.0.clone().to_string()),
@@ -1354,6 +1330,8 @@ impl Channel for TelegramChannel {
         Ok(MemberInfo {
             user_id: user.0.to_string(),
             display_name: Some(display_name(&member.user)),
+            username: member.user.username.clone(),
+            bot: member.user.is_bot,
             status: member_status(&member.kind),
             rights: member_rights(&member.kind),
             // Telegram has no roles, and grants privileges to the person directly.
@@ -1398,12 +1376,29 @@ impl Channel for TelegramChannel {
             // whether one of its topics still exists.
             id: conversation.clone(),
             kind,
-            // A private chat has no title, and is named by whoever is on the other end.
+            // A private chat has no title, and is named by whoever is on the other end, by
+            // account rather than by a name anybody could take.
             title: info
                 .title()
                 .map(|title| self.locate(chat, thread, title))
-                .or_else(|| info.first_name().map(str::to_string))
-                .or_else(|| info.username().map(|username| format!("@{username}"))),
+                .or_else(|| {
+                    let name = match (info.first_name(), info.last_name()) {
+                        (Some(first), Some(last)) if !last.is_empty() => {
+                            Some(format!("{first} {last}"))
+                        }
+                        (Some(first), _) => Some(first.to_string()),
+                        (None, _) => None,
+                    };
+                    let id = info.id.0.to_string();
+                    (name.is_some() || info.username().is_some()).then(|| {
+                        describe_account(&AccountLabel {
+                            name: name.as_deref(),
+                            username: info.username(),
+                            id: Some(&id),
+                            ..AccountLabel::default()
+                        })
+                    })
+                }),
         })
     }
 
@@ -1477,6 +1472,8 @@ impl Channel for TelegramChannel {
                 .map(|member| MemberInfo {
                     user_id: member.user.id.0.to_string(),
                     display_name: Some(display_name(&member.user)),
+                    username: member.user.username.clone(),
+                    bot: member.user.is_bot,
                     status: member_status(&member.kind),
                     rights: member_rights(&member.kind),
                     roles: Vec::new(),
@@ -1589,7 +1586,6 @@ fn member_rights(kind: &teloxide::types::ChatMemberKind) -> Vec<MemberRight> {
     .collect()
 }
 
-/// Best-effort human name for a Telegram user.
 /// Describe a message Telegram just made, as the record of something the bridge sent.
 ///
 /// Read off the response rather than off what was submitted. HTML is only how a body is handed to
@@ -1598,7 +1594,6 @@ fn member_rights(kind: &teloxide::types::ChatMemberKind) -> Vec<MemberRight> {
 /// the bridge's own rows in the same shape as everybody else's without a second rendering pass.
 fn sent_message(message: &Message) -> SentMessage {
     let (attachments, notes) = describe_content(message);
-    let user = message.from.as_ref();
     SentMessage {
         message_id: message.id.0.to_string(),
         text: message
@@ -1606,21 +1601,13 @@ fn sent_message(message: &Message) -> SentMessage {
             .or_else(|| message.caption())
             .unwrap_or_default()
             .to_string(),
-        sender: Sender {
-            id: user.map(|user| user.id.0.to_string()).unwrap_or_default(),
-            display_name: user.map_or_else(
-                || message.chat.title().unwrap_or("unknown sender").to_string(),
-                display_name,
-            ),
-            username: user.and_then(|user| user.username.clone()),
-            is_bot: user.is_some_and(|user| user.is_bot),
-            // A send by the bot itself always carries `from`, so this only becomes true for a
-            // message posted as the chat, which is what a channel post is.
-            on_behalf_of_chat: user.is_none(),
-        },
+        // A send by the bot itself carries the bot as `from`, except a post in a channel, which
+        // Telegram attributes to the channel.
+        sender: sender_of(message),
         attachments,
         notes,
         timestamp: message.date,
+        reply_to: reply_context(message),
     }
 }
 
@@ -1700,6 +1687,141 @@ fn replied_to(message: &Message) -> Option<&Message> {
     topic_root(message).is_none().then_some(replied)
 }
 
+/// The account behind a message, or `None` when it was posted as a chat.
+///
+/// Telegram fills `from` with a placeholder whenever a message is posted as a chat, for clients too
+/// old to read `sender_chat`: an anonymous admin writes as a bot called "Group", and somebody
+/// posting as their own channel as one called "Channel". Taken at face value those read as bots of
+/// that name and lose the chat that actually spoke, so `sender_chat` wins whenever it is set.
+fn author_account(message: &Message) -> Option<&teloxide::types::User> {
+    if message.sender_chat.is_some() {
+        None
+    } else {
+        message.from.as_ref()
+    }
+}
+
+/// Who wrote a message, as the bridge names a sender.
+fn sender_of(message: &Message) -> Sender {
+    // An administrator's custom title on an anonymous post, or the author a channel signs with.
+    let signature = message.author_signature().map(str::to_string);
+    if let Some(user) = author_account(message) {
+        return Sender {
+            id: user.id.0.to_string(),
+            display_name: display_name(user),
+            username: user.username.clone(),
+            is_bot: user.is_bot,
+            on_behalf_of_chat: false,
+            anonymous_admin: false,
+            signature,
+        };
+    }
+    // Posted as a chat: an anonymous admin as the group, somebody as their own channel, a channel
+    // post as the channel, or one auto-forwarded into its discussion group. A channel post can
+    // arrive with no `sender_chat` at all, in which case the channel itself is what spoke.
+    let chat = message.sender_chat.as_ref().unwrap_or(&message.chat);
+    Sender {
+        id: chat.id.0.to_string(),
+        display_name: chat.title().unwrap_or("an unnamed chat").to_string(),
+        username: chat.username().map(str::to_string),
+        is_bot: false,
+        on_behalf_of_chat: true,
+        // Only a group's administrators can post as the group, which says more about how far to
+        // trust the message than the group's name does.
+        anonymous_admin: !message.chat.is_channel() && chat.id == message.chat.id,
+        signature,
+    }
+}
+
+/// How a bot is named when its inline mode wrote a message: its handle, which every bot has.
+fn handle_of(bot: &teloxide::types::User) -> String {
+    bot.username.clone().unwrap_or_else(|| bot.id.0.to_string())
+}
+
+/// What a message answers: a message in this chat, or one quoted from somewhere else.
+fn reply_context(message: &Message) -> Option<ReplyContext> {
+    // The part of the replied-to message shown with the reply. When the replier picked it, that is
+    // what the reply is about, which the opening of the message need not be; when Telegram did,
+    // it is still the text the reply arrived with.
+    let quoted = message.quote().is_some_and(|quote| quote.is_manual);
+    let quote = message
+        .quote()
+        .map(|quote| truncate(&quote.text, REPLY_EXCERPT_CHARS));
+    if let Some(replied) = replied_to(message) {
+        let author = sender_of(replied);
+        let excerpt = quote.or_else(|| {
+            replied
+                .text()
+                .or_else(|| replied.caption())
+                .map(|text| truncate(text, REPLY_EXCERPT_CHARS))
+        });
+        return Some(ReplyContext {
+            message_id: replied.id.0.to_string(),
+            sender_name: Some(author.display_name),
+            sender_id: (!author.id.is_empty()).then_some(author.id),
+            sender_username: author.username,
+            sender_is_bot: author.is_bot,
+            posted_as_chat: author.on_behalf_of_chat,
+            sender_anonymous_admin: author.anonymous_admin,
+            sender_signature: author.signature,
+            excerpt,
+            quoted,
+            forwarded_from: replied.forward_origin().map(forward_origin),
+            via_bot: replied.via_bot.as_ref().map(handle_of),
+            answering: None,
+            edited_at: replied.edit_date().copied(),
+            elsewhere: None,
+        });
+    }
+    // A reply to a message in another chat, or in another topic of this one. Telegram hands over
+    // who wrote it and where, but not its text, so the quote is all there is to show of it.
+    let MessageKind::Common(common) = &message.kind else {
+        return None;
+    };
+    let external = common.external_reply.as_ref()?;
+    let elsewhere = match &external.chat {
+        Some(chat) if chat.id == message.chat.id => "another topic of this group".to_string(),
+        Some(chat) => match chat.title() {
+            Some(title) => format!("the chat {title:?}"),
+            None => "another chat".to_string(),
+        },
+        None => "a chat Telegram did not name".to_string(),
+    };
+    let mut reply = ReplyContext {
+        message_id: external
+            .message_id
+            .map(|message_id| message_id.0.to_string())
+            .unwrap_or_default(),
+        quoted,
+        excerpt: quote,
+        elsewhere: Some(elsewhere),
+        ..ReplyContext::default()
+    };
+    match &external.origin {
+        MessageOrigin::User { sender_user, .. } => {
+            reply.sender_name = Some(display_name(sender_user));
+            reply.sender_id = Some(sender_user.id.0.to_string());
+            reply.sender_username = sender_user.username.clone();
+            reply.sender_is_bot = sender_user.is_bot;
+        }
+        // Named but with no id, which is how the reply line shows an account it cannot vouch
+        // for: their privacy settings keep the link back to it from the bot.
+        MessageOrigin::HiddenUser {
+            sender_user_name, ..
+        } => reply.sender_name = Some(sender_user_name.clone()),
+        MessageOrigin::Chat {
+            sender_chat: chat, ..
+        }
+        | MessageOrigin::Channel { chat, .. } => {
+            reply.sender_name = Some(chat.title().unwrap_or("an unnamed chat").to_string());
+            reply.sender_id = Some(chat.id.0.to_string());
+            reply.sender_username = chat.username().map(str::to_string);
+            reply.posted_as_chat = true;
+        }
+    }
+    Some(reply)
+}
+
 fn display_name(user: &teloxide::types::User) -> String {
     match &user.last_name {
         Some(last) if !last.is_empty() => format!("{} {}", user.first_name, last),
@@ -1714,20 +1836,35 @@ fn forward_origin(origin: &MessageOrigin) -> ForwardOrigin {
             name: display_name(sender_user),
             id: Some(sender_user.id.0.to_string()),
             username: sender_user.username.clone(),
+            is_bot: sender_user.is_bot,
         },
         MessageOrigin::HiddenUser {
             sender_user_name, ..
         } => ForwardOrigin::HiddenUser {
             name: sender_user_name.clone(),
         },
-        MessageOrigin::Chat { sender_chat, .. } => ForwardOrigin::Chat {
+        MessageOrigin::Chat {
+            sender_chat,
+            author_signature,
+            ..
+        } => ForwardOrigin::Chat {
             title: sender_chat.title().unwrap_or("a group").to_string(),
+            id: Some(sender_chat.id.0.to_string()),
+            username: sender_chat.username().map(str::to_string),
+            signature: author_signature.clone(),
+            channel: sender_chat.is_channel(),
         },
         MessageOrigin::Channel {
-            chat, message_id, ..
+            chat,
+            message_id,
+            author_signature,
+            ..
         } => ForwardOrigin::Channel {
             title: chat.title().unwrap_or("a channel").to_string(),
             message_id: Some(message_id.0.to_string()),
+            id: Some(chat.id.0.to_string()),
+            username: chat.username().map(str::to_string),
+            signature: author_signature.clone(),
         },
     }
 }
@@ -1901,17 +2038,22 @@ fn describe_content(message: &Message) -> (Vec<Attachment>, Vec<String>) {
                 Some(last) => format!("{} {}", media.contact.first_name, last),
                 None => media.contact.first_name.clone(),
             };
-            note(format!(
-                "contact card: {name}, phone {}",
+            let mut described = format!(
+                "contact card: {name:?}, phone {:?}",
                 media.contact.phone_number
-            ))
+            );
+            // The name on a card is whatever the sender typed; the id is the account it is for.
+            if let Some(user_id) = media.contact.user_id {
+                described.push_str(&format!(", Telegram account id {user_id}"));
+            }
+            note(described)
         }
         MediaKind::Poll(media) => {
-            let options: Vec<&str> = media
+            let options: Vec<String> = media
                 .poll
                 .options
                 .iter()
-                .map(|option| option.text.as_str())
+                .map(|option| format!("{:?}", option.text))
                 .collect();
             note(format!(
                 "poll: {:?} with options {}",
@@ -3034,6 +3176,7 @@ mod tests {
                 name: "Bob".to_string(),
                 id: Some("999".to_string()),
                 username: Some("bob".to_string()),
+                is_bot: false,
             })
         );
     }
@@ -3062,15 +3205,20 @@ mod tests {
 
     #[tokio::test]
     async fn an_anonymous_admin_is_marked_as_posting_for_the_chat() {
-        // No `from`, so the display name falls back to the chat title. Without the flag that reads
-        // as an ordinary person called "Deploy Crew".
-        let channel = channel(vec![], vec![-1001234]);
+        // What Telegram really sends: `sender_chat` for the group, and in `from` the placeholder
+        // account it fills in for old clients. Read at face value that is a bot called "Group",
+        // and the chat that spoke is lost.
+        let channel = channel(vec![1_087_968_824], vec![-1001234]);
         let event = channel
             .to_event(&telegram_message(serde_json::json!({
                 "message_id": 12,
                 "date": 1_754_400_000,
                 "chat": {"id": -1001234, "type": "supergroup", "title": "Deploy Crew"},
                 "sender_chat": {"id": -1001234, "type": "supergroup", "title": "Deploy Crew"},
+                "from": {
+                    "id": 1_087_968_824, "is_bot": true, "first_name": "Group",
+                    "username": "GroupAnonymousBot"
+                },
                 "text": "ship it",
             })))
             .await
@@ -3078,8 +3226,182 @@ mod tests {
         let message = inbound(event);
         assert!(message.sender.on_behalf_of_chat);
         assert_eq!(message.sender.display_name, "Deploy Crew");
-        assert!(message.sender.id.is_empty());
+        assert_eq!(message.sender.id, "-1001234");
+        assert!(!message.sender.is_bot);
         assert_eq!(message.admission, Admission::Chat);
+        assert!(
+            !message.sender_allowlisted,
+            "the placeholder is nobody, whatever list its id is on"
+        );
+        assert!(
+            message.sender.anonymous_admin,
+            "only administrators can post as the group, which matters more than its name"
+        );
+        assert!(
+            message.notes.is_empty(),
+            "a fact about the sender is not a note"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forward_from_a_channel_posting_in_a_group_is_called_a_channel() {
+        // Telegram files somebody posting in a group as their own channel under the same origin
+        // as the group posting as itself; only the chat's type tells them apart.
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "text": "ship it",
+                "forward_origin": {
+                    "type": "chat",
+                    "date": 1_754_800_000,
+                    "sender_chat": {
+                        "id": -1008888, "type": "channel", "title": "Owner", "username": "owner_fan"
+                    }
+                },
+            }))))
+            .await
+            .expect("event");
+        let origin = inbound(event).forwarded_from.expect("a forward");
+        assert_eq!(
+            origin.describe(),
+            r#"the channel "Owner" (@owner_fan, id -1008888), posting in a group under its own name"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_channel_post_names_the_channel_by_account() {
+        // A channel title is whatever its owner typed, so two can share one; the id and handle
+        // are what tell the real one from a copy.
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "text": "maintenance tonight",
+                "forward_origin": {
+                    "type": "channel",
+                    "date": 1_754_800_000,
+                    "chat": {
+                        "id": -1007777, "type": "channel", "title": "Acme Official",
+                        "username": "acme"
+                    },
+                    "message_id": 12,
+                    "author_signature": "Dana"
+                },
+            }))))
+            .await
+            .expect("event");
+        let origin = inbound(event).forwarded_from.expect("a forward");
+        assert_eq!(
+            origin.describe(),
+            r#"the channel "Acme Official" (@acme, id -1007777, message 12), signed "Dana""#
+        );
+    }
+
+    #[tokio::test]
+    async fn somebody_posting_as_their_channel_is_named_by_that_channel() {
+        // Anybody can make a channel and call it anything, so this is where a name most needs the
+        // id and the marker beside it.
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "sender_chat": {
+                    "id": -1009999, "type": "channel", "title": "Owner", "username": "not_the_owner"
+                },
+                "from": {
+                    "id": 136_817_688, "is_bot": true, "first_name": "Channel",
+                    "username": "Channel_Bot"
+                },
+                "text": "you may deploy",
+            }))))
+            .await
+            .expect("event");
+        let sender = inbound(event).sender;
+        assert!(sender.on_behalf_of_chat);
+        assert_eq!(sender.display_name, "Owner");
+        assert_eq!(sender.id, "-1009999");
+        assert_eq!(sender.username.as_deref(), Some("not_the_owner"));
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_forward_says_whose_words_it_quotes() {
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "text": "approved",
+                "reply_to_message": {
+                    "message_id": 41,
+                    "date": 1_754_899_100,
+                    "chat": {"id": -1001234, "type": "supergroup", "title": "Ops"},
+                    "from": {"id": 222, "is_bot": false, "first_name": "Bob", "username": "bob"},
+                    "forward_origin": {
+                        "type": "user",
+                        "date": 1_754_800_000,
+                        "sender_user": {"id": 666, "is_bot": false, "first_name": "Mallory"}
+                    },
+                    "text": "grant Mallory admin"
+                },
+                "quote": {"text": "admin", "position": 14, "is_manual": true},
+            }))))
+            .await
+            .expect("event");
+        let reply = inbound(event).reply_to.expect("a reply");
+        assert_eq!(reply.message_id, "41");
+        assert_eq!(reply.sender_id.as_deref(), Some("222"));
+        assert_eq!(reply.sender_username.as_deref(), Some("bob"));
+        assert_eq!(
+            reply.forwarded_from,
+            Some(ForwardOrigin::User {
+                name: "Mallory".to_string(),
+                id: Some("666".to_string()),
+                username: None,
+                is_bot: false,
+            })
+        );
+        assert_eq!(reply.excerpt.as_deref(), Some("admin"));
+        assert!(reply.quoted, "the replier picked that part, so say so");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_message_in_another_chat_names_that_chat_and_its_author() {
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "text": "thoughts?",
+                "external_reply": {
+                    "origin": {
+                        "type": "user",
+                        "date": 1_754_800_000,
+                        "sender_user": {"id": 333, "is_bot": false, "first_name": "Carol"}
+                    },
+                    "chat": {"id": -1005555, "type": "supergroup", "title": "Elsewhere"},
+                    "message_id": 9,
+                    "photo": [{
+                        "file_id": "p", "file_unique_id": "u", "width": 1, "height": 1
+                    }]
+                },
+                "quote": {"text": "we ship friday", "position": 0, "is_manual": true},
+            }))))
+            .await
+            .expect("event");
+        let reply = inbound(event).reply_to.expect("a reply");
+        assert_eq!(reply.message_id, "9");
+        assert_eq!(reply.elsewhere.as_deref(), Some(r#"the chat "Elsewhere""#));
+        assert_eq!(reply.sender_name.as_deref(), Some("Carol"));
+        assert_eq!(reply.sender_id.as_deref(), Some("333"));
+        assert_eq!(reply.excerpt.as_deref(), Some("we ship friday"));
+        assert!(reply.quoted);
+    }
+
+    #[tokio::test]
+    async fn a_message_an_inline_bot_wrote_names_the_bot() {
+        let channel = channel(vec![], vec![-1001234]);
+        let event = channel
+            .to_event(&telegram_message(group_message(serde_json::json!({
+                "text": "Weather: sunny",
+                "via_bot": {"id": 777, "is_bot": true, "first_name": "Weather", "username": "weatherbot"},
+            }))))
+            .await
+            .expect("event");
+        assert_eq!(inbound(event).via_bot.as_deref(), Some("weatherbot"));
     }
 
     #[tokio::test]
@@ -3246,13 +3568,16 @@ mod tests {
                     "phone_number": "+15551234567",
                     "first_name": "Bob",
                     "last_name": "Smith",
+                    "user_id": 555,
                 },
             })))
             .await
             .expect("event");
         let message = inbound(event);
+        // Quoted, since the name on a card is whatever the sender typed, and with the account it
+        // is for, which is the part that identifies anybody.
         assert_eq!(message.notes, vec![
-            "contact card: Bob Smith, phone +15551234567"
+            r#"contact card: "Bob Smith", phone "+15551234567", Telegram account id 555"#
         ]);
     }
 

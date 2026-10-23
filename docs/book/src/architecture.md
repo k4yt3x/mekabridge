@@ -85,7 +85,7 @@ The agent's only source of routing information, because a `tools/call` names the
 channel: telegram
 conversation: telegram:123456789
 message: 4821
-from: Alice (@alice, id 123456789)
+from: "Alice" (@alice, id 123456789)
 admitted: user allowlist
 chat: direct
 at: 2026-08-05T14:22:31+00:00

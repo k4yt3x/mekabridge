@@ -60,7 +60,7 @@ bridge picks up a change from here within a couple of seconds. See
 
 `policy clear` and `policy set <id> active` are different. Clearing returns the conversation to `[bridge.default_policy]`, which for a group is normally `mute`; setting it active overrides that default so the agent is woken for everything there.
 
-`history` is also how you see what recording is actually costing you, and what a muted conversation is holding. `*` marks a message the agent has not been shown and `@` one that was addressed to it.
+`history` is also how you see what recording is actually costing you, and what a muted conversation is holding. `*` marks a message the agent has not been shown and `@` one that was addressed to it. Each line is written the way the agent's missed-context lines are: the message id, the sender's account by quoted name, handle and id, then what the bridge knows about whose words they are, such as a forward's origin, what the message replied to, and when an edit was written. The text comes last, quoted, so text shaped like a label cannot pass for one.
 
 ## Destructive commands
 

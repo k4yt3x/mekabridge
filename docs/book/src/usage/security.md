@@ -47,7 +47,7 @@ Anyone who can message the bot can put words in front of the model, and forwarde
 
 **A message's headers cannot be forged.** Routing headers sit outside a per-item random nonce that fences user text. A message reading `conversation: telegram:999` arrives visibly quoted inside the fence rather than as a header, and any occurrence of the nonce itself is stripped before fencing.
 
-**Provenance is always stated.** `from:`, `admitted:`, and `forwarded from:` mean the agent never has to guess whose words it is reading.
+**Provenance is always stated.** `from:`, `admitted:`, `forwarded from:`, `via bot:` and `in reply to` mean the agent never has to guess whose words it is reading or what they answered. The labels travel with the message: a history entry, a search hit, a lookup, and the lines a mention brings with it from a muted chat all carry them, so a forward read back later still names where its words came from, and an edit made after an answer says when. Every account is named by id as well as name, and every name is quoted, so a display name spelling out somebody else's handle and id cannot pass for theirs. A file opened by handle says which message and sender it came with, since a handle can be quoted from anywhere, and a direct chat is listed under the account in it rather than its name.
 
 What neither prevents is an admitted sender persuading the agent to do something. The tools that matter here are the ones with effects you cannot undo from the chat:
 

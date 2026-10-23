@@ -37,7 +37,10 @@ use rusqlite::{
 };
 use uuid::Uuid;
 
-use crate::watch::{MAX_PATTERNS, MAX_WATCHES, WatchField, WatchMode};
+use crate::{
+    channel::MessageLabels,
+    watch::{MAX_PATTERNS, MAX_WATCHES, WatchField, WatchMode},
+};
 
 /// Schema statements applied in order. The index of a statement is its schema version, tracked in
 /// SQLite's `user_version`, so adding a migration means appending to this array and never editing
@@ -56,6 +59,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_011.sql"),
     include_str!("store/schema_012.sql"),
     include_str!("store/schema_013.sql"),
+    include_str!("store/schema_014.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -496,6 +500,21 @@ pub struct MessageRecord {
     /// Derived on read and ignored by [`Store::record_message`]. Never set on a row held by the
     /// placeholder account, whose real account is unknown rather than known to be gone.
     pub previous_account: bool,
+    /// What the envelope said about the message beyond its sender and text. Empty on a row
+    /// recorded before these were kept.
+    pub labels: MessageLabels,
+}
+
+impl MessageRecord {
+    /// When this revision's wording was written, for a row that is an edit.
+    ///
+    /// [`Self::timestamp`] is when the message was first said, on every revision alike, so this is
+    /// the only thing that shows an edit made after somebody had already answered the original.
+    pub fn edited_at(&self) -> Option<DateTime<Utc>> {
+        (self.revision != 0)
+            .then(|| DateTime::from_timestamp_millis(self.revision))
+            .flatten()
+    }
 }
 
 impl MessageRecord {
@@ -760,6 +779,23 @@ pub struct StoredAttachment {
     pub bytes: Option<u64>,
     /// Where the file was written, once the agent has downloaded it.
     pub path: Option<PathBuf>,
+    /// The message the file came with, by its platform id.
+    pub message_id: String,
+    /// Who sent that message, as recorded with it. `None` when the message itself was not
+    /// recorded, as with history switched off.
+    pub sender: Option<AttachmentSender>,
+}
+
+/// Who sent the message a file came with, so a file opened by handle says whose it is.
+///
+/// A handle is a number anybody can quote, from any conversation, so the file it opens has to say
+/// where it is from rather than borrow the provenance of whatever message mentioned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentSender {
+    pub name: String,
+    pub id: Option<String>,
+    pub own: bool,
+    pub labels: MessageLabels,
 }
 
 /// Handle to the SQLite database. Cheap to clone; all clones share one connection thread.
@@ -2546,6 +2582,18 @@ impl Store {
     /// The conversation must already be on file; a message from an address the address book has
     /// never seen is refused by the schema rather than filed under nothing.
     pub async fn record_message(&self, record: MessageRecord) -> Result<bool> {
+        // NULL rather than `{}` when there is nothing to say, the same as every row from before
+        // the column existed.
+        let labels = if record.labels == MessageLabels::default() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&record.labels).map_err(|error| StoreError::Corrupt {
+                    key: "labels".to_string(),
+                    message: error.to_string(),
+                })?,
+            )
+        };
         let inserted = self
             .connection
             .call(move |connection| {
@@ -2554,9 +2602,9 @@ impl Store {
                         "INSERT INTO messages
                              (conversation_id, account_id, message_id, revision, sender_id,
                               sender_name, text, notes, addressed, seen, own, session_id,
-                              deleted_at, superseded_at, timestamp)
+                              deleted_at, superseded_at, timestamp, labels)
                          VALUES ({CONVERSATION_ID_OF}, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                                 ?12, ?13, ?14, ?15)
+                                 ?12, ?13, ?14, ?15, ?16)
                          ON CONFLICT(conversation_id, message_id, account_id, revision) DO NOTHING"
                     ),
                     rusqlite::params![
@@ -2575,6 +2623,7 @@ impl Store {
                         record.deleted_at.map(to_rfc3339),
                         record.superseded_at.map(to_rfc3339),
                         to_rfc3339(record.timestamp),
+                        labels,
                     ],
                 )
             })
@@ -3195,11 +3244,29 @@ impl Store {
                 connection
                     .query_row(
                         "SELECT a.handle, c.address, c.channel, a.kind, a.file_ref, a.thumb_ref,
-                                a.file_name, a.media_type, a.bytes, a.path
+                                a.file_name, a.media_type, a.bytes, a.path, a.message_id,
+                                m.sender_name, m.sender_id, m.own, m.labels
                          FROM attachments a JOIN conversations c ON c.id = a.conversation_id
+                         LEFT JOIN messages m
+                           ON m.conversation_id = a.conversation_id
+                          AND m.account_id = a.account_id
+                          AND m.message_id = a.message_id
+                          AND m.revision = a.revision
                          WHERE a.handle = ?1",
                         [handle],
                         |row| {
+                            let sender_name: Option<String> = row.get(11)?;
+                            let labels =
+                                decode_labels(row.get::<_, Option<String>>(14)?.as_deref());
+                            let sender = match sender_name {
+                                Some(name) => Some(AttachmentSender {
+                                    name,
+                                    id: row.get(12)?,
+                                    own: row.get::<_, Option<bool>>(13)?.unwrap_or(false),
+                                    labels,
+                                }),
+                                None => None,
+                            };
                             Ok(StoredAttachment {
                                 handle: row.get::<_, i64>(0)?.to_string(),
                                 conversation: row.get(1)?,
@@ -3211,6 +3278,8 @@ impl Store {
                                 media_type: row.get(7)?,
                                 bytes: row.get::<_, Option<i64>>(8)?.map(|bytes| bytes as u64),
                                 path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+                                message_id: row.get(10)?,
+                                sender,
                             })
                         },
                     )
@@ -3376,7 +3445,8 @@ const MESSAGE_COLUMNS: &str = "m.id, c.address, m.account_id, m.message_id, m.re
                                                WHERE r.channel = c.channel
                                                  AND r.platform_id <> ''
                                                ORDER BY r.last_seen_at DESC, r.id DESC
-                                               LIMIT 1), 0)";
+                                               LIMIT 1), 0),
+     m.labels";
 
 const MESSAGE_FROM: &str = "messages m
      JOIN conversations c ON c.id = m.conversation_id
@@ -3426,11 +3496,35 @@ fn senders_json(sender_ids: &[String]) -> Option<String> {
 /// finding them is the point.
 const MESSAGE_CURRENT: &str = "m.deleted_at IS NULL AND m.superseded_at IS NULL";
 
+/// A message's stored labels, read leniently, unlike every other column.
+///
+/// One row whose labels a build cannot read would otherwise fail every history read, search and
+/// lookback that touched it. The row reads back marked as having labels that could not be read,
+/// so a forward is not taken for the sender's own words for want of its label, and the failure is
+/// logged as well.
+fn decode_labels(raw: Option<&str>) -> MessageLabels {
+    match raw.map(serde_json::from_str::<MessageLabels>) {
+        Some(Ok(labels)) => labels,
+        Some(Err(error)) => {
+            tracing::warn!(
+                "could not read a recorded message's labels, so it reads back marked as such: {}",
+                error
+            );
+            MessageLabels {
+                unreadable: true,
+                ..MessageLabels::default()
+            }
+        }
+        None => MessageLabels::default(),
+    }
+}
+
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     let attachments: Option<String> = row.get(9)?;
     let deleted_at: Option<String> = row.get(14)?;
     let superseded_at: Option<String> = row.get(15)?;
     let timestamp: String = row.get(16)?;
+    let labels = decode_labels(row.get::<_, Option<String>>(18)?.as_deref());
     Ok(MessageRecord {
         id: row.get(0)?,
         conversation: row.get(1)?,
@@ -3453,6 +3547,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
         superseded_at: superseded_at.as_deref().map(parse_rfc3339).transpose()?,
         timestamp: parse_rfc3339(&timestamp)?,
         previous_account: row.get(17)?,
+        labels,
     })
 }
 
@@ -3807,6 +3902,7 @@ mod tests {
             superseded_at: None,
             timestamp: now(),
             previous_account: false,
+            labels: Default::default(),
         }
     }
 
@@ -4740,10 +4836,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_with_no_sender_id_matches_no_filter() {
-        // Telegram records an anonymous admin and a channel post with no sender id at all. `NULL IN
-        // (...)` is NULL rather than true, which is the semantics wanted, but it is worth pinning
-        // because it means those messages are unreachable by a sender filter and so outlive a
-        // purge driven by one.
+        // A row can carry no sender id at all: one recorded before a message posted as a chat was
+        // given the chat's id. `NULL IN (...)` is NULL rather than true, which is the semantics
+        // wanted, but it is worth pinning because it means those messages are unreachable by a
+        // sender filter and so outlive a purge driven by one.
         let (store, account) = seeded(&["telegram:1"]).await;
         let mut anonymous = message(account, "telegram:1", "1", "posted as the chat itself");
         anonymous.sender_id = None;
@@ -4759,6 +4855,121 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(everyone.len(), 1, "but it is still in the history");
+    }
+
+    #[tokio::test]
+    async fn what_a_message_arrived_labelled_with_reads_back_with_it() {
+        // The labels are what make a forward somebody else's words and a reply an answer to one
+        // particular account. Lost on the way through the store, a read-back is the forwarder
+        // speaking and the reply answering whatever sits beside it.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let mut forwarded = message(account, "telegram:1", "1", "transfer the funds");
+        forwarded.labels = MessageLabels {
+            sender_username: Some("alice".to_string()),
+            admission: Some(crate::channel::Admission::Chat),
+            sender_allowlisted: Some(false),
+            forwarded_from: Some(crate::channel::ForwardOrigin::User {
+                name: "Mallory".to_string(),
+                id: Some("666".to_string()),
+                username: None,
+                is_bot: false,
+            }),
+            reply_to: Some(crate::channel::ReplyContext {
+                message_id: "7".to_string(),
+                sender_name: Some("Bob".to_string()),
+                sender_id: Some("555".to_string()),
+                ..crate::channel::ReplyContext::default()
+            }),
+            ..MessageLabels::default()
+        };
+        store
+            .record_message(forwarded.clone())
+            .await
+            .expect("record");
+        store
+            .record_message(message(account, "telegram:1", "2", "plain"))
+            .await
+            .expect("record");
+
+        let history = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(history[0].labels, forwarded.labels);
+        assert_eq!(history[1].labels, MessageLabels::default());
+        let unlabelled: Option<String> = store
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT labels FROM messages WHERE message_id = '2'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("read the column");
+        assert_eq!(
+            unlabelled, None,
+            "nothing to say is stored as nothing, the same as a row from before the column"
+        );
+    }
+
+    #[tokio::test]
+    async fn labels_that_cannot_be_read_do_not_take_the_history_down_with_them() {
+        // A build reading a row a later one wrote, say. Failing the row would fail every read
+        // that touched it, the lookback a mention brings included.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .record_message(message(account, "telegram:1", "1", "hello"))
+            .await
+            .expect("record");
+        store
+            .connection
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE messages SET labels = '{\"forwarded_from\":{\"kind\":\"from_the_future\"}}'",
+                    [],
+                )
+            })
+            .await
+            .expect("corrupt the labels");
+        let history = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("still reads");
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0].labels.unreadable,
+            "said, so the missing labels are not read as there being nothing to say"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_says_when_its_wording_was_written() {
+        // Every revision carries the time the message was first said. Without the edit's own time
+        // an edit made after somebody answered reads as what they answered.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let original = message(account, "telegram:1", "1", "may I have the logs?");
+        let edited_at = original.timestamp + chrono::Duration::hours(2);
+        store
+            .record_message(original.clone())
+            .await
+            .expect("record");
+        let mut revision = message(account, "telegram:1", "1", "may I have admin?");
+        revision.revision = edited_at.timestamp_millis();
+        revision.timestamp = original.timestamp;
+        store.record_message(revision).await.expect("record");
+
+        let history = store
+            .history("telegram:1", &[], 10, None, None)
+            .await
+            .expect("read");
+        assert_eq!(history[0].edited_at(), None);
+        assert_eq!(
+            history[1].edited_at().map(|at| at.timestamp_millis()),
+            Some(edited_at.timestamp_millis())
+        );
+        assert_eq!(history[1].timestamp, original.timestamp);
     }
 
     #[tokio::test]

@@ -729,6 +729,122 @@ impl BridgeSink {
         Ok((record, channel))
     }
 
+    /// Show a registered file, or describe it where it cannot be shown.
+    async fn show_attachment(
+        &self,
+        record: &crate::store::StoredAttachment,
+        channel: Arc<dyn Channel>,
+        session: Option<&str>,
+    ) -> std::result::Result<ViewedAttachment, SinkError> {
+        match self.session_has_vision(session).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(ViewedAttachment::Description(format!(
+                    "This is a {} ({}). The current model has no vision, so it cannot be shown. \
+                     Use attachment_download to get the file itself.",
+                    record.kind,
+                    describe_file(record)
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not ask meka whether the calling session's profile has vision ({}); \
+                     describing the file instead of showing it",
+                    error
+                );
+                // Not "no vision": that would stay in the agent's history as a fact about its
+                // model, when all that failed was asking.
+                return Ok(ViewedAttachment::Description(format!(
+                    "This is a {} ({}). Whether the current model can see images could not be \
+                     checked, so it is not shown. Use attachment_download to get the file itself.",
+                    record.kind,
+                    describe_file(record)
+                )));
+            }
+        }
+
+        // A video, animation, or animated sticker is not a viewable image, but the platform already
+        // generated a still for it, so that is what "show me" resolves to. Falling back like this
+        // has to be said out loud: a single frame of a video, or a preview of page one of a PDF, is
+        // not the file, and an agent shown one without comment would reasonably think otherwise.
+        let (file_ref, preview) = match (&record.thumb_ref, is_viewable_image(record)) {
+            (_, true) => (Some(record.file_ref.clone()), false),
+            (Some(thumb_ref), false) => (Some(thumb_ref.clone()), true),
+            (None, false) => (None, false),
+        };
+        let Some(file_ref) = file_ref else {
+            return Ok(ViewedAttachment::Description(format!(
+                "This is a {} ({}) and has no image preview. Use attachment_download to get the \
+                 file itself.",
+                record.kind,
+                describe_file(record)
+            )));
+        };
+
+        // Answered before fetching where the size is already known. A connector refusing an
+        // oversize file returns its own wording, which names a byte ceiling no operator
+        // configured and says nothing about `attachment_download`; the branch below that
+        // *does* say it only fires on the base64 form, which is the looser of meka's two
+        // limits and so never first.
+        //
+        // Only when the file itself is what will be fetched. `record.bytes` sizes the main file
+        // while a preview fetches the thumbnail, so checking one against the other rejected every
+        // oversized video on the strength of a number describing something else.
+        if !preview && record.bytes.is_some_and(|bytes| bytes > MAX_VIEW_BYTES) {
+            return Ok(ViewedAttachment::Description(format!(
+                "This {} is {}, too large to show inline. Use attachment_download to get the file \
+                 itself.",
+                record.kind,
+                describe_file(record)
+            )));
+        }
+        let fetched = channel
+            .fetch(&file_ref, MAX_VIEW_BYTES)
+            .await
+            .map_err(|error| SinkError::Delivery(error.to_string()))?;
+
+        let media_type = fetched
+            .media_type
+            .or_else(|| record.media_type.clone())
+            .unwrap_or_else(|| "image/jpeg".to_string());
+        if !VIEWABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
+            return Ok(ViewedAttachment::Description(format!(
+                "This is a {} of type {}, which cannot be shown as an image. Use \
+                 attachment_download to get the file itself.",
+                record.kind,
+                crate::channel::describe_media_type(&media_type)
+            )));
+        }
+
+        let data = base64::engine::general_purpose::STANDARD.encode(&fetched.bytes);
+        // Unreachable while `MAX_VIEW_BYTES` stays under three quarters of this, which is the
+        // point: it is the assertion that keeps the two constants honest with each other.
+        // meka replaces an oversized image with a placeholder rather than erroring, so
+        // crossing the line silently would look to the agent like a picture with nothing in
+        // it.
+        if data.len() > MAX_VIEW_BASE64_BYTES {
+            return Ok(ViewedAttachment::Description(format!(
+                "This {} is {} bytes, too large to show inline. Use attachment_download to get the \
+                 file itself.",
+                record.kind,
+                fetched.bytes.len()
+            )));
+        }
+        tracing::info!(handle = %record.handle, preview, "the agent viewed an attachment");
+        Ok(ViewedAttachment::Image {
+            media_type,
+            data,
+            note: preview.then(|| {
+                format!(
+                    "This is the preview frame for a {}, not the {} itself ({}).",
+                    record.kind,
+                    record.kind,
+                    describe_file(record)
+                )
+            }),
+        })
+    }
+
     /// Check that an id is well formed and names a configured channel.
     ///
     /// Deliberately does not require the conversation to be one the bridge has seen. Whether a chat
@@ -966,6 +1082,7 @@ async fn record_own_messages(
             superseded_at: None,
             timestamp: message.timestamp,
             previous_account: false,
+            labels: crate::channel::MessageLabels::of_sent(message),
         };
         if let Err(error) = store.record_message(record).await {
             tracing::warn!(
@@ -1366,113 +1483,28 @@ impl OutboundSink for BridgeSink {
         session: Option<&str>,
     ) -> std::result::Result<ViewedAttachment, SinkError> {
         let (record, channel) = self.attachment(handle).await?;
-
-        match self.session_has_vision(session).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(ViewedAttachment::Description(format!(
-                    "This is a {} ({}). The current model has no vision, so it cannot be shown. \
-                     Use attachment_download to get the file itself.",
-                    record.kind,
-                    describe_file(&record)
-                )));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "could not ask meka whether the calling session's profile has vision ({}); \
-                     describing the file instead of showing it",
-                    error
-                );
-                // Not "no vision": that would stay in the agent's history as a fact about its
-                // model, when all that failed was asking.
-                return Ok(ViewedAttachment::Description(format!(
-                    "This is a {} ({}). Whether the current model can see images could not be \
-                     checked, so it is not shown. Use attachment_download to get the file itself.",
-                    record.kind,
-                    describe_file(&record)
-                )));
-            }
-        }
-
-        // A video, animation, or animated sticker is not a viewable image, but the platform already
-        // generated a still for it, so that is what "show me" resolves to. Falling back like this
-        // has to be said out loud: a single frame of a video, or a preview of page one of a PDF, is
-        // not the file, and an agent shown one without comment would reasonably think otherwise.
-        let (file_ref, preview) = match (&record.thumb_ref, is_viewable_image(&record)) {
-            (_, true) => (Some(record.file_ref.clone()), false),
-            (Some(thumb_ref), false) => (Some(thumb_ref.clone()), true),
-            (None, false) => (None, false),
-        };
-        let Some(file_ref) = file_ref else {
-            return Ok(ViewedAttachment::Description(format!(
-                "This is a {} ({}) and has no image preview. Use attachment_download to get the \
-                 file itself.",
-                record.kind,
-                describe_file(&record)
-            )));
-        };
-
-        // Answered before fetching where the size is already known. A connector refusing an
-        // oversize file returns its own wording, which names a byte ceiling no operator
-        // configured and says nothing about `attachment_download`; the branch below that
-        // *does* say it only fires on the base64 form, which is the looser of meka's two
-        // limits and so never first.
-        //
-        // Only when the file itself is what will be fetched. `record.bytes` sizes the main file
-        // while a preview fetches the thumbnail, so checking one against the other rejected every
-        // oversized video on the strength of a number describing something else.
-        if !preview && record.bytes.is_some_and(|bytes| bytes > MAX_VIEW_BYTES) {
-            return Ok(ViewedAttachment::Description(format!(
-                "This {} is {}, too large to show inline. Use attachment_download to get the file \
-                 itself.",
-                record.kind,
-                describe_file(&record)
-            )));
-        }
-        let fetched = channel
-            .fetch(&file_ref, MAX_VIEW_BYTES)
-            .await
-            .map_err(|error| SinkError::Delivery(error.to_string()))?;
-
-        let media_type = fetched
-            .media_type
-            .or_else(|| record.media_type.clone())
-            .unwrap_or_else(|| "image/jpeg".to_string());
-        if !VIEWABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
-            return Ok(ViewedAttachment::Description(format!(
-                "This is a {} of type {media_type}, which cannot be shown as an image. Use \
-                 attachment_download to get the file itself.",
-                record.kind
-            )));
-        }
-
-        let data = base64::engine::general_purpose::STANDARD.encode(&fetched.bytes);
-        // Unreachable while `MAX_VIEW_BYTES` stays under three quarters of this, which is the
-        // point: it is the assertion that keeps the two constants honest with each other.
-        // meka replaces an oversized image with a placeholder rather than erroring, so
-        // crossing the line silently would look to the agent like a picture with nothing in
-        // it.
-        if data.len() > MAX_VIEW_BASE64_BYTES {
-            return Ok(ViewedAttachment::Description(format!(
-                "This {} is {} bytes, too large to show inline. Use attachment_download to get the \
-                 file itself.",
-                record.kind,
-                fetched.bytes.len()
-            )));
-        }
-        tracing::info!(handle = %record.handle, preview, "the agent viewed an attachment");
-        Ok(ViewedAttachment::Image {
-            media_type,
-            data,
-            note: preview.then(|| {
-                format!(
-                    "This is the preview frame for a {}, not the {} itself ({}).",
-                    record.kind,
-                    record.kind,
-                    describe_file(&record)
-                )
-            }),
-        })
+        // Said first, before the picture or its description, so the file is read as whose it is
+        // rather than as belonging to whatever message quoted its handle.
+        let source = attachment_source(&record);
+        Ok(
+            match self.show_attachment(&record, channel, session).await? {
+                ViewedAttachment::Description(description) => {
+                    ViewedAttachment::Description(format!("{source}\n\n{description}"))
+                }
+                ViewedAttachment::Image {
+                    media_type,
+                    data,
+                    note,
+                } => ViewedAttachment::Image {
+                    media_type,
+                    data,
+                    note: Some(match note {
+                        Some(note) => format!("{source}\n\n{note}"),
+                        None => source,
+                    }),
+                },
+            },
+        )
     }
 
     async fn attachment_download(
@@ -1492,6 +1524,7 @@ impl OutboundSink for BridgeSink {
             return Ok(DownloadedAttachment {
                 path: path.clone(),
                 bytes,
+                source: attachment_source(&record),
                 media_type: record.media_type,
             });
         }
@@ -1547,6 +1580,7 @@ impl OutboundSink for BridgeSink {
         tracing::info!(handle = %record.handle, path = %path.display(), "the agent downloaded an attachment");
         Ok(DownloadedAttachment {
             bytes: fetched.bytes.len() as u64,
+            source: attachment_source(&record),
             media_type: fetched.media_type.or(record.media_type),
             path,
         })
@@ -2345,17 +2379,20 @@ fn chat_kind(kind: &str) -> ChatKind {
 
 /// A message the platform supplied, as the history tools hand one back.
 ///
-/// The connector settles whether it was the bot's own from its account id. What only the bridge's
-/// record could say, such as whether it was seen, deleted or edited, is left at its defaults rather
-/// than guessed, and the entry is marked as unrecorded so that nobody takes the defaults for facts.
+/// The connector settles whether it was the bot's own from its account id, and gives what the
+/// platform's record says of it: when it was last edited, what it replies to, whether it was
+/// forwarded. What only the bridge's record could say, such as whether it was seen or how it was
+/// let in, is left at its defaults rather than guessed, and the entry is marked as unrecorded so
+/// that nobody takes the defaults for facts.
 fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> HistoryEntry {
-    HistoryEntry {
+    let mut entry = HistoryEntry {
         conversation: conversation.as_str().to_string(),
         message_id: message.message_id,
         sender: message.sender_name,
         sender_id: message.sender_id,
         text: message.text,
         notes: (!message.notes.is_empty()).then(|| message.notes.join("; ")),
+
         attachments: Vec::new(),
         addressed: false,
         unseen: false,
@@ -2367,18 +2404,25 @@ fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> Histo
         unrecorded: true,
         cursor: crate::mcp::platform_cursor(message.timestamp),
         timestamp: message.timestamp.to_rfc3339(),
-    }
+        edited_at: message.edited_at.map(|at| at.to_rfc3339()),
+        // Everything the labels say, which `label` fills in below.
+        ..HistoryEntry::default()
+    };
+    entry.label(&message.labels);
+    entry
 }
 
 /// Translate a stored message into what the history tools hand back.
 fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
-    HistoryEntry {
+    let edited_at = record.edited_at().map(|at| at.to_rfc3339());
+    let mut entry = HistoryEntry {
         conversation: record.conversation,
         message_id: record.message_id,
         sender: record.sender_name,
         sender_id: record.sender_id,
         text: record.text,
         notes: record.notes,
+
         attachments: record.attachments,
         addressed: record.addressed,
         unseen: !record.seen,
@@ -2389,8 +2433,56 @@ fn history_entry(record: crate::store::MessageRecord) -> HistoryEntry {
         previous_account: record.previous_account,
         unrecorded: false,
         timestamp: record.timestamp.to_rfc3339(),
+        edited_at,
         cursor: record.id,
+        // Everything the labels say, which `label` fills in below.
+        ..HistoryEntry::default()
+    };
+    entry.label(&record.labels);
+    entry
+}
+
+/// Where a registered file came from: the message, the conversation, and who sent it.
+fn attachment_source(record: &crate::store::StoredAttachment) -> String {
+    let mut source = format!(
+        "This file came with message {} in {}",
+        record.message_id, record.conversation
+    );
+    match &record.sender {
+        Some(sender) if sender.own => source.push_str(", which you sent"),
+        Some(sender) => {
+            let labels = &sender.labels;
+            source.push_str(", sent by ");
+            source.push_str(&crate::channel::describe_account(
+                &crate::channel::AccountLabel {
+                    name: Some(&sender.name),
+                    username: labels.sender_username.as_deref(),
+                    id: sender.id.as_deref(),
+                    is_bot: labels.sender_is_bot,
+                    posted_as_chat: labels.posted_as_chat,
+                    anonymous_admin: labels.sender_anonymous_admin,
+                    signature: labels.sender_signature.as_deref(),
+                },
+            ));
+            if let Some(answering) = &labels.answering {
+                source.push_str(", as ");
+                source.push_str(&answering.describe());
+            }
+            if let Some(origin) = &labels.forwarded_from {
+                source.push_str(", who forwarded it from ");
+                source.push_str(&origin.describe());
+            }
+            if labels.unreadable {
+                source.push_str(
+                    ", though what the bridge recorded about that message could not be read",
+                );
+            }
+        }
+        // History switched off, or the message aged out: the file is all that is left of it.
+        None => source.push_str(", which is no longer recorded, so who sent it is not known"),
     }
+    source.push('.');
+    source
 }
 
 /// Whether the attachment's own bytes are something a provider can look at directly.
@@ -2408,7 +2500,7 @@ fn describe_file(record: &crate::store::StoredAttachment) -> String {
         parts.push(format!("{name:?}"));
     }
     if let Some(media_type) = &record.media_type {
-        parts.push(media_type.clone());
+        parts.push(crate::channel::describe_media_type(media_type));
     }
     if let Some(bytes) = record.bytes {
         parts.push(format!("{bytes} bytes"));

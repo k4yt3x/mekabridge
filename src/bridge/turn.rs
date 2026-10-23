@@ -405,10 +405,13 @@ mod tests {
                 username: None,
                 is_bot: true,
                 on_behalf_of_chat: false,
+                anonymous_admin: false,
+                signature: None,
             },
             attachments: Vec::new(),
             notes: Vec::new(),
             timestamp: chrono::Utc::now(),
+            reply_to: None,
         }
     }
 

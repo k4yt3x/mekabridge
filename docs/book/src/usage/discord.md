@@ -86,14 +86,14 @@ why the two platforms differ.
 channel: discord
 conversation: discord:1183429847290374144
 message: 1287733441209827329
-from: Ali (@alice_dev, id 245119312739729408)
+from: "Ali" (@alice_dev, id 245119312739729408)
 roles: Moderators, Release Team
 admitted: server allowlist (the server this was said in is allowed); sender not individually allowlisted
 chat: group "Acme Corp › #deploys"
 server: 1029384756473829101
 at: 2026-08-12T14:03:11.427+00:00
 woke you: you were named, or this replies to something you said
-in reply to a message from Ali (id 1287733441209827300): "rollback is done"
+in reply to message 1287733441209827300 from "Ali" (@alice_dev, id 245119312739729408): "rollback is done"
 attachment: photo, "crash.png", image/png, 1920x1080, 412.3 KiB [418]
 text (verbatim, fenced by a19f4c):
 <<<a19f4c
@@ -101,7 +101,11 @@ text (verbatim, fenced by a19f4c):
 a19f4c>>>
 ```
 
-- **`from`** uses the sender's nickname in that server when they have one, falling back to their display name and then their handle.
+- **`from`** uses the sender's nickname in that server when they have one, falling back to their display name and then their handle. The name is quoted, since it is the one part of an account its owner picks; the id is what identifies them.
+- **A webhook** reads as `"Name" (posted under a chat's or an integration's name, with no person's account shown, id ...) [bot]`. A webhook posts under whatever name it likes, the owner's included, so it is given no handle and its id is the webhook's.
+- **`forwarded from`** on Discord reads `a message whose author the platform does not name, possibly the sender's own, in "Acme Corp › #general"`. Discord leaves the author out of a forward, so the bridge says only that the words were forwarded, and where from when it knows that channel.
+- **An app's answer** to somebody's slash command, button or form is from the app's bot account, and carries `answering: a command used by "Name" (@handle, id ...)`, since somebody asked for it. These reach the agent like any other bot's message. An answer the app deferred is posted first as an empty "thinking" placeholder, which is not delivered; the answer is, once the app fills it in.
+- **`in reply to`** names the account being answered by id, and says when that message was itself a forward.
 - **`roles`** is what they hold in this server, which is the difference between a stranger and a moderator. Discord supplies it on every message, so it costs nothing.
 - **`chat`** says where the message was said as one path, outermost first. A thread reads `Acme Corp › #deploys › rollback tonight`, so the agent can tell a tangent from the room it came out of. The same text becomes the conversation's title in `conversation_list`, though a message that knows less, one whose server name has not arrived say, does not shorten a title already there.
 - **`parent`** appears on a message in a thread, and is the conversation id of the channel the thread was started in, so the agent can post there, read it or mute it. A post in a forum or media channel has none, since those take posts rather than messages, and neither does a thread whose channel the bridge could not look up.

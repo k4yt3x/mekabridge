@@ -155,8 +155,11 @@ impl ChatKind {
 /// Who sent an inbound message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender {
-    /// Platform-native user id. Empty when the message was posted on behalf of a chat rather than
-    /// by an individual, which is what [`Sender::on_behalf_of_chat`] marks.
+    /// Platform-native id of the account, or, when [`Sender::on_behalf_of_chat`] is set, of the
+    /// chat or integration the message was posted as. Empty only where the platform gave neither.
+    ///
+    /// The id is what tells two senders of the same name apart, and a chat posting under somebody
+    /// else's name is exactly the case where that matters, so it is kept there too.
     pub id: String,
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,12 +167,191 @@ pub struct Sender {
     /// The sender is another bot rather than a person.
     #[serde(default)]
     pub is_bot: bool,
-    /// The message was posted as the chat itself, not by an identifiable account. Telegram does
-    /// this for anonymous group admins and for channel posts forwarded into a linked
-    /// discussion group. Without this the display name falls back to the chat title and an
-    /// anonymous post is indistinguishable from a named person.
+    /// The message was posted as a chat or by an integration, not by an identifiable account.
+    /// Telegram does this for anonymous group admins, for somebody posting as their own channel,
+    /// and for channel posts forwarded into a linked discussion group; Discord for a webhook. The
+    /// name is whatever that chat or integration chose, so without this it reads as a named person
+    /// it may have been chosen to imitate.
     #[serde(default)]
     pub on_behalf_of_chat: bool,
+    /// Posted as the group by one of its administrators, which is the only way anybody can post
+    /// as a Telegram group. Says more about how far to trust the message than the group's name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous_admin: bool,
+    /// The name a post was signed with: an administrator's custom title, or the author a channel
+    /// names on its posts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+impl Sender {
+    /// How the bridge names this sender wherever it shows one.
+    pub fn describe(&self) -> String {
+        describe_account(&AccountLabel {
+            name: Some(&self.display_name),
+            username: self.username.as_deref(),
+            id: (!self.id.is_empty()).then_some(self.id.as_str()),
+            is_bot: self.is_bot,
+            posted_as_chat: self.on_behalf_of_chat,
+            anonymous_admin: self.anonymous_admin,
+            signature: self.signature.as_deref(),
+        })
+    }
+}
+
+/// A chat named the way [`describe_account`] names an account: its title quoted, then what
+/// identifies it.
+fn describe_chat(
+    title: &str,
+    username: Option<&str>,
+    id: Option<&str>,
+    message_id: Option<&str>,
+) -> String {
+    let mut details = Vec::new();
+    if let Some(username) = username {
+        details.push(describe_handle(username));
+    }
+    if let Some(id) = id {
+        details.push(format!("id {id}"));
+    }
+    if let Some(message_id) = message_id {
+        details.push(format!("message {message_id}"));
+    }
+    if details.is_empty() {
+        format!("{title:?}")
+    } else {
+        format!("{title:?} ({})", details.join(", "))
+    }
+}
+
+/// The parts of an account the bridge names it by, borrowed from wherever they are held.
+#[derive(Default)]
+pub struct AccountLabel<'a> {
+    pub name: Option<&'a str>,
+    pub username: Option<&'a str>,
+    pub id: Option<&'a str>,
+    pub is_bot: bool,
+    pub posted_as_chat: bool,
+    pub anonymous_admin: bool,
+    pub signature: Option<&'a str>,
+}
+
+/// An account named in full, held rather than borrowed, for the labels that name somebody other
+/// than the sender.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_bot: bool,
+}
+
+impl AccountRef {
+    pub fn describe(&self) -> String {
+        describe_account(&AccountLabel {
+            name: Some(&self.name),
+            username: self.username.as_deref(),
+            id: self.id.as_deref(),
+            is_bot: self.is_bot,
+            ..AccountLabel::default()
+        })
+    }
+}
+
+/// What an app's message answers: somebody using one of its commands, buttons or forms.
+///
+/// The app wrote the message, which its author line says, but somebody asked for it, and who that
+/// was is the part of its provenance the author line cannot show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invocation {
+    /// What was used, as the bridge words it: `a command`, `a button or menu`, `a form`.
+    pub what: String,
+    pub by: AccountRef,
+}
+
+impl Invocation {
+    pub fn describe(&self) -> String {
+        format!(
+            "an app's answer to {} used by {}",
+            self.what,
+            self.by.describe()
+        )
+    }
+}
+
+/// A media type as the bridge shows it: bare when it is made only of what a media type is made of,
+/// quoted otherwise.
+///
+/// The sender's client names the type, and Telegram passes on whatever it said. Unquoted, one
+/// reading `image/png [999]` offers a handle to somebody else's file, and one with a parameter
+/// can spell out a whole sentence beside the bridge's own.
+pub fn describe_media_type(media_type: &str) -> String {
+    let plain = !media_type.is_empty()
+        && media_type
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/.+-_".contains(character));
+    if plain {
+        media_type.to_string()
+    } else {
+        format!("{media_type:?}")
+    }
+}
+
+/// An account's handle, written `@name`, and quoted unless it is made only of the characters a
+/// platform handle allows, since an old Discord bot name can hold anything, a closing parenthesis
+/// and a fake id included.
+pub fn describe_handle(username: &str) -> String {
+    let plain = !username.is_empty()
+        && username
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.".contains(character));
+    if plain {
+        format!("@{username}")
+    } else {
+        format!("@{username:?}")
+    }
+}
+
+/// How the bridge names an account, the same way everywhere it shows one.
+///
+/// The name is quoted because it is the one part the account chose for itself. Unquoted, somebody
+/// who called themselves `Alice (@alice, id 1)` would read as Alice, with their own id trailing
+/// after as though it were somebody else's. A username is quoted too where it needs to be, by
+/// [`describe_handle`].
+pub fn describe_account(account: &AccountLabel<'_>) -> String {
+    let mut rendered = match account.name {
+        Some(name) => format!("{name:?}"),
+        None => "someone the platform did not name".to_string(),
+    };
+    let mut details = Vec::new();
+    if account.posted_as_chat {
+        details.push(
+            "posted under a chat's or an integration's name, with no person's account shown"
+                .to_string(),
+        );
+    }
+    if account.anonymous_admin {
+        details.push("by one of this group's administrators, anonymously".to_string());
+    }
+    if let Some(signature) = account.signature {
+        details.push(format!("signed {signature:?}"));
+    }
+    if let Some(username) = account.username {
+        details.push(describe_handle(username));
+    }
+    if let Some(id) = account.id {
+        details.push(format!("id {id}"));
+    }
+    if !details.is_empty() {
+        rendered.push_str(&format!(" ({})", details.join(", ")));
+    }
+    if account.is_bot {
+        rendered.push_str(" [bot]");
+    }
+    rendered
 }
 
 /// Why an inbound message was allowed to reach the agent.
@@ -231,16 +413,48 @@ pub enum ForwardOrigin {
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_bot: bool,
     },
     /// An account whose privacy settings hide the link back to it.
     HiddenUser { name: String },
-    /// A group or supergroup.
-    Chat { title: String },
+    /// A group or supergroup posting as itself, which is one of its administrators, anonymously.
+    ///
+    /// The id and handle are kept because a title is whatever the group's owner typed, and two
+    /// groups can share one.
+    Chat {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// The administrator's custom title, when the group shows one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// Whether the chat that posted is a channel posting in a group under its own name, which
+        /// anybody who owns a channel can do, rather than the group posting as itself.
+        #[serde(default, skip_serializing_if = "is_false")]
+        channel: bool,
+    },
     /// A channel post, which is addressable by id.
     Channel {
         title: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// The author's name, when the channel signs its posts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// An author the platform will not name, which is every forward on Discord: a snapshot
+    /// deliberately leaves its author out. `place` is where the original was posted, when the
+    /// bridge knows what that place is called.
+    Unnamed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<String>,
     },
 }
 
@@ -248,39 +462,265 @@ impl ForwardOrigin {
     /// How the envelope names this origin.
     pub fn describe(&self) -> String {
         match self {
-            Self::User { name, id, username } => {
-                let mut rendered = name.clone();
-                match (username, id) {
-                    (Some(username), Some(id)) => {
-                        rendered.push_str(&format!(" (@{username}, id {id})"));
-                    }
-                    (Some(username), None) => rendered.push_str(&format!(" (@{username})")),
-                    (None, Some(id)) => rendered.push_str(&format!(" (id {id})")),
-                    (None, None) => {}
+            Self::User {
+                name,
+                id,
+                username,
+                is_bot,
+            } => describe_account(&AccountLabel {
+                name: Some(name),
+                username: username.as_deref(),
+                id: id.as_deref(),
+                is_bot: *is_bot,
+                ..AccountLabel::default()
+            }),
+            Self::HiddenUser { name } => {
+                format!("{name:?} (account hidden by their privacy settings)")
+            }
+            Self::Chat {
+                title,
+                id,
+                username,
+                signature,
+                channel,
+            } => {
+                let chat = describe_chat(title, username.as_deref(), id.as_deref(), None);
+                let mut rendered = if *channel {
+                    format!("the channel {chat}, posting in a group under its own name")
+                } else {
+                    format!("the group {chat} posting as itself, which only its administrators can")
+                };
+                if let Some(signature) = signature {
+                    rendered.push_str(&format!(", signed {signature:?}"));
                 }
                 rendered
             }
-            Self::HiddenUser { name } => {
-                format!("{name} (account hidden by their privacy settings)")
+            Self::Channel {
+                title,
+                message_id,
+                id,
+                username,
+                signature,
+            } => {
+                let mut rendered = format!(
+                    "the channel {}",
+                    describe_chat(
+                        title,
+                        username.as_deref(),
+                        id.as_deref(),
+                        message_id.as_deref()
+                    )
+                );
+                if let Some(signature) = signature {
+                    rendered.push_str(&format!(", signed {signature:?}"));
+                }
+                rendered
             }
-            Self::Chat { title } => format!("the group {title:?}"),
-            Self::Channel { title, message_id } => match message_id {
-                Some(message_id) => format!("the channel {title:?} (message {message_id})"),
-                None => format!("the channel {title:?}"),
-            },
+            // Not "somebody other than the forwarder": forwarding one's own message is ordinary,
+            // and the platform does not say which it is.
+            Self::Unnamed { place } => {
+                let mut rendered = "a message whose author the platform does not name, possibly \
+                                    the forwarder's own"
+                    .to_string();
+                if let Some(place) = place {
+                    rendered.push_str(&format!(", in {place:?}"));
+                }
+                rendered
+            }
         }
     }
 }
 
 /// Context for a message that was sent as a reply to another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Says who wrote what is being answered as fully as the sender line says who is answering. A name
+/// alone is whatever that account chose to be called, and a reply is how an approval is given, so
+/// the replied-to account's id and whether its words were its own are what make "yes" mean
+/// something.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyContext {
+    /// The replied-to message's id, or empty where the platform names a message in another chat
+    /// without giving its id.
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
+    /// The replied-to message's author, as [`Sender::id`] is for the sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sender_is_bot: bool,
+    /// As [`Sender::on_behalf_of_chat`], for the replied-to message's author.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub posted_as_chat: bool,
+    /// As [`Sender::anonymous_admin`], for the replied-to message's author.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sender_anonymous_admin: bool,
+    /// As [`Sender::signature`], for the replied-to message's author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_signature: Option<String>,
     /// Short quote of the message being replied to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
+    /// Whether the excerpt is the part of the message the replier picked to quote, rather than
+    /// its opening.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quoted: bool,
+    /// Where the replied-to message's words came from, when it was itself a forward. Its author is
+    /// then the forwarder, and the excerpt is somebody else's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<ForwardOrigin>,
+    /// The bot whose inline mode wrote the replied-to message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_bot: Option<String>,
+    /// What the replied-to message answers, when it is an app's answer to somebody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answering: Option<Invocation>,
+    /// When the replied-to message was last edited, as of when this was read.
+    ///
+    /// A message read back from the platform carries the message it answers as that message reads
+    /// now, so an edit made after the reply would otherwise show as what was answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
+    /// Where the replied-to message is, when that is not this conversation, as the bridge words
+    /// it: `the chat "Ops"`, or `another topic of this group`. Telegram lets a reply quote a
+    /// message from anywhere, and an id from somewhere else names nothing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elsewhere: Option<String>,
+}
+
+impl ReplyContext {
+    /// How the envelope and the history name what a message answers.
+    pub fn describe(&self) -> String {
+        let mut rendered = match (&self.elsewhere, self.message_id.is_empty()) {
+            (Some(place), true) => format!("a message in {place}"),
+            (Some(place), false) => format!("message {} in {place}", self.message_id),
+            (None, true) => "a message".to_string(),
+            (None, false) => format!("message {}", self.message_id),
+        };
+        // Beside the message it belongs to, so it cannot be read as the edit time of the message
+        // doing the replying, nor of whoever a forward came from.
+        if let Some(edited_at) = self.edited_at {
+            rendered.push_str(&format!(" (last edited at {})", edited_at.to_rfc3339()));
+        }
+        rendered.push_str(" from ");
+        rendered.push_str(&describe_account(&AccountLabel {
+            name: self.sender_name.as_deref(),
+            username: self.sender_username.as_deref(),
+            id: self.sender_id.as_deref(),
+            is_bot: self.sender_is_bot,
+            posted_as_chat: self.posted_as_chat,
+            anonymous_admin: self.sender_anonymous_admin,
+            signature: self.sender_signature.as_deref(),
+        }));
+        if let Some(bot) = &self.via_bot {
+            rendered.push_str(&format!(
+                ", written by {}'s inline mode",
+                describe_handle(bot)
+            ));
+        }
+        if let Some(answering) = &self.answering {
+            rendered.push_str(&format!(", as {}", answering.describe()));
+        }
+        if let Some(origin) = &self.forwarded_from {
+            rendered.push_str(&format!(", who forwarded it from {}", origin.describe()));
+        }
+        match &self.excerpt {
+            Some(excerpt) if self.quoted => rendered.push_str(&format!(", quoting {excerpt:?}")),
+            Some(excerpt) => rendered.push_str(&format!(": {excerpt:?}")),
+            None => {}
+        }
+        rendered
+    }
+}
+
+/// Everything the bridge knows about a message beyond who sent it and what it says.
+///
+/// The envelope states all of this when a message arrives. It is kept with the recorded message,
+/// and filled in on one the platform supplies, so a message read back says the same thing. Without
+/// it a forward read from history is the forwarder's own words, an edit made after somebody
+/// answered reads as what they answered, a reply answers whatever happens to sit next to it, and a
+/// display name is the only sign of who spoke.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageLabels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sender_is_bot: bool,
+    /// As [`Sender::on_behalf_of_chat`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub posted_as_chat: bool,
+    /// As [`Sender::anonymous_admin`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sender_anonymous_admin: bool,
+    /// As [`Sender::signature`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sender_roles: Vec<String>,
+    /// How the message was let in. `None` on what the bridge sent and on what it never received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<Admission>,
+    /// Whether the sender's account was on the user allowlist when the bridge saw the message.
+    /// `None` where that is not known: the bridge's own messages, and anything recorded before
+    /// it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_allowlisted: Option<bool>,
+    /// The bot whose inline mode wrote the message on the sender's behalf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_bot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<ForwardOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyContext>,
+    /// The album the message belongs to, as [`InboundMessage::group_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// What an app's message answers, as [`InboundMessage::answering`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answering: Option<Invocation>,
+    /// Set on a row whose stored labels this build could not read, so the absence of every other
+    /// label is not taken to mean there was nothing to say. Never stored.
+    #[serde(skip)]
+    pub unreadable: bool,
+}
+
+impl MessageLabels {
+    /// What an inbound message's envelope said about it.
+    pub fn of(message: &InboundMessage) -> Self {
+        Self {
+            sender_username: message.sender.username.clone(),
+            sender_is_bot: message.sender.is_bot,
+            posted_as_chat: message.sender.on_behalf_of_chat,
+            sender_anonymous_admin: message.sender.anonymous_admin,
+            sender_signature: message.sender.signature.clone(),
+            sender_roles: message.sender_roles.clone(),
+            admission: Some(message.admission),
+            sender_allowlisted: Some(message.sender_allowlisted),
+            via_bot: message.via_bot.clone(),
+            forwarded_from: message.forwarded_from.clone(),
+            reply_to: message.reply_to.clone(),
+            album: message.group_id.clone(),
+            answering: message.answering.clone(),
+            unreadable: false,
+        }
+    }
+
+    /// What the bridge's own sent message says beyond its text.
+    pub fn of_sent(message: &SentMessage) -> Self {
+        Self {
+            sender_username: message.sender.username.clone(),
+            sender_is_bot: message.sender.is_bot,
+            posted_as_chat: message.sender.on_behalf_of_chat,
+            reply_to: message.reply_to.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+const fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Broad category of an attachment.
@@ -383,6 +823,9 @@ pub struct SentMessage {
     pub notes: Vec<String>,
     /// The platform's own send time, not the bridge's, so recorded order matches the chat's.
     pub timestamp: DateTime<Utc>,
+    /// What the platform says the message answers, from the same response. Recorded so the
+    /// agent's own "done" reads back with what it was done for.
+    pub reply_to: Option<ReplyContext>,
 }
 
 /// One message the platform found, from its own record rather than the bridge's.
@@ -411,6 +854,12 @@ pub struct FoundMessage {
     /// thing.
     pub own: bool,
     pub timestamp: DateTime<Utc>,
+    /// When the wording was last changed, which the timestamp, being when it was first said, does
+    /// not show.
+    pub edited_at: Option<DateTime<Utc>>,
+    /// What the platform's own record says about the message beyond its sender and text. Never an
+    /// admission, since the bridge did not receive it.
+    pub labels: MessageLabels,
 }
 
 /// How a channel that loses what is said while it is disconnected asks to be caught up.
@@ -596,6 +1045,15 @@ pub struct InboundMessage {
     /// Set when the message was forwarded from somewhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_from: Option<ForwardOrigin>,
+    /// The bot whose inline mode wrote this message for the sender, by handle.
+    ///
+    /// The sender chose to post it, but the words are that bot's, which Telegram marks under the
+    /// sender's name and the agent should be able to see as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_bot: Option<String>,
+    /// What this message answers, when it is an app answering somebody's command, button or form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answering: Option<Invocation>,
     /// Groups the messages of one album together. Platforms deliver an album as several messages
     /// sharing this id, so without it a batch of photos reads as unrelated pictures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -786,6 +1244,12 @@ pub struct MemberInfo {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Their handle, which unlike a display name is theirs alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Whether this is a bot rather than a person.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bot: bool,
     pub status: MemberStatus,
     /// Empty for anyone who is not an administrator, and on a platform that grants privileges
     /// through roles rather than directly.
@@ -1602,6 +2066,8 @@ mod tests {
                 username: Some("alice".to_string()),
                 is_bot: false,
                 on_behalf_of_chat: false,
+                anonymous_admin: false,
+                signature: None,
             },
             admission: Admission::User,
             sender_allowlisted: true,
@@ -1615,6 +2081,7 @@ mod tests {
                 name: "Bob".to_string(),
                 id: Some("999".to_string()),
                 username: Some("bob".to_string()),
+                is_bot: false,
             }),
             group_id: Some("13294839284".to_string()),
             notes: Vec::new(),
@@ -1633,6 +2100,8 @@ mod tests {
             timestamp: DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z")
                 .expect("literal parses")
                 .with_timezone(&Utc),
+            via_bot: None,
+            answering: None,
         }));
         let encoded = serde_json::to_string(&event).expect("serializes");
         let decoded: InboundEvent = serde_json::from_str(&encoded).expect("deserializes");

@@ -266,8 +266,33 @@ Four fields say what has happened to a message since:
 |-------|---------|
 | `own` | The agent sent this rather than received it |
 | `deleted` | The platform says it has since been retracted. The text is kept and still searchable |
-| `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id` |
+| `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id`, with an `edited_at` of its own |
 | `previous_account` | It went through a bot account this channel no longer uses, because the bot was deleted and recreated. Its `message_id` belongs to that account, so replying to it, reacting to it, editing it, or deleting it from the current one fails |
+
+### Whose words, and what they answered
+
+Everything the header of a woken message says about where its words came from is kept with the message and handed back with it, by `history_read`, `history_search`, and a lookup by id alike. Without it a forward read from history is the forwarder's own words, a reply answers whatever happens to sit next to it, and an edit made after somebody answered reads as what they answered. Each field is omitted when it does not apply:
+
+| Field | Meaning |
+|-------|---------|
+| `sender_id` | The sender's account id, which is what tells two people of the same name apart. For a message posted as a chat or by a webhook, that chat's or webhook's id |
+| `sender_username` | Their handle |
+| `sender_bot` | The sender is a bot |
+| `posted_as_chat` | Posted under a chat's or an integration's name, with no person's account shown: an anonymous Telegram admin, somebody posting as their channel, a Discord webhook. `sender` is whatever name that chose |
+| `sender_anonymous_admin` | One of a Telegram group's administrators posted this as the group, which only they can |
+| `sender_signature` | What the post was signed with: an administrator's custom title, or the author a channel names |
+| `sender_roles` | What they held in the chat when they said it |
+| `admitted` | Which allowlist let the message in, as a woken message's `admitted:` line words it |
+| `sender_allowlisted` | Whether their account was on `allowed_users` when the bridge saw the message, stated either way |
+| `forwarded_from` | Whose words these are, when the message was forwarded |
+| `via_bot` | The bot whose inline mode wrote the message for the sender |
+| `reply_to` | What the message answers: its `message_id`, its sender by name and id, an `excerpt`, `forwarded_from` when that message was itself a forward, `via_bot`, `answering` when it was an app's answer, and `edited_at` when it had been edited by the time it was read. On an entry read from Discord that can be after the reply, and the excerpt is the wording as it reads now. `quoted` means the excerpt is the part the replier picked; `elsewhere` says where the message is when it is in another chat or topic |
+| `album` | Messages sharing it were sent together |
+| `answering` | What an app's message answers: somebody using its command, button or form, named by account |
+| `edited_at` | When this wording was written, on an edit. `timestamp` is when the message was first said, on every revision alike |
+| `labels_unreadable` | What the bridge recorded about this message could not be read, so the absence of the fields above says nothing |
+
+`admitted` is left out of an `unrecorded` entry, since the bridge never received it. Its `sender_allowlisted` is judged when the entry is read. The bridge's own messages carry `reply_to` when they answered something, and none of the sender's trust fields. Messages recorded before 0.24.0 carry none of these, because nothing was kept of them; their `edited_at` is the one exception, since the edit time was always stored.
 
 A message the agent was woken for is in its context permanently, so the record is the only thing able to tell it afterwards that what it acted on has been withdrawn or rewritten. That is why neither is erased. Both are excluded from `backlog_check` and from the missed-context lookback, though: a retracted message must never be offered as news.
 
@@ -340,7 +365,7 @@ Somebody's standing in a chat and the privileges they hold.
 
 Omitting `user_id` is the useful case: it lets the agent find out what it is allowed to do in a group before trying, rather than discovering it from a failure. An owner is reported as holding everything, which is what Telegram means by sending no rights flags at all for one.
 
-The answer also carries the roles somebody holds and, for anyone currently restricted, when that lifts. On Discord permissions are computed for the specific channel asked about, including its overwrites, because holding a permission in a server says nothing about holding it in a given room.
+The answer also carries the roles somebody holds, their `username` and whether they are a `bot`, and, for anyone currently restricted, when that lifts. A display name is whatever somebody chose to be called; the handle and the id are what identify them. On Discord permissions are computed for the specific channel asked about, including its overwrites, because holding a permission in a server says nothing about holding it in a given room.
 
 ## `member_list`
 
@@ -390,6 +415,8 @@ Returns the image itself, which meka forwards to the provider as a multimodal bl
 
 Prefer triaging from the `attachment:` line first. It carries the media type, pixel size, running time and byte count, which is usually enough to decide whether a file is worth looking at, and what an agent looks at stays in its context for the life of the session.
 
+Every answer opens by saying where the file came from: the message, the conversation, and who sent it, with whose words they were when that message was a forward. A handle is a number anybody can quote, and it opens a file from any conversation, so a file has to say whose it is rather than borrow the standing of whatever message mentioned its handle. `attachment_download` says the same after the path.
+
 Videos, animations, and animated stickers resolve to the still frame the platform already generated, so this works for them without any transcoding. Anything with no viewable form, such as a PDF or a voice note, comes back as a description naming the file and pointing at `attachment_download` instead. So does everything when the profile of the session asking has no vision.
 
 ## `attachment_download`
@@ -412,6 +439,8 @@ Known conversations, most recently active first.
 | `limit` | integer, optional | Default 50, capped at 200 |
 
 This is not garnish. In a session that runs for months, compaction eventually summarises away the older parts of the context. `conversation_list` is how the agent re-derives its address book instead of scrolling back through history that may no longer be there.
+
+A direct chat is titled after the account in it, as `"Alice" (@alice, id 111)`, not by the name alone. On Discord a direct chat's id is not the person's, so a stranger who took the owner's display name would otherwise be listed as a conversation with the owner.
 
 Each entry carries `policy` (the one actually in force, whether from an explicit decision or the configured default), `policy_until` when somebody ruled on it explicitly, and `unseen` for how much a muted conversation is holding.
 

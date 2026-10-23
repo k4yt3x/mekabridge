@@ -1254,11 +1254,37 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
                     () = shutdown.cancelled() => return,
                     () = tokio::time::sleep(INBOX_DRAIN) => {}
                 }
+                wait_for_posting_to_stop(&drain).await;
                 run_turn(Arc::clone(&drain)).await;
             }
         }
     });
     (address, shutdown)
+}
+
+/// How long the bridge has to have stopped posting before the stub opens a turn on what it posted.
+///
+/// The bridge posts a batch one item at a time with a commit after each, which takes well under a
+/// millisecond on the Linux runner and tens of them on the Windows and macOS ones. A drain tick
+/// landing between two items would split a batch the bridge released whole, which is a slow disk
+/// and not the behaviour under test.
+const POSTING_GAP: Duration = Duration::from_millis(150);
+
+async fn wait_for_posting_to_stop(recorder: &MekaRecorder) {
+    loop {
+        let since_last = recorder
+            .attempt_times
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .map(std::time::Instant::elapsed);
+        match since_last {
+            Some(elapsed) if elapsed < POSTING_GAP => {
+                tokio::time::sleep(POSTING_GAP - elapsed).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 /// A channel that records what it was asked to send and never talks to a network.
@@ -3398,8 +3424,10 @@ async fn messages_that_arrive_together_are_batched_into_one_turn() {
     }
 
     harness
-        .wait_for("a turn", |harness| !harness.items().is_empty())
+        .wait_for("a turn", |harness| !harness.turns().is_empty())
         .await;
+    // Longer than the stub waits for posting to stop, so a batch that had split would have had time
+    // to show it.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(
@@ -3611,9 +3639,9 @@ async fn the_parts_of_one_split_post_arrive_together() {
     }
 
     harness
-        .wait_for("the turn", |harness| !harness.items().is_empty())
+        .wait_for("the turn", |harness| !harness.turns().is_empty())
         .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let turns = harness.turns();
     assert_eq!(turns.len(), 1, "one post is one turn, got {turns:#?}");
     assert_eq!(

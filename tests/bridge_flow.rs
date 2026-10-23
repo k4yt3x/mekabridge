@@ -1841,6 +1841,13 @@ async fn sink_against_meka(
     )
 }
 
+/// Absolute on the platform the suite runs on, since the config refuses a relative `cwd` and
+/// `/srv/agent` has no drive letter on Windows. Nothing is created there.
+#[cfg(windows)]
+const AGENT_CWD: &str = r"C:\srv\agent";
+#[cfg(not(windows))]
+const AGENT_CWD: &str = "/srv/agent";
+
 fn config_for(meka_address: SocketAddr, database: &std::path::Path, typing: bool) -> Config {
     let raw = format!(
         r#"
@@ -1854,10 +1861,10 @@ max_queue_depth = 64
 typing_indicator = {typing}
 
 [session]
-cwd = "/srv/agent"
+cwd = '{AGENT_CWD}'
 
 [storage]
-path = "{}"
+path = '{}'
 
 [[channels.telegram]]
 id = "mock"
@@ -2418,7 +2425,7 @@ async fn the_session_is_created_in_the_configured_working_directory() {
     let [body] = created.as_slice() else {
         panic!("one session is created: {created:?}");
     };
-    assert_eq!(body["working_directory"], "/srv/agent", "{body}");
+    assert_eq!(body["working_directory"], AGENT_CWD, "{body}");
     assert_eq!(body["permission"], "read", "{body}");
 }
 

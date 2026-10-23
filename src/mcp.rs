@@ -3789,12 +3789,16 @@ mod tests {
 
     #[tokio::test]
     async fn send_file_rejects_a_missing_file() {
+        // Under a temp dir rather than a literal `/nonexistent/...`, which has no drive letter and
+        // so is refused on Windows as not absolute before its existence is ever checked.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let missing = directory.path().join("report.pdf");
         let (server, _sink) = server_with(FakeSink::default());
         let result = server
             .file_send_inner(
                 SendFileArgs {
                     conversation: "telegram:1".to_string(),
-                    paths: vec!["/nonexistent/mekabridge/report.pdf".to_string()],
+                    paths: vec![missing.display().to_string()],
                     caption: None,
                     as_photo: false,
                     link_preview: false,

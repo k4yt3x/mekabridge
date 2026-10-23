@@ -259,6 +259,9 @@ struct MekaRecorder {
     /// When each post arrived, for tests that measure the wait between them rather than how many
     /// there were.
     attempt_times: Mutex<Vec<std::time::Instant>>,
+    /// The bridge's own store, so the drain can tell a batch still being posted from one that has
+    /// all landed. Unset for the stubs a test starts by hand, which open turns on the tick alone.
+    bridge_store: std::sync::OnceLock<Store>,
     /// `class` and `source` off each post, so a test can pin the contract rather than the body.
     classes: Mutex<Vec<(String, String)>>,
     /// The item each `Idempotency-Key` was answered with, so a replay answers the same item, as
@@ -1262,15 +1265,21 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
     (address, shutdown)
 }
 
-/// How long the bridge has to have stopped posting before the stub opens a turn on what it posted.
-///
-/// The bridge posts a batch one item at a time with a commit after each, which takes well under a
-/// millisecond on the Linux runner and tens of them on the Windows and macOS ones. A drain tick
-/// landing between two items would split a batch the bridge released whole, which is a slow disk
-/// and not the behaviour under test.
-const POSTING_GAP: Duration = Duration::from_millis(150);
+/// How long the bridge may go without posting before the drain stops waiting on rows it still holds
+/// rendered. Those are waiting out a refusal rather than being posted.
+const POSTING_STALL: Duration = Duration::from_secs(1);
 
+/// Hold the drain while the bridge is partway through posting a batch it claimed whole.
+///
+/// The bridge posts a batch one item at a time with a commit after each, and a drain tick landing
+/// between two would split it across turns. meka reads the late ones at the next round boundary of
+/// the same turn, which a stub whose turns end the moment they open cannot model. Waiting on a gap
+/// between posts instead was tried and lost to stalls on the shared runners, so this waits on the
+/// bridge's own record of what it rendered and meka has not yet accepted.
 async fn wait_for_posting_to_stop(recorder: &MekaRecorder) {
+    let Some(store) = recorder.bridge_store.get() else {
+        return;
+    };
     loop {
         let since_last = recorder
             .attempt_times
@@ -1278,12 +1287,17 @@ async fn wait_for_posting_to_stop(recorder: &MekaRecorder) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last()
             .map(std::time::Instant::elapsed);
-        match since_last {
-            Some(elapsed) if elapsed < POSTING_GAP => {
-                tokio::time::sleep(POSTING_GAP - elapsed).await;
-            }
-            _ => return,
+        if since_last.is_none_or(|elapsed| elapsed >= POSTING_STALL) {
+            return;
         }
+        if store
+            .queue_stats()
+            .await
+            .is_ok_and(|stats| stats.in_flight == 0)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -2207,6 +2221,9 @@ impl Harness {
         let store = Store::open(&config.storage.path)
             .await
             .expect("store opens");
+        if recorder.bridge_store.set(store.clone()).is_err() {
+            unreachable!("the recorder was made above");
+        }
         let accounts = mock_accounts(&store).await;
         let channel = Arc::new(MockChannel::new("mock"));
         let channels = Arc::new(ChannelRegistry::from_channels([
@@ -3426,8 +3443,7 @@ async fn messages_that_arrive_together_are_batched_into_one_turn() {
     harness
         .wait_for("a turn", |harness| !harness.turns().is_empty())
         .await;
-    // Longer than the stub waits for posting to stop, so a batch that had split would have had time
-    // to show it.
+    // Long enough for a second turn to open behind the first, had the batch been split.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(

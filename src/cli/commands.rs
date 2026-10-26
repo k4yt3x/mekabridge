@@ -1343,6 +1343,7 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
     let mut open = store.rows_in(QueueState::InFlight).await?;
     open.extend(store.rows_in(QueueState::Posted).await?);
     let mut owed = 0_usize;
+    let mut lost = 0_usize;
     for row in &open {
         let Some(closed) = store
             .failed(row.seq, "the session it belonged to was reset", Utc::now())
@@ -1350,8 +1351,11 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
         else {
             continue;
         };
-        store.mark_unseen(closed.key()).await?;
-        owed += 1;
+        if closed.owed {
+            owed += 1;
+        } else {
+            lost += 1;
+        }
     }
     match store.session_id().await? {
         Some(session_id) => {
@@ -1362,6 +1366,12 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
                     "{} message(s) that had been handed over are back among what the agent has \
                      not seen",
                     owed
+                );
+            }
+            if lost > 0 {
+                println!(
+                    "{lost} message(s) that had been handed over are lost: no history row was kept \
+                     for them to go back into"
                 );
             }
             println!(

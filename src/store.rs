@@ -583,6 +583,16 @@ impl QueuedMessage {
     }
 }
 
+/// A hand-over closed as [`QueueState::Failed`], which nothing will deliver now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undelivered {
+    pub row: QueuedMessage,
+    /// Whether its message went back among what the agent is owed, in the transaction that closed
+    /// the row. `false` when there is no history row to put back, which
+    /// `[storage].history_retention` of zero makes the rule: the message really is gone.
+    pub owed: bool,
+}
+
 /// What happened to an [`Store::enqueue`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
@@ -682,9 +692,8 @@ pub enum Offer {
     /// Back in the queue, for a hand-over of its own under a new key.
     Retrying,
     /// Out of offers, and now `failed`. This is what an operator needs to hear about: the agent was
-    /// never handed it, and nothing will hand it over now. What is still possible is
-    /// [`Store::mark_unseen`], which puts it back among what the agent is owed.
-    Exhausted(Box<QueuedMessage>),
+    /// never handed it, and nothing will hand it over now.
+    Exhausted(Box<Undelivered>),
     /// Something else had already closed it, so nothing changed.
     Closed,
 }
@@ -2267,19 +2276,19 @@ impl Store {
         Ok(closed > 0)
     }
 
-    /// Close a row that will never reach the model, and give back what its item had taken.
+    /// Close a row that will never reach the model, give back what its item had taken, and put its
+    /// message back among what the agent is owed.
     ///
-    /// Returns the row so the caller can put it among what the agent is owed and say who lost what,
-    /// and nothing for a row something else had already closed. The rendered body goes, since
-    /// nothing will ever post it again and keeping it would pin a second copy of somebody's message
-    /// for the life of the database; the key and the item id stay, because they are what names this
-    /// hand-over in meka's own logs.
+    /// Returns the row so the caller can say who lost what, and nothing for a row something else
+    /// had already closed. The rendered body goes, since nothing will ever post it again and
+    /// keeping it would pin a second copy of somebody's message for the life of the database; the
+    /// key and the item id stay, because they are what names this hand-over in meka's own logs.
     pub async fn failed(
         &self,
         seq: i64,
         error: &str,
         at: DateTime<Utc>,
-    ) -> Result<Option<QueuedMessage>> {
+    ) -> Result<Option<Undelivered>> {
         let error = error.to_string();
         let at = to_rfc3339(at);
         let row = self
@@ -2298,9 +2307,10 @@ impl Store {
                     return Ok(None);
                 }
                 restore(&transaction, seq)?;
+                let owed = unsee(&transaction, seq)?;
                 let row = read_row(&transaction, seq)?;
                 transaction.commit()?;
-                Ok(row)
+                Ok(row.map(|row| Undelivered { row, owed }))
             })
             .await?;
         Ok(row)
@@ -2351,9 +2361,12 @@ impl Store {
                          WHERE seq = ?1",
                         rusqlite::params![seq, at],
                     )?;
+                    let owed = unsee(&transaction, seq)?;
                     let row = read_row(&transaction, seq)?;
                     transaction.commit()?;
-                    return Ok(row.map_or(Offer::Closed, |row| Offer::Exhausted(Box::new(row))));
+                    return Ok(row.map_or(Offer::Closed, |row| {
+                        Offer::Exhausted(Box::new(Undelivered { row, owed }))
+                    }));
                 }
                 transaction.execute(
                     &format!(
@@ -2873,33 +2886,6 @@ impl Store {
             .await?;
         records.reverse();
         Ok((count, records, watermark))
-    }
-
-    /// Put one message back among what the agent is owed.
-    ///
-    /// Keyed on one message rather than a watermark because a message is marked seen when it is
-    /// queued, assuming the agent is about to be handed it, and that assumption fails exactly when
-    /// its batch runs out of attempts. Without this the message is neither delivered nor owed, so
-    /// nothing short of `history_read` over the right window finds it again.
-    ///
-    /// A `false` return is legitimate: `[storage].history_retention` of zero writes no history, so
-    /// there is nothing to un-see.
-    pub async fn mark_unseen(&self, key: MessageKey<'_>) -> Result<bool> {
-        let key = OwnedKey::from(key);
-        let changed = self
-            .connection
-            .call(move |connection| {
-                connection.execute(
-                    &format!(
-                        "UPDATE messages SET seen = 0
-                         WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
-                           AND message_id = ?3 AND revision = ?4"
-                    ),
-                    rusqlite::params![key.conversation, key.account, key.message_id, key.revision],
-                )
-            })
-            .await?;
-        Ok(changed > 0)
     }
 
     /// Record that the agent has read these rows, so they stop counting as owed to it.
@@ -3802,6 +3788,25 @@ fn restore(connection: &rusqlite::Connection, seq: i64) -> rusqlite::Result<()> 
         [seq],
     )?;
     Ok(())
+}
+
+/// Put the message the row at `seq` was queued for back among what the agent is owed, for a row
+/// closed as `failed`.
+///
+/// A message is marked seen the moment it is queued, on the assumption that the agent is about to
+/// be handed it, and closing its row as `failed` is exactly where that assumption fails. Done in
+/// the transaction that closes the row: a crash between the two would leave the message neither
+/// delivered nor owed, so that nothing but `history_read` over the right window would ever turn it
+/// up again. `false` when there is no history row to put back.
+fn unsee(connection: &rusqlite::Connection, seq: i64) -> rusqlite::Result<bool> {
+    let changed = connection.execute(
+        "UPDATE messages SET seen = 0
+         WHERE (conversation_id, account_id, message_id, revision) =
+               (SELECT conversation_id, account_id, message_id, revision
+                FROM inbound_queue WHERE seq = ?1)",
+        [seq],
+    )?;
+    Ok(changed > 0)
 }
 
 /// A value that is not what its column promised, reported the way `rusqlite` reports one so it
@@ -6070,7 +6075,7 @@ mod tests {
         let Offer::Exhausted(exhausted) = second else {
             panic!("the second offer runs it out: {second:?}");
         };
-        assert_eq!(exhausted.conversation, "telegram:123");
+        assert_eq!(exhausted.row.conversation, "telegram:123");
         assert_eq!(store.pending_count().await.expect("count"), 0);
         assert_eq!(store.queue_stats().await.expect("stats").failed, 1);
     }
@@ -6130,46 +6135,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_exhausted_message_is_owed_to_the_agent_again() {
+    async fn a_message_nothing_will_deliver_is_owed_to_the_agent_again() {
         // A message is marked seen the moment it is queued, on the assumption that the agent is
-        // about to be handed it. Running out of attempts is exactly when that assumption fails, and
-        // without this the message is neither delivered nor owed: absent from `unseen`, from the
-        // missed-context lookback, and from the `mekabridge unseen` predicate.
+        // about to be handed it. Closing its row as failed, by running out of offers or by giving
+        // up on its hand-over, is exactly when that assumption fails, and without this the message
+        // is neither delivered nor owed: absent from `unseen`, from the missed-context lookback,
+        // and from the `mekabridge unseen` predicate.
+        //
+        // It goes back in the transaction that closes the row, so no crash between the two can lose
+        // it.
         let (store, account) = seeded(&["telegram:123"]).await;
-        let mut record = message(account, "telegram:123", "m1", "are you there?");
-        record.seen = true;
-        store.record_message(record).await.expect("record");
-        assert_eq!(
+        for id in ["m1", "m2"] {
+            let mut record = message(account, "telegram:123", id, "are you there?");
+            record.seen = true;
+            store.record_message(record).await.expect("record");
+            store
+                .enqueue(key(account, "telegram:123", id), id, now(), 10)
+                .await
+                .expect("enqueue");
+        }
+        let owed = async || {
             store
                 .unseen_summary(Some("telegram:123"))
                 .await
                 .expect("summary")
-                .count,
-            0
-        );
+                .count
+        };
+        assert_eq!(owed().await, 0);
+        let claimed = claim_all(&store, 10).await;
+        let held = hold_all(&store, &claimed).await;
 
-        assert!(
-            store
-                .mark_unseen(key(account, "telegram:123", "m1"))
-                .await
-                .expect("unsee")
-        );
+        let offer = store
+            .reoffer(held[0].seq, "boom", 0, None, now())
+            .await
+            .expect("reoffer");
+        let Offer::Exhausted(exhausted) = offer else {
+            panic!("zero offers runs it out: {offer:?}");
+        };
+        assert!(exhausted.owed);
         assert_eq!(
-            store
-                .unseen_summary(Some("telegram:123"))
-                .await
-                .expect("summary")
-                .count,
+            owed().await,
             1,
-            "an undeliverable message must come back as something the agent has not seen"
+            "an exhausted message must come back as something the agent has not seen"
         );
 
-        assert!(
-            !store
-                .mark_unseen(key(account, "telegram:123", "nothing-here"))
-                .await
-                .expect("unsee"),
-            "a message that was never recorded cannot be un-seen"
+        let failed = store
+            .failed(held[1].seq, "gone", now())
+            .await
+            .expect("fail")
+            .expect("the row it closed comes back");
+        assert!(failed.owed);
+        assert_eq!(
+            owed().await,
+            2,
+            "and so must one whose hand-over was given up on"
         );
     }
 
@@ -6572,11 +6591,15 @@ mod tests {
         let held = hold_all(&store, &claimed).await;
         let seq = held[0].seq;
 
-        let closed = store
+        let Undelivered { row: closed, owed } = store
             .failed(seq, "no turn could deliver it", now())
             .await
             .expect("fail")
             .expect("the row it closed comes back");
+        assert!(
+            !owed,
+            "nothing was recorded for it, so there is nothing to put back"
+        );
         assert_eq!(closed.message_id, "a");
         assert_eq!(closed.state, QueueState::Failed);
         assert_eq!(

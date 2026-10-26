@@ -2347,6 +2347,29 @@ impl Harness {
         })
         .await;
     }
+
+    /// Wait for what `mock:1` owes the agent to reach `expected`, failing with the count it stopped
+    /// at.
+    ///
+    /// For messages sent while a chat is muted. They are only owed once the writer has persisted
+    /// them, and a sleep long enough to show the agent was not handed them is no promise the writer
+    /// got that far.
+    async fn wait_for_owed(&self, expected: u64, message: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let owed = self
+                .store
+                .unseen_summary(Some("mock:1"))
+                .await
+                .expect("summary")
+                .count;
+            if owed == expected || tokio::time::Instant::now() >= deadline {
+                assert_eq!(owed, expected, "{message}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 impl Drop for Harness {
@@ -3246,9 +3269,9 @@ async fn the_owner_hears_when_turns_move_to_a_fallback_and_when_they_come_back()
 #[tokio::test]
 async fn the_owner_is_not_promised_a_recovery_that_cannot_happen() {
     // With `[storage].history_retention` at zero nothing is written to the history, so there is no
-    // row for `mark_unseen` to put back and the message really is gone. Telling the owner it will
-    // come back as unseen context would send them looking for something that does not exist, in
-    // the one configuration where a message is genuinely lost.
+    // row for the give-up to put back and the message really is gone. Telling the owner it will
+    // come back as unseen context would send them looking for something that does not exist, in the
+    // one configuration where a message is genuinely lost.
     let harness = Harness::start_script_with(TurnScript::GiveUp, Setup {
         history_retention: Duration::ZERO,
         ..Setup::with_owner()
@@ -4475,6 +4498,14 @@ async fn a_group_nobody_has_ruled_on_follows_the_configured_default() {
         "a group defaults to mentions only, so ordinary talk must not cost a turn: {:?}",
         harness.items()
     );
+    harness
+        .wait_until("the three to be recorded", async |store| {
+            store
+                .history("mock:-100", &[], 10, None, None)
+                .await
+                .is_ok_and(|rows| rows.len() == 3)
+        })
+        .await;
     assert_eq!(
         harness
             .store
@@ -4847,6 +4878,7 @@ async fn a_muted_conversation_records_everything_and_wakes_only_on_a_mention() {
         "ordinary talk in a muted chat must not cost a turn: {:?}",
         harness.items()
     );
+    await_history(&harness, 3, "the three to be recorded").await;
     assert_eq!(
         harness
             .store
@@ -4977,6 +5009,9 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
 
     // Withheld, not discarded. The distinction is the whole reason this is tolerable: the agent
     // was not interrupted, and the message is still there for it to find.
+    harness
+        .wait_for_owed(1, "the message has to survive for history_read")
+        .await;
     let (owed, ..) = harness
         .store
         .take_unseen("mock:1", Utc::now(), 10)
@@ -5058,6 +5093,11 @@ async fn unmuting_reports_the_backlog_once_and_then_stops() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(harness.items().is_empty());
+    // A message the writer has yet to persist when the mute lifts is recorded as an active chat's,
+    // and handed over rather than owed.
+    harness
+        .wait_for_owed(4, "all four are recorded while muted")
+        .await;
 
     harness
         .store
@@ -8246,7 +8286,11 @@ async fn two_messages_in_one_pass_state_their_chat_s_backlog_once() {
     // renders an item per message, so two mentions that settle together are two items; the backlog
     // belongs on the first of them and marking it seen there is what keeps the second from
     // restating what the agent is already being shown in the same turn.
-    let harness = Harness::start_script(TurnScript::Hold).await;
+    //
+    // The two have to settle together for that, so the floor has to outlast a stalled writer
+    // persisting them. At the default, a stall between the two releases the first alone, and the
+    // second becomes a pass of its own, which states the mute again.
+    let harness = Harness::start_script_with(TurnScript::Hold, Setup::coalescing()).await;
     harness
         .store
         .set_policy("mock:1", "telegram", Policy::Mute, None, None, Utc::now())

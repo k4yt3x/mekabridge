@@ -468,7 +468,7 @@ If the meka that runs the bridge also runs your own sessions, put the bridge's s
 - **What it does:** the agent's writes go to the project. Its notes about the chats stay out of your sessions, and its inline memories stop counting against the [`[memory] inline_max_bytes`](https://docs.meka.so/configuration/config-file.html#memory) budget your sessions see. meka refuses a write past that budget, so a busy chat agent filling the global tier would eventually get your own writes refused too.
 - **What it does not do:** hide your global memories from the agent. A session on a project still reads the whole global tier, and this agent talks to whoever is in the chats, so a note they should never hear belongs in a project of your own sessions rather than in the global tier.
 
-Create the project, then move the session onto it. `mekabridge session show` prints the session's id, and the token needs `sessions:w`:
+Create the project, then move the session onto it. `mekabridge session show` prints the session's id, and the token needs `sessions:w`. `meka project add` works on meka's own host; from another machine, `POST /v1/projects` with `{"name": "chat"}` adds the project instead, with a token holding `memory:w`:
 
 ```sh
 meka project add chat

@@ -40,7 +40,8 @@ use crate::{
     },
     store::{
         AccountId, Backlog, ConversationRecord, EnqueueOutcome, HandOver, MessageKey, Offer,
-        Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store, WatchRecord,
+        Policy, PolicyRecord, QueueState, QueuedMessage, Recovered, Store, Undelivered,
+        WatchRecord,
     },
     watch::Watchlist,
 };
@@ -1336,7 +1337,7 @@ async fn fail(context: &SessionContext, row: &QueuedMessage, reason: &str, retry
         // tell.
         Ok(None) => true,
         Ok(Some(closed)) => {
-            let posts = closed.posts.max(1);
+            let posts = closed.row.posts.max(1);
             give_up(context, std::slice::from_ref(&closed), reason, retry, posts).await;
             true
         }
@@ -1356,7 +1357,7 @@ async fn fail_all(context: &SessionContext, rows: &[QueuedMessage], reason: &str
     let mut closed = Vec::with_capacity(rows.len());
     for row in rows {
         match context.store.failed(row.seq, reason, Utc::now()).await {
-            Ok(Some(row)) => closed.push(row),
+            Ok(Some(undelivered)) => closed.push(undelivered),
             Ok(None) => {}
             Err(error) => {
                 tracing::error!(seq = row.seq, "failed to record a lost message: {}", error);
@@ -1366,42 +1367,33 @@ async fn fail_all(context: &SessionContext, rows: &[QueuedMessage], reason: &str
     if closed.is_empty() {
         return;
     }
-    let posts = closed.iter().map(|row| row.posts).max().unwrap_or(1).max(1);
+    let posts = closed
+        .iter()
+        .map(|closed| closed.row.posts)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     give_up(context, &closed, reason, retry, posts).await;
 }
 
-/// Put messages nothing will deliver back among what the agent is owed, and say so.
+/// Say that nothing will deliver these messages. Closing their rows already put each back among
+/// what the agent is owed, where a history row was kept for it.
 async fn give_up(
     context: &SessionContext,
-    rows: &[QueuedMessage],
+    rows: &[Undelivered],
     reason: &str,
     retry: Retry,
     attempts: u32,
 ) {
     tracing::error!(count = rows.len(), "giving up on {} message(s)", rows.len());
-    // Owed to the agent again. A message is marked seen the moment it is queued, on the assumption
-    // that the agent is about to be handed it, and this is exactly where that assumption fails.
-    // Without this it is neither delivered nor owed, so nothing but `history_read` over the right
-    // window would ever turn it up again. What each hand-over reported as a *backlog* is given back
-    // by the store, against the row that reported it.
-    let mut affected: BTreeSet<ConversationId> = BTreeSet::new();
-    // Whether that actually worked, which it cannot when `[storage].history_retention` is zero:
-    // there is no history row to un-see, so the message really is gone. The owner is told which of
-    // the two happened rather than promised the recoverable one.
-    let mut recoverable = false;
-    for message in rows {
-        match context.store.mark_unseen(message.key()).await {
-            Ok(marked) => recoverable |= marked,
-            Err(error) => tracing::error!(
-                conversation = %message.conversation,
-                "failed to mark an undeliverable message unseen: {}",
-                error
-            ),
-        }
-        if let Some(conversation) = ConversationId::parse(&message.conversation) {
-            affected.insert(conversation);
-        }
-    }
+    let affected: BTreeSet<ConversationId> = rows
+        .iter()
+        .filter_map(|closed| ConversationId::parse(&closed.row.conversation))
+        .collect();
+    // Not owed when `[storage].history_retention` is zero: there is no history row to put back, so
+    // the message really is gone. The owner is told which of the two happened rather than promised
+    // the recoverable one.
+    let recoverable = rows.iter().any(|closed| closed.owed);
     announce(
         context,
         &affected,
@@ -1486,7 +1478,7 @@ async fn offer_again(
             reason
         ),
         Offer::Exhausted(exhausted) => {
-            let posts = exhausted.posts.max(1);
+            let posts = exhausted.row.posts.max(1);
             give_up(
                 context,
                 std::slice::from_ref(&*exhausted),

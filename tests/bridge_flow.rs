@@ -2081,13 +2081,24 @@ impl Default for Setup {
 
 impl Setup {
     /// A floor generous enough to hold a burst together while the writer persists it, for the tests
-    /// that are about coalescing rather than about latency.
+    /// that are about coalescing rather than about latency. A loaded Windows runner has stalled a
+    /// write past 600ms.
     fn coalescing() -> Self {
         Self {
-            coalesce_floor: Duration::from_millis(600),
+            coalesce_floor: Duration::from_secs(2),
             // Clear of the floor, or the ceiling would release the burst at the very moment the
             // floor was meant to be holding it together.
-            settle_max: Duration::from_secs(3),
+            settle_max: Duration::from_secs(5),
+            ..Self::default()
+        }
+    }
+
+    /// A ceiling far above the quiet period, for the tests that tell a message released after the
+    /// quiet period from one held until the ceiling. At the default the two are under half a second
+    /// apart, and a loaded Windows runner took longer than that to deliver one that was never held.
+    fn ceiling_far_off() -> Self {
+        Self {
+            settle_max: Duration::from_secs(5),
             ..Self::default()
         }
     }
@@ -2153,8 +2164,15 @@ impl Harness {
     }
 
     /// A harness whose turns take `delay` to begin, for testing what happens while one runs.
+    ///
+    /// Nothing is asked about before a minute is out, or a delay past the default two seconds would
+    /// have the sweep settling the running turn's own item while the test still watched it run.
     async fn start_slow(delay: Duration) -> Self {
-        let harness = Self::start().await;
+        let harness = Self::start_with_setup(Setup {
+            hand_over_within: Duration::from_secs(60),
+            ..Setup::default()
+        })
+        .await;
         harness.recorder.set(&harness.recorder.turn_delay, delay);
         harness
     }
@@ -3546,7 +3564,7 @@ async fn sending_the_message_ends_the_wait_for_it() {
     // Discord message would be held until its author's last notice aged out, which is the whole
     // of the wait rather than a bound on it, and the feature would make the bridge slower than
     // having no debounce at all.
-    let harness = Harness::start().await;
+    let harness = Harness::start_with_setup(Setup::ceiling_far_off()).await;
     harness.channel.report_typing();
     harness.sender.send(typing()).await.expect("queued");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3560,10 +3578,9 @@ async fn sending_the_message_ends_the_wait_for_it() {
     harness
         .wait_for("the turn", |harness| !harness.items().is_empty())
         .await;
-    // settle_max is 600ms here, so anything at or past that is the ceiling rescuing a stuck hold
-    // rather than the rule working.
+    // Anything near five seconds is the ceiling rescuing a stuck hold rather than the rule working.
     assert!(
-        sent.elapsed() < Duration::from_millis(500),
+        sent.elapsed() < Duration::from_secs(2),
         "a finished message must not wait out the typing it produced, waited {:?}",
         sent.elapsed()
     );
@@ -3577,7 +3594,7 @@ async fn a_chat_held_for_typing_does_not_hold_up_another() {
     // Not the patient harness: the channel reports typing for every chat on it, so a long quiet
     // period would be one the second chat legitimately waits out too, and the test would be
     // measuring that rather than the hold on the first.
-    let harness = Harness::start().await;
+    let harness = Harness::start_with_setup(Setup::ceiling_far_off()).await;
     harness.channel.report_typing();
     harness
         .sender
@@ -3601,11 +3618,11 @@ async fn a_chat_held_for_typing_does_not_hold_up_another() {
                 .any(|turn| turn.contains("are you there?"))
         })
         .await;
-    // Tight on purpose. With the wake branch this is the 150ms quiet period plus scheduling;
-    // without it the loop sleeps however long the held chat asked for, which the harness ceiling
-    // caps at roughly 450ms here and which in production is the full typing TTL.
+    // With the wake branch this is the 150ms quiet period plus scheduling; without it the loop
+    // sleeps however long the held chat asked for, which the ceiling caps at nearly five seconds
+    // here and which in production is the full typing TTL.
     assert!(
-        sent.elapsed() < Duration::from_millis(350),
+        sent.elapsed() < Duration::from_secs(2),
         "an unrelated chat must not wait behind a typing hold, waited {:?}",
         sent.elapsed()
     );
@@ -3623,17 +3640,17 @@ async fn typing_does_not_hold_a_chat_past_the_ceiling() {
         .send(message("hey", "1"))
         .await
         .expect("queued");
-    for _ in 0..8 {
+    // The notices keep coming until the turn shows, so nothing but the ceiling can release it. The
+    // deadline is far past the harness's 600ms ceiling and well inside the typing TTL.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.items().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ceiling has to win over a notice nobody stops sending"
+        );
         harness.sender.send(typing()).await.expect("queued");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    // settle_max is 600ms in the harness, so the ceiling is well past by now.
-    let turns = harness.items();
-    assert!(
-        !turns.is_empty(),
-        "the ceiling has to win over a notice nobody stops sending"
-    );
 }
 
 #[tokio::test]
@@ -3699,13 +3716,25 @@ async fn one_chat_mid_burst_does_not_hold_up_another() {
     // Readiness used to be one window over the whole queue, so any conversation still receiving
     // deferred delivery for every other conversation. With a quiet period long enough to be useful
     // that would mean a busy room stalling a direct message.
-    let harness = Harness::start().await;
+    //
+    // A quiet period longer than the suite's, so the burst can keep the busy chat from going quiet
+    // at a pace the store keeps up with. At 150ms it took ten messages a second, and on a slow disk
+    // the quiet chat's own writes queued behind them.
+    let harness = Harness::start_with_setup(Setup {
+        settle: Duration::from_millis(500),
+        ..Setup::ceiling_far_off()
+    })
+    .await;
     harness.channel.report_typing();
 
+    // Outlasts the ceiling, so one window over the whole queue would hold the quiet chat for all of
+    // it rather than only until the burst ran out. Every gap stays well under the quiet period and
+    // the count under the queue depth of 64, since a burst that went quiet or started being dropped
+    // would release early and look like the fix.
     let busy = tokio::spawn({
         let sender = harness.sender.clone();
         async move {
-            for index in 0..40 {
+            for index in 0..24 {
                 let mut event = message(&format!("chatter {index}"), &format!("busy-{index}"));
                 if let InboundEvent::Message(inner) = &mut event {
                     inner.conversation = ConversationId::parse("mock:-100").expect("valid");
@@ -3713,13 +3742,13 @@ async fn one_chat_mid_burst_does_not_hold_up_another() {
                 if sender.send(event).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     });
 
     // Long enough that the busy conversation is unmistakably mid-burst.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let sent = tokio::time::Instant::now();
     harness
         .sender
@@ -3736,8 +3765,10 @@ async fn one_chat_mid_burst_does_not_hold_up_another() {
         .await;
     busy.abort();
 
+    // The quiet period plus however long the burst's writes held the quiet chat's up. Waiting on
+    // the busy chat is the ceiling instead, over four seconds from here however slow the machine.
     assert!(
-        sent.elapsed() < Duration::from_millis(400),
+        sent.elapsed() < Duration::from_secs(3),
         "a quiet chat must not wait on a busy one, waited {:?}",
         sent.elapsed()
     );
@@ -3751,10 +3782,10 @@ async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
     // wait end when the person stops rather than when a guessed timer does.
     // A quiet period well clear of the gaps below. At the suite's 150ms a loaded machine stretched
     // a 60ms gap past it often enough to split the burst, which is a slow machine and not the
-    // behaviour under test.
+    // behaviour under test, and a loaded Windows runner did the same at 600ms.
     let harness = Harness::start_with_setup(Setup {
-        settle: Duration::from_millis(600),
-        settle_max: Duration::from_secs(3),
+        settle: Duration::from_secs(2),
+        settle_max: Duration::from_secs(5),
         ..Setup::default()
     })
     .await;
@@ -3777,10 +3808,13 @@ async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
 
+    // The turn rather than the first item, which a slow commit can leave alone at meka for longer
+    // than the sleep below while the stub waits for the rest of the batch.
     harness
-        .wait_for("a turn", |harness| !harness.items().is_empty())
+        .wait_for("a turn", |harness| !harness.turns().is_empty())
         .await;
-    // Longer than the quiet period, so a burst that had split would have had time to show it.
+    // Long enough for the rest of a burst that had split to follow: it was sent moments after the
+    // part that went first, so its own quiet period is all but over by then.
     tokio::time::sleep(Duration::from_millis(900)).await;
 
     let turns = harness.turns();
@@ -6153,7 +6187,10 @@ async fn a_message_arriving_mid_turn_is_handed_over_without_waiting_for_the_turn
     // to end, and the envelope after carried a `late:` line saying the reply had been written
     // without it. Now it is handed over while the turn runs, and meka reads it at that turn's next
     // round boundary under a header of its own.
-    let harness = Harness::start_slow(Duration::from_millis(700)).await;
+    //
+    // A turn far longer than the bound below, so waiting for it can never pass for a loaded machine
+    // being slow to hand the amendment over.
+    let harness = Harness::start_slow(Duration::from_secs(5)).await;
     harness
         .sender
         .send(message("check the prod logs", "1"))
@@ -6175,7 +6212,7 @@ async fn a_message_arriving_mid_turn_is_handed_over_without_waiting_for_the_turn
         .await;
 
     assert!(
-        sent.elapsed() < Duration::from_millis(600),
+        sent.elapsed() < Duration::from_secs(2),
         "the amendment waited {:?} for a turn it never had to wait for",
         sent.elapsed()
     );
@@ -8540,14 +8577,15 @@ async fn a_batch_meka_has_held_too_long_is_asked_about_without_a_reconnect() {
         .send(message_elsewhere("unrelated", "2"))
         .await
         .expect("queued");
+    // The straggler is the only row that can reach done, since meka holds the message that woke the
+    // loop like any other. Nothing is asserted about rows in flight: by now that message is on its
+    // way over, and a slow commit leaves it there long enough to be counted.
     harness
-        .wait_for_queue("the straggler to be settled", |stats| stats.done >= 1)
+        .wait_for_queue(
+            "the straggler to be settled rather than left with nothing able to move it",
+            |stats| stats.done >= 1,
+        )
         .await;
-    assert_eq!(
-        harness.store.queue_stats().await.expect("stats").in_flight,
-        0,
-        "the rows were left in flight with nothing able to move them"
-    );
 }
 
 #[tokio::test]

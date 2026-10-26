@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.24.1] - 2026-10-26
+
+### Added
+
+- A compaction meka could not finish is logged, at error when a full context window forced it.
+
+### Changed
+
+- The log line for a compaction says what set it off: a full window, a request, or retention.
+
 ## [0.24.0] - 2026-10-23
 
 ### Added
@@ -634,7 +646,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.1...HEAD
+[0.24.1]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...0.24.1
 [0.24.0]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...0.24.0
 [0.23.0]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...0.23.0
 [0.22.0]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...0.22.0

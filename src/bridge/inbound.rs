@@ -2046,6 +2046,7 @@ async fn apply(
             true
         }
         TurnEvent::ContextCompacted {
+            trigger,
             source,
             replaced_count,
             generation,
@@ -2054,13 +2055,22 @@ async fn apply(
             // everyone the agent has ever spoken to, on every platform, so a compaction is the
             // moment its memory of conversations nobody is currently having becomes a summary.
             // Nothing here can prevent it; an operator wondering why the agent forgot somebody
-            // should be able to find when.
+            // should be able to find when, and whether the window or somebody's request set it off.
             tracing::warn!(
+                trigger = %trigger,
                 source = %source,
                 replaced = replaced_count,
                 generation,
                 "meka compacted the session; earlier conversations are now a summary"
             );
+            false
+        }
+        TurnEvent::CompactionFailed {
+            trigger,
+            error,
+            interrupted,
+        } => {
+            log_failed_compaction(trigger, error, *interrupted);
             false
         }
         TurnEvent::PermissionRequired { tool_name, .. } => {
@@ -2090,6 +2100,29 @@ fn log_notice(level: &str, text: &str) {
         tracing::info!(level, "meka notice: {}", text);
     } else {
         tracing::warn!(level, "meka notice: {}", text);
+    }
+}
+
+/// Log a compaction that ended without replacing the window, at a level that says how close the
+/// session is to refusing turns.
+fn log_failed_compaction(trigger: &str, error: &str, interrupted: bool) {
+    if interrupted {
+        tracing::info!(
+            trigger,
+            "a compaction of the session was stopped before it finished"
+        );
+    } else if matches!(trigger, "reactive" | "proactive" | "emergency") {
+        // The window forced this one, so it is still full: the next turns are likely to be refused
+        // as too large for the model, in every chat at once, and nothing here can shorten the
+        // session. Said before that happens, with meka's reason.
+        tracing::error!(
+            trigger,
+            error,
+            "meka could not compact the session, whose context is full; turns may soon be refused \
+             as too large for the model"
+        );
+    } else {
+        tracing::warn!(trigger, error, "meka could not compact the session");
     }
 }
 
@@ -3099,6 +3132,39 @@ mod tests {
     /// the log as a warning. A level no meka sends today must not be quieted either.
     #[test]
     fn a_notice_is_logged_at_mekas_own_level() {
+        let levels = levels_logged_by(|| {
+            log_notice("info", "checklist: 1 open item, continuing, nudge 1 of 3");
+            log_notice("warn", "checklist: 1 item left open after 3 nudges");
+            log_notice("critical", "a level no meka sends today");
+        });
+        assert_eq!(levels, vec![
+            tracing::Level::INFO,
+            tracing::Level::WARN,
+            tracing::Level::WARN
+        ]);
+    }
+
+    /// Only a compaction the window forced is an error: the session is still full, and the next
+    /// turns in every chat are the ones that pay. One somebody asked for that failed leaves the
+    /// window where it was, and one somebody stopped is nobody's fault.
+    #[test]
+    fn a_failed_compaction_is_an_error_only_when_the_window_forced_it() {
+        let levels = levels_logged_by(|| {
+            log_failed_compaction("reactive", "the checkpoint turn failed", false);
+            log_failed_compaction("emergency", "the summarizer request failed", false);
+            log_failed_compaction("requested", "the checkpoint turn failed", false);
+            log_failed_compaction("reactive", "", true);
+        });
+        assert_eq!(levels, vec![
+            tracing::Level::ERROR,
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO
+        ]);
+    }
+
+    /// The level of every event `log` emits, in order.
+    fn levels_logged_by(log: impl FnOnce()) -> Vec<tracing::Level> {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         #[derive(Clone, Default)]
@@ -3118,22 +3184,12 @@ mod tests {
 
         let levels = Levels::default();
         let subscriber = tracing_subscriber::registry().with(levels.clone());
-        tracing::subscriber::with_default(subscriber, || {
-            log_notice("info", "checklist: 1 open item, continuing, nudge 1 of 3");
-            log_notice("warn", "checklist: 1 item left open after 3 nudges");
-            log_notice("critical", "a level no meka sends today");
-        });
-        assert_eq!(
-            *levels
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            vec![
-                tracing::Level::INFO,
-                tracing::Level::WARN,
-                tracing::Level::WARN
-            ]
-        );
+        tracing::subscriber::with_default(subscriber, log);
+        levels
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn attachment(file_ref: &str) -> Attachment {

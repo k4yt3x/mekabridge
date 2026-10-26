@@ -74,9 +74,24 @@ pub enum TurnEvent {
     /// platform, so a compaction is the moment its memory of people who are not in the current
     /// conversation becomes a summary.
     ContextCompacted {
+        /// What set it going: `reactive` or `proactive` when the window filled, `emergency` when
+        /// the provider refused a request as too large, `manual`, `requested` by the agent, or
+        /// `retention`. Empty from a meka before 0.84.
+        trigger: String,
         source: String,
         replaced_count: u64,
         generation: u64,
+    },
+    /// A compaction ended without replacing the window.
+    ///
+    /// The one that the window forced is the warning before an outage here: a permanent session
+    /// that cannot be compacted goes on to refuse every turn as too large for the model, which
+    /// silences every chat at once.
+    CompactionFailed {
+        trigger: String,
+        error: String,
+        /// Somebody stopped it, rather than it failing.
+        interrupted: bool,
     },
     /// Emitted when a gated tool needs approval, which for this bridge means the session has
     /// meka's `approvals` switch on.
@@ -274,9 +289,18 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
             text: string("text"),
         },
         "context.compacted" => TurnEvent::ContextCompacted {
+            trigger: string("trigger"),
             source: string("source"),
             replaced_count: number("replaced_count"),
             generation: number("generation"),
+        },
+        "context.compaction_failed" => TurnEvent::CompactionFailed {
+            trigger: string("trigger"),
+            error: string("error"),
+            interrupted: value
+                .get("interrupted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         },
         "permission_required" => TurnEvent::PermissionRequired {
             request_id: string("request_id"),
@@ -434,13 +458,45 @@ mod tests {
 
     #[test]
     fn parses_a_compaction() {
+        let data = r#"{"compaction_id":"c1","trigger":"reactive","source":"checkpoint",
+                       "memories_written":["alice-timezone"],"kept_recent":true,
+                       "replaced_count":42,"generation":3}"#;
+        assert_eq!(
+            event("context.compacted", data),
+            TurnEvent::ContextCompacted {
+                trigger: "reactive".to_string(),
+                source: "checkpoint".to_string(),
+                replaced_count: 42,
+                generation: 3
+            }
+        );
+    }
+
+    /// What a meka before 0.84 sends, which names no trigger.
+    #[test]
+    fn a_compaction_from_an_older_meka_still_parses() {
         let data = r#"{"source":"summarizer","replaced_count":42,"generation":3}"#;
         assert_eq!(
             event("context.compacted", data),
             TurnEvent::ContextCompacted {
+                trigger: String::new(),
                 source: "summarizer".to_string(),
                 replaced_count: 42,
                 generation: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_compaction_that_failed() {
+        let data = r#"{"compaction_id":"c1","trigger":"emergency",
+                       "error":"the summarizer request failed","interrupted":false}"#;
+        assert_eq!(
+            event("context.compaction_failed", data),
+            TurnEvent::CompactionFailed {
+                trigger: "emergency".to_string(),
+                error: "the summarizer request failed".to_string(),
+                interrupted: false,
             }
         );
     }

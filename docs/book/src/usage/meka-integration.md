@@ -461,6 +461,25 @@ fallbacks = ["backup"]
 
 meka moves a turn to the next profile listed when the upstream is still failing after its retries, or refuses for quota or billing, and goes back to the session's own profile as soon as it answers again. The owner is told when turns move to a fallback and when they come back, rather than on every turn: another model is answering, and another account may be paying. A provider that keeps failing and recovering moves turns back and forth every few minutes, so moves are reported at most once every fifteen minutes, and the next notice says how many there were. Without a fallback, the owner is told of the failed turns themselves while meka retries them; see [Delivery accounting](#delivery-accounting).
 
+## A project for the bridge's session
+
+If the meka that runs the bridge also runs your own sessions, put the bridge's session on a [project](https://docs.meka.so/usage/projects.html), which needs meka 0.84. Otherwise everything the agent notes about the people and groups it talks to lands in the global memory tier, which every one of your sessions reads. A project gives those notes a tier of their own:
+
+- **What it does:** the agent's writes go to the project. Its notes about the chats stay out of your sessions, and its inline memories stop counting against the [`[memory] inline_max_bytes`](https://docs.meka.so/configuration/config-file.html#memory) budget your sessions see. meka refuses a write past that budget, so a busy chat agent filling the global tier would eventually get your own writes refused too.
+- **What it does not do:** hide your global memories from the agent. A session on a project still reads the whole global tier, and this agent talks to whoever is in the chats, so a note they should never hear belongs in a project of your own sessions rather than in the global tier.
+
+Create the project, then move the session onto it. `mekabridge session show` prints the session's id, and the token needs `sessions:w`:
+
+```sh
+meka project add chat
+curl -s -X PATCH http://127.0.0.1:8080/v1/sessions/<id> \
+  -H "Authorization: Bearer $MEKA_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"project": "chat"}'
+```
+
+The answer is the session record, with `"project": "chat"`. A `409` means a turn was running; send it again. meka records the project on the session, so it holds across restarts of either side, and the agent's next turn restates the memories it now sees. The bridge does not set it: a session the bridge creates later, after `mekabridge session reset` or when meka no longer has the old one, starts on no project, as it starts on meka's default profile, and needs moving again.
+
 ## What the agent is told
 
 meka captures an MCP server's `instructions` from the handshake and surfaces them to the agent. mekabridge uses that for the few things nothing else can tell it, and for nothing else. In full:

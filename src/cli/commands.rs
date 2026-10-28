@@ -406,15 +406,25 @@ pub async fn doctor(config: &Config) -> Result<()> {
                     None => {
                         // The bridge creates its session without naming a profile, so meka has to
                         // have one to fall back on. Nothing marked active means either no profile
-                        // is configured or several are with no default chosen between them, and
-                        // meka defers that failure to the first session rather than refusing to
-                        // start, so this surfaces at the first message otherwise. The remedy is
-                        // meka's own wording: `default_profile` is what a command writes, and
-                        // sending an operator to hand-edit the file instead is worse advice.
-                        println!(
-                            "  fail   meka has no default profile, so creating the bridge's \
-                             session will fail; run `meka profile use <name>`"
-                        );
+                        // is configured, which meka 0.85 starts on, or several are with no default
+                        // chosen between them, and meka defers that failure to the first session
+                        // rather than refusing to start, so this surfaces at the first message
+                        // otherwise. The remedies are meka's own wording: a command is what writes
+                        // the file, and sending an operator to hand-edit it instead is worse
+                        // advice.
+                        //
+                        // A running `meka serve` reads a shell's edit only at startup or on `POST
+                        // /v1/config/reload`, which takes a `config:w` token few operators hold, so
+                        // the restart is part of the remedy.
+                        let remedy = if listed.is_empty() {
+                            "meka has no profile, so creating the bridge's session will fail; run \
+                             `meka account add <name>` and `meka profile add <name>`, then restart \
+                             meka"
+                        } else {
+                            "meka has no default profile, so creating the bridge's session will \
+                             fail; run `meka profile use <name>`, then restart meka"
+                        };
+                        println!("  fail   {remedy}");
                         failures += 1;
                     }
                 },

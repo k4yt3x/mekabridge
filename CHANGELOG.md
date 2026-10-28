@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.3] - 2026-10-28
+
+### Fixed
+
+- `doctor` says to add a profile to a meka that has none, and to restart meka after a profile edit.
+
 ## [0.24.2] - 2026-10-26
 
 ### Fixed
@@ -653,7 +659,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.2...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.3...HEAD
+[0.24.3]: https://github.com/k4yt3x/mekabridge/compare/0.24.2...0.24.3
 [0.24.2]: https://github.com/k4yt3x/mekabridge/compare/0.24.1...0.24.2
 [0.24.1]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...0.24.1
 [0.24.0]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...0.24.0

@@ -4,6 +4,8 @@ meka and mekabridge are each other's client. Getting the two configurations to a
 
 **meka 0.80.0 or later is required.** 0.80 runs every process meka starts at the highest `oom_score_adj`, which the [`meka.service` unit](./operations.md#systemd) relies on to keep a runaway command from taking meka down with it. 0.79 speaks MCP 2026-07-28 to this bridge, which keeps no session, so a bridge restart costs no reconnect. 0.78 says when a turn on the bridge's messages failed and will be tried again (`inbox.deferred`), and why it gave a message up, which is how the owner hears of an outage while meka is still trying rather than once it stops. 0.76 renamed a session's `cwd` to `working_directory`, and this bridge sends only the new name, which an older meka refuses as a field it does not know: with `[session].cwd` set, no session can be created. It cuts the other way too: a bridge older than 0.21.0 with `[session].cwd` set cannot create one on meka 0.76. A session already bound keeps working on either mix, so the two can be upgraded one after the other. 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way the bridge hears of one, so against an older meka a hole opened while the feed is read slowly is found an hour or so later rather than at once. 0.70 moved `vision` from `GET /v1/info` onto each entry of `GET /v1/profiles`, and the bridge reads it only there, so before 0.70 `attachment_view` describes every image instead of showing it while everything else looks healthy. Before 0.55 nothing works at all, in both directions at once: messages are handed over through the session inbox, `POST /v1/sessions/{id}/inbox`, which an older meka has no route for and answers with a 404; and their outcome is read from the session feed, `GET /v1/sessions/{id}/stream`, which before 0.55 was a view of one turn that closed at its terminal rather than the session's own feed. `mekabridge doctor` fails on the version for all of these reasons.
 
+With a Claude profile, meka 0.86 or later is worth having. On an older meka, a Claude session that loaded one of the bridge's tools refuses every later turn once the bridge stops offering that tool, as turning off [`admin_tools`](./security.md#moderation-tools) or a bridge upgrade that renames a tool does, until `mekabridge session reset` starts another. 0.86 carries on without the tool.
+
 ## How a message gets to the agent
 
 Every message is one **inbox item** of its own:
@@ -130,7 +132,7 @@ required = true
 eager_load_tools = ["message_send", "conversation_list"]
 ```
 
-If `[mcp].token` is set on the bridge, meka needs the matching token. **It does not go in `config.toml`**, which will not parse a `[[mcp.servers]]` entry containing `auth_token` at all: meka refuses to start rather than connecting unauthenticated. Store it instead, which is also how it is rotated later:
+If `[mcp].token` is set on the bridge, meka needs the matching token. **It does not go in `config.toml`**, which will not parse a `[[mcp.servers]]` entry containing `auth_token` at all: meka refuses to start rather than connecting unauthenticated. Store it instead, which is also how it is rotated later, and how it is stored again if the `url` above moves to another host or port: from meka 0.85 a token is presented only to the endpoint it was stored for, and meka's log names that endpoint when it holds one back:
 
 ```sh
 meka mcp login mekabridge --auth-token-stdin
@@ -168,7 +170,9 @@ writing under a name that exists replaces it. Watches stored by 0.16.0 are kept 
 
 The agent's own history is the other half. A session that has been running across the upgrade has
 old names in its transcript and may reach for one; meka answers with a "did you mean" hint that
-catches reordered words, so `send_message` points at `message_send`. Nothing needs to be reset.
+catches reordered words, so `send_message` points at `message_send`. Nothing needs to be reset on
+meka 0.86 or later; on an older meka, a Claude session that had loaded one of the renamed tools
+refuses every turn until `mekabridge session reset` starts another.
 
 ### Upgrading to 0.18.0, which changed three arguments
 

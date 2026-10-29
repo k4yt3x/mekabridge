@@ -178,7 +178,7 @@ That last part is what `history_read` and `history_search` read, and it makes th
 
 ## Troubleshooting
 
-**meka refuses every turn.** meka started while the bridge's port was closed. It retries in the background and should clear within a few minutes; restart meka if you would rather not wait. See [meka Integration](./meka-integration.md).
+**meka refuses every turn.** meka started while the bridge's port was closed. It retries in the background and should clear within a few minutes; restart meka if you would rather not wait. If meka's log says the bridge's bearer token was given for another URL, the `url` meka has for the bridge has moved since the token was stored, and it will not clear on its own: store the token again with `meka mcp login mekabridge --auth-token-stdin`. See [meka Integration](./meka-integration.md).
 
 **One message went unanswered while others worked.** Look for `the model returned an empty response`
 or `the agent sent no messages this turn` around that timestamp. The first means the provider

@@ -75,7 +75,7 @@ Turn it off when the bot is an administrator for a different reason. Promoting a
 admin_tools = false
 ```
 
-That removes them from `tools/list` entirely rather than failing at call time, so the agent never offers a capability the deployment does not want.
+That removes them from `tools/list` entirely rather than failing at call time, so the agent never offers a capability the deployment does not want. With a Claude profile on meka before 0.86, turning it off after the agent has loaded one of them makes Claude refuse every later turn in that session; `mekabridge session reset` starts another. See [meka Integration](./meka-integration.md).
 
 For a finer grain, meka can raise the required permission on individual tools:
 

@@ -2022,11 +2022,12 @@ async fn apply(
                 "the session feed has a hole; asking what became of every hand-over still out"
             );
             if dropped.is_none() {
-                // meka never issued the position this feed resumed from, which is a meka that
-                // restarted or reloaded the session and numbers its events from the start again.
-                // Kept, the old position would outrank every new id until they passed it: each
-                // reconnect would read as another hole, and one after they passed it would resume
-                // from it and skip what lay below without a word.
+                // meka restarted or reloaded the session since the position this feed resumed from.
+                // Before meka 0.87 the new feed numbers its events from the start again, so kept,
+                // the old position would outrank every new id until they passed it: each reconnect
+                // would read as another hole, and one after they passed it would resume from it and
+                // skip what lay below without a word. From 0.87 the new ids start above every old
+                // one, and dropping the position costs nothing.
                 context.position.store(0, Ordering::SeqCst);
                 if let Err(error) = context.store.set_feed_position(session_id, 0).await {
                     tracing::error!("failed to reset the feed position: {}", error);

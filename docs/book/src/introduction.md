@@ -24,7 +24,7 @@ The bridge reports facts and supplies capabilities; who counts as trusted, and w
     meka serve  ──────── tools/call ────────►  mekabridge  ◄──── long poll ────  Telegram
                                                           ◄──── gateway ──────  Discord
       :8080     ◄─ POST /v1/sessions/{id}/inbox ┘   │
-                ── GET /v1/sessions/{id}/stream ►   └── SQLite: session, queue, conversations
+                ──── GET /v1/sessions/{id}/feed ►   └── SQLite: session, queue, conversations
 ```
 
 meka and mekabridge each act as the other's client. meka calls the bridge's MCP tools to send messages; the bridge puts messages in meka's inbox and follows the session's event feed to learn what became of them.

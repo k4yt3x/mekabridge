@@ -2,9 +2,9 @@
 //!
 //! Two doors matter here. Messages go in through the session inbox, `POST /v1/sessions/{id}/inbox`,
 //! which answers the moment the item is durable on meka's side and never refuses for a turn in
-//! flight. What became of them comes back on the session feed, `GET /v1/sessions/{id}/stream`,
-//! one connection per session that carries every turn's events, whoever started the turn, and does
-//! not end of its own accord.
+//! flight. What became of them comes back on the session feed, `GET /v1/sessions/{id}/feed`
+//! (`/stream` before meka 0.89), one connection per session that carries every turn's events,
+//! whoever started the turn, and does not end of its own accord.
 //!
 //! Retries are deliberately asymmetric. Read-only endpoints retry what [`MekaError::is_retryable`]
 //! admits, which is meka's own error taxonomy by `type` URI rather than by status code, plus a bare
@@ -15,7 +15,14 @@
 
 pub mod sse;
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
@@ -75,10 +82,10 @@ pub struct ProblemDetail {
 
     /// The upstream's own error text, relayed as an RFC 9457 extension member.
     ///
-    /// meka's `detail` on a 502 names its server log rather than the failure, so without this the
-    /// owner's notice says only that the provider refused and an operator has to go and read
-    /// meka's log to learn whether a credential died or a quota ran out. Absent when the operator
-    /// set `[serve] relay_provider_errors = false`.
+    /// meka's `detail` on a 502 says that the provider failed the turn and not why, so without
+    /// this the owner's notice says only that the provider refused and an operator has to go and
+    /// read meka's log to learn whether a credential died or a quota ran out. Absent when the
+    /// operator set `[serve] relay_provider_errors = false`.
     pub provider_response: Option<String>,
 }
 
@@ -305,6 +312,16 @@ impl MekaError {
     pub fn is_session_locked(&self) -> bool {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::SessionLocked)
     }
+
+    /// Whether the path names no route at all, as against a resource the route does not have.
+    ///
+    /// meka's router has no fallback, so a path it does not serve gets the framework's bare 404,
+    /// while every 404 meka writes itself, `session-not-found` among them, is a problem document. A
+    /// proxy in front of meka that serves none of the API answers the same way, and asking it at
+    /// another path costs a request.
+    pub fn is_route_missing(&self) -> bool {
+        matches!(self, Self::UnexpectedStatus { status: 404, .. })
+    }
 }
 
 type Result<T> = std::result::Result<T, MekaError>;
@@ -324,7 +341,7 @@ pub struct SessionInfo {
     #[serde(default)]
     pub working_directory: Option<String>,
     /// The profile the session runs on, which a request may move it off, so it is not always the
-    /// one marked [`Profile::active`].
+    /// one marked [`Profile::default`].
     pub profile: String,
     /// Whether a turn is running on this session right now.
     ///
@@ -392,15 +409,17 @@ pub struct Profile {
     pub vision: bool,
     /// Whether a session naming no profile gets this one. The bridge never names one, so this is
     /// the profile its session starts on.
-    #[serde(default)]
-    pub active: bool,
+    ///
+    /// Called `active` before meka 0.89. No meka sends both, so the alias reads either.
+    #[serde(default, alias = "active")]
+    pub default: bool,
 }
 
 /// The profile called `name` in a listing, or the one a new session gets when `name` is `None`.
 pub fn find_profile<'a>(profiles: &'a [Profile], name: Option<&str>) -> Option<&'a Profile> {
     profiles.iter().find(|profile| match name {
         Some(name) => profile.name == name,
-        None => profile.active,
+        None => profile.default,
     })
 }
 
@@ -518,6 +537,13 @@ pub struct MekaClient {
     base_url: Url,
     token: Secret,
     max_retries: u32,
+    /// Whether the feed last opened at `/stream`, where meka served it before 0.89, rather than at
+    /// `/feed`.
+    ///
+    /// Shared between clones, so every reconnect goes straight to the route that answered last,
+    /// and a meka upgraded or downgraded under a running bridge costs one 404 on the reconnect
+    /// after it.
+    feed_at_stream: Arc<AtomicBool>,
 }
 
 impl MekaClient {
@@ -539,6 +565,7 @@ impl MekaClient {
             base_url: config.base_url.clone(),
             token: config.token.clone(),
             max_retries: config.max_retries,
+            feed_at_stream: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -809,7 +836,7 @@ impl MekaClient {
         decode(response).await
     }
 
-    /// `GET /v1/sessions/{id}/stream`: the session's event feed.
+    /// `GET /v1/sessions/{id}/feed`: the session's event feed.
     ///
     /// Every event of every turn on the session, whoever started it, for as long as the connection
     /// is held; it does not end with a turn. `last_event_id` is the last id already handled, and
@@ -822,6 +849,11 @@ impl MekaClient {
     /// over, and a session evicted for idleness comes back rather than answering 404. It is also
     /// what keeps the session resident: meka does not evict one with a live subscriber.
     ///
+    /// Before 0.89 meka served the feed at `/stream`, and neither route answers on the other's
+    /// meka. So whichever route a feed last opened at is asked first, and a route meka does not
+    /// serve is asked again at the other, rather than taking a version off `/v1/info` that a meka
+    /// upgraded under a running bridge would leave stale.
+    ///
     /// Errors before the first byte surface here rather than inside the stream, so the caller can
     /// tell a session that is gone from a connection that was lost.
     pub async fn open_feed(
@@ -829,7 +861,35 @@ impl MekaClient {
         session_id: Uuid,
         last_event_id: Option<u64>,
     ) -> Result<impl Stream<Item = Result<StreamItem>> + Send + use<>> {
-        let url = self.endpoint(&format!("/v1/sessions/{session_id}/stream"))?;
+        let at_stream = self.feed_at_stream.load(Ordering::SeqCst);
+        match self
+            .request_feed(session_id, last_event_id, at_stream)
+            .await
+        {
+            Err(error) if error.is_route_missing() => {
+                let other = self
+                    .request_feed(session_id, last_event_id, !at_stream)
+                    .await;
+                // A problem means the route exists as surely as a feed does: `session-not-found`
+                // comes from a route that would have served the session.
+                if matches!(&other, Ok(_) | Err(MekaError::Problem(_))) {
+                    self.feed_at_stream.store(!at_stream, Ordering::SeqCst);
+                }
+                other
+            }
+            opened => opened,
+        }
+    }
+
+    /// Open the feed at `/stream` when `at_stream`, else at `/feed`.
+    async fn request_feed(
+        &self,
+        session_id: Uuid,
+        last_event_id: Option<u64>,
+        at_stream: bool,
+    ) -> Result<impl Stream<Item = Result<StreamItem>> + Send + use<>> {
+        let route = if at_stream { "stream" } else { "feed" };
+        let url = self.endpoint(&format!("/v1/sessions/{session_id}/{route}"))?;
         let mut request = self.http.get(url).bearer_auth(self.token.expose());
         if let Some(last_event_id) = last_event_id {
             request = request.header("Last-Event-ID", last_event_id.to_string());
@@ -1013,10 +1073,14 @@ mod tests {
     }
 
     /// The segment after the last slash is the whole contract, so meka moving its URIs to another
-    /// host, as it once did, changes nothing here.
+    /// host, as 0.89 did from `meka.run` to `meka.bot`, changes nothing here.
     #[test]
     fn the_host_a_type_uri_sits_under_decides_nothing() {
-        for host in ["https://meka.run", "https://errors.example"] {
+        for host in [
+            "https://meka.bot",
+            "https://meka.run",
+            "https://errors.example",
+        ] {
             assert_eq!(
                 problem(&format!("{host}/errors/context-overflow")).kind(),
                 ProblemKind::ContextOverflow,
@@ -1369,8 +1433,8 @@ mod tests {
         assert!(!info.turn_in_flight);
     }
 
-    /// The bridge names no profile, so its session starts on the one marked `active`. A request can
-    /// move it to another afterwards, and from then on whether it can be shown an image is that
+    /// The bridge names no profile, so its session starts on the one marked `default`. A request
+    /// can move it to another afterwards, and from then on whether it can be shown an image is that
     /// profile's answer, not the default's.
     #[test]
     fn a_profile_is_found_by_name_or_as_the_default() {
@@ -1381,16 +1445,16 @@ mod tests {
 
         let body = r#"{"profiles":[
             {"name":"cheap","account":"personal","backend":"openai-responses","vision":false,
-             "active":false},
+             "default":false},
             {"name":"work","account":"work","backend":"anthropic-messages",
-             "model":"claude-opus-5","vision":true,"active":true}]}"#;
+             "model":"claude-opus-5","vision":true,"default":true}]}"#;
         let parsed: Response = serde_json::from_str(body).expect("profiles must deserialize");
-        let active = find_profile(&parsed.profiles, None).expect("one profile is the default");
-        assert_eq!(active.name, "work");
-        assert_eq!(active.account, "work");
-        assert_eq!(active.backend.as_deref(), Some("anthropic-messages"));
-        assert_eq!(active.model.as_deref(), Some("claude-opus-5"));
-        assert!(active.vision);
+        let default = find_profile(&parsed.profiles, None).expect("one profile is the default");
+        assert_eq!(default.name, "work");
+        assert_eq!(default.account, "work");
+        assert_eq!(default.backend.as_deref(), Some("anthropic-messages"));
+        assert_eq!(default.model.as_deref(), Some("claude-opus-5"));
+        assert!(default.vision);
         let moved = find_profile(&parsed.profiles, Some("cheap")).expect("found by name");
         assert!(
             !moved.vision,
@@ -1404,12 +1468,23 @@ mod tests {
         assert_eq!(parsed.profiles[0].model, None);
     }
 
+    /// meka 0.89 renamed the default's flag from `active`. Read under one name alone, a `doctor`
+    /// run against the other meka finds no default and fails, saying creating the session will.
+    #[test]
+    fn the_default_profile_reads_under_either_name() {
+        for flag in ["default", "active"] {
+            let body = format!(r#"{{"name":"work","account":"work","vision":true,"{flag}":true}}"#);
+            let profile: Profile = serde_json::from_str(&body).expect("must deserialize");
+            assert!(profile.default, "the default under `{flag}`");
+        }
+    }
+
     /// A profile naming an account `config.toml` does not have. meka lists it with no `backend`
     /// rather than dropping it, and reports the dangling account beside the table, so a required
     /// field here would turn the row that explains the misconfiguration into a decode error.
     #[test]
     fn a_profile_on_a_missing_account_still_reads() {
-        let body = r#"{"name":"work","account":"gone","vision":true,"active":true}"#;
+        let body = r#"{"name":"work","account":"gone","vision":true,"default":true}"#;
         let profile: Profile = serde_json::from_str(body).expect("must deserialize");
         assert_eq!(profile.backend, None);
         assert_eq!(profile.account, "gone");
@@ -1421,8 +1496,8 @@ mod tests {
         assert_eq!(rendered, "t (409): d");
     }
 
-    /// meka's own `detail` for a 502 points at its server log, so the owner's notice is only worth
-    /// reading if the relayed upstream text rides along with it.
+    /// meka's own `detail` for a 502 says that the provider failed the turn and not why, so the
+    /// owner's notice is only worth reading if the relayed upstream text rides along with it.
     #[test]
     fn the_upstream_response_reaches_whoever_reads_the_failure() {
         let mut detail = problem("https://meka.run/errors/provider");
@@ -1461,9 +1536,9 @@ mod tests {
     /// caught here instead of by an operator reading a notice that stopped naming the cause.
     #[test]
     fn a_real_502_body_parses_into_both_new_fields() {
-        let body = r#"{"type":"https://meka.run/errors/provider-unavailable",
+        let body = r#"{"type":"https://meka.bot/errors/provider-unavailable",
                        "title":"Provider temporarily unavailable","status":502,
-                       "detail":"its response is in the server log",
+                       "detail":"the provider did not complete this turn",
                        "provider_response":"529 overloaded_error","retry_after":30}"#;
         let detail: ProblemDetail = serde_json::from_str(body).expect("a 502 body must parse");
         assert_eq!(detail.kind(), ProblemKind::ProviderUnavailable);

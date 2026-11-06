@@ -405,12 +405,12 @@ pub async fn doctor(config: &Config) -> Result<()> {
                     ),
                     None => {
                         // The bridge creates its session without naming a profile, so meka has to
-                        // have one to fall back on. Nothing marked active means either no profile
-                        // is configured, which meka 0.85 starts on, or several are with no default
-                        // chosen between them, and meka defers that failure to the first session
-                        // rather than refusing to start, so this surfaces at the first message
-                        // otherwise. The remedies are meka's own wording: a command is what writes
-                        // the file, and sending an operator to hand-edit it instead is worse
+                        // have one to fall back on. Nothing marked the default means either no
+                        // profile is configured, which meka 0.85 starts on, or several are with no
+                        // default chosen between them, and meka defers that failure to the first
+                        // session rather than refusing to start, so this surfaces at the first
+                        // message otherwise. The remedies are meka's own wording: a command is what
+                        // writes the file, and sending an operator to hand-edit it instead is worse
                         // advice.
                         //
                         // A running `meka serve` reads a shell's edit only at startup or on `POST
@@ -1903,13 +1903,13 @@ mod tests {
 
     #[test]
     fn vision_is_judged_on_the_profile_the_session_is_on() {
-        let profile = |name: &str, vision: bool, active: bool| Profile {
+        let profile = |name: &str, vision: bool, default: bool| Profile {
             name: name.to_string(),
             account: "work".to_string(),
             backend: Some("anthropic-messages".to_string()),
             model: None,
             vision,
-            active,
+            default,
         };
         let profiles = [profile("work", true, true), profile("text", false, false)];
         let session = |name: &str| VisionSubject::Session {

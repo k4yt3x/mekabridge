@@ -9,7 +9,7 @@
                              sink  ◄──  MCP server    session task ──POST /inbox──┐
                                             ▲             ▲                       │
                                             │             │                       ▼
-                                       meka serve  ◄──  feed reader ◄──GET /stream─┘
+                                       meka serve  ◄──  feed reader ◄──GET /feed───┘
 ```
 
 Inbound goes left to right and stops at the queue. Outbound starts when the agent calls a tool, and never before.
@@ -38,7 +38,7 @@ It stays there until meka says the item carrying it is durable on *its* side, an
 Three tasks, deliberately separate:
 
 - The **writer** persists every event before acknowledging it.
-- The **feed reader** holds `GET /v1/sessions/{id}/stream` open and hands every frame straight on. It touches nothing and decides nothing, which is what keeps meka's per-consumer buffer drained while the session task is busy with a request of its own.
+- The **feed reader** holds `GET /v1/sessions/{id}/feed` open and hands every frame straight on. It touches nothing and decides nothing, which is what keeps meka's per-consumer buffer drained while the session task is busy with a request of its own.
 - The **session task** claims messages, renders and posts them, and acts on what the feed says. It is the only writer of queue state, so the bridge never races itself.
 
 Claiming happens in one transaction, so a session task racing a restart cannot hand the same message over twice.

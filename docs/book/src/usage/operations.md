@@ -205,11 +205,11 @@ says which:
 
 `owner_conversation` has meka's error verbatim, and after a provider failure the upstream's own
 response alongside it, as `The provider said: ...`. That is what names a revoked credential or a
-spent quota rather than leaving the notice pointing at meka's log. Two things withhold it: a meka
-older than the `[serve] relay_provider_errors` key, and an operator who set that key to `false`,
-which is worth doing where read-only meka tokens go to people not entitled to the provider account,
-since the same text names it. `mekabridge queue list` shows the rows as `failed`, and
-`mekabridge unseen` counts what the agent still has not been shown, unless
+spent quota, which meka's own sentence does not: it says the provider failed the turn, not why. Two
+things withhold it: a meka older than the `[serve] relay_provider_errors` key, and an operator who
+set that key to `false`, which is worth doing where read-only meka tokens go to people not entitled
+to the provider account, since the same text names it. `mekabridge queue list` shows the rows as
+`failed`, and `mekabridge unseen` counts what the agent still has not been shown, unless
 `[storage].history_retention` is zero, in which case there is no history to put the message back
 into and it is gone.
 

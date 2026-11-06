@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// Who started a turn, off `turn.started`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnSource {
-    /// A `POST /turn`.
+    /// A client's own turn: `POST /turns`, or `POST /turn` before meka 0.89.
     Client,
     /// meka opened the turn on waiting inbox items, which it names.
     Inbox { item_ids: Vec<String> },
@@ -79,7 +79,8 @@ pub enum TurnEvent {
         /// `retention`. Empty from a meka before 0.84.
         trigger: String,
         source: String,
-        replaced_count: u64,
+        /// How many messages the compaction took out of the window. meka 0.89 stopped sending it.
+        replaced_count: Option<u64>,
         generation: u64,
     },
     /// A compaction ended without replacing the window.
@@ -94,7 +95,8 @@ pub enum TurnEvent {
         interrupted: bool,
     },
     /// Emitted when a gated tool needs approval, which for this bridge means the session has
-    /// meka's `approvals` switch on.
+    /// meka's `approvals` switch on. `approval.requested` from meka 0.89, `permission_required`
+    /// before it, with the same fields.
     ///
     /// The turn does not stall on it. Every session here is created with
     /// `supports_permission_prompts: false`, which meka answers by denying the call at once with a
@@ -291,7 +293,9 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
         "context.compacted" => TurnEvent::ContextCompacted {
             trigger: string("trigger"),
             source: string("source"),
-            replaced_count: number("replaced_count"),
+            replaced_count: value
+                .get("replaced_count")
+                .and_then(serde_json::Value::as_u64),
             generation: number("generation"),
         },
         "context.compaction_failed" => TurnEvent::CompactionFailed {
@@ -302,7 +306,7 @@ pub fn parse(event_name: &str, data: &str) -> Result<Option<Parsed>, serde_json:
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
         },
-        "permission_required" => TurnEvent::PermissionRequired {
+        "approval.requested" | "permission_required" => TurnEvent::PermissionRequired {
             request_id: string("request_id"),
             tool_name: string("tool_name"),
             expires_in_seconds: value
@@ -456,23 +460,24 @@ mod tests {
         );
     }
 
+    /// What meka 0.89 sends, which no longer counts the messages the compaction replaced.
     #[test]
     fn parses_a_compaction() {
         let data = r#"{"compaction_id":"c1","trigger":"reactive","source":"checkpoint",
                        "memories_written":["alice-timezone"],"kept_recent":true,
-                       "replaced_count":42,"generation":3}"#;
+                       "generation":3}"#;
         assert_eq!(
             event("context.compacted", data),
             TurnEvent::ContextCompacted {
                 trigger: "reactive".to_string(),
                 source: "checkpoint".to_string(),
-                replaced_count: 42,
+                replaced_count: None,
                 generation: 3
             }
         );
     }
 
-    /// What a meka before 0.84 sends, which names no trigger.
+    /// What a meka before 0.84 sends, which names no trigger and counts the replaced messages.
     #[test]
     fn a_compaction_from_an_older_meka_still_parses() {
         let data = r#"{"source":"summarizer","replaced_count":42,"generation":3}"#;
@@ -481,10 +486,29 @@ mod tests {
             TurnEvent::ContextCompacted {
                 trigger: String::new(),
                 source: "summarizer".to_string(),
-                replaced_count: 42,
+                replaced_count: Some(42),
                 generation: 3
             }
         );
+    }
+
+    /// meka 0.89 renamed `permission_required` to `approval.requested` and kept its fields, so a
+    /// request parked on a session that opted into approvals is reported on either meka.
+    #[test]
+    fn parses_an_approval_request_under_either_name() {
+        let data = r#"{"request_id":"r1","tool_name":"shell_execute","input":{},
+                       "expires_in_seconds":1800}"#;
+        for name in ["approval.requested", "permission_required"] {
+            assert_eq!(
+                event(name, data),
+                TurnEvent::PermissionRequired {
+                    request_id: "r1".to_string(),
+                    tool_name: "shell_execute".to_string(),
+                    expires_in_seconds: 1800,
+                },
+                "{name}"
+            );
+        }
     }
 
     #[test]

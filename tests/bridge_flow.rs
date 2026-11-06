@@ -319,6 +319,12 @@ struct MekaRecorder {
     feed_gap: Mutex<bool>,
     /// Feed attaches to refuse with a 404, standing in for a session meka has lost.
     feed_404_first: Mutex<usize>,
+    /// Whether the feed is served where meka served it before 0.89, at `/stream`, leaving `/feed`
+    /// a path this meka has no route for.
+    feed_before_0_89: Mutex<bool>,
+    /// The route each feed request asked at, `feed` or `stream`, one answered with a bare 404
+    /// included.
+    feed_routes: Mutex<Vec<&'static str>>,
     /// Close the feed connection after this many frames, to exercise the reconnect.
     drop_feed_after: Mutex<Option<usize>>,
     /// Whether the feed carries a frame this build cannot parse: a known event name with a payload
@@ -1020,7 +1026,45 @@ fn finish(feed: &Feed, turn: &str, stop_reason: &str) {
     feed.push("turn.finished", Some(turn), data);
 }
 
-/// `GET /v1/sessions/{id}/stream`: the session feed, which does not end with a turn.
+/// `GET /v1/sessions/{id}/feed`, where meka 0.89 serves the feed.
+async fn open_feed_at_feed(
+    State(recorder): State<Arc<MekaRecorder>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    open_feed_at(recorder, headers, "feed").await
+}
+
+/// `GET /v1/sessions/{id}/stream`, where meka served the feed before 0.89.
+async fn open_feed_at_stream(
+    State(recorder): State<Arc<MekaRecorder>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    open_feed_at(recorder, headers, "stream").await
+}
+
+/// The feed at `route`, or the bare 404 meka's router gives a path it has no route for when this
+/// meka serves the feed at the other.
+async fn open_feed_at(
+    recorder: Arc<MekaRecorder>,
+    headers: axum::http::HeaderMap,
+    route: &'static str,
+) -> axum::response::Response {
+    recorder
+        .feed_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(route);
+    let before_0_89 = *recorder
+        .feed_before_0_89
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if (route == "stream") != before_0_89 {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    open_feed(State(recorder), headers).await
+}
+
+/// The session feed, which does not end with a turn.
 ///
 /// Replays everything after `Last-Event-ID` out of the ring, then follows the live feed for as long
 /// as the connection is held.
@@ -1206,11 +1250,11 @@ async fn profiles() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "profiles": [
             {"name": "work", "account": "work", "backend": "anthropic-messages",
-             "vision": true, "active": true},
+             "vision": true, "default": true},
             {"name": "text", "account": "work", "backend": "anthropic-messages",
-             "vision": false, "active": false},
+             "vision": false, "default": false},
             {"name": "eyes", "account": "work", "backend": "anthropic-messages",
-             "vision": true, "active": false},
+             "vision": true, "default": false},
         ],
     }))
 }
@@ -1230,7 +1274,14 @@ async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationTok
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", axum::routing::get(get_session))
         .route("/v1/sessions/{id}/inbox", post(enqueue_item))
-        .route("/v1/sessions/{id}/stream", axum::routing::get(open_feed))
+        .route(
+            "/v1/sessions/{id}/feed",
+            axum::routing::get(open_feed_at_feed),
+        )
+        .route(
+            "/v1/sessions/{id}/stream",
+            axum::routing::get(open_feed_at_stream),
+        )
         .route("/v1/sessions/{id}/cancel", post(cancel_turn))
         .route("/v1/profiles", axum::routing::get(profiles))
         .route("/v1/health/ready", axum::routing::get(ready))
@@ -5370,6 +5421,76 @@ async fn the_sink_lists_conversations_for_the_agent() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "mock:1");
     assert_eq!(listed[0].title.as_deref(), Some("Alice"));
+}
+
+/// meka 0.89 moved the feed from `/stream` to `/feed` and left nothing at the old path. The route
+/// that answered last is asked first, by every clone of the client, so a bridge on either meka
+/// meets one bare 404 at most, and another only when meka is upgraded or downgraded under it. A
+/// problem from the other route is meka's answer about the session, so a session an older meka lost
+/// is still reported as gone, and the route that said so is the one asked next.
+#[tokio::test]
+async fn the_feed_is_opened_wherever_this_meka_serves_it() {
+    let recorder = Arc::new(MekaRecorder::default());
+    recorder.set(&recorder.feed_before_0_89, true);
+    let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
+    let meka = MekaClient::new(
+        &config_for(
+            address,
+            &std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+            false,
+        )
+        .meka,
+    )
+    .expect("client");
+    let routes = || {
+        recorder
+            .feed_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    };
+    let session = uuid::Uuid::new_v4();
+
+    recorder.set(&recorder.feed_404_first, 1);
+    let gone = meka
+        .open_feed(session, None)
+        .await
+        .err()
+        .expect("the session is gone");
+    assert!(gone.is_session_missing(), "{gone}");
+    assert_eq!(routes(), ["feed", "stream"]);
+
+    for client in [meka.clone(), meka.clone()] {
+        drop(
+            client
+                .open_feed(session, None)
+                .await
+                .expect("a meka before 0.89 serves the feed at /stream"),
+        );
+    }
+    assert_eq!(routes(), ["feed", "stream", "stream", "stream"]);
+
+    recorder.set(&recorder.feed_before_0_89, false);
+    drop(
+        meka.open_feed(session, Some(7))
+            .await
+            .expect("an upgraded meka serves it at /feed"),
+    );
+    assert_eq!(routes(), [
+        "feed", "stream", "stream", "stream", "stream", "feed"
+    ]);
+    assert_eq!(
+        recorder
+            .attaches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .copied(),
+        Some(Some(7)),
+        "the second route is asked to resume from the same place"
+    );
+
+    shutdown.cancel();
 }
 
 #[tokio::test]

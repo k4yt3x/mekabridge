@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.4] - 2026-11-06
+
+### Fixed
+
+- The session feed opens on meka 0.89, which serves it at `/feed`, and still on an older meka.
+- `doctor` finds the default profile on meka 0.89, which marks it `default` rather than `active`.
+- A permission request is logged again on meka 0.89, which calls it `approval.requested`.
+- A compaction on meka 0.89 is no longer logged as replacing zero messages.
+
 ## [0.24.3] - 2026-10-28
 
 ### Fixed
@@ -659,7 +668,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.3...HEAD
+[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.4...HEAD
+[0.24.4]: https://github.com/k4yt3x/mekabridge/compare/0.24.3...0.24.4
 [0.24.3]: https://github.com/k4yt3x/mekabridge/compare/0.24.2...0.24.3
 [0.24.2]: https://github.com/k4yt3x/mekabridge/compare/0.24.1...0.24.2
 [0.24.1]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...0.24.1

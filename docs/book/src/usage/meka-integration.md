@@ -80,9 +80,11 @@ owner is told, and the chats only where the agent had not got a word in.
 One connection, held open for as long as the bridge runs:
 
 ```
-GET /v1/sessions/{id}/stream
+GET /v1/sessions/{id}/feed
 Last-Event-ID: <the last event acted on>
 ```
+
+A meka before 0.89 serves it at `/v1/sessions/{id}/stream` instead and has no `/feed`, as 0.89 has no `/stream`. The bridge asks first wherever the feed last opened, and at the other path when meka has no route for that one, so it follows meka through an upgrade or a downgrade without a restart or a setting.
 
 It carries every turn on the session, whoever started it, and does not end with one. That is how the
 bridge sees the turns nobody asked it for, a scheduled job firing at three in the morning or a
@@ -467,9 +469,9 @@ meka moves a turn to the next profile listed when the upstream is still failing 
 
 ## A project for the bridge's session
 
-If the meka that runs the bridge also runs your own sessions, put the bridge's session on a [project](https://docs.meka.so/usage/projects.html), which needs meka 0.84. Otherwise everything the agent notes about the people and groups it talks to lands in the global memory tier, which every one of your sessions reads. A project gives those notes a tier of their own:
+If the meka that runs the bridge also runs your own sessions, put the bridge's session on a [project](https://docs.meka.bot/usage/projects.html), which needs meka 0.84. Otherwise everything the agent notes about the people and groups it talks to lands in the global memory tier, which every one of your sessions reads. A project gives those notes a tier of their own:
 
-- **What it does:** the agent's writes go to the project. Its notes about the chats stay out of your sessions, and its inline memories stop counting against the [`[memory] inline_max_bytes`](https://docs.meka.so/configuration/config-file.html#memory) budget your sessions see. meka refuses a write past that budget, so a busy chat agent filling the global tier would eventually get your own writes refused too.
+- **What it does:** the agent's writes go to the project. Its notes about the chats stay out of your sessions, and its inline memories stop counting against the [`[memory] inline_max_bytes`](https://docs.meka.bot/configuration/config-file.html#memory) budget your sessions see. meka refuses a write past that budget, so a busy chat agent filling the global tier would eventually get your own writes refused too.
 - **What it does not do:** hide your global memories from the agent. A session on a project still reads the whole global tier, and this agent talks to whoever is in the chats, so a note they should never hear belongs in a project of your own sessions rather than in the global tier.
 
 Create the project, then move the session onto it. `mekabridge session show` prints the session's id, and the token needs `sessions:w`. `meka project add` works on meka's own host; from another machine, `POST /v1/projects` with `{"name": "chat"}` adds the project instead, with a token holding `memory:w`:

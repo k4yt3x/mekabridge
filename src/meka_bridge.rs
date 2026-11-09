@@ -1,8 +1,8 @@
-//! mekabridge relays messages between third-party chat platforms and a single, permanent
-//! [meka](https://github.com/k4yt3x/meka) agent session.
+//! Meka Bridge relays messages between third-party chat platforms and a single, permanent
+//! [Meka](https://github.com/k4yt3x/meka) agent session.
 //!
-//! Inbound messages are queued and handed over one at a time, through meka's session inbox, which
-//! is where a message waits for the agent. meka reads them all into one turn, so messages that
+//! Inbound messages are queued and handed over one at a time, through Meka's session inbox, which
+//! is where a message waits for the agent. Meka reads them all into one turn, so messages that
 //! settle together still cost one provider round trip, and one that lands while the agent is
 //! working is read by that same turn rather than waiting for it.
 //!

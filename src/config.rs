@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Directory name used under the platform config and data directories.
-const APP_DIR: &str = "mekabridge";
+const APP_DIR: &str = "meka-bridge";
 
 /// Shortest a conversation is ever held before its messages are claimed.
 ///
@@ -35,18 +35,18 @@ const APP_DIR: &str = "mekabridge";
 /// anybody types.
 const DEFAULT_COALESCE_FLOOR: Duration = Duration::from_secs(1);
 
-/// First wait before a hand-over meka did not accept is posted again, doubled on each further one.
+/// First wait before a hand-over Meka did not accept is posted again, doubled on each further one.
 ///
-/// meka's own inbox waits ten seconds before its first retry and doubles from there, so a batch
-/// waits on the same schedule whether it is the bridge or meka that cannot get through. Coming
+/// Meka's own inbox waits ten seconds before its first retry and doubles from there, so a batch
+/// waits on the same schedule whether it is the bridge or Meka that cannot get through. Coming
 /// straight back would spend the next post inside the same outage.
 const DEFAULT_RETRY_BASE: Duration = Duration::from_secs(10);
 
-/// How long a batch may go unaccepted before it is given up on, matching the hour meka gives an
+/// How long a batch may go unaccepted before it is given up on, matching the hour Meka gives an
 /// item it has accepted before it reports `inbox.failed`.
 const DEFAULT_HAND_OVER_WITHIN: Duration = Duration::from_secs(60 * 60);
 
-/// How often meka is asked about a hand-over it has held longer than an outcome can take. Bounds
+/// How often Meka is asked about a hand-over it has held longer than an outcome can take. Bounds
 /// the cost of asking about one it is legitimately holding for the next turn.
 const DEFAULT_STRAGGLER_SWEEP: Duration = Duration::from_secs(5 * 60);
 
@@ -104,12 +104,12 @@ pub struct MekaConfig {
     pub max_retries: u32,
 }
 
-/// The one meka session this bridge instance owns.
+/// The one Meka session this bridge instance owns.
 #[derive(Debug)]
 pub struct SessionConfig {
     pub cwd: Option<PathBuf>,
     pub permission: Permission,
-    /// Create a replacement session when meka reports the stored id no longer exists.
+    /// Create a replacement session when Meka reports the stored id no longer exists.
     pub recreate_on_missing: bool,
 }
 
@@ -121,7 +121,7 @@ pub struct BridgeConfig {
     pub max_queue_depth: usize,
     /// Ceiling on how many messages one pass claims, renders and posts.
     ///
-    /// Not a ceiling on what one turn reads: meka takes every item posted around it, so a burst
+    /// Not a ceiling on what one turn reads: Meka takes every item posted around it, so a burst
     /// wider than this is posted over consecutive passes and still reaches the agent in one
     /// turn. What it bounds is how much work is in flight on this side at once.
     pub batch_max_messages: usize,
@@ -151,26 +151,26 @@ pub struct BridgeConfig {
     /// How often the typing indicator is renewed while the model writes a message. See
     /// [`BridgeConfig::retry_base`] for why this is not in the file format either.
     pub typing_refresh: Duration,
-    /// How long the first repeat of a hand-over meka did not accept waits, doubling thereafter.
+    /// How long the first repeat of a hand-over Meka did not accept waits, doubling thereafter.
     ///
     /// Absent from the file format for the same reason as [`BridgeConfig::coalesce_floor`]: it
-    /// describes how meka behaves when it cannot be reached rather than anything an operator has a
-    /// preference about, and it mirrors the schedule meka's own inbox retries on.
+    /// describes how Meka behaves when it cannot be reached rather than anything an operator has a
+    /// preference about, and it mirrors the schedule Meka's own inbox retries on.
     pub retry_base: Duration,
-    /// How long a hand-over may go unaccepted by meka before it is given up on, from when it was
+    /// How long a hand-over may go unaccepted by Meka before it is given up on, from when it was
     /// rendered.
     ///
-    /// The same hour meka gives an item it has accepted, so a message waits the same length of
+    /// The same hour Meka gives an item it has accepted, so a message waits the same length of
     /// time whichever side of the hand-over the outage is on. Not in the file format: the test
     /// harness shrinks it, and an operator has no better number.
     pub hand_over_within: Duration,
     /// Extra times a message is offered after an item carrying it was taken back unread, or after
     /// the model came back empty. Not in the file format for the same reason.
     pub max_offers: u32,
-    /// How often meka is asked about hand-overs it has held longer than an outcome can take.
+    /// How often Meka is asked about hand-overs it has held longer than an outcome can take.
     ///
     /// On a clock rather than on the queue's own round, because a hand-over can sit unresolved for
-    /// a long time with nothing wrong: meka holds an item a tool round carried into the
+    /// a long time with nothing wrong: Meka holds an item a tool round carried into the
     /// conversation for whatever turn comes next, which on a quiet session is hours away, and
     /// asking will not hurry it. Not in the file format; the test harness shrinks it.
     pub straggler_sweep: Duration,
@@ -227,13 +227,13 @@ impl DefaultPolicy {
     }
 }
 
-/// How meka reaches this bridge's MCP server.
+/// How Meka reaches this bridge's MCP server.
 #[derive(Debug)]
 pub struct McpConfig {
     pub transport: McpTransport,
     pub bind: SocketAddr,
     pub path: String,
-    /// Bearer token meka must present. `None` leaves the endpoint unauthenticated, which is only
+    /// Bearer token Meka must present. `None` leaves the endpoint unauthenticated, which is only
     /// reasonable on a loopback bind.
     pub token: Option<Secret>,
     /// `Host` header values the MCP transport accepts. rmcp defaults to loopback names to blunt
@@ -246,7 +246,7 @@ pub struct McpConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
-    /// Streamable HTTP on [`McpConfig::bind`]. meka connects with `transport = "http"`.
+    /// Streamable HTTP on [`McpConfig::bind`]. Meka connects with `transport = "http"`.
     Http,
     /// stdio, for `meka mcp` style child-process launches and MCP Inspector debugging.
     Stdio,
@@ -270,7 +270,7 @@ pub struct StorageConfig {
 /// Logging setup.
 #[derive(Debug)]
 pub struct LogConfig {
-    /// `EnvFilter` directive string, for example `info` or `mekabridge=debug,teloxide=warn`.
+    /// `EnvFilter` directive string, for example `info` or `meka_bridge=debug,teloxide=warn`.
     pub level: String,
     pub format: LogFormat,
 }
@@ -390,9 +390,9 @@ pub enum TelegramParseMode {
     None,
 }
 
-/// meka permission level a session runs at.
+/// Meka permission level a session runs at.
 ///
-/// The four rungs meka defines. Asking about a call above the level is a switch beside them, which
+/// The four rungs Meka defines. Asking about a call above the level is a switch beside them, which
 /// this bridge leaves off: it declares `supports_permission_prompts: false`, so there is no one
 /// here to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -405,7 +405,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// Wire form accepted by meka's session API.
+    /// Wire form accepted by Meka's session API.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -421,7 +421,7 @@ impl Config {
     ///
     /// `path` overrides the default location; when it is `None` the platform config directory is
     /// used and a missing file is an error, because there is no useful zero-config behaviour (a bot
-    /// token and a meka token are both mandatory).
+    /// token and a Meka token are both mandatory).
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let path = match path {
             Some(path) => path.to_path_buf(),
@@ -445,7 +445,7 @@ impl Config {
     }
 }
 
-/// Default config file location, `<config dir>/mekabridge/config.toml`.
+/// Default config file location, `<config dir>/meka-bridge/config.toml`.
 pub fn default_config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| {
         BridgeError::config("no platform config directory is available; pass --config")
@@ -453,7 +453,7 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(base.join(APP_DIR).join("config.toml"))
 }
 
-/// Default data directory, `<data dir>/mekabridge`.
+/// Default data directory, `<data dir>/meka-bridge`.
 fn default_data_dir() -> Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| {
         BridgeError::config("no platform data directory is available; set [storage].path")
@@ -826,7 +826,7 @@ impl FileConfig {
             None => data_dir
                 .as_ref()
                 .ok_or_else(|| BridgeError::config("no data directory"))?
-                .join("mekabridge.db"),
+                .join("meka-bridge.db"),
         };
         let attachment_dir = match self.storage.attachment_dir {
             Some(path) => expand_path(&path, &config_dir)?,
@@ -1303,7 +1303,7 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str) -> Result<Config> {
-        Config::from_toml(raw, Path::new("/etc/mekabridge/config.toml"))
+        Config::from_toml(raw, Path::new("/etc/meka-bridge/config.toml"))
     }
 
     const MINIMAL: &str = r#"
@@ -1470,8 +1470,8 @@ token = \"meka-token\"
 
     #[test]
     fn the_retired_turn_knobs_are_refused_by_name() {
-        // Both stopped meaning anything when hand-over moved to meka's inbox: the bridge no longer
-        // holds a turn open to time out, and meka retries a hand-over it accepted itself. A file
+        // Both stopped meaning anything when hand-over moved to Meka's inbox: the bridge no longer
+        // holds a turn open to time out, and Meka retries a hand-over it accepted itself. A file
         // still carrying either is refused rather than read with the knob silently inert, so an
         // operator is not left reading their own config as the explanation for behaviour it no
         // longer controls.
@@ -1496,8 +1496,8 @@ token = \"meka-token\"
 
     #[test]
     fn the_permission_ladder_matches_mekas() {
-        // Pinned against meka's own four, because the wire form goes straight into
-        // `POST /v1/sessions` and a level meka cannot parse is a 422 on the first message rather
+        // Pinned against Meka's own four, because the wire form goes straight into
+        // `POST /v1/sessions` and a level Meka cannot parse is a 422 on the first message rather
         // than a startup error anybody sees.
         for (raw, expected) in [
             ("none", Permission::None),
@@ -1514,7 +1514,7 @@ token = \"meka-token\"
 
     #[test]
     fn an_unknown_level_is_refused_with_the_ladder() {
-        // A typo has to come back naming the word and the levels meka has, not as a bare parse
+        // A typo has to come back naming the word and the levels Meka has, not as a bare parse
         // failure.
         let raw = format!("{MINIMAL}\n[session]\npermission = \"writeable\"\n");
         let error = parse(&raw).expect_err("a level that never existed must be refused");
@@ -1827,7 +1827,7 @@ allowed_users = [1]
     #[test]
     fn relative_cwd_is_rejected() {
         let raw = format!("{MINIMAL}\n[session]\ncwd = \"relative/path\"\n");
-        let error = parse(&raw).expect_err("meka requires an absolute cwd");
+        let error = parse(&raw).expect_err("Meka requires an absolute cwd");
         assert!(error.to_string().contains("absolute path"));
     }
 
@@ -1885,12 +1885,12 @@ allowed_users = [123]
     #[test]
     fn storage_paths_default_under_the_data_directory() {
         let config = parse(MINIMAL).expect("valid");
-        assert!(config.storage.path.ends_with("mekabridge/mekabridge.db"));
+        assert!(config.storage.path.ends_with("meka-bridge/meka-bridge.db"));
         assert!(
             config
                 .storage
                 .attachment_dir
-                .ends_with("mekabridge/attachments")
+                .ends_with("meka-bridge/attachments")
         );
     }
 
@@ -1900,7 +1900,7 @@ allowed_users = [123]
         let config = parse(&raw).expect("valid");
         assert_eq!(
             config.storage.path,
-            Path::new("/etc/mekabridge/state.db"),
+            Path::new("/etc/meka-bridge/state.db"),
             "relative paths must anchor to the config file, not the process cwd"
         );
     }

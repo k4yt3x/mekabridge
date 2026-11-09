@@ -2052,7 +2052,7 @@ impl Channel for DiscordChannel {
             vec![
                 MinimalActivity {
                     kind: ActivityType::Custom,
-                    name: "relaying to meka".to_string(),
+                    name: "relaying to Meka".to_string(),
                     url: None,
                 }
                 .into(),

@@ -77,7 +77,7 @@ What replaces it is four things the agent asks for, none of which involves the b
 ### Look back once
 
 The agent answers, is done for now, and wants one glance in a few minutes to see whether its answer
-landed. meka's own scheduler does this, and needs nothing from the bridge:
+landed. Meka's own scheduler does this, and needs nothing from the bridge:
 
 ```
 schedule_create(
@@ -111,7 +111,7 @@ quiet. `backlog_check` is the gate, and a tool gate runs at `read`:
 schedule_create(
   every: "2m",
   gate: {
-    check: { tool: "mcp__mekabridge__backlog_check", arguments: { policy: "mute" } },
+    check: { tool: "mcp__meka-bridge__backlog_check", arguments: { policy: "mute" } },
     when: { at: "/latest", is: "changed" }
   },
   prompt: "Something new was said in a muted chat since you last looked. ..."
@@ -133,18 +133,18 @@ suits a job that should keep at it until it has read everything, every page of i
 into `conversations` only at a chat the question named: an unnamed one leaves the answer once its
 backlog is read, and a `changed` gate fires on that.
 
-`mekabridge unseen` is the shell form of the same question, for a gate outside meka or a job that
+`meka-bridge unseen` is the shell form of the same question, for a gate outside Meka or a job that
 predates the tool:
 
 ```
 schedule_create(
   every: "2m",
-  gate: { check: { command: "mekabridge unseen --policy mute" }, when: "changed" },
+  gate: { check: { command: "meka-bridge unseen --policy mute" }, when: "changed" },
   prompt: "..."
 )
 ```
 
-Prefer the tool gate. A shell gate runs unattended with no sandbox, so meka requires
+Prefer the tool gate. A shell gate runs unattended with no sandbox, so Meka requires
 `permission = "unrestricted"` to create one; a tool gate needs only `read`, and so does an ungated
 `at:` job.
 
@@ -282,25 +282,25 @@ The same way back as for policies, and for the same reason: the agent sets these
 that fires on everything is expensive to leave standing.
 
 ```console
-$ mekabridge watch list [--patterns]
-$ mekabridge watch write spam-signatures --patterns-file ./rules/spam.txt --reason 'spam'
-$ mekabridge watch write pump --match all --pattern '购买' --pattern '止盈' --pattern '止损'
-$ mekabridge watch delete spam-signatures
+$ meka-bridge watch list [--patterns]
+$ meka-bridge watch write spam-signatures --patterns-file ./rules/spam.txt --reason 'spam'
+$ meka-bridge watch write pump --match all --pattern '购买' --pattern '止盈' --pattern '止损'
+$ meka-bridge watch delete spam-signatures
 ```
 
 `--patterns-file` reads one pattern per line, skipping blank lines and `#` comments, so a rule set
 can live in a file under version control and be diffed. It combines with `--pattern`. A change from
 either side is picked up by a running bridge within a couple of seconds, without a restart.
 
-## `mekabridge unseen`
+## `meka-bridge unseen`
 
 ```console
-$ mekabridge unseen telegram:-1001234567890
+$ meka-bridge unseen telegram:-1001234567890
 2026-08-14T10:22:31+00:00
 3 unseen, newest 2026-08-14T10:22:31+00:00
 $ echo $?
 0
-$ mekabridge unseen --policy mute --exclude discord:1183429847290374144
+$ meka-bridge unseen --policy mute --exclude discord:1183429847290374144
 2026-08-14T10:22:31+00:00
 4 unseen, newest 2026-08-14T10:22:31+00:00
   telegram:-1001234567890: 3 unseen, newest 2026-08-14T10:22:31+00:00
@@ -369,7 +369,7 @@ to send one message. So the wait exists only where it can end when the person ac
 
 The consequence on Telegram is worth stating plainly: two messages a few seconds apart are handed
 over separately, and the agent may answer the first before reading the second. If the second lands
-while the agent is still working on the first, meka reads it into that same turn at its next round
+while the agent is still working on the first, Meka reads it into that same turn at its next round
 boundary, under a header saying it arrived while the agent was working, so the agent can account for
 it before finishing or correct itself with `message_edit`.
 
@@ -385,9 +385,9 @@ None of the above takes the operator out of the loop. A decision the agent made 
 outside the chat:
 
 ```console
-$ mekabridge policy list
-$ mekabridge policy set telegram:-1001234567890 mute
-$ mekabridge policy clear telegram:-1001234567890
+$ meka-bridge policy list
+$ meka-bridge policy set telegram:-1001234567890 mute
+$ meka-bridge policy clear telegram:-1001234567890
 ```
 
 `policy clear` returns a conversation to the default for its kind, which is different from setting

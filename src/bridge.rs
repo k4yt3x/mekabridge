@@ -2,8 +2,8 @@
 //!
 //! The MCP listener is bound first, before any channel connects or the queue starts moving, so a
 //! port conflict is a startup failure rather than a bridge that runs with no way for the agent to
-//! answer anybody. meka retries a failed MCP connect in the background, so the bridge no longer has
-//! to be up before meka; being up first still avoids the window in which meka, unless its entry for
+//! answer anybody. Meka retries a failed MCP connect in the background, so the bridge no longer has
+//! to be up before Meka; being up first still avoids the window in which Meka, unless its entry for
 //! this bridge is marked `required`, runs turns with no tool to answer anybody.
 
 pub mod envelope;
@@ -64,7 +64,7 @@ const EVENT_BUFFER: usize = 8;
 /// Buffer between the feed reader and the session task.
 ///
 /// Sized so a model streaming a reply never has the reader waiting on a session task that is in
-/// the middle of a request. meka drops a feed reader that falls behind its own 256-event ring, so
+/// the middle of a request. Meka drops a feed reader that falls behind its own 256-event ring, so
 /// the reader has to be able to take a burst several times that size off the wire while the
 /// session task is busy.
 const FEED_BUFFER: usize = 4096;
@@ -82,21 +82,21 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// tell one of those from a message it has never seen without a record of having delivered it.
 const DELIVERED_RETENTION: chrono::Duration = chrono::Duration::days(7);
 
-/// Media types meka will pass through to the provider as an image, from its
+/// Media types Meka will pass through to the provider as an image, from its
 /// `ALLOWED_IMAGE_MIME_TYPES`. Anything else is replaced with a text placeholder on its side, so
 /// the bridge screens for it here and returns a useful description instead.
 const VIEWABLE_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// meka's ceiling on a base64 image in an MCP tool result, from its `MAX_MCP_IMAGE_BYTES`.
+/// Meka's ceiling on a base64 image in an MCP tool result, from its `MAX_MCP_IMAGE_BYTES`.
 const MAX_VIEW_BASE64_BYTES: usize = 10 * 1024 * 1024;
 
 /// Ceiling on the raw bytes fetched for a view. Independent of `attachment_max_bytes`, which bounds
 /// what may be written to disk rather than what may be shown.
 ///
-/// This is meka's *second* image ceiling, `image::MAX_IMAGE_RAW_BYTES`: the decoded size it will
+/// This is Meka's *second* image ceiling, `image::MAX_IMAGE_RAW_BYTES`: the decoded size it will
 /// hand a provider, checked separately from [`MAX_VIEW_BASE64_BYTES`] and far tighter. Sized off
-/// the base64 one alone, this sat at nearly twice what meka accepts, so a five-megabyte screenshot
-/// passed every check here and was then replaced on meka's side by a line of text saying it was
+/// the base64 one alone, this sat at nearly twice what Meka accepts, so a five-megabyte screenshot
+/// passed every check here and was then replaced on Meka's side by a line of text saying it was
 /// suppressed. That is the outcome the screening exists to avoid: the agent is better told the file
 /// is too big to show than handed a picture with nothing in it.
 const MAX_VIEW_BYTES: u64 = 3_750_000;
@@ -243,7 +243,7 @@ pub async fn run(config: Config) -> Result<()> {
     let channels = Arc::new(ChannelRegistry::build(&config.channels)?);
     let meka = MekaClient::new(&config.meka)?;
 
-    // Bind before anything else starts, so a port conflict is a startup failure rather than a meka
+    // Bind before anything else starts, so a port conflict is a startup failure rather than a Meka
     // that can never take a turn.
     let mcp_server = serve::bind(&config.mcp).await?;
     if let Some(address) = mcp_server.local_addr() {
@@ -370,7 +370,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     // The session task binds the session and publishes it here; the reader opens the feed once
     // it has, and again on a rebind. The position is the last event the session task handled,
-    // read by the reader on every connection so meka replays strictly after it.
+    // read by the reader on every connection so Meka replays strictly after it.
     let (session_sender, session_receiver) = watch::channel::<Option<uuid::Uuid>>(None);
     let position = Arc::new(AtomicU64::new(0));
     let (feed_sender, feed_receiver) = mpsc::channel(FEED_BUFFER);
@@ -420,7 +420,7 @@ pub async fn run(config: Config) -> Result<()> {
     wake_drain.notify_one();
     tracing::info!(
         channels = channels.count(),
-        "mekabridge is running; waiting for messages"
+        "Meka Bridge is running; waiting for messages"
     );
 
     let went_deaf = tokio::select! {
@@ -438,7 +438,7 @@ pub async fn run(config: Config) -> Result<()> {
         Ok(()) => tracing::info!("all tasks stopped cleanly"),
         Err(_elapsed) => {
             // A hand-over in flight is durable on whichever side it reached; the next start posts
-            // it again under the same key or asks meka what became of it.
+            // it again under the same key or asks Meka what became of it.
             tracing::warn!(
                 "shutdown timed out after {}s; abandoning in-flight work",
                 SHUTDOWN_DRAIN_TIMEOUT.as_secs()
@@ -660,9 +660,9 @@ impl BridgeSink {
     /// Whether the session asking can be shown an image, which is its profile's `vision`, asked
     /// afresh each time.
     ///
-    /// `caller` is the session meka names on the call, and the one whose history keeps the image,
+    /// `caller` is the session Meka names on the call, and the one whose history keeps the image,
     /// which is not always the bridge's own: a sub-agent spawned from it runs on a profile of its
-    /// own. A call naming none was made outside any meka turn, so no session keeps the image and
+    /// own. A call naming none was made outside any Meka turn, so no session keeps the image and
     /// the bridge's own answers for it, or before one is bound, the default profile a new one
     /// starts on. Not cached, because a request can move a session to another profile while both
     /// processes run.
@@ -694,15 +694,15 @@ impl BridgeSink {
         };
         let (profile, profiles) = tokio::try_join!(profile, self.meka.profiles())
             .map_err(|error| SinkError::Internal(error.to_string()))?;
-        // Not answered as "no vision" when the profile is missing: that is a session meka cannot
-        // run, or a meka with no default, and either is a check that failed rather than a model
+        // Not answered as "no vision" when the profile is missing: that is a session Meka cannot
+        // run, or a Meka with no default, and either is a check that failed rather than a model
         // that cannot see.
         find_profile(&profiles, profile.as_deref())
             .map(|profile| profile.vision)
             .ok_or_else(|| {
                 SinkError::Internal(match profile {
-                    Some(name) => format!("meka has no profile {name:?}"),
-                    None => "meka has no default profile".to_string(),
+                    Some(name) => format!("Meka has no profile {name:?}"),
+                    None => "Meka has no default profile".to_string(),
                 })
             })
     }
@@ -748,7 +748,7 @@ impl BridgeSink {
             }
             Err(error) => {
                 tracing::warn!(
-                    "could not ask meka whether the calling session's profile has vision ({}); \
+                    "could not ask Meka whether the calling session's profile has vision ({}); \
                      describing the file instead of showing it",
                     error
                 );
@@ -784,7 +784,7 @@ impl BridgeSink {
         // Answered before fetching where the size is already known. A connector refusing an
         // oversize file returns its own wording, which names a byte ceiling no operator
         // configured and says nothing about `attachment_download`; the branch below that
-        // *does* say it only fires on the base64 form, which is the looser of meka's two
+        // *does* say it only fires on the base64 form, which is the looser of Meka's two
         // limits and so never first.
         //
         // Only when the file itself is what will be fetched. `record.bytes` sizes the main file
@@ -819,7 +819,7 @@ impl BridgeSink {
         let data = base64::engine::general_purpose::STANDARD.encode(&fetched.bytes);
         // Unreachable while `MAX_VIEW_BYTES` stays under three quarters of this, which is the
         // point: it is the assertion that keeps the two constants honest with each other.
-        // meka replaces an oversized image with a placeholder rather than erroring, so
+        // Meka replaces an oversized image with a placeholder rather than erroring, so
         // crossing the line silently would look to the agent like a picture with nothing in
         // it.
         if data.len() > MAX_VIEW_BASE64_BYTES {
@@ -1652,7 +1652,7 @@ impl OutboundSink for BridgeSink {
                 policy = policy.as_str(),
                 until = ?until,
                 reason = ?reason,
-                "the agent turned a conversation down; `mekabridge policy clear` undoes it"
+                "the agent turned a conversation down; `meka-bridge policy clear` undoes it"
             ),
         }
         Ok(existing.map(|record| record.policy))
@@ -2062,7 +2062,7 @@ impl OutboundSink for BridgeSink {
 
 /// What the chats a scope covers are holding for the agent, together and one by one.
 ///
-/// Shared by the `backlog_check` tool and `mekabridge unseen`, so the tool and the gate command
+/// Shared by the `backlog_check` tool and `meka-bridge unseen`, so the tool and the gate command
 /// cannot disagree about which chats a question covers. Each chat's policy is the one in force now,
 /// an explicit ruling or else the configured default for its kind, since "the chats that do not
 /// wake me" is a question about now.
@@ -2637,7 +2637,7 @@ mod tests {
         assert_eq!(
             sigpipe_disposition(),
             libc::SIG_DFL,
-            "piping `mekabridge history` into `head` should end quietly, not panic"
+            "piping `meka-bridge history` into `head` should end quietly, not panic"
         );
 
         assert!(
@@ -2677,15 +2677,15 @@ mod tests {
         reason = "pinning a shipped constant against an external contract is the point"
     )]
     fn the_view_ceiling_matches_what_meka_will_actually_accept() {
-        // meka applies two image ceilings, and the tighter is the decoded one it hands a provider,
+        // Meka applies two image ceilings, and the tighter is the decoded one it hands a provider,
         // `image::MAX_IMAGE_RAW_BYTES`. Sized off the base64 one alone this sat at nearly twice
-        // what meka accepts, so an image passed every check here and was replaced on meka's side by
+        // what Meka accepts, so an image passed every check here and was replaced on Meka's side by
         // a line of text saying it was suppressed -- which is the outcome the screening exists to
-        // avoid. meka's check is `>`, so equality passes.
+        // avoid. Meka's check is `>`, so equality passes.
         const MEKA_MAX_IMAGE_RAW_BYTES: u64 = 3_750_000;
         assert!(
             MAX_VIEW_BYTES <= MEKA_MAX_IMAGE_RAW_BYTES,
-            "fetching up to {MAX_VIEW_BYTES} bytes hands meka more than it will show"
+            "fetching up to {MAX_VIEW_BYTES} bytes hands Meka more than it will show"
         );
         // And the base64 form of a file at the ceiling still fits the looser limit, which is what
         // makes the check on the encoded size a backstop rather than the deciding one.

@@ -1,4 +1,4 @@
-//! The MCP server meka connects to, and the outbound tool surface it exposes.
+//! The MCP server Meka connects to, and the outbound tool surface it exposes.
 //!
 //! Routing has to be explicit because nothing on the wire names a conversation. A `tools/call`
 //! carries a progress token, a tool-use id and the session it came from in `_meta`, but one session
@@ -48,10 +48,10 @@ pub use crate::{
 ///
 /// The fence wording is deliberately no stronger than [`crate::bridge::envelope`] guarantees, and
 /// stops short of "everything outside a fence is the bridge's", which is false twice over:
-/// `history_read` hands other people's words back as unfenced JSON, and meka writes a header of its
+/// `history_read` hands other people's words back as unfenced JSON, and Meka writes a header of its
 /// own above each item.
 const SERVER_INSTRUCTIONS: &str = "\
-mekabridge connects you to people on Telegram and Discord.
+Meka Bridge connects you to people on Telegram and Discord.
 
 Not every message wakes you. A busy group is often on mentions only, whether or not you asked for \
 that: there, only somebody naming you, replying to something you said, or matching a watch you set \
@@ -84,7 +84,7 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// Deliver Markdown text. Returns the platform message ids produced, which may be several
     /// because long text is split.
     ///
-    /// `session` names the meka session that asked, and is recorded with the message. The bridge
+    /// `session` names the Meka session that asked, and is recorded with the message. The bridge
     /// owns one permanent session, but it is not the only one that can reach these tools: a
     /// sub-agent spawned from it holds the same MCP server and speaks on the same account. Without
     /// this the history can say the bot said something and not which session did.
@@ -186,7 +186,7 @@ pub trait OutboundSink: Send + Sync + 'static {
 
     /// Retrieve an attachment for viewing, without writing it to disk.
     ///
-    /// `session` names the meka session that asked. Whether it may be shown the picture at all is
+    /// `session` names the Meka session that asked. Whether it may be shown the picture at all is
     /// its profile's answer, because the image lands in its history, and that is not always the
     /// bridge's own session: a sub-agent spawned from it reaches the same tools on a profile of its
     /// own.
@@ -245,7 +245,7 @@ pub trait OutboundSink: Send + Sync + 'static {
     /// history where it has one, from before the oldest message recorded, and a platform cursor as
     /// `before` reads the platform alone. Neither happens with `sender_ids`.
     ///
-    /// `session` names the meka session reading. What it returns counts as seen only when that is
+    /// `session` names the Meka session reading. What it returns counts as seen only when that is
     /// the bridge's own session, or none is named.
     async fn history_read(
         &self,
@@ -367,7 +367,7 @@ impl From<WatchRecord> for WatchSummary {
 
 /// What a conversation, or the whole bridge, is holding for the agent.
 ///
-/// JSON rather than the one line this used to answer with, because the useful reader is meka's
+/// JSON rather than the one line this used to answer with, because the useful reader is Meka's
 /// scheduler: a tool gate runs at `read` and points into the result with a JSON pointer, so the
 /// value worth watching has to be a field it can name. The two counts are deliberately separate
 /// fields rather than one summary, since only one of them can be gated on; see
@@ -504,7 +504,7 @@ pub struct HistoryEntry {
     /// and one of them sharing a display name would otherwise be indistinguishable.
     #[serde(skip_serializing_if = "is_false")]
     pub own: bool,
-    /// The meka session that sent it, present only on the agent's own messages and only when the
+    /// The Meka session that sent it, present only on the agent's own messages and only when the
     /// caller identified itself. Several sessions share one bot account, so this is what says
     /// which of them spoke.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1157,7 +1157,7 @@ pub struct GetConversationArgs {
     pub conversation: String,
 }
 
-/// `_meta` key meka uses to name the session a tool call came from.
+/// `_meta` key Meka uses to name the session a tool call came from.
 ///
 /// Recorded on every outbound message rather than only logged. The bridge binds one session of its
 /// own, but a sub-agent spawned from it reaches the same tools on the same account, so "the bot
@@ -1245,7 +1245,7 @@ const ADMIN_TOOLS: &[&str] = &[
     "member_list",
 ];
 
-/// The MCP server exposing mekabridge's outbound tools.
+/// The MCP server exposing Meka Bridge's outbound tools.
 #[derive(Clone)]
 pub struct BridgeMcpServer {
     sink: Arc<dyn OutboundSink>,
@@ -1549,7 +1549,7 @@ impl BridgeMcpServer {
         {
             Ok(()) => {
                 if let Some(session) = session {
-                    tracing::debug!(session = %session, "react from meka session");
+                    tracing::debug!(session = %session, "react from Meka session");
                 }
                 let summary = match emoji {
                     Some(emoji) => format!(
@@ -2054,7 +2054,7 @@ impl BridgeMcpServer {
                        refused; the error says the limit.",
         // `read_only_hint` deserves the caveat: this does write a file. It writes only into
         // `[storage].attachment_dir`, which exists for exactly this, is bounded by
-        // `attachment_max_bytes`, and is swept on `attachment_retention`. Marking it otherwise would put it above meka's `read` level, where a bridge run at `read` could receive a document and never open it.
+        // `attachment_max_bytes`, and is swept on `attachment_retention`. Marking it otherwise would put it above Meka's `read` level, where a bridge run at `read` could receive a document and never open it.
         annotations(title = "Download attachment", read_only_hint = true, open_world_hint = true)
     )]
     async fn attachment_download(
@@ -2374,7 +2374,7 @@ impl BridgeMcpServer {
         if let Some(old) = &args.conversation {
             let id = old.as_str().unwrap_or("<id>");
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "`conversation` was replaced by `conversations`, a list, in mekabridge 0.20.0: \
+                "`conversation` was replaced by `conversations`, a list, in Meka Bridge 0.20.0: \
                  pass `conversations: [\"{id}\"]` for that chat, or leave both out for every \
                  chat. A scheduled job's gate keeps the arguments it was created with, so a \
                  job passing `conversation` has to be recreated with the new one."
@@ -2700,21 +2700,24 @@ impl BridgeMcpServer {
 impl ServerHandler for BridgeMcpServer {
     fn get_info(&self) -> ServerConfig {
         // The protocol version is deliberately left at the default so it is negotiated with the
-        // client. meka pins its own rmcp, ahead of this crate's or behind it as releases go, and
+        // client. Meka pins its own rmcp, ahead of this crate's or behind it as releases go, and
         // negotiation is what keeps the two interoperable across upgrades.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mekabridge", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "meka-bridge",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     /// Acknowledge the notification stream a 2026-07-28 client opens on every connection, with
     /// nothing in it.
     ///
-    /// meka asks for every list-changed kind and whatever resources the model subscribed to. Every
+    /// Meka asks for every list-changed kind and whatever resources the model subscribed to. Every
     /// tool here is fixed when the server starts and there are no prompts or resources, so nothing
     /// would ever be sent; at the SDK's default the method is answered "not found", which is the
     /// same answer, logged by rmcp as a warning on every connect. The empty acknowledgment says it
-    /// without one, and the stream idles until meka closes it or the server shuts down.
+    /// without one, and the stream idles until Meka closes it or the server shuts down.
     fn accepted_subscription_filter(
         &self,
         _requested: &SubscriptionFilter,
@@ -2722,11 +2725,11 @@ impl ServerHandler for BridgeMcpServer {
         Some(SubscriptionFilter::default())
     }
 
-    /// Hold an acknowledged stream until meka closes it or the bridge begins to shut down.
+    /// Hold an acknowledged stream until Meka closes it or the bridge begins to shut down.
     ///
-    /// Returning is what sends the stream's final result, which tells meka the server ended it on
+    /// Returning is what sends the stream's final result, which tells Meka the server ended it on
     /// purpose. Ended by the transport going away instead, which is what the SDK's default does on
-    /// shutdown, the result never reaches meka and it warns that the stream ended abruptly. meka
+    /// shutdown, the result never reaches Meka and it warns that the stream ended abruptly. Meka
     /// opens another once the bridge is back either way, and says so if the bridge is still down
     /// when it first tries.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
@@ -2738,9 +2741,9 @@ impl ServerHandler for BridgeMcpServer {
     }
 }
 
-/// The meka session a tool call came from.
+/// The Meka session a tool call came from.
 ///
-/// meka only sets it for a call made inside an agent turn, so this is `None` for anything else.
+/// Meka only sets it for a call made inside an agent turn, so this is `None` for anything else.
 fn calling_session(context: &RequestContext<RoleServer>) -> Option<String> {
     context
         .meta
@@ -2813,9 +2816,9 @@ fn sent_result(conversation: &str, message_ids: &[String]) -> CallToolResult {
 ///
 /// Refused by `file_send` at every level, because the bridge cannot tell which level its caller
 /// runs at, and nothing in these is worth sending to a chat. `environ` is where a `${VAR}` in this
-/// bridge's config comes from, so it holds the bot tokens and meka's; `cmdline`, `fd` and `mem`
+/// bridge's config comes from, so it holds the bot tokens and Meka's; `cmdline`, `fd` and `mem`
 /// hold the rest of what a process was given. The system-wide files beside them (`meminfo`,
-/// `cpuinfo`, `mounts`) carry no secret and stay sendable. The same line meka 0.68 draws for its
+/// `cpuinfo`, `mounts`) carry no secret and stay sendable. The same line Meka 0.68 draws for its
 /// own `file_read`.
 fn is_process_proc_entry(path: &Path) -> bool {
     let mut components = path.components();
@@ -3227,7 +3230,7 @@ mod tests {
                 return Err(SinkError::UnknownAttachment(handle.to_string()));
             }
             Ok(DownloadedAttachment {
-                path: PathBuf::from("/var/lib/mekabridge/attachments/q3.pdf"),
+                path: PathBuf::from("/var/lib/meka-bridge/attachments/q3.pdf"),
                 bytes: 8_400_000,
                 media_type: Some("application/pdf".to_string()),
                 source:
@@ -3866,7 +3869,7 @@ mod tests {
             "/proc/cpuinfo",
             "/proc/net/tcp",
             "/procfs/1234/environ",
-            "/var/lib/mekabridge/proc/self/environ",
+            "/var/lib/meka-bridge/proc/self/environ",
         ] {
             assert!(!is_process_proc_entry(Path::new(elsewhere)), "{elsewhere}");
         }
@@ -4058,7 +4061,7 @@ mod tests {
                     conversation: "telegram:1".to_string(),
                     paths: vec![
                         good.to_string_lossy().into_owned(),
-                        "/nonexistent/mekabridge/missing.png".to_string(),
+                        "/nonexistent/meka-bridge/missing.png".to_string(),
                     ],
                     caption: None,
                     as_photo: false,
@@ -5056,7 +5059,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_backlog_answers_with_the_field_a_gate_points_at() {
-        // The shape is the contract. meka's scheduler gates a job by pointing a JSON pointer into
+        // The shape is the contract. Meka's scheduler gates a job by pointing a JSON pointer into
         // this result, so `latest` has to be a field it can name rather than prose to parse, and
         // it has to be separate from `unseen`: the backlog falls every time the agent reads, so a
         // gate watching that for a change fires on the reading.
@@ -5808,15 +5811,15 @@ mod tests {
 
     #[test]
     fn the_instructions_fit_inside_mekas_cap() {
-        // meka truncates a server's `instructions` to `MAX_MCP_DESCRIPTION_LENGTH` at handshake and
+        // Meka truncates a server's `instructions` to `MAX_MCP_DESCRIPTION_LENGTH` at handshake and
         // appends an ellipsis. There is no error and no log line, so going over would silently cost
         // the agent whichever paragraphs happen to sit at the end, and the value is captured in a
-        // `OnceLock` on first connect so it would stay lost until meka restarts.
+        // `OnceLock` on first connect so it would stay lost until Meka restarts.
         const MEKA_MAX_DESCRIPTION_CHARS: usize = 2048;
         let length = SERVER_INSTRUCTIONS.chars().count();
         assert!(
             length <= MEKA_MAX_DESCRIPTION_CHARS,
-            "the instructions are {length} characters, over meka's {MEKA_MAX_DESCRIPTION_CHARS}; \
+            "the instructions are {length} characters, over Meka's {MEKA_MAX_DESCRIPTION_CHARS}; \
              the tail would be silently cut. Trim a paragraph rather than raising this."
         );
     }
@@ -5895,16 +5898,16 @@ mod tests {
 
     #[test]
     fn the_tool_index_stays_inside_this_bridges_share() {
-        // meka 0.60 gives the agent a `[Tool discovery]` index over every deferred tool on every
+        // Meka 0.60 gives the agent a `[Tool discovery]` index over every deferred tool on every
         // MCP server at once, bounded as a whole. Past the bound the entire section drops a tier:
         // every tool keeps its name and loses its summary, on every server, not just the one that
         // overran. The summaries are what tell the agent when to reach for backlog_check rather
         // than history_read, so losing them is a real loss of judgement, and this bridge is large
         // enough to cause it by itself.
         //
-        // The budget here is the share this bridge may take, over the entry lines alone; meka's
-        // preamble and group heading add roughly 260 bytes on top. Measured against meka 0.61's
-        // own renderer, the whole section is 5.1 KB for this bridge and 7.0 KB once meka's
+        // The budget here is the share this bridge may take, over the entry lines alone; Meka's
+        // preamble and group heading add roughly 260 bytes on top. Measured against Meka 0.61's
+        // own renderer, the whole section is 5.1 KB for this bridge and 7.0 KB once Meka's
         // built-in MCP-resource tools are counted, so what is left over is about four more
         // described tools. That is the headroom this ceiling protects: it is not room for a
         // second server of any size, which drops the tier for everyone whatever this does.
@@ -5924,9 +5927,9 @@ mod tests {
             } else {
                 "unrestricted"
             };
-            // The line meka renders per tool, in its fullest tier.
+            // The line Meka renders per tool, in its fullest tier.
             rendered += format!(
-                "- **mcp__mekabridge__{}** (level `{level}`): {}\n",
+                "- **mcp__meka-bridge__{}** (level `{level}`): {}\n",
                 tool.name,
                 index_summary(description)
             )
@@ -5934,18 +5937,18 @@ mod tests {
         }
         assert!(
             rendered <= SHARE_OF_THE_INDEX,
-            "the tool descriptions render to {rendered} bytes of meka's index, over the \
+            "the tool descriptions render to {rendered} bytes of Meka's index, over the \
              {SHARE_OF_THE_INDEX} this bridge allows itself. Shorten the opening sentence of the \
-             longest ones rather than raising this: meka keeps whole sentences up to \
+             longest ones rather than raising this: Meka keeps whole sentences up to \
              {MEKA_TOOL_SUMMARY_MAX_CHARS} characters, so what the agent sees in the index is the \
              longest run of whole sentences that fits."
         );
     }
 
-    /// Characters meka packs into one tool's index summary before it stops.
+    /// Characters Meka packs into one tool's index summary before it stops.
     const MEKA_TOOL_SUMMARY_MAX_CHARS: usize = 250;
 
-    /// What meka shows for one tool in `[Tool discovery]`, reproducing its packing rule.
+    /// What Meka shows for one tool in `[Tool discovery]`, reproducing its packing rule.
     ///
     /// Whole sentences up to the budget, with an ellipsis when anything was dropped, rather than a
     /// character cut: a tool whose second sentence documents its most consequential argument gets
@@ -5997,15 +6000,15 @@ mod tests {
 
     #[test]
     fn only_the_irreversible_tools_sit_above_read() {
-        // meka derives a tool's required permission from `readOnlyHint`, so this list is the
+        // Meka derives a tool's required permission from `readOnlyHint`, so this list is the
         // permission model. The line is what a tool can do to *other people*, not whether it
         // changes anything: gating replying above `read` would make that level mean "understands
         // every message and answers none". So `conversation_block` stays read-only however much
         // it modifies,
         // being this bridge's own record and liftable by the agent itself.
         //
-        // Where the far side lands is meka's call, and it is `unrestricted`: an MCP tool runs in
-        // its server's own process, which meka will not admit at `workspace`.
+        // Where the far side lands is Meka's call, and it is `unrestricted`: an MCP tool runs in
+        // its server's own process, which Meka will not admit at `workspace`.
         const ABOVE_READ: &[&str] = &[
             "message_delete",
             "member_moderate",

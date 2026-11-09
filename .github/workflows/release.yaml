@@ -26,13 +26,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: mekabridge-linux-amd64
+            artifact: meka-bridge-linux-amd64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: mekabridge-windows-amd64
+            artifact: meka-bridge-windows-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: mekabridge-macos-arm64
+            artifact: meka-bridge-macos-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -67,7 +67,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/${{ env.BUILD_PROFILE }}/mekabridge staging/
+          cp target/${{ matrix.target }}/${{ env.BUILD_PROFILE }}/meka-bridge staging/
           tar -czf ${{ matrix.artifact }}.tar.gz -C staging .
 
       - name: Package artifacts (Windows)
@@ -75,7 +75,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging
-          Copy-Item "target/${{ matrix.target }}/${{ env.BUILD_PROFILE }}/mekabridge.exe" staging/
+          Copy-Item "target/${{ matrix.target }}/${{ env.BUILD_PROFILE }}/meka-bridge.exe" staging/
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact

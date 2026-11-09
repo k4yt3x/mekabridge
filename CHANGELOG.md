@@ -7,20 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-09
+
+### Changed
+
+- **Breaking:** mekabridge is now Meka Bridge, and its binary `meka-bridge`.
+- **Breaking:** the default config and data folders are named `meka-bridge`.
+- **Breaking:** the default database is `meka-bridge.db`.
+- **Breaking:** `MEKA_BRIDGE_CONFIG` replaces `MEKABRIDGE_CONFIG`.
+- **Breaking:** the bridge logs under the `meka_bridge` target.
+- **Breaking:** release files are `meka-bridge-<platform>`, in the `k4yt3x/meka-bridge` repository.
+- The agent reads Meka Bridge as each message's sender, and in the bridge's notes and instructions.
+- Notices to the operator's chat begin `Meka Bridge:`.
+- Meka is written with a capital M throughout, as Meka now writes its own name.
+
 ## [0.24.4] - 2026-11-06
 
 ### Fixed
 
-- The session feed opens on meka 0.89, which serves it at `/feed`, and still on an older meka.
-- `doctor` finds the default profile on meka 0.89, which marks it `default` rather than `active`.
-- A permission request is logged again on meka 0.89, which calls it `approval.requested`.
-- A compaction on meka 0.89 is no longer logged as replacing zero messages.
+- The session feed opens on Meka 0.89, which serves it at `/feed`, and still on an older Meka.
+- `doctor` finds the default profile on Meka 0.89, which marks it `default` rather than `active`.
+- A permission request is logged again on Meka 0.89, which calls it `approval.requested`.
+- A compaction on Meka 0.89 is no longer logged as replacing zero messages.
 
 ## [0.24.3] - 2026-10-28
 
 ### Fixed
 
-- `doctor` says to add a profile to a meka that has none, and to restart meka after a profile edit.
+- `doctor` says to add a profile to a Meka that has none, and to restart Meka after a profile edit.
 
 ## [0.24.2] - 2026-10-26
 
@@ -33,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A compaction meka could not finish is logged, at error when a full context window forced it.
+- A compaction Meka could not finish is logged, at error when a full context window forced it.
 
 ### Changed
 
@@ -83,36 +97,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Discord messages give the server's id as `server:`, and a thread its channel's as `parent:`.
 - A Telegram forum topic is named on the `chat:` line after its group, once its name has been seen.
-- The owner hears of a turn meka is still retrying, with the error and deadline, and of recovery.
-- The owner hears when meka moves the agent's turns to a fallback profile, and when they come back.
+- The owner hears of a turn Meka is still retrying, with the error and deadline, and of recovery.
+- The owner hears when Meka moves the agent's turns to a fallback profile, and when they come back.
 
 ### Changed
 
-- **Breaking:** meka 0.80 or later is required; `doctor` fails against anything older.
+- **Breaking:** Meka 0.80 or later is required; `doctor` fails against anything older.
 - A Discord chat reads outermost first, `Acme Corp › #deploys › rollback`, in headers and titles.
-- The owner's notice for a message meka gave up on names the error, not only the attempts made.
-- A hand-over is asked about once meka's own `retry_until` passes, rather than after a fixed hour.
+- The owner's notice for a message Meka gave up on names the error, not only the attempts made.
+- A hand-over is asked about once Meka's own `retry_until` passes, rather than after a fixed hour.
 - rmcp is held at `warn` where `[log].level` lets `info` through, since it logs every request now.
 
 ### Fixed
 
 - A Discord thread in a channel the bot was granted after joining is no longer unnamed or dropped.
 - A message in a Telegram forum topic no longer reads as a reply to whoever opened the topic.
-- A message meka gave up on after a failed turn while the bridge was away fails, not re-sent.
-- meka's notification stream is acknowledged and ended cleanly, with no rmcp warning or error.
-- The MCP server names itself to meka as mekabridge, not as the rmcp library it is built on.
+- A message Meka gave up on after a failed turn while the bridge was away fails, not re-sent.
+- Meka's notification stream is acknowledged and ended cleanly, with no rmcp warning or error.
+- The MCP server names itself to Meka as `meka-bridge`, not as the rmcp library it is built on.
 - `[mcp].path = "/"` is refused at startup, rather than stopping the MCP server as it starts.
 
 ## [0.21.0] - 2026-10-15
 
 ### Changed
 
-- **Breaking:** meka 0.76 or later is required; `doctor` fails against anything older.
+- **Breaking:** Meka 0.76 or later is required; `doctor` fails against anything older.
 
 ### Fixed
 
-- A session can be created with `[session].cwd` set again: meka 0.76 refuses the old `cwd` name.
-- `mekabridge session show` names the session's directory again on meka 0.76.
+- A session can be created with `[session].cwd` set again: Meka 0.76 refuses the old `cwd` name.
+- `meka-bridge session show` names the session's directory again on Meka 0.76.
 
 ### Security
 
@@ -128,12 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `history_read` marks as `unseen` each entry that had not reached the agent in any form before.
 - A fresh Discord session fetches back what each chat with history missed while it was disconnected.
 - `[[channels.discord]].backfill` sets how far back: a day by default, never past retention.
-- `mekabridge unseen` takes several chats, or every chat narrowed by `--exclude` and `--policy`.
+- `meka-bridge unseen` takes several chats, or every chat narrowed by `--exclude` and `--policy`.
 
 ### Changed
 
 - **Breaking:** `backlog_check` takes `conversations`, a list; `conversation` is refused by name.
-- A blocked chat is left out of `backlog_check` and `mekabridge unseen` unless it is named.
+- A blocked chat is left out of `backlog_check` and `meka-bridge unseen` unless it is named.
 - `conversation_list` reports nothing unseen in a blocked chat.
 
 ### Fixed
@@ -156,25 +170,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `doctor` fails when the bridge's session is on a profile meka no longer has.
+- `doctor` fails when the bridge's session is on a profile Meka no longer has.
 
 ### Changed
 
-- **Breaking:** meka 0.71 or later is required; `doctor` fails against anything older.
-- meka's notices are logged at meka's own level, so a checklist nudge is no longer a warning.
+- **Breaking:** Meka 0.71 or later is required; `doctor` fails against anything older.
+- Meka's notices are logged at Meka's own level, so a checklist nudge is no longer a warning.
 
 ### Removed
 
-- Reading meka's pre-0.46 names: `turn.cancelled`, `turn-cancelled` and `provider_configured`.
+- Reading Meka's pre-0.46 names: `turn.cancelled`, `turn-cancelled` and `provider_configured`.
 - Naming `ask` and `write` as retired in `[session].permission`; both are refused as unknown levels.
 
 ### Fixed
 
-- `attachment_view` shows images again: meka 0.70 moved `vision` off `/v1/info` onto each profile.
+- `attachment_view` shows images again: Meka 0.70 moved `vision` off `/v1/info` onto each profile.
 - `attachment_view` checks vision on the profile of the session calling it, not on the default one.
 - `attachment_view` no longer tells the agent it has no vision when the check itself failed.
-- A hole in the session feed is acted on again: meka 0.71 reports it as `feed.gap`, not a notice.
-- After meka restarts, the feed resumes from meka's new numbering, not the old process's position.
+- A hole in the session feed is acted on again: Meka 0.71 reports it as `feed.gap`, not a notice.
+- After Meka restarts, the feed resumes from Meka's new numbering, not the old process's position.
 - `doctor` reads a `/v1/info` without `vision`, so its version and scope checks run, not fail.
 - `doctor` judges vision on the profile the bridge's session is on, not on the default one.
 - `doctor` warns when it cannot read which session is bound, rather than reporting none.
@@ -217,7 +231,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A watch is a named rule holding many patterns, so a rule set is one watch rather than a hundred.
 - `match: all` wakes the agent only when every pattern matches, which lookahead cannot express here.
-- `mekabridge watch write --patterns-file` loads a rule set from a file, one pattern per line.
+- `meka-bridge watch write --patterns-file` loads a rule set from a file, one pattern per line.
 - `watch_list` reports each rule's patterns and a count, and `watch_delete` takes a name.
 
 ### Changed
@@ -231,37 +245,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Watches: a pattern the agent sets that wakes it in a muted chat, beside a mention and a reply.
-- `watch_create`, `watch_delete` and `watch_list`, and `mekabridge watch` for the operator.
+- `watch_create`, `watch_delete` and `watch_list`, and `meka-bridge watch` for the operator.
 - A watch reads one named field: the message text, the sender's name, or the sender's id.
 - Every message a watch woke says which watch fired, on its `woke you:` line.
 - `history_read` takes `after`, a forward cursor, so a sweep reads only what it has not seen.
 
 ### Changed
 
-- **Breaking:** every tool is renamed `<noun>_<verb>`; update `eager_load_tools` in meka's config.
+- **Breaking:** every tool is renamed `<noun>_<verb>`; update `eager_load_tools` in Meka's config.
 - **Breaking:** `backlog_check` (was `unseen`) answers JSON, so a tool gate can watch `/latest`.
 - **Breaking:** the database moves to schema 11, so an older build will not open it afterwards.
-- Tool descriptions are shorter, keeping this bridge well inside meka's bounded tool index.
+- Tool descriptions are shorter, keeping this bridge well inside Meka's bounded tool index.
 
 ### Fixed
 
-- The group attention docs showed a scheduled-job gate in a syntax meka retired in 0.43.
+- The group attention docs showed a scheduled-job gate in a syntax Meka retired in 0.43.
 
 ## [0.15.1] - 2026-09-18
 
 ### Added
 
-- The meka integration docs cover meka 0.60's bounded tool index and what eager loading now buys.
+- The Meka integration docs cover Meka 0.60's bounded tool index and what eager loading now buys.
 
 ### Fixed
 
-- The docs named meka's `load_tool` and `fetch_url`; 0.60 renamed them `tool_load` and `web_fetch`.
+- The docs named Meka's `load_tool` and `fetch_url`; 0.60 renamed them `tool_load` and `web_fetch`.
 
 ## [0.15.0] - 2026-09-17
 
 ### Added
 
-- `doctor` fails when `[meka].token` is missing `sessions:r` or `sessions:w`, on meka 0.57 or later.
+- `doctor` fails when `[meka].token` is missing `sessions:r` or `sessions:w`, on Meka 0.57 or later.
 
 ### Changed
 
@@ -269,38 +283,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A mid-turn reconnect to meka 0.57 logged the turn's messages again as though it had just begun.
+- A mid-turn reconnect to Meka 0.57 logged the turn's messages again as though it had just begun.
 
 ## [0.14.0] - 2026-09-16
 
 ### Added
 
-- Messages reach the agent through meka's session inbox, so nothing waits for a turn to end.
+- Messages reach the agent through Meka's session inbox, so nothing waits for a turn to end.
 - One hand-over per message, keyed and written down, so a restart repeats and loses nothing.
-- The session feed is followed for every turn's outcome, including turns meka starts for itself.
+- The session feed is followed for every turn's outcome, including turns Meka starts for itself.
 - `queue list` and `status` report each message's hand-over state, and `doctor` counts them.
 
 ### Changed
 
-- **Breaking:** meka 0.55.0 or later is required; nothing older has an inbox or a session feed.
+- **Breaking:** Meka 0.55.0 or later is required; nothing older has an inbox or a session feed.
 - **Breaking:** the database is rebuilt on first start; an older build will not open the result.
 - **Breaking:** `[meka].turn_timeout` and `[bridge].turn_retries` are refused at startup by name.
 - A message that lands mid-turn is read by that turn instead of being marked `late:` in the next.
-- A message is delivered when meka says the model read it, not when a turn ended.
-- A hand-over meka does not accept is retried for an hour, matching meka's own inbox ceiling.
-- Each message is its own inbox item, and meka reads them all into one turn.
+- A message is delivered when Meka says the model read it, not when a turn ended.
+- A hand-over Meka does not accept is retried for an hour, matching Meka's own inbox ceiling.
+- Each message is its own inbox item, and Meka reads them all into one turn.
 - `[bridge].batch_max_messages` now bounds one claim and post pass, not what one turn reads.
 - `session reset` closes any hand-over out and puts its messages back among the unseen.
 
 ### Removed
 
 - The turn submission, its timeout, its retry budget, and the rejoin that kept its stream alive.
-- The `[mekabridge] N new messages.` line and `--- message N of N ---`; meka now heads each item.
+- The `[Meka Bridge] N new messages.` line and `--- message N of N ---`; Meka now heads each item.
 
 ### Fixed
 
 - A restart mid-turn no longer hands a message over twice, nor waits on an outcome it missed.
-- A store that cannot record a new session no longer leaves a fresh meka session behind per retry.
+- A store that cannot record a new session no longer leaves a fresh Meka session behind per retry.
 
 ## [0.13.1] - 2026-09-13
 
@@ -319,7 +333,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** the database is rebuilt on first start, keying every message on the bot account.
-- `mekabridge history` marks messages that went through a bot account the channel no longer uses.
+- `meka-bridge history` marks messages that went through a bot account the channel no longer uses.
 - `policy set` refuses a conversation on a channel that is not configured.
 
 ### Fixed
@@ -333,9 +347,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** meka 0.48.0 or later is required; on anything older every turn is refused.
-- A turn meka could not answer takes its message back, so a retry no longer leaves a duplicate.
-- `doctor` fails on a meka too old to drive, instead of leaving it to the first message.
+- **Breaking:** Meka 0.48.0 or later is required; on anything older every turn is refused.
+- A turn Meka could not answer takes its message back, so a retry no longer leaves a duplicate.
+- `doctor` fails on a Meka too old to drive, instead of leaving it to the first message.
 
 ### Fixed
 
@@ -345,16 +359,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** meka 0.46.0 or later is required, which renamed three contracts the bridge reads.
-- **Breaking:** `[session].permission` refuses `ask` by name, which meka 0.46 retired.
+- **Breaking:** Meka 0.46.0 or later is required, which renamed three contracts the bridge reads.
+- **Breaking:** `[session].permission` refuses `ask` by name, which Meka 0.46 retired.
 - `doctor` reads profiles from `GET /v1/profiles` and names the account each one bills.
 - `doctor` names `meka profile use`, `default_profile` and `[profiles.<name>]`, as 0.46 spells them.
 
 ### Fixed
 
-- A turn meka cancels is read as cancelled, not as an outcome nobody could establish.
-- `doctor` no longer reports every healthy meka 0.46 as having no profile configured.
-- `doctor` and `session show` read a session whose level meka records as unset, rather than failing.
+- A turn Meka cancels is read as cancelled, not as an outcome nobody could establish.
+- `doctor` no longer reports every healthy Meka 0.46 as having no profile configured.
+- `doctor` and `session show` read a session whose level Meka records as unset, rather than failing.
 
 ## [0.10.0] - 2026-08-31
 
@@ -367,15 +381,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The agent's own messages are recorded in history, so it can check what it has already said.
-- Own messages record which meka session sent them, since more than one can speak on the same bot.
+- Own messages record which Meka session sent them, since more than one can speak on the same bot.
 - One history row per real message, so an id read back from history addresses the message it names.
 - A reply that was only partly delivered records the parts that did land, rather than nothing.
 - Files the agent sends get attachment handles, so another session can open what it sent.
 - `attachment:` lines carry pixel size and running time, to judge a file without fetching it.
 - `send_message` numbers the parts of a split reply, as `part 2/3: 502`.
-- `mekabridge history` marks the agent's own messages, and deleted and superseded ones.
-- `mekabridge doctor` checks that operator notices can reach the chat configured to receive them.
-- `mekabridge doctor` names the provider profile and model the agent's session actually runs on.
+- `meka-bridge history` marks the agent's own messages, and deleted and superseded ones.
+- `meka-bridge doctor` checks that operator notices can reach the chat configured to receive them.
+- `meka-bridge doctor` names the provider profile and model the agent's session actually runs on.
 - A session that outgrew the model's context window is reported as that, with how to shorten it.
 
 ### Changed
@@ -395,8 +409,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The systemd unit in the docs did not restart the bridge after the signals systemd calls clean.
 - A message hitting a provider rate limit was given up on at once instead of using its retries.
 - A conversation too long for the model was retried three times, each attempt certain to fail.
-- `mekabridge doctor` said no model was configured on meka 0.44, however the profile was set.
-- The setup docs put the bridge's MCP token where meka 0.44 refuses to start if it finds it.
+- `meka-bridge doctor` said no model was configured on Meka 0.44, however the profile was set.
+- The setup docs put the bridge's MCP token where Meka 0.44 refuses to start if it finds it.
 
 ## [0.8.0] - 2026-08-25
 
@@ -416,7 +430,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `unseen`, reporting what the agent has not been shown without spending it. Tool and CLI alike.
-- `mekabridge unseen` exits 0, 1 or 2, and prints a marker that moves only when a chat does.
+- `meka-bridge unseen` exits 0, 1 or 2, and prints a marker that moves only when a chat does.
 - `unmute` and `unblock` take a `duration`, for joining a discussion without having to leave it.
 - A Group Attention page, covering what wakes the agent and what it can arrange for itself.
 - **Breaking:** a chat whose message could not be delivered is told so, in one line and no detail.
@@ -424,13 +438,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both notices are held to one per chat per 15 minutes; the owner's counts what it swallowed.
 - `[bridge].notify_failures` turns the chat's notice off, leaving the owner's and the logs.
 - A compaction is logged at warn: it is where the agent's memory of other chats becomes a summary.
-- `doctor` fails when meka will not create a session at the configured level, before a message does.
+- `doctor` fails when Meka will not create a session at the configured level, before a message does.
 - `doctor` states when the moderation tools are registered and the session cannot dispatch them.
 
 ### Changed
 
-- **Breaking:** meka 0.42.0 or later is required; the rejoin and the permission levels need it.
-- **Breaking:** `[session].permission` follows meka 0.42: `write` is gone, split in two.
+- **Breaking:** Meka 0.42.0 or later is required; the rejoin and the permission levels need it.
+- **Breaking:** `[session].permission` follows Meka 0.42: `write` is gone, split in two.
 - **Breaking:** a config still setting `permission = "write"` is refused by name at startup.
 - **Breaking:** moderation, delete and rename tools need `unrestricted`; talking still needs `read`.
 - **Breaking:** a Telegram message now starts a turn as it arrives. The Bot API reports no typing.
@@ -444,7 +458,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `turn_retries` defaults to `3`, now that the attempts are spaced out rather than instant.
 - A turn that failed after the agent had sent or run something is no longer retried.
 - An error needing an operator is given up on at once instead of spending the whole budget.
-- A `provider` error is no longer retried on read-only calls; meka means it as one it cannot repair.
+- A `provider` error is no longer retried on read-only calls; Meka means it as one it cannot repair.
 - `list_members` clamps its `limit` before the connector sees it, as the other limits already did.
 - The inbound buffer is 8 rather than 64, bounding how many messages a hard kill can lose.
 
@@ -458,12 +472,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A dropped turn stream is rejoined rather than guessed at, so its outcome is known.
 - A turn that already acted is never replayed, whether it failed, was cancelled or lost its stream.
 - Events the bridge knows it missed no longer count as proof that the agent did nothing.
-- A submission meka never accepted no longer spends the backlog or the overflow notice it reported.
+- A submission Meka never accepted no longer spends the backlog or the overflow notice it reported.
 - A batch stranded by a hard kill says it was interrupted rather than arriving as new work.
 - A message that ran out of attempts is owed to the agent again rather than left marked seen.
 - A message recorded while a turn ran is no longer marked seen without ever having been shown.
 - A failed batch waits between attempts, so a rate limit no longer spends them all in seconds.
-- meka being unreachable is retried rather than written off on the first attempt.
+- Meka being unreachable is retried rather than written off on the first attempt.
 - A reply containing a run longer than the platform limit hung the splitter; it now splits.
 - A long reply is no longer split into bodies the platform refuses, so none arrives half sent.
 - Telegram's 4096 is counted in UTF-16 units, so an emoji-heavy reply is no longer refused whole.
@@ -478,15 +492,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The fence marker around user text is redacted however it is spelled.
 - A `duration` far enough in the future panicked and hung the tool call; it is refused now.
 - Two attachments on one Discord message no longer overwrite each other's file.
-- An image is screened against the size meka will really show, and says to download it instead.
-- `doctor` reads meka's degraded readiness and fails on what it names, rather than exiting 0.
+- An image is screened against the size Meka will really show, and says to download it instead.
+- `doctor` reads Meka's degraded readiness and fails on what it names, rather than exiting 0.
 - Requests have deadlines, so a connection that goes silent without closing no longer wedges a turn.
 - A 429 or 5xx without a Problem Detail body, as a reverse proxy sends, was never retried.
 - A chat mid-burst delayed delivery for every other chat; readiness is now per conversation.
 - A lapsed policy's notice was filed where nothing would read it, so the agent was never told.
 - The docs said `[mcp].strict` defaults to on. It does not, so the samples now set `required`.
-- The docs said `workspace` would do for moderating. meka refuses an MCP tool it cannot confine.
-- The docs named a provider error as reaching the owner in full; meka 0.42 logs it rather than send.
+- The docs said `workspace` would do for moderating. Meka refuses an MCP tool it cannot confine.
+- The docs named a provider error as reaching the owner in full; Meka 0.42 logs it rather than send.
 - `read_history` and `search_history` overstated what a block hides and what the history holds.
 - A list ran into the paragraphs around it, so prose mixed with bullets arrived as one block.
 - A list written with blank lines between its items was packed as tight as one without.
@@ -505,7 +519,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A deferred batch lost what a muted chat had missed, and the retry then reported it as silent.
-- `typing_max` never applied while a batch waited on a turn meka started itself.
+- `typing_max` never applied while a batch waited on a turn Meka started itself.
 - `online_only` emptied the list on a platform reporting no presence, reading as nobody around.
 - The `presence` warning told operators to enable Server Members, which the bridge never asks for.
 - `presence` was missing from the config reference and the template `config init` writes.
@@ -523,13 +537,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The typing indicator now lasts as long as the turn, rather than lapsing after 30 seconds.
-- The indicator opens once meka accepts the turn, not when the bridge tries to submit one.
-- A chat waiting on a turn meka started itself now sees the indicator instead of silence.
+- The indicator opens once Meka accepts the turn, not when the bridge tries to submit one.
+- A chat waiting on a turn Meka started itself now sees the indicator instead of silence.
 - A busy session is retried on a timer, and logged once per wait rather than once per attempt.
 
 ### Fixed
 
-- A batch meka refused was resubmitted hundreds of times a second until the other turn finished.
+- A batch Meka refused was resubmitted hundreds of times a second until the other turn finished.
 - A cancelled typing indicator still went out, leaving chats typing minutes after the agent stopped.
 - A deferred batch flagged the next batch's own messages as having arrived mid-turn.
 - The queue-overflow notice was lost when a deferred batch's envelope was discarded.
@@ -540,7 +554,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A message could be declared undeliverable when meka was busy with a turn of its own.
+- A message could be declared undeliverable when Meka was busy with a turn of its own.
 
 ## [0.4.0] - 2026-08-12
 
@@ -584,7 +598,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A record of every message from every chat that is not blocked, kept for `history_retention`.
 - `read_history` and `search_history`, so the agent can catch up on what it was not woken for.
 - A mention in a muted chat arrives with the count of what was missed and the last few messages.
-- `mekabridge policy list|set|clear` and `mekabridge history`, the operator's side of both.
+- `meka-bridge policy list|set|clear` and `meka-bridge history`, the operator's side of both.
 - `[bridge].mute_followup`, so answering a mention does not need a second one to carry on.
 - `[bridge].mute_context`, the lookback printed alongside a mention. `0` makes the agent ask.
 - `doctor` reports the attention defaults, how many chats override them, and what history holds.
@@ -595,7 +609,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** set `[bridge.default_policy]` to `active` per chat kind to restore 0.2.x.
 - **Breaking:** the old `mute` tool is now `block`, which is what it always did.
 - **Breaking:** existing mutes migrate to blocks, so a chat already silenced stays silenced.
-- **Breaking:** `mekabridge mute list|add|rm` is now `mekabridge policy list|set|clear`.
+- **Breaking:** `meka-bridge mute list|add|rm` is now `meka-bridge policy list|set|clear`.
 - `list_conversations` reports `policy`, `policy_until`, and `unseen` instead of `muted_until`.
 - A shed message is no longer called lost, since `read_history` still reaches it.
 - Telegram privacy mode should now be off; `doctor` explains why it defeats the history.
@@ -614,7 +628,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `allow_all`, for a bot anyone may message, such as a public or customer-service bot.
 - The agent can mute a noisy chat, for a while or indefinitely, and unmute it later.
 - Muted chats are shown in the conversation list, and the agent is told what it missed on expiry.
-- `mekabridge mute list|add|rm`, so an operator can lift a mute the agent set on itself.
+- `meka-bridge mute list|add|rm`, so an operator can lift a mute the agent set on itself.
 - The agent can edit a message it sent, correcting itself in place instead of sending a follow-up.
 - The agent can delete a message, its own anywhere or anyone's in a group it moderates.
 - Group moderation: restrict, ban, unban, or kick a member, with an optional duration.
@@ -634,17 +648,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `doctor` and the docs described images as riding the turn, which they have not since 0.1.0.
 - Editing a message to empty text blamed length instead of saying it renders to nothing.
-- `mekabridge mute add` accepted a malformed id, silencing nothing while reporting success.
+- `meka-bridge mute add` accepted a malformed id, silencing nothing while reporting success.
 
 ## [0.1.0] - 2026-08-11
 
 ### Added
 
-- Relay between one permanent meka session and chat platforms, Telegram first.
+- Relay between one permanent Meka session and chat platforms, Telegram first.
 - Replying, staying quiet, messaging someone else, and messaging first are all the agent's call.
 - Six agent tools: send a message or a file, react, view or download an attachment, list chats.
 - Streamable HTTP and stdio MCP transports, with optional bearer auth and health endpoints.
-- Runs at meka's `read` permission level, so nothing the agent needs requires `write`.
+- Runs at Meka's `read` permission level, so nothing the agent needs requires `write`.
 - Durable queue, so nothing anyone sent is lost to a crash or a restart.
 - Messages typed in a burst settle into one turn instead of being answered mid-thought.
 - Messages that land mid-turn are flagged, so the agent can correct a premature reply.
@@ -668,39 +682,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/mekabridge/compare/0.24.4...HEAD
-[0.24.4]: https://github.com/k4yt3x/mekabridge/compare/0.24.3...0.24.4
-[0.24.3]: https://github.com/k4yt3x/mekabridge/compare/0.24.2...0.24.3
-[0.24.2]: https://github.com/k4yt3x/mekabridge/compare/0.24.1...0.24.2
-[0.24.1]: https://github.com/k4yt3x/mekabridge/compare/0.24.0...0.24.1
-[0.24.0]: https://github.com/k4yt3x/mekabridge/compare/0.23.0...0.24.0
-[0.23.0]: https://github.com/k4yt3x/mekabridge/compare/0.22.0...0.23.0
-[0.22.0]: https://github.com/k4yt3x/mekabridge/compare/0.21.0...0.22.0
-[0.21.0]: https://github.com/k4yt3x/mekabridge/compare/0.20.0...0.21.0
-[0.20.0]: https://github.com/k4yt3x/mekabridge/compare/0.19.1...0.20.0
-[0.19.1]: https://github.com/k4yt3x/mekabridge/compare/0.19.0...0.19.1
-[0.19.0]: https://github.com/k4yt3x/mekabridge/compare/0.18.2...0.19.0
-[0.18.2]: https://github.com/k4yt3x/mekabridge/compare/0.18.1...0.18.2
-[0.18.1]: https://github.com/k4yt3x/mekabridge/compare/0.18.0...0.18.1
-[0.18.0]: https://github.com/k4yt3x/mekabridge/compare/0.17.0...0.18.0
-[0.17.0]: https://github.com/k4yt3x/mekabridge/compare/0.16.0...0.17.0
-[0.16.0]: https://github.com/k4yt3x/mekabridge/compare/0.15.1...0.16.0
-[0.15.1]: https://github.com/k4yt3x/mekabridge/compare/0.15.0...0.15.1
-[0.15.0]: https://github.com/k4yt3x/mekabridge/compare/0.14.0...0.15.0
-[0.14.0]: https://github.com/k4yt3x/mekabridge/compare/0.13.1...0.14.0
-[0.13.1]: https://github.com/k4yt3x/mekabridge/compare/0.13.0...0.13.1
-[0.13.0]: https://github.com/k4yt3x/mekabridge/compare/0.12.0...0.13.0
-[0.12.0]: https://github.com/k4yt3x/mekabridge/compare/0.11.0...0.12.0
-[0.11.0]: https://github.com/k4yt3x/mekabridge/compare/0.10.0...0.11.0
-[0.10.0]: https://github.com/k4yt3x/mekabridge/compare/0.9.0...0.10.0
-[0.9.0]: https://github.com/k4yt3x/mekabridge/compare/0.8.0...0.9.0
-[0.8.0]: https://github.com/k4yt3x/mekabridge/compare/0.7.0...0.8.0
-[0.7.0]: https://github.com/k4yt3x/mekabridge/compare/0.6.0...0.7.0
-[0.6.0]: https://github.com/k4yt3x/mekabridge/compare/0.5.0...0.6.0
-[0.5.0]: https://github.com/k4yt3x/mekabridge/compare/0.4.1...0.5.0
-[0.4.1]: https://github.com/k4yt3x/mekabridge/compare/0.4.0...0.4.1
-[0.4.0]: https://github.com/k4yt3x/mekabridge/compare/0.3.0...0.4.0
-[0.3.0]: https://github.com/k4yt3x/mekabridge/compare/0.2.1...0.3.0
-[0.2.1]: https://github.com/k4yt3x/mekabridge/compare/0.2.0...0.2.1
-[0.2.0]: https://github.com/k4yt3x/mekabridge/compare/0.1.0...0.2.0
-[0.1.0]: https://github.com/k4yt3x/mekabridge/releases/tag/0.1.0
+[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...HEAD
+[0.25.0]: https://github.com/k4yt3x/meka-bridge/compare/0.24.4...0.25.0
+[0.24.4]: https://github.com/k4yt3x/meka-bridge/compare/0.24.3...0.24.4
+[0.24.3]: https://github.com/k4yt3x/meka-bridge/compare/0.24.2...0.24.3
+[0.24.2]: https://github.com/k4yt3x/meka-bridge/compare/0.24.1...0.24.2
+[0.24.1]: https://github.com/k4yt3x/meka-bridge/compare/0.24.0...0.24.1
+[0.24.0]: https://github.com/k4yt3x/meka-bridge/compare/0.23.0...0.24.0
+[0.23.0]: https://github.com/k4yt3x/meka-bridge/compare/0.22.0...0.23.0
+[0.22.0]: https://github.com/k4yt3x/meka-bridge/compare/0.21.0...0.22.0
+[0.21.0]: https://github.com/k4yt3x/meka-bridge/compare/0.20.0...0.21.0
+[0.20.0]: https://github.com/k4yt3x/meka-bridge/compare/0.19.1...0.20.0
+[0.19.1]: https://github.com/k4yt3x/meka-bridge/compare/0.19.0...0.19.1
+[0.19.0]: https://github.com/k4yt3x/meka-bridge/compare/0.18.2...0.19.0
+[0.18.2]: https://github.com/k4yt3x/meka-bridge/compare/0.18.1...0.18.2
+[0.18.1]: https://github.com/k4yt3x/meka-bridge/compare/0.18.0...0.18.1
+[0.18.0]: https://github.com/k4yt3x/meka-bridge/compare/0.17.0...0.18.0
+[0.17.0]: https://github.com/k4yt3x/meka-bridge/compare/0.16.0...0.17.0
+[0.16.0]: https://github.com/k4yt3x/meka-bridge/compare/0.15.1...0.16.0
+[0.15.1]: https://github.com/k4yt3x/meka-bridge/compare/0.15.0...0.15.1
+[0.15.0]: https://github.com/k4yt3x/meka-bridge/compare/0.14.0...0.15.0
+[0.14.0]: https://github.com/k4yt3x/meka-bridge/compare/0.13.1...0.14.0
+[0.13.1]: https://github.com/k4yt3x/meka-bridge/compare/0.13.0...0.13.1
+[0.13.0]: https://github.com/k4yt3x/meka-bridge/compare/0.12.0...0.13.0
+[0.12.0]: https://github.com/k4yt3x/meka-bridge/compare/0.11.0...0.12.0
+[0.11.0]: https://github.com/k4yt3x/meka-bridge/compare/0.10.0...0.11.0
+[0.10.0]: https://github.com/k4yt3x/meka-bridge/compare/0.9.0...0.10.0
+[0.9.0]: https://github.com/k4yt3x/meka-bridge/compare/0.8.0...0.9.0
+[0.8.0]: https://github.com/k4yt3x/meka-bridge/compare/0.7.0...0.8.0
+[0.7.0]: https://github.com/k4yt3x/meka-bridge/compare/0.6.0...0.7.0
+[0.6.0]: https://github.com/k4yt3x/meka-bridge/compare/0.5.0...0.6.0
+[0.5.0]: https://github.com/k4yt3x/meka-bridge/compare/0.4.1...0.5.0
+[0.4.1]: https://github.com/k4yt3x/meka-bridge/compare/0.4.0...0.4.1
+[0.4.0]: https://github.com/k4yt3x/meka-bridge/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/k4yt3x/meka-bridge/compare/0.2.1...0.3.0
+[0.2.1]: https://github.com/k4yt3x/meka-bridge/compare/0.2.0...0.2.1
+[0.2.0]: https://github.com/k4yt3x/meka-bridge/compare/0.1.0...0.2.0
+[0.1.0]: https://github.com/k4yt3x/meka-bridge/releases/tag/0.1.0

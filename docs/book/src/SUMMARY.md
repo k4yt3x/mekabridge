@@ -14,7 +14,7 @@
 
 # Usage
 
-- [meka Integration](./usage/meka-integration.md)
+- [Meka Integration](./usage/meka-integration.md)
 - [Telegram](./usage/telegram.md)
 - [Discord](./usage/discord.md)
 - [MCP Tools](./usage/mcp-tools.md)

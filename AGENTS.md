@@ -61,3 +61,4 @@ CI's `lint` job denies warnings on both clippy and rustdoc, so the bare commands
 ## Prose style
 
 - Avoid using em dashes (`—`) in writing.
+- Meka and Meka Bridge are the products, in prose and in every string a person reads, a comment's included. `meka` and `meka-bridge` are what is typed or read by a machine: the commands and binaries, the `meka_bridge` crate, paths, tracing targets, config keys such as `[meka]`, and wire values.

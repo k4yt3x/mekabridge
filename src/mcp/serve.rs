@@ -1,8 +1,8 @@
 //! Hosting for the MCP server: streamable HTTP (the normal deployment) and stdio (for MCP Inspector
 //! and child-process launches).
 //!
-//! The HTTP listener is bound before the bridge needs meka for anything, so a port conflict fails
-//! startup outright. meka retries a failed MCP connect in the background with backoff, so a meka
+//! The HTTP listener is bound before the bridge needs Meka for anything, so a port conflict fails
+//! startup outright. Meka retries a failed MCP connect in the background with backoff, so a Meka
 //! that boots first recovers on its own; until it does, a server entry marked `required` refuses
 //! turns rather than running them toolless, which is why coming up promptly still matters.
 
@@ -224,7 +224,7 @@ fn streamable_config(
     let mut streamable = StreamableHttpServerConfig::default();
     streamable.cancellation_token = transport.child_token();
     // rmcp defaults to accepting loopback `Host` values only, as a DNS-rebinding guard. A bind on a
-    // routable address needs the operator to name the hosts meka will use.
+    // routable address needs the operator to name the hosts Meka will use.
     if !config.allowed_hosts.is_empty() {
         streamable.allowed_hosts.clone_from(&config.allowed_hosts);
     }

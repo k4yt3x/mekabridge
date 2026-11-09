@@ -1,9 +1,9 @@
 //! Durable state: the session binding, the accounts the bridge speaks as, the conversation address
 //! book, the inbound queue, and the message history.
 //!
-//! The queue is the hand-off buffer between the platforms and meka's inbox. A message is written
+//! The queue is the hand-off buffer between the platforms and Meka's inbox. A message is written
 //! before it is acknowledged to the platform, since a crash with a full buffer in memory would
-//! silently swallow everything a user typed, and it stays here until meka has said the item
+//! silently swallow everything a user typed, and it stays here until Meka has said the item
 //! carrying it is durable on its side. Rows are claimed into a *batch*, one inbox item carrying one
 //! rendered envelope; the batch row is what a retry, a reconciliation, or a restart posts again
 //! under the same key, and it is where what the envelope stated once is kept until the item
@@ -76,20 +76,20 @@ const WAL_PRAGMA_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// message to decide, almost always, to ignore it. Conversations with no policy are cached too,
 /// being the common case.
 ///
-/// Seconds rather than minutes because this is also how long an operator running `mekabridge policy
-/// set` against a live daemon waits to see it take effect, and that CLI is the recovery path for a
-/// policy the agent set on itself.
+/// Seconds rather than minutes because this is also how long an operator running `meka-bridge
+/// policy set` against a live daemon waits to see it take effect, and that CLI is the recovery path
+/// for a policy the agent set on itself.
 const POLICY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Ceiling on cached policy lookups, past which the cache is emptied rather than grown.
 const POLICY_CACHE_MAX_ENTRIES: usize = 4096;
 
-/// `meta` key holding the meka session UUID this bridge instance owns.
+/// `meta` key holding the Meka session UUID this bridge instance owns.
 const META_SESSION_ID: &str = "session_id";
 /// `meta` key counting inbound messages shed because the queue was full, so the next envelope can
 /// tell the agent that it is not seeing everything.
 const META_DROPPED: &str = "dropped_messages";
-/// `meta` key holding when the last turn completed, for `mekabridge status`.
+/// `meta` key holding when the last turn completed, for `meka-bridge status`.
 const META_LAST_TURN: &str = "last_turn_at";
 /// Prefix of the `meta` key holding the last feed event handled for a session, so a restart resumes
 /// the feed from there. Keyed by session because ids start again on a new one.
@@ -484,7 +484,7 @@ pub struct MessageRecord {
     /// Recorded as its own column rather than inferred from [`Self::sender_id`], so reading a row
     /// back never requires knowing which account the bot holds on that platform.
     pub own: bool,
-    /// The meka session that sent an outbound message, and `None` on everything received.
+    /// The Meka session that sent an outbound message, and `None` on everything received.
     pub session_id: Option<String>,
     /// When the platform reported this message deleted.
     ///
@@ -532,7 +532,7 @@ impl MessageRecord {
 ///
 /// One row is one inbox item. It outlives the request that posts it, so a retry after an ambiguous
 /// failure, or after a restart on either side, posts the same [`Self::key`] and the same
-/// [`Self::body`], and meka answers with the item it already made and that item's current state,
+/// [`Self::body`], and Meka answers with the item it already made and that item's current state,
 /// which is also how a hand-over whose feed events were missed is reconciled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessage {
@@ -550,9 +550,9 @@ pub struct QueuedMessage {
     /// The rendered item, byte for byte. Dropped once the row reaches [`QueueState::Failed`],
     /// where it would only be a second copy of [`Self::payload`] that nothing will ever post.
     pub body: Option<String>,
-    /// The meka session the item is, or will be, posted to.
+    /// The Meka session the item is, or will be, posted to.
     pub session_id: Option<Uuid>,
-    /// meka's id for the item, from the 202.
+    /// Meka's id for the item, from the 202.
     pub item_id: Option<String>,
     /// The dropped-message count this item reported, owed back if the item never delivers.
     pub dropped: u64,
@@ -566,9 +566,9 @@ pub struct QueuedMessage {
     pub last_error: Option<String>,
     /// When the item was rendered.
     pub held_at: Option<DateTime<Utc>>,
-    /// When meka accepted it.
+    /// When Meka accepted it.
     pub posted_at: Option<DateTime<Utc>>,
-    /// When meka stops retrying the item, as its answer to the post said.
+    /// When Meka stops retrying the item, as its answer to the post said.
     pub retry_until: Option<DateTime<Utc>>,
 }
 
@@ -653,9 +653,9 @@ pub enum WatchOutcome {
 pub enum QueueState {
     /// Waiting to be claimed.
     Pending,
-    /// Claimed and rendered, and meka has not accepted it yet.
+    /// Claimed and rendered, and Meka has not accepted it yet.
     InFlight,
-    /// meka has the item; the feed says what becomes of it.
+    /// Meka has the item; the feed says what becomes of it.
     Posted,
     /// The model read it.
     Done,
@@ -702,11 +702,11 @@ pub enum Offer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandOver<'a> {
     /// The `Idempotency-Key` it is posted under, minted once and never again, so every post of
-    /// this row is the same request to meka.
+    /// this row is the same request to Meka.
     pub key: &'a str,
-    /// The rendered item, byte for byte. meka refuses the same key with other words.
+    /// The rendered item, byte for byte. Meka refuses the same key with other words.
     pub body: &'a str,
-    /// The meka session it is, or will be, posted to. meka scopes keys per session.
+    /// The Meka session it is, or will be, posted to. Meka scopes keys per session.
     pub session_id: Uuid,
     /// The dropped-message count it states, which comes off the counter as it is stored.
     pub dropped: u64,
@@ -730,19 +730,19 @@ pub struct Backlog {
 pub struct Recovered {
     /// Rows claimed but never rendered, returned to `pending`.
     pub orphaned: usize,
-    /// Rows meka never accepted, which are posted again under their own key.
+    /// Rows Meka never accepted, which are posted again under their own key.
     pub unposted: usize,
-    /// Rows meka has, whose fate the feed's replay or a reconciliation settles.
+    /// Rows Meka has, whose fate the feed's replay or a reconciliation settles.
     pub posted: usize,
 }
 
-/// Queue row counts by state, for `mekabridge status`.
+/// Queue row counts by state, for `meka-bridge status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueStats {
     pub pending: u64,
-    /// Rendered, and not yet accepted by meka.
+    /// Rendered, and not yet accepted by Meka.
     pub in_flight: u64,
-    /// With meka, waiting for the feed to say what became of them.
+    /// With Meka, waiting for the feed to say what became of them.
     pub posted: u64,
     pub done: u64,
     pub failed: u64,
@@ -843,7 +843,7 @@ impl Store {
         connection
             .call(|connection| {
                 // `busy_timeout` first, so everything after it waits rather than failing. WAL lets
-                // `mekabridge status` read while the daemon writes.
+                // `meka-bridge status` read while the daemon writes.
                 connection.pragma_update(None, "busy_timeout", 5_000)?;
                 connection.pragma_update(None, "foreign_keys", "ON")?;
                 // Retried by hand, because the busy handler `busy_timeout` installs is not
@@ -877,7 +877,7 @@ impl Store {
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
                         Some(format!(
                             "the database is at schema version {applied}, newer than the {} this \
-                             build knows. It was written by a later mekabridge; upgrade rather \
+                             build knows. It was written by a later Meka Bridge; upgrade rather \
                              than rolling back.",
                             MIGRATIONS.len()
                         )),
@@ -983,7 +983,7 @@ impl Store {
         }
     }
 
-    /// The meka session this bridge owns, if one has been created.
+    /// The Meka session this bridge owns, if one has been created.
     pub async fn session_id(&self) -> Result<Option<Uuid>> {
         let Some(raw) = self.meta_get(META_SESSION_ID).await? else {
             return Ok(None);
@@ -1775,7 +1775,7 @@ impl Store {
     ///
     /// Cached for the same reason the policy is: this runs on every message from a muted
     /// conversation, and the answer is almost always the same one. The TTL is also how long an
-    /// operator running `mekabridge watch` against a live daemon waits to see it take effect.
+    /// operator running `meka-bridge watch` against a live daemon waits to see it take effect.
     ///
     /// The `Arc` is deliberately reused when a refetch finds the rows unchanged, so a caller can
     /// tell "these are the same watches" by pointer and skip recompiling a regex set it already
@@ -2006,7 +2006,7 @@ impl Store {
     /// restart) cannot hand the same message over twice.
     ///
     /// One pass may span conversations, which is what makes several chats that all became ready
-    /// together reach the agent in one turn rather than one each: meka reads every item waiting for
+    /// together reach the agent in one turn rather than one each: Meka reads every item waiting for
     /// it into the turn it opens. `ready` narrows which are eligible, not how many may be claimed
     /// at once.
     pub async fn claim(&self, ready: &[String], limit: usize) -> Result<Vec<QueuedMessage>> {
@@ -2082,7 +2082,7 @@ impl Store {
     ///
     /// For a payload this build cannot decode, which will never become readable and would otherwise
     /// wedge the queue behind it for ever. Guarded on nothing having been rendered yet, like
-    /// [`Self::unclaim`]: once a key is minted, meka may hold the item under it, and only the
+    /// [`Self::unclaim`]: once a key is minted, Meka may hold the item under it, and only the
     /// hand-over's own outcome may close the row.
     pub async fn complete(&self, sequences: &[i64]) -> Result<()> {
         let sequences = sequences.to_vec();
@@ -2113,7 +2113,7 @@ impl Store {
     /// store errors exhaust the offer budget and declare a message undeliverable that was never
     /// even attempted.
     ///
-    /// A row with a key is refused. Its item exists under that key, so meka may already hold it,
+    /// A row with a key is refused. Its item exists under that key, so Meka may already hold it,
     /// and putting the row back would hand the same message over twice; [`Self::reoffer`] is what
     /// takes a rendered row back, and it sheds the key on the way.
     pub async fn unclaim(&self, sequences: &[i64]) -> Result<()> {
@@ -2139,7 +2139,7 @@ impl Store {
     /// Stamp a rendered item onto a claimed row, and take off what the item states only once.
     ///
     /// One transaction, because the writes describe one fact. The key is minted here and never
-    /// again, so every post of this row is the same request to meka. The dropped-message count the
+    /// again, so every post of this row is the same request to Meka. The dropped-message count the
     /// item reported comes off the counter in the same write, so a crash between rendering and this
     /// call loses the item and keeps the count rather than the reverse. And the backlog the item
     /// states is marked seen here, stamped with this row's `seq`, which is what lets a second
@@ -2204,9 +2204,9 @@ impl Store {
         Ok(held)
     }
 
-    /// Record that meka has the row's item, on `session_id`.
+    /// Record that Meka has the row's item, on `session_id`.
     ///
-    /// Accepted on a row already posted as well as on one waiting: a reconciliation that finds meka
+    /// Accepted on a row already posted as well as on one waiting: a reconciliation that finds Meka
     /// with no record of the item posts it afresh, and the new id is the one the feed will name.
     /// The session is written because a row held before a rebind is posted to the session the
     /// bridge has now.
@@ -2282,7 +2282,7 @@ impl Store {
     /// Returns the row so the caller can say who lost what, and nothing for a row something else
     /// had already closed. The rendered body goes, since nothing will ever post it again and
     /// keeping it would pin a second copy of somebody's message for the life of the database; the
-    /// key and the item id stay, because they are what names this hand-over in meka's own logs.
+    /// key and the item id stay, because they are what names this hand-over in Meka's own logs.
     pub async fn failed(
         &self,
         seq: i64,
@@ -2318,7 +2318,7 @@ impl Store {
 
     /// Offer a row again, spending one of its offers.
     ///
-    /// For the two ways a hand-over comes apart without the message having been answered: meka took
+    /// For the two ways a hand-over comes apart without the message having been answered: Meka took
     /// the item back before the model read it, and the model read it and came back with nothing at
     /// all, no text and no tool call. Either way the row goes back to `pending`, held until
     /// `not_before` when one is given, and the next claim renders it afresh under a new key. A row
@@ -2416,7 +2416,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// The row meka knows as `item_id`, if any.
+    /// The row Meka knows as `item_id`, if any.
     pub async fn row_by_item(&self, item_id: &str) -> Result<Option<QueuedMessage>> {
         let item_id = item_id.to_string();
         let row = self
@@ -2453,7 +2453,7 @@ impl Store {
     /// startup.
     ///
     /// Only rows claimed and never rendered move: the process died between the claim and
-    /// [`Self::hold`], so nothing was rendered for them and nothing reached meka. A row that was
+    /// [`Self::hold`], so nothing was rendered for them and nothing reached Meka. A row that was
     /// rendered is left where it is, since it is either posted again under its own key or asked
     /// about, and either answer is better than a guess.
     pub async fn recover(&self) -> Result<Recovered> {
@@ -2532,7 +2532,7 @@ impl Store {
         Ok(stats)
     }
 
-    /// Delete every queue row regardless of state. Backs `mekabridge queue clear`.
+    /// Delete every queue row regardless of state. Backs `meka-bridge queue clear`.
     ///
     /// A hand-over that was still out gives back what its item took first, exactly as if it had
     /// failed. Deleting the row alone would not do it: `ON DELETE SET NULL` clears the stamp on the
@@ -3148,7 +3148,7 @@ impl Store {
         Ok(counts)
     }
 
-    /// How many messages are recorded, for `mekabridge status`.
+    /// How many messages are recorded, for `meka-bridge status`.
     pub async fn message_count(&self) -> Result<u64> {
         let count = self
             .connection
@@ -6009,8 +6009,8 @@ mod tests {
     #[tokio::test]
     async fn an_unclaimed_row_keeps_its_offer_budget() {
         // Rows claimed and handed back before a batch was made of them were never offered to
-        // meka: the process died, or the envelope could not be built. Spending an attempt on that
-        // would let a fault of the bridge's own declare a message undeliverable that meka never
+        // Meka: the process died, or the envelope could not be built. Spending an attempt on that
+        // would let a fault of the bridge's own declare a message undeliverable that Meka never
         // saw.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
@@ -6140,7 +6140,7 @@ mod tests {
         // about to be handed it. Closing its row as failed, by running out of offers or by giving
         // up on its hand-over, is exactly when that assumption fails, and without this the message
         // is neither delivered nor owed: absent from `unseen`, from the missed-context lookback,
-        // and from the `mekabridge unseen` predicate.
+        // and from the `meka-bridge unseen` predicate.
         //
         // It goes back in the transaction that closes the row, so no crash between the two can lose
         // it.
@@ -6213,7 +6213,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_returns_only_the_rows_nothing_was_rendered_for() {
         // Two rows claimed at once; the process died after binding the first into a batch and
-        // before binding the second. The bound one is a hand-over meka may already have and is
+        // before binding the second. The bound one is a hand-over Meka may already have and is
         // left for the post or the feed to settle; the other was never rendered for anybody.
         let (store, account) = seeded(&["telegram:123"]).await;
         for id in ["a", "b"] {
@@ -6426,7 +6426,7 @@ mod tests {
         let session = Uuid::new_v4();
         let first = claimed[0].seq;
         let item = HandOver {
-            key: "mekabridge-1",
+            key: "meka-bridge-1",
             body: "body",
             session_id: session,
             dropped: 0,
@@ -6435,18 +6435,18 @@ mod tests {
         assert!(store.hold(first, item, now()).await.expect("hold"));
         let held = store.row(first).await.expect("read").expect("on file");
         assert_eq!(held.state, QueueState::InFlight);
-        assert_eq!(held.key.as_deref(), Some("mekabridge-1"));
+        assert_eq!(held.key.as_deref(), Some("meka-bridge-1"));
         assert_eq!(held.body.as_deref(), Some("body"));
         assert_eq!(held.session_id, Some(session));
         assert_eq!(held.held_at, Some(now()));
         // A second render of the same row is refused: the key it would post under is already
-        // minted, and a row with two keys is two items to meka.
+        // minted, and a row with two keys is two items to Meka.
         assert!(
             !store
                 .hold(
                     first,
                     HandOver {
-                        key: "mekabridge-2",
+                        key: "meka-bridge-2",
                         body: "other",
                         ..item
                     },
@@ -6613,7 +6613,7 @@ mod tests {
         assert_eq!(
             closed.key.as_deref(),
             Some("key-1-0"),
-            "the key stays: it is what names this hand-over in meka's own logs"
+            "the key stays: it is what names this hand-over in Meka's own logs"
         );
         let stats = store.queue_stats().await.expect("stats");
         assert_eq!((stats.failed, stats.in_flight), (1, 0));
@@ -6769,7 +6769,7 @@ mod tests {
         // Every terminal write is guarded on the row still being in flight. Unguarded, a `done` row
         // could be released to `pending` and handed to the agent a second time. The session task
         // is serial so no live path does this today, but the store is the wrong place to rely on
-        // that: a second process, or `mekabridge queue clear`, reaches these directly.
+        // that: a second process, or `meka-bridge queue clear`, reaches these directly.
         let (store, account) = seeded(&["telegram:123"]).await;
         store
             .enqueue(key(account, "telegram:123", "a"), "a", now(), 10)
@@ -6805,7 +6805,7 @@ mod tests {
         );
         assert_eq!(stats.done, 1, "and nothing new was counted as delivered");
 
-        // A rendered row is not unclaimable either: its key is minted and meka may already have the
+        // A rendered row is not unclaimable either: its key is minted and Meka may already have the
         // item, so putting it back would hand the same message over twice.
         let claimed = claim_all(&store, 1).await;
         let held = hold_all(&store, &claimed).await;
@@ -6813,13 +6813,13 @@ mod tests {
         assert_eq!(
             store.queue_stats().await.expect("stats").in_flight,
             1,
-            "a rendered row was put back in the queue under a key meka may hold"
+            "a rendered row was put back in the queue under a key Meka may hold"
         );
     }
 
     #[tokio::test]
     async fn a_row_cleared_under_a_hand_over_settles_without_error() {
-        // `mekabridge queue clear` against a running bridge takes the rows out from under the
+        // `meka-bridge queue clear` against a running bridge takes the rows out from under the
         // session task, which then hears from the feed about an item it posted. Every write has to
         // shrug at that rather than fail the loop.
         let (store, account) = seeded(&["telegram:123"]).await;
@@ -6901,7 +6901,7 @@ mod tests {
                 .expect("summary")
                 .count,
             0,
-            "the backlog is spent while the item is with meka"
+            "the backlog is spent while the item is with Meka"
         );
 
         assert_eq!(store.clear_queue().await.expect("clear"), 1);

@@ -1463,7 +1463,7 @@ pub struct ChannelCapabilities {
     pub member_roles: bool,
 }
 
-/// What a platform says about one conversation. Used by `mekabridge doctor`.
+/// What a platform says about one conversation. Used by `meka-bridge doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationInfo {
     /// The id the conversation is really known by, which differs from the one asked about when a
@@ -1475,7 +1475,7 @@ pub struct ConversationInfo {
     pub title: Option<String>,
 }
 
-/// Who a channel is logged in as. Used by `mekabridge doctor`.
+/// Who a channel is logged in as. Used by `meka-bridge doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelIdentity {
     pub id: String,

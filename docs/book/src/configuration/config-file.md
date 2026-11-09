@@ -1,6 +1,6 @@
 # Config File
 
-TOML, loaded from the platform config directory unless `--config` says otherwise. `mekabridge config path` prints the resolved location.
+TOML, loaded from the platform config directory unless `--config` says otherwise. `meka-bridge config path` prints the resolved location.
 
 Unknown keys are rejected, so a typo is a startup error rather than a setting that silently does nothing.
 
@@ -10,7 +10,7 @@ Every credential accepts either an inline value or a file:
 
 ```toml
 token = "${MEKA_BRIDGE_TOKEN}"        # environment substitution, recommended
-token_file = "/etc/mekabridge/meka.token"   # file, recommended for production
+token_file = "/etc/meka-bridge/meka.token"   # file, recommended for production
 token = "sk_literal"                   # inline, logs a warning at startup
 ```
 
@@ -24,27 +24,27 @@ How to reach `meka serve`.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `base_url` | `http://127.0.0.1:8080` | Where meka is listening |
+| `base_url` | `http://127.0.0.1:8080` | Where Meka is listening |
 | `token` / `token_file` | *(required)* | Bearer token; needs the `sessions:r` and `sessions:w` scopes |
 | `connect_timeout` | `10s` | TCP connect budget |
 | `max_retries` | `3` | Attempts against retryable failures on read-only calls |
 
-Handing a message over is never retried at this layer. The schedule belongs on the row instead, where it survives a restart and `mekabridge queue list` can show it.
+Handing a message over is never retried at this layer. The schedule belongs on the row instead, where it survives a restart and `meka-bridge queue list` can show it.
 
-> **`turn_timeout` was removed in 0.14.0 and a config still setting it is refused at startup by name.** It was a ceiling on a turn this bridge held open end to end, and it holds none: a message goes into meka's inbox and meka runs the turn. Delete the line. Since meka 0.51 nothing times out a reply on either side, so if you want a ceiling it belongs in meka rather than in a client that is no longer watching.
+> **`turn_timeout` was removed in 0.14.0 and a config still setting it is refused at startup by name.** It was a ceiling on a turn this bridge held open end to end, and it holds none: a message goes into Meka's inbox and Meka runs the turn. Delete the line. Since Meka 0.51 nothing times out a reply on either side, so if you want a ceiling it belongs in Meka rather than in a client that is no longer watching.
 
 ## `[session]`
 
-The one meka session this instance owns.
+The one Meka session this instance owns.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `cwd` | meka's working directory | Absolute path the agent works in |
-| `permission` | `read` | meka permission level. `read`, `workspace` or `unrestricted`; see below |
-| `recreate_on_missing` | `true` | Create a replacement when meka reports the stored session is gone |
+| `cwd` | Meka's working directory | Absolute path the agent works in |
+| `permission` | `read` | Meka permission level. `read`, `workspace` or `unrestricted`; see below |
+| `recreate_on_missing` | `true` | Create a replacement when Meka reports the stored session is gone |
 
 All three work for replying. The bridge's send tools are annotated read-only, because they change
-nothing on your machine, so replying sits at meka's `read` level:
+nothing on your machine, so replying sits at Meka's `read` level:
 
 - `read`: the agent can answer messages, run commands, and browse, but cannot modify files.
 - `workspace`: it can also write, confined to the session's workspace.
@@ -56,11 +56,11 @@ nothing on your machine, so replying sits at meka's `read` level:
 > the config before its next turn.
 
 Why moderation needs the top rung rather than `workspace` is
-[explained under meka Integration](../usage/meka-integration.md#why-unrestricted-and-not-workspace);
-the short version is that meka will not let an unsandboxed MCP tool run at a level whose promise is
+[explained under Meka Integration](../usage/meka-integration.md#why-unrestricted-and-not-workspace);
+the short version is that Meka will not let an unsandboxed MCP tool run at a level whose promise is
 confinement. `doctor` reports when the moderation tools are registered and the session sits below it.
 
-If you would rather sends be gated too, invert it from meka's side:
+If you would rather sends be gated too, invert it from Meka's side:
 
 ```toml
 [mcp.servers.tool_permissions]
@@ -78,7 +78,7 @@ When `recreate_on_missing` fires, the agent's memory of every past conversation 
 | `max_queue_depth` | `256` | Messages that may be waiting before new ones are shed |
 | `settle` | `3s` | Quiet period a chat goes through before its messages reach the agent, **on platforms that report typing**. Ignored elsewhere. `0s` turns it off |
 | `settle_max` | `30s` | Ceiling on that wait, so a compose box left open cannot strand a message. Only reached where typing is reported, and does not override a message waiting out a retry |
-| `batch_max_messages` | `32` | Most messages claimed, rendered and posted in one pass. Not a limit on what one turn reads: meka takes every item posted around it |
+| `batch_max_messages` | `32` | Most messages claimed, rendered and posted in one pass. Not a limit on what one turn reads: Meka takes every item posted around it |
 | `typing_indicator` | `true` | Show a typing state in the originating chats while the model is writing a message, and at no other time |
 | `typing_max` | `2m` | Ceiling on how long one such window may last. Not a safety net: it is the only thing that closes a window whose closing event never arrives |
 | `mute_context` | `5` | Messages of missed context printed alongside a mention in a muted conversation. `0` withholds them and leaves the agent to ask |
@@ -89,17 +89,17 @@ That split is deliberate. Without the signal any wait is a guess, and there is n
 
 Every conversation is also held for one second regardless, which is not configurable. It exists for the wire rather than for people: platforms split one thing into several messages, Telegram's multi-photo albums above all, and without it a post arrives as one photo followed by a separate turn carrying the rest. Those parts land milliseconds apart, so a second is generous. See [Group attention](../usage/group-attention.md).
 
-The indicator tracks one thing: the interval in which the model is writing the arguments to a send tool, which meka opens with `tool_call.composing`. It is not raised while the agent reads, searches, thinks, or waits on a turn somebody else started, and a turn that never writes a message never draws one at all. The window is closed by the next tool call meka announces, whichever one that is, rather than by the one that opened it: meka can retry a provider round mid-arguments, and the retry comes back with different call ids, so the closing event for the original never arrives.
+The indicator tracks one thing: the interval in which the model is writing the arguments to a send tool, which Meka opens with `tool_call.composing`. It is not raised while the agent reads, searches, thinks, or waits on a turn somebody else started, and a turn that never writes a message never draws one at all. The window is closed by the next tool call Meka announces, whichever one that is, rather than by the one that opened it: Meka can retry a provider round mid-arguments, and the retry comes back with different call ids, so the closing event for the original never arrives.
 
 That is narrower than it used to be. The indicator previously went up when a turn started and stayed up for its whole length, which for a turn spent on a dozen tool calls was a claim that a reply was seconds away for minutes at a time. The cost of the change is that a long turn now looks like silence; the benefit is that when the indicator is up it is true.
 
-Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-chat-completions` today, meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn read items from rather than the message's eventual target; those are the same thing unless the turn read items from several chats.
+Two things follow from where the signal comes from. On a provider backend that does not stream a tool call as it is written, `openai-chat-completions` today, Meka resolves the name and arguments together, so the window has no duration and the indicator is at most a flicker. And because `tool_call.composing` carries only the tool name, the indicator is shown in the conversations the turn read items from rather than the message's eventual target; those are the same thing unless the turn read items from several chats.
 
-`typing_max` is the only thing that closes a window whose closing event never arrives. A window is normally closed by the next tool call meka announces, but a feed that goes quiet after `tool_call.composing` produces no such event. Sized for a whole turn, as it once was, the ceiling could never fire and a chat showed "typing" for half an hour before falling silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
+`typing_max` is the only thing that closes a window whose closing event never arrives. A window is normally closed by the next tool call Meka announces, but a feed that goes quiet after `tool_call.composing` produces no such event. Sized for a whole turn, as it once was, the ceiling could never fire and a chat showed "typing" for half an hour before falling silent with nothing delivered. Two minutes is generous against a model writing a long reply and short enough that nobody is misled for long.
 
 How often the indicator is renewed is not configurable: Telegram clears the status after about five seconds and Discord after ten, so the interval is fixed at four to look continuous on both.
 
-> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. meka now retries an item it has accepted itself, for as long as its `[serve] inbox_retry_ceiling` allows, an hour by default, and the bridge posts one it has not accepted for an hour on the same schedule, so with meka's default the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
+> **`turn_retries` was removed in 0.14.0 and is refused at startup by name too.** It counted attempts at a turn the bridge submitted and watched. Meka now retries an item it has accepted itself, for as long as its `[serve] inbox_retry_ceiling` allows, an hour by default, and the bridge posts one it has not accepted for an hour on the same schedule, so with Meka's default the two halves add up to the same hour whichever side the outage is on. There is no longer a number here for an operator to have a preference about. Delete the line.
 
 A message that could not be delivered produces two notices, deliberately different. The chat it came from is told one line that says nothing but that something went wrong: whoever is in it did nothing wrong, cannot act on an upstream status code, and is not necessarily somebody you would hand one to. `owner_conversation` gets the rest: which chats lost what, how many attempts were made, and the error verbatim.
 
@@ -107,11 +107,11 @@ Both are rate limited to one message per conversation per fifteen minutes, and t
 
 A chat is told only where the agent had not already answered it. A turn that sent something and then died has left work half done, which is worth telling the owner about, but an apology in a chat the agent had just replied in would contradict what it said there.
 
-`owner_conversation` hears two more things the chats never do. A turn meka is still retrying is reported at its first failed attempt, with the error, when meka tries next and when it gives up, so an outage reaches the owner before an hour of silence does; it is limited to one every fifteen minutes too, on a window of its own so it never holds back the failure notice that may follow. And turns served from one of the agent's profile `fallbacks` are reported when they move to the fallback and when they come back, at most once every fifteen minutes, since another model may be answering and another account paying.
+`owner_conversation` hears two more things the chats never do. A turn Meka is still retrying is reported at its first failed attempt, with the error, when Meka tries next and when it gives up, so an outage reaches the owner before an hour of silence does; it is limited to one every fifteen minutes too, on a window of its own so it never holds back the failure notice that may follow. And turns served from one of the agent's profile `fallbacks` are reported when they move to the fallback and when they come back, at most once every fifteen minutes, since another model may be answering and another account paying.
 
 Those are the only places the bridge writes chat content of its own, and `notify_failures = false` removes the chats' share. With it off and no `owner_conversation` set, a message the agent never receives is reported only in the logs, and the bridge says so at startup.
 
-`owner_conversation` names a chat, not a person, and startup can only check the shape of the id, never whether anything answers to it. Discord makes that gap sharp, because a user id and a channel id are both snowflakes: the wrong one is accepted here and then answered with `Unknown Channel` on every send, and nothing says so. Write `discord:@<user id>` to be reached by direct message and the bridge opens the channel itself. `mekabridge doctor` asks the platform whether the configured id resolves, which is the only way to settle it short of sending.
+`owner_conversation` names a chat, not a person, and startup can only check the shape of the id, never whether anything answers to it. Discord makes that gap sharp, because a user id and a channel id are both snowflakes: the wrong one is accepted here and then answered with `Unknown Channel` on every send, and nothing says so. Write `discord:@<user id>` to be reached by direct message and the bridge opens the channel itself. `meka-bridge doctor` asks the platform whether the configured id resolves, which is the only way to settle it short of sending.
 
 The message is also put back among what the agent has not seen, so `backlog_check` counts it and it comes back as missed context the next time that conversation wakes.
 
@@ -141,20 +141,20 @@ These are the same three states Telegram and Discord offer in their own notifica
 
 Groups default to `mute` because a bot with privacy mode off receives every message said in every group it is in, and in a busy one almost none of it concerns the agent. A one-to-one chat has nobody else in it, so `mute` there would be a no-op at best; the bridge refuses it and points at `conversation_block`.
 
-A conversation with an explicit decision keeps it, so changing these defaults moves only the conversations nobody has ruled on. `mekabridge policy list` shows both.
+A conversation with an explicit decision keeps it, so changing these defaults moves only the conversations nobody has ruled on. `meka-bridge policy list` shows both.
 
 Setting a default to `block` is allowed but warns on every startup: a bridge that answers nobody is hard to tell from a broken one.
 
 ## `[mcp]`
 
-The endpoint meka connects to.
+The endpoint Meka connects to.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `transport` | `http` | `http` (streamable HTTP) or `stdio` |
 | `bind` | `127.0.0.1:9100` | Listen address for `http` |
 | `path` | `/mcp` | Endpoint path |
-| `token` / `token_file` | none | Bearer token meka must present |
+| `token` / `token_file` | none | Bearer token Meka must present |
 | `allowed_hosts` | loopback names | `Host` values accepted, a DNS-rebinding guard |
 | `health` | `true` | Serve `/health/live` and `/health/ready` |
 
@@ -164,8 +164,8 @@ A non-loopback `bind` without a `token` is a `doctor` failure: anyone who can re
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `path` | `<data dir>/mekabridge/mekabridge.db` | SQLite database |
-| `attachment_dir` | `<data dir>/mekabridge/attachments` | Where `attachment_download` writes files |
+| `path` | `<data dir>/meka-bridge/meka-bridge.db` | SQLite database |
+| `attachment_dir` | `<data dir>/meka-bridge/attachments` | Where `attachment_download` writes files |
 | `attachment_max_bytes` | `20971520` (20 MiB) | Ceiling on what `attachment_download` will fetch. Telegram's cloud API caps `getFile` at 20 MiB regardless, so raising this only helps against a local Bot API server |
 | `attachment_retention` | `30d` | How long an attachment stays reachable. Governs both the handle and any file downloaded through it, so past this the agent can no longer fetch a file from an older message |
 | `history_retention` | `30d` | How long a recorded message stays readable through `history_read` and `history_search`. `0s` records nothing at all |
@@ -180,12 +180,12 @@ The default matches `attachment_retention` so a message and the picture attached
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `level` | `info` | `EnvFilter` directive, e.g. `mekabridge=debug,teloxide=warn` |
+| `level` | `info` | `EnvFilter` directive, e.g. `meka_bridge=debug,teloxide=warn` |
 | `format` | `text` | `text` or `json` |
 
 `RUST_LOG` overrides `level`, and `-v` / `-vv` override both.
 
-Where `level` lets `info` through for everything, as the default does, rmcp, the MCP library, is held at `warn` unless `level` names it. meka speaks a protocol to this bridge with no session to log once, so rmcp logs every request it serves as it starts and ends, three lines a tool call. Add `rmcp=info` to `level` to see them. A quieter `level` is left as it is, and `RUST_LOG` and `-vv` are not capped.
+Where `level` lets `info` through for everything, as the default does, rmcp, the MCP library, is held at `warn` unless `level` names it. Meka speaks a protocol to this bridge with no session to log once, so rmcp logs every request it serves as it starts and ends, three lines a tool call. Add `rmcp=info` to `level` to see them. A quieter `level` is left as it is, and `RUST_LOG` and `-vv` are not capped.
 
 ## `[[channels.telegram]]`
 
@@ -239,10 +239,10 @@ At least one allowlist, or `allow_all`, must be set. `allowed_users` gates direc
 ```toml
 [meka]
 base_url = "http://127.0.0.1:8080"
-token_file = "/etc/mekabridge/meka.token"
+token_file = "/etc/meka-bridge/meka.token"
 
 [session]
-cwd = "/var/lib/mekabridge/workspace"
+cwd = "/var/lib/meka-bridge/workspace"
 permission = "workspace"
 
 [bridge]
@@ -258,11 +258,11 @@ channel = "mute"
 transport = "http"
 bind = "127.0.0.1:9100"
 path = "/mcp"
-token_file = "/etc/mekabridge/mcp.token"
+token_file = "/etc/meka-bridge/mcp.token"
 
 [storage]
-path = "/var/lib/mekabridge/state.db"
-attachment_dir = "/var/lib/mekabridge/attachments"
+path = "/var/lib/meka-bridge/state.db"
+attachment_dir = "/var/lib/meka-bridge/attachments"
 attachment_retention = "14d"
 history_retention = "14d"
 
@@ -272,13 +272,13 @@ format = "json"
 
 [[channels.telegram]]
 id = "telegram"
-token_file = "/etc/mekabridge/telegram.token"
+token_file = "/etc/meka-bridge/telegram.token"
 allowed_users = [123456789]
 allowed_chats = [-1001234567890]
 
 [[channels.discord]]
 id = "discord"
-token_file = "/etc/mekabridge/discord.token"
+token_file = "/etc/meka-bridge/discord.token"
 allowed_users = ["245119312739729408"]
 allowed_channels = ["111222333444555666"]
 ```

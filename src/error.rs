@@ -7,10 +7,10 @@
 
 use std::path::PathBuf;
 
-/// Convenience alias for fallible mekabridge operations.
+/// Convenience alias for fallible Meka Bridge operations.
 pub type Result<T> = std::result::Result<T, BridgeError>;
 
-/// Every way mekabridge can fail, as seen by `main` and the orchestration layer.
+/// Every way Meka Bridge can fail, as seen by `main` and the orchestration layer.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error("configuration is invalid: {message}")]
@@ -33,7 +33,7 @@ pub enum BridgeError {
     #[error("channel: {0}")]
     Channel(#[from] crate::channel::ChannelError),
 
-    #[error("meka: {0}")]
+    #[error("Meka: {0}")]
     Meka(#[from] crate::meka::MekaError),
 
     /// A command refused to act, or found something wrong. Distinct from [`Self::Config`] so the

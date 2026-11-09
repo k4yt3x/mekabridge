@@ -1,11 +1,11 @@
 //! Builds one inbox item: the text of one message as the agent is handed it.
 //!
-//! This is the agent's only source of routing information. A `tools/call` names the meka session it
+//! This is the agent's only source of routing information. A `tools/call` names the Meka session it
 //! came from but not the conversation, and one session talks to everybody, so the conversation id
 //! printed here is what the agent has to echo back to `message_send` in order to reply to the right
 //! person.
 //!
-//! One item per message, because meka batches for itself: one turn reads every item posted around
+//! One item per message, because Meka batches for itself: one turn reads every item posted around
 //! it and writes one block per item into a user message, under a header of its own. A second layer
 //! of batching here would only repeat what the server does.
 //!
@@ -202,7 +202,7 @@ impl Item<'_> {
     pub fn render(&self) -> String {
         let mut out = String::new();
         if let Some(identity) = format_identities(self.identities) {
-            let _ = writeln!(out, "[mekabridge] You are {identity}.");
+            let _ = writeln!(out, "[Meka Bridge] You are {identity}.");
         }
         if self.dropped > 0 {
             let dropped_noun = if self.dropped == 1 {
@@ -215,8 +215,8 @@ impl Item<'_> {
             // message is gone when it is one tool call away.
             let _ = writeln!(
                 out,
-                "[mekabridge] {} earlier {dropped_noun} could not be queued, so you were not woken \
-                 for {}.",
+                "[Meka Bridge] {} earlier {dropped_noun} could not be queued, so you were not \
+                 woken for {}.",
                 self.dropped,
                 if self.dropped == 1 { "it" } else { "them" }
             );
@@ -252,7 +252,7 @@ impl Item<'_> {
             // entirely.
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken in {} by somebody naming you, replying to \
+                "[Meka Bridge] You are only woken in {} by somebody naming you, replying to \
                  something you said, or matching a watch you set. Nothing has been said there \
                  since you last looked.",
                 missed.conversation
@@ -267,7 +267,7 @@ impl Item<'_> {
         if missed.muted {
             let _ = writeln!(
                 out,
-                "[mekabridge] You are only woken in {} by somebody naming you, replying to \
+                "[Meka Bridge] You are only woken in {} by somebody naming you, replying to \
                  something you said, or matching a watch you set; nothing else there reaches you. \
                  {} {noun} you have not seen were said there; history_read and history_search \
                  reach all of them.",
@@ -279,7 +279,7 @@ impl Item<'_> {
             // on mentions only would be a lie.
             let _ = writeln!(
                 out,
-                "[mekabridge] {} {noun} in {} were recorded while you were not being woken for \
+                "[Meka Bridge] {} {noun} in {} were recorded while you were not being woken for \
                  them, and you have not seen them; history_read and history_search reach all of \
                  them.",
                 missed.count, missed.conversation
@@ -1330,7 +1330,7 @@ mod tests {
 
     #[test]
     fn a_claimed_pass_renders_one_item_per_message() {
-        // meka writes a header of its own above each item and reads them into one turn in the order
+        // Meka writes a header of its own above each item and reads them into one turn in the order
         // they were posted, so numbering them here would be the bridge repeating what the server
         // says, in words that could disagree with it.
         let items = render_pass(
@@ -1989,7 +1989,7 @@ mod tests {
         }
         .render();
         assert!(
-            rendered.contains("[mekabridge] You are @mybot on telegram."),
+            rendered.contains("[Meka Bridge] You are @mybot on telegram."),
             "got:\n{rendered}"
         );
     }

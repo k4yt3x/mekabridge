@@ -1,13 +1,13 @@
-//! Client for meka's HTTP API.
+//! Client for Meka's HTTP API.
 //!
 //! Two doors matter here. Messages go in through the session inbox, `POST /v1/sessions/{id}/inbox`,
-//! which answers the moment the item is durable on meka's side and never refuses for a turn in
+//! which answers the moment the item is durable on Meka's side and never refuses for a turn in
 //! flight. What became of them comes back on the session feed, `GET /v1/sessions/{id}/feed`
-//! (`/stream` before meka 0.89), one connection per session that carries every turn's events,
+//! (`/stream` before Meka 0.89), one connection per session that carries every turn's events,
 //! whoever started the turn, and does not end of its own accord.
 //!
 //! Retries are deliberately asymmetric. Read-only endpoints retry what [`MekaError::is_retryable`]
-//! admits, which is meka's own error taxonomy by `type` URI rather than by status code, plus a bare
+//! admits, which is Meka's own error taxonomy by `type` URI rather than by status code, plus a bare
 //! 429 or 5xx from whatever sits between the two processes. Session creation and an inbox post
 //! never retry here: the post is retried by the session task, where the schedule is written down
 //! and observable, and it carries an `Idempotency-Key` so a retry after an ambiguous failure finds
@@ -38,7 +38,7 @@ use crate::{
 /// Longest silence tolerated on the open feed before it is treated as dead.
 ///
 /// Bounds the gap between reads, not the whole response, so a feed held open for days is
-/// unaffected: meka sends a keep-alive comment every twenty seconds and this is three of those. It
+/// unaffected: Meka sends a keep-alive comment every twenty seconds and this is three of those. It
 /// is what turns a connection that stopped speaking without closing into an error the reader can
 /// reconnect on.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -51,14 +51,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much of the upstream's own response is repeated when an error is rendered.
 ///
-/// meka bounds what it sends at 4 KiB, which is sized for its log rather than for a chat: the
+/// Meka bounds what it sends at 4 KiB, which is sized for its log rather than for a chat: the
 /// owner's notice carries this in the middle and appends the attempt count and the affected
 /// conversations after it, so an unbounded one pushes those past a platform's length limit and into
-/// a second message. The actionable part is the error type, which sits at the start, and meka's own
+/// a second message. The actionable part is the error type, which sits at the start, and Meka's own
 /// log keeps the whole thing either way.
 const PROVIDER_RESPONSE_PREVIEW_CHARS: usize = 400;
 
-/// Problem Detail (RFC 9457) as returned by every meka error response.
+/// Problem Detail (RFC 9457) as returned by every Meka error response.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ProblemDetail {
@@ -69,7 +69,7 @@ pub struct ProblemDetail {
     pub detail: String,
     /// Seconds the upstream asked the caller to wait, as an RFC 9457 extension member.
     ///
-    /// meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
+    /// Meka sends this on the 429s it raises itself, its concurrency limit and its idempotency
     /// cap, and on a `RetryableProvider` too, which is the case that matters most: a rate limit
     /// now arrives carrying the one number that is not a guess. It used to be dropped at the
     /// boundary that turns an error into a Problem Detail.
@@ -82,15 +82,15 @@ pub struct ProblemDetail {
 
     /// The upstream's own error text, relayed as an RFC 9457 extension member.
     ///
-    /// meka's `detail` on a 502 says that the provider failed the turn and not why, so without
+    /// Meka's `detail` on a 502 says that the provider failed the turn and not why, so without
     /// this the owner's notice says only that the provider refused and an operator has to go and
-    /// read meka's log to learn whether a credential died or a quota ran out. Absent when the
+    /// read Meka's log to learn whether a credential died or a quota ran out. Absent when the
     /// operator set `[serve] relay_provider_errors = false`.
     pub provider_response: Option<String>,
 }
 
 impl ProblemDetail {
-    /// Classify the stable `type` URI. meka's docs are explicit that clients should route on this
+    /// Classify the stable `type` URI. Meka's docs are explicit that clients should route on this
     /// rather than on the status code or the human-readable detail.
     pub fn kind(&self) -> ProblemKind {
         match self.type_uri.rsplit('/').next().unwrap_or_default() {
@@ -118,7 +118,7 @@ impl ProblemDetail {
 }
 
 impl ProblemDetail {
-    /// The problem as one line, with or without meka's `detail`: without it for a reader that
+    /// The problem as one line, with or without Meka's `detail`: without it for a reader that
     /// already has that sentence, as a give-up's own reason does.
     pub fn summary(&self, with_detail: bool) -> String {
         let mut line = if with_detail && !self.detail.is_empty() {
@@ -126,8 +126,8 @@ impl ProblemDetail {
         } else {
             format!("{} ({})", self.title, self.status)
         };
-        // Appended rather than replacing `detail`, which stays meka's own sentence. This reaches
-        // the owner's notice, which is the reader meka relayed it for; the affected chat is told
+        // Appended rather than replacing `detail`, which stays Meka's own sentence. This reaches
+        // the owner's notice, which is the reader Meka relayed it for; the affected chat is told
         // one line carrying none of it.
         if let Some(response) = &self.provider_response {
             let preview: String = response
@@ -151,7 +151,7 @@ impl std::fmt::Display for ProblemDetail {
     }
 }
 
-/// Machine-readable meka error categories.
+/// Machine-readable Meka error categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProblemKind {
     Auth,
@@ -169,7 +169,7 @@ pub enum ProblemKind {
     /// terminal `turn.failed`, never as an HTTP response.
     StreamDetached,
     Provider,
-    /// The transient half of the same 502: a failure meka's own classifier recognised, covering an
+    /// The transient half of the same 502: a failure Meka's own classifier recognised, covering an
     /// overload, a 5xx, a dropped connection and a stalled stream.
     ///
     /// Split out of [`Self::Provider`] because a relayed `Retry-After` was the only thing
@@ -180,7 +180,7 @@ pub enum ProblemKind {
     /// a 429, a subscription's spent usage window. Nothing changes until its reset, which rides as
     /// `retry_after` when the upstream stated one.
     ProviderExhausted,
-    /// The conversation no longer fits the model's window and meka could not compact it far
+    /// The conversation no longer fits the model's window and Meka could not compact it far
     /// enough. A 502 like [`Self::Provider`], and deliberately a separate type: the same
     /// conversation will not fit on the next attempt either, so this is the one upstream failure
     /// where retrying is certain to waste the budget.
@@ -194,27 +194,27 @@ pub enum ProblemKind {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MekaError {
-    #[error("could not reach meka: {0}")]
+    #[error("could not reach Meka: {0}")]
     Transport(#[from] reqwest::Error),
 
-    #[error("meka rejected the request: {0}")]
+    #[error("Meka rejected the request: {0}")]
     Problem(ProblemDetail),
 
-    #[error("meka returned HTTP {status} with an unexpected body: {body}")]
+    #[error("Meka returned HTTP {status} with an unexpected body: {body}")]
     UnexpectedStatus { status: u16, body: String },
 
     /// The feed connection ended.
     ///
     /// Never an outcome in itself. The feed carries on server-side and a turn is never stopped for
-    /// want of a reader, so the reader reconnects from the last id it handled and meka replays what
+    /// want of a reader, so the reader reconnects from the last id it handled and Meka replays what
     /// it missed.
     #[error("the session feed ended: {reason}")]
     FeedEnded { reason: String },
 
-    #[error("could not decode a meka response: {0}")]
+    #[error("could not decode a Meka response: {0}")]
     Decode(String),
 
-    #[error("could not build the meka client: {0}")]
+    #[error("could not build the Meka client: {0}")]
     Build(String),
 }
 
@@ -222,12 +222,12 @@ impl MekaError {
     /// Whether retrying the same request could plausibly succeed.
     ///
     /// [`ProblemKind::ProviderUnavailable`] is the transient upstream failure and the one this
-    /// exists for. [`ProblemKind::Provider`] is retryable too, despite reading like a refusal: meka
+    /// exists for. [`ProblemKind::Provider`] is retryable too, despite reading like a refusal: Meka
     /// describes it as a catch-all meaning "no reason to expect a retry to help" rather than "a
     /// retry cannot help", and asks clients not to be built so that they never retry it. The queue
-    /// bounds the attempts, which is the part meka does warn against leaving open.
+    /// bounds the attempts, which is the part Meka does warn against leaving open.
     ///
-    /// [`ProblemKind::ContextOverflow`] is the exception, and why meka split it out as well: it
+    /// [`ProblemKind::ContextOverflow`] is the exception, and why Meka split it out as well: it
     /// will refuse the same conversation forever.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -241,7 +241,7 @@ impl MekaError {
                 | ProblemKind::ProviderUnavailable
                 // Plausibly, once the reset passes, and the queue waits for `retry_after`. Only a
                 // turn ends this way, so it arrives on the feed rather than on a request this
-                // retries, and meka decides there how long the item is tried.
+                // retries, and Meka decides there how long the item is tried.
                 | ProblemKind::ProviderExhausted
                 | ProblemKind::SessionLocked
                 // Both arrive only as a turn's terminal on the feed, where nothing here retries
@@ -251,7 +251,7 @@ impl MekaError {
                 | ProblemKind::StreamDetached => true,
                 // A `type` this build has never heard of, where the status is the only thing left
                 // to go on. Reading those as permanent is a trap rather than a conservative
-                // default: this bridge asks meka to give `RetryableProvider` an arm of its own
+                // default: this bridge asks Meka to give `RetryableProvider` an arm of its own
                 // instead of letting it fall through to `internal`, and the natural way to grant
                 // that is a new URI. Landing it would otherwise turn every rate limit into a
                 // message given up on at the first attempt, which is the fault the whole retry
@@ -260,7 +260,7 @@ impl MekaError {
                 _ => false,
             },
             // No Problem Detail body, so nothing to route on but the status. This is what a reverse
-            // proxy in front of meka produces: nginx's 503 while meka restarts, or a 429 from
+            // proxy in front of Meka produces: nginx's 503 while Meka restarts, or a 429 from
             // whatever is metering the hop. Treating those as permanent meant `doctor` and `status`
             // giving up on the first hiccup.
             Self::UnexpectedStatus { status, .. } => *status == 429 || (500..600).contains(status),
@@ -288,7 +288,7 @@ impl MekaError {
         }
     }
 
-    /// Whether meka says the session id the bridge holds no longer exists, which is the cue to
+    /// Whether Meka says the session id the bridge holds no longer exists, which is the cue to
     /// create a replacement.
     pub fn is_session_missing(&self) -> bool {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::SessionNotFound)
@@ -304,9 +304,9 @@ impl MekaError {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::ContextOverflow)
     }
 
-    /// Whether another meka process holds the session, which is a wait rather than a failure.
+    /// Whether another Meka process holds the session, which is a wait rather than a failure.
     ///
-    /// A REPL opened on the bridge's session is the ordinary way here. meka refuses an inbox post
+    /// A REPL opened on the bridge's session is the ordinary way here. Meka refuses an inbox post
     /// on it before anything is written, and its own driver asks a held session again every ten
     /// seconds until the holder lets go, so the post is simply made again later.
     pub fn is_session_locked(&self) -> bool {
@@ -315,9 +315,9 @@ impl MekaError {
 
     /// Whether the path names no route at all, as against a resource the route does not have.
     ///
-    /// meka's router has no fallback, so a path it does not serve gets the framework's bare 404,
-    /// while every 404 meka writes itself, `session-not-found` among them, is a problem document. A
-    /// proxy in front of meka that serves none of the API answers the same way, and asking it at
+    /// Meka's router has no fallback, so a path it does not serve gets the framework's bare 404,
+    /// while every 404 Meka writes itself, `session-not-found` among them, is a problem document. A
+    /// proxy in front of Meka that serves none of the API answers the same way, and asking it at
     /// another path costs a request.
     pub fn is_route_missing(&self) -> bool {
         matches!(self, Self::UnexpectedStatus { status: 404, .. })
@@ -337,7 +337,7 @@ pub struct SessionInfo {
     #[serde(default)]
     pub permission: Option<String>,
     pub title: String,
-    /// Omitted by meka when the session has no working directory of its own.
+    /// Omitted by Meka when the session has no working directory of its own.
     #[serde(default)]
     pub working_directory: Option<String>,
     /// The profile the session runs on, which a request may move it off, so it is not always the
@@ -345,7 +345,7 @@ pub struct SessionInfo {
     pub profile: String,
     /// Whether a turn is running on this session right now.
     ///
-    /// Read by `mekabridge session show` and by nothing that decides anything: what became of a
+    /// Read by `meka-bridge session show` and by nothing that decides anything: what became of a
     /// hand-over is what the feed says, and a session busy with somebody else's turn is no
     /// obstacle to putting a message in its inbox.
     pub turn_in_flight: bool,
@@ -359,17 +359,17 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerInfo {
     pub version: String,
-    /// The permission levels this meka will create a session at, from `[permissions].enabled`.
+    /// The permission levels this Meka will create a session at, from `[permissions].enabled`.
     ///
     /// Asking for one outside the set is a 422 at session creation, which happens on the first
     /// message rather than at startup, so without this the misconfiguration surfaces as a message
     /// that never gets answered.
     ///
-    /// Defaulted rather than required, so a meka too old to send it still decodes and `doctor` can
+    /// Defaulted rather than required, so a Meka too old to send it still decodes and `doctor` can
     /// say it is too old, rather than reporting a body it could not read.
     #[serde(default)]
     pub enabled_permissions: Vec<String>,
-    /// The scopes `[meka].token` holds, as meka reports them.
+    /// The scopes `[meka].token` holds, as Meka reports them.
     ///
     /// The one thing about the token nothing else here could check. Every call `doctor` makes
     /// needs a read scope only, so a token that cannot hand a message over answers all of them and
@@ -391,26 +391,26 @@ pub struct Profile {
     /// The wire protocol the account speaks, such as `anthropic-messages`.
     ///
     /// Omitted when the profile names an account `config.toml` does not have, which is a
-    /// misconfiguration no meka will start a session on.
+    /// misconfiguration no Meka will start a session on.
     #[serde(default)]
     pub backend: Option<String>,
-    /// Omitted by meka when the profile configures none.
+    /// Omitted by Meka when the profile configures none.
     #[serde(default)]
     pub model: Option<String>,
     /// Whether a session on this profile can look at images at all.
     ///
     /// The bridge attaches nothing to a turn, so this gates `attachment_view` instead. Worth being
-    /// precise about why, because the obvious reason is wrong: meka checks `vision` only on the
+    /// precise about why, because the obvious reason is wrong: Meka checks `vision` only on the
     /// paths that bring an image *in*, and forwards an MCP tool result's image block to the
     /// provider whatever the setting says. So this check is not belt and braces over one of
-    /// meka's, it is the only thing standing between a non-vision profile and an image block
-    /// committed to the session's history, after which meka refuses every later turn in that
+    /// Meka's, it is the only thing standing between a non-vision profile and an image block
+    /// committed to the session's history, after which Meka refuses every later turn in that
     /// session while the profile cannot see it.
     pub vision: bool,
     /// Whether a session naming no profile gets this one. The bridge never names one, so this is
     /// the profile its session starts on.
     ///
-    /// Called `active` before meka 0.89. No meka sends both, so the alias reads either.
+    /// Called `active` before Meka 0.89. No Meka sends both, so the alias reads either.
     #[serde(default, alias = "active")]
     pub default: bool,
 }
@@ -431,7 +431,7 @@ pub struct ReadyStatus {
     #[serde(default)]
     pub session_db: bool,
     /// Whether `config.toml` names at least one profile. Not whether its credential works, which
-    /// meka only finds out when a session first needs it.
+    /// Meka only finds out when a session first needs it.
     #[serde(default)]
     pub profile_configured: bool,
     #[serde(default)]
@@ -449,14 +449,14 @@ pub struct InboxReceipt {
     /// Whether the `Idempotency-Key` had been used before, so the item is the earlier one.
     #[serde(default)]
     pub replayed: bool,
-    /// When meka stops retrying the item: its enqueue plus `[serve] inbox_retry_ceiling`.
+    /// When Meka stops retrying the item: its enqueue plus `[serve] inbox_retry_ceiling`.
     ///
-    /// Kept as meka wrote it and read through [`Self::retry_until`], so a timestamp this build
+    /// Kept as Meka wrote it and read through [`Self::retry_until`], so a timestamp this build
     /// cannot parse costs the owner's notice a time rather than costing the post its receipt.
     #[serde(default)]
     pub retry_until: Option<String>,
     /// On a replayed key, the last failed turn's error: on an item waiting for its next attempt,
-    /// and on one meka gave up on because a turn failed.
+    /// and on one Meka gave up on because a turn failed.
     ///
     /// What tells such a give-up apart from an item taken back unread, since a cancelled turn and
     /// a `DELETE` withdraw it too and leave this empty. A give-up with no failed turn behind it,
@@ -464,13 +464,13 @@ pub struct InboxReceipt {
     /// reads as one of those.
     #[serde(default)]
     pub last_error: Option<ProblemDetail>,
-    /// On a replayed key, meka's sentence for why the item was withdrawn.
+    /// On a replayed key, Meka's sentence for why the item was withdrawn.
     #[serde(default)]
     pub failure: Option<String>,
 }
 
 impl InboxReceipt {
-    /// [`Self::retry_until`] as a time, or `None` when meka sent none this build can read.
+    /// [`Self::retry_until`] as a time, or `None` when Meka sent none this build can read.
     pub fn retry_until(&self) -> Option<DateTime<Utc>> {
         self.retry_until
             .as_deref()
@@ -479,7 +479,7 @@ impl InboxReceipt {
     }
 }
 
-/// Where an inbox item is in its life, as meka names it.
+/// Where an inbox item is in its life, as Meka names it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(from = "String")]
 pub enum InboxState {
@@ -489,7 +489,7 @@ pub enum InboxState {
     Appended,
     /// The provider accepted a request carrying it, so the model has read it.
     Delivered,
-    /// Taken back: by a `DELETE`, by the cancellation of the turn it opened, or by meka giving up
+    /// Taken back: by a `DELETE`, by the cancellation of the turn it opened, or by Meka giving up
     /// on it.
     Withdrawn,
     /// A name this build does not know, kept rather than failing the post over it.
@@ -525,10 +525,10 @@ impl std::fmt::Display for InboxState {
 /// read at the running turn's next round boundary, or rides the next turn's opening.
 pub const INBOX_CLASS: &str = "steer";
 
-/// Who the header meka writes above each item names as the sender. The same name the MCP
+/// Who the header Meka writes above each item names as the sender. The same name the MCP
 /// instructions use for this bridge, so the agent reads one name for it. Without it the header
 /// names nobody.
-pub const INBOX_SOURCE: &str = "mekabridge";
+pub const INBOX_SOURCE: &str = "Meka Bridge";
 
 /// HTTP client for one `meka serve` instance.
 #[derive(Clone)]
@@ -537,11 +537,11 @@ pub struct MekaClient {
     base_url: Url,
     token: Secret,
     max_retries: u32,
-    /// Whether the feed last opened at `/stream`, where meka served it before 0.89, rather than at
+    /// Whether the feed last opened at `/stream`, where Meka served it before 0.89, rather than at
     /// `/feed`.
     ///
     /// Shared between clones, so every reconnect goes straight to the route that answered last,
-    /// and a meka upgraded or downgraded under a running bridge costs one 404 on the reconnect
+    /// and a Meka upgraded or downgraded under a running bridge costs one 404 on the reconnect
     /// after it.
     feed_at_stream: Arc<AtomicBool>,
 }
@@ -553,7 +553,7 @@ impl MekaClient {
             .connect_timeout(config.connect_timeout)
             // No overall request timeout: the feed is held open for as long as the bridge runs.
             // `read_timeout` is the one that works on a stream, because it bounds the gap between
-            // reads rather than the whole response, and meka sends a keep-alive comment every
+            // reads rather than the whole response, and Meka sends a keep-alive comment every
             // twenty seconds. Without it a connection that goes silent without closing -- a NAT
             // dropping state, a machine pulled off the network -- is indistinguishable from a quiet
             // session, and the reader would wait forever on a feed that will never speak again.
@@ -593,7 +593,7 @@ impl MekaClient {
                 // The bridge never relays reasoning, so asking for it would only waste bandwidth.
                 "supports_reasoning_stream": false,
                 // There is no interface here to show an approval prompt on. Declaring that makes
-                // meka deny a gated tool immediately with a notice, instead of parking the turn on
+                // Meka deny a gated tool immediately with a notice, instead of parking the turn on
                 // the SSE channel for a minute waiting for an answer that can never arrive.
                 "supports_permission_prompts": false,
             },
@@ -671,7 +671,7 @@ impl MekaClient {
 
     /// `GET /v1/health/ready`.
     ///
-    /// The only endpoint here whose failure status carries an answer rather than an error. meka
+    /// The only endpoint here whose failure status carries an answer rather than an error. Meka
     /// replies 503 with the same `ReadyStatus` body it sends on 200, naming which subsystem is the
     /// blocker, and not a Problem Detail. Handing that to the shared decode path turned the one
     /// response worth reading into "unexpected body", retried three times on the way, so `doctor`
@@ -690,10 +690,10 @@ impl MekaClient {
                     .await?;
                 if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                     let body = response.text().await?;
-                    // A 503 that is not meka's own answer came from something in between, a proxy
-                    // while meka restarts, and is the transient case worth retrying.
+                    // A 503 that is not Meka's own answer came from something in between, a proxy
+                    // while Meka restarts, and is the transient case worth retrying.
                     //
-                    // Told apart by the two words meka can put in `status`, not merely by it being
+                    // Told apart by the two words Meka can put in `status`, not merely by it being
                     // present. Every field here defaults, so requiring a non-empty string admitted
                     // any JSON object carrying one: a load balancer's
                     // `{"status":"Service Unavailable","message":...}` parsed into all three flags
@@ -729,9 +729,9 @@ impl MekaClient {
 
     /// `POST /v1/sessions/{id}/cancel`. Idempotent server-side, so a retry is safe.
     ///
-    /// With a `turn_id` meka stops only that turn and answers `409 turn-mismatch` when another is
+    /// With a `turn_id` Meka stops only that turn and answers `409 turn-mismatch` when another is
     /// running, so a caller that watched one turn cannot stop the scheduled fire that replaced it.
-    /// Without one it stops whatever runs, which is what the operator's `mekabridge cancel` means.
+    /// Without one it stops whatever runs, which is what the operator's `meka-bridge cancel` means.
     pub async fn cancel_turn(&self, session_id: Uuid, turn_id: Option<&str>) -> Result<()> {
         let url = self.endpoint(&format!("/v1/sessions/{session_id}/cancel"))?;
         let body = turn_id.map(|turn_id| serde_json::json!({ "turn_id": turn_id }));
@@ -799,17 +799,17 @@ impl MekaClient {
 
     /// `POST /v1/sessions/{id}/inbox`: hand the agent a message without waiting for it.
     ///
-    /// Answers as soon as the item is durable on meka's side, whether or not a turn is running: a
+    /// Answers as soon as the item is durable on Meka's side, whether or not a turn is running: a
     /// running one reads it at its next round boundary, and an idle session opens a turn for it.
-    /// meka retries a turn that fails before the model produced anything, and reports the item's
+    /// Meka retries a turn that fails before the model produced anything, and reports the item's
     /// fate on the feed, so nothing about the turn is waited on here.
     ///
     /// `key` is recorded on the item. A retry after an ambiguous failure, or after a restart on
     /// either side, is answered with the item it already made and that item's current state rather
     /// than a second copy, which is also how a hand-over whose events were missed is reconciled.
-    /// That lasts as long as the item does: meka's `[session].turn_retention` deletes one, key and
+    /// That lasts as long as the item does: Meka's `[session].turn_retention` deletes one, key and
     /// all, once it has been delivered or withdrawn for longer than the window. `body` has to be
-    /// byte-identical on a replay: meka refuses the same key with other words.
+    /// byte-identical on a replay: Meka refuses the same key with other words.
     ///
     /// Never retried here. The session task schedules the retry, where the wait is written down
     /// and survives a restart.
@@ -840,18 +840,18 @@ impl MekaClient {
     ///
     /// Every event of every turn on the session, whoever started it, for as long as the connection
     /// is held; it does not end with a turn. `last_event_id` is the last id already handled, and
-    /// meka replays what came after it before following the live feed, across turns. A resume that
-    /// outruns meka's replay ring, or names a position a restarted meka never issued, is reported
+    /// Meka replays what came after it before following the live feed, across turns. A resume that
+    /// outruns Meka's replay ring, or names a position a restarted Meka never issued, is reported
     /// on the feed as a `feed.gap` rather than as a silent hole, which is the caller's cue to
     /// reconcile what it was waiting on.
     ///
     /// Opening the feed loads the session, so the bridge subscribes before it has anything to hand
     /// over, and a session evicted for idleness comes back rather than answering 404. It is also
-    /// what keeps the session resident: meka does not evict one with a live subscriber.
+    /// what keeps the session resident: Meka does not evict one with a live subscriber.
     ///
-    /// Before 0.89 meka served the feed at `/stream`, and neither route answers on the other's
-    /// meka. So whichever route a feed last opened at is asked first, and a route meka does not
-    /// serve is asked again at the other, rather than taking a version off `/v1/info` that a meka
+    /// Before 0.89 Meka served the feed at `/stream`, and neither route answers on the other's
+    /// Meka. So whichever route a feed last opened at is asked first, and a route Meka does not
+    /// serve is asked again at the other, rather than taking a version off `/v1/info` that a Meka
     /// upgraded under a running bridge would leave stale.
     ///
     /// Errors before the first byte surface here rather than inside the stream, so the caller can
@@ -908,9 +908,9 @@ impl MekaClient {
 pub struct StreamItem {
     /// `None` only until the first id of a connection has been seen.
     ///
-    /// Not "whenever meka omits one", which is the obvious reading and is wrong:
+    /// Not "whenever Meka omits one", which is the obvious reading and is wrong:
     /// `eventsource-stream` implements the spec's persistent last-event-ID buffer, so an event
-    /// sent without an `id:` line is reported carrying the previous one. meka does send
+    /// sent without an `id:` line is reported carrying the previous one. Meka does send
     /// several that way, including the synthesised `turn.started` that opens a resumed feed and
     /// `feed.gap`. Inheriting the previous id is harmless here, since resuming from it is
     /// idempotent, and the parser starts afresh with each connection, so a `feed.gap` that opens
@@ -927,7 +927,7 @@ pub struct StreamItem {
 /// The stream ends when the connection does, and not before: the feed carries on past every
 /// terminal. A frame this build cannot parse is reported as [`MekaError::Decode`] and the stream
 /// carries on, since the frame decides nothing on its own and reconnecting would replay it out of
-/// meka's ring to fail identically.
+/// Meka's ring to fail identically.
 fn events_from(
     response: reqwest::Response,
 ) -> impl Stream<Item = Result<StreamItem>> + Send + use<> {
@@ -999,7 +999,7 @@ async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> 
     })
 }
 
-/// Turn an error response into a [`MekaError`], preferring the Problem Detail body when meka sent
+/// Turn an error response into a [`MekaError`], preferring the Problem Detail body when Meka sent
 /// one and falling back to the raw text when it did not (a reverse proxy returning 502 HTML, say).
 async fn problem_from(response: reqwest::Response) -> MekaError {
     let status = response.status().as_u16();
@@ -1026,7 +1026,7 @@ async fn problem_from(response: reqwest::Response) -> MekaError {
 
 /// Exponential backoff with jitter: 250ms, 500ms, 1s, 2s, capped at 8s.
 ///
-/// The jitter matters because the bridge and meka restart together under systemd, and a fixed
+/// The jitter matters because the bridge and Meka restart together under systemd, and a fixed
 /// schedule would have every retry land in lockstep.
 async fn backoff(attempt: u32) {
     use rand::RngExt as _;
@@ -1072,7 +1072,7 @@ mod tests {
         );
     }
 
-    /// The segment after the last slash is the whole contract, so meka moving its URIs to another
+    /// The segment after the last slash is the whole contract, so Meka moving its URIs to another
     /// host, as 0.89 did from `meka.run` to `meka.bot`, changes nothing here.
     #[test]
     fn the_host_a_type_uri_sits_under_decides_nothing() {
@@ -1105,19 +1105,19 @@ mod tests {
         assert!(MekaError::Problem(problem("https://meka.run/errors/internal")).is_retryable());
     }
 
-    /// meka's catch-all for an upstream failure it could not classify, which it documents as
+    /// Meka's catch-all for an upstream failure it could not classify, which it documents as
     /// meaning not classified as transient rather than will fail again. It holds transient failures
-    /// meka did not recognise as such, so reading it as permanent would give up on those at the
+    /// Meka did not recognise as such, so reading it as permanent would give up on those at the
     /// first attempt.
     #[test]
     fn a_provider_failure_is_worth_another_attempt() {
         assert!(MekaError::Problem(problem("https://meka.run/errors/provider")).is_retryable());
     }
 
-    /// The type meka minted so a transient upstream failure stops arriving byte-identical to a dead
+    /// The type Meka minted so a transient upstream failure stops arriving byte-identical to a dead
     /// credential. Unrecognised it would fall to [`ProblemKind::Other`], which retries a 502 by its
     /// status alone and would answer correctly today for the wrong reason, then stop the moment
-    /// meka gave one of these a 4xx.
+    /// Meka gave one of these a 4xx.
     #[test]
     fn an_upstream_meka_calls_transient_is_worth_another_attempt() {
         let detail = problem("https://meka.run/errors/provider-unavailable");
@@ -1125,7 +1125,7 @@ mod tests {
         assert!(MekaError::Problem(detail).is_retryable());
     }
 
-    /// The one upstream refusal that must not be retried, and the reason meka split it out of
+    /// The one upstream refusal that must not be retried, and the reason Meka split it out of
     /// `provider`: the conversation that did not fit will not fit on the next attempt either, so
     /// the whole retry budget is spent proving it.
     #[test]
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn the_read_timeout_leaves_room_for_mekas_keep_alive() {
-        // meka sends a keep-alive comment every twenty seconds on both SSE endpoints, and that is
+        // Meka sends a keep-alive comment every twenty seconds on both SSE endpoints, and that is
         // the only traffic a turn spending ten minutes inside one tool call produces. Set at or
         // under that interval this stops being a liveness check and becomes a timer that kills
         // every long turn, which would look exactly like a flaky network rather than a
@@ -1164,14 +1164,14 @@ mod tests {
         const MEKA_KEEP_ALIVE: Duration = Duration::from_secs(20);
         assert!(
             STREAM_READ_TIMEOUT >= MEKA_KEEP_ALIVE * 2,
-            "a read timeout of {STREAM_READ_TIMEOUT:?} gives meka's {MEKA_KEEP_ALIVE:?} keep-alive \
+            "a read timeout of {STREAM_READ_TIMEOUT:?} gives Meka's {MEKA_KEEP_ALIVE:?} keep-alive \
              no margin"
         );
     }
 
     #[test]
     fn a_type_this_build_has_never_heard_of_falls_back_to_the_status() {
-        // Forward compatibility with the very change this bridge asks meka for. Its
+        // Forward compatibility with the very change this bridge asks Meka for. Its
         // `RetryableProvider` currently has no arm in the mapping onto a Problem Detail and lands
         // on `internal`; giving it one means a new URI, and reading an unknown URI as permanent
         // would turn every rate limit into a message abandoned on the first attempt the day that
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn a_bare_status_from_something_between_the_two_processes_is_retried() {
-        // A reverse proxy answering while meka restarts sends HTML, not RFC 9457, so there is no
+        // A reverse proxy answering while Meka restarts sends HTML, not RFC 9457, so there is no
         // `type` to route on. Reading those as permanent had `doctor` and `status` give up on the
         // first hiccup.
         for status in [429, 500, 502, 503, 504] {
@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn a_concurrency_limit_carries_a_retry_after_today() {
-        // Contradicting an earlier comment here that said meka never sends this. `TurnGuard`
+        // Contradicting an earlier comment here that said Meka never sends this. `TurnGuard`
         // answers its 429 with `with_retry_after(1)`, which sets both the header and a
         // `retry_after` body extension that flattens to the top level. The value is an
         // integer there, so the field has to tolerate one.
@@ -1268,7 +1268,7 @@ mod tests {
         );
     }
 
-    /// The one 409 that is a wait rather than a refusal: another meka process holds the session,
+    /// The one 409 that is a wait rather than a refusal: another Meka process holds the session,
     /// and an inbox post is refused on it before anything is written.
     #[test]
     fn a_locked_session_is_a_wait_rather_than_a_failure() {
@@ -1311,7 +1311,7 @@ mod tests {
         assert_eq!(InboxState::Delivered.to_string(), "delivered");
     }
 
-    /// meka 0.78 answers a post with when it stops retrying the item and, on a replay, what it gave
+    /// Meka 0.78 answers a post with when it stops retrying the item and, on a replay, what it gave
     /// the item up on. The deadline is what the owner's notice quotes; the error is the only thing
     /// that tells a give-up apart from an item a cancelled turn took back.
     #[test]
@@ -1378,7 +1378,7 @@ mod tests {
 
     /// A field arriving that this build has never heard of is the easy half of reading `/v1/info`;
     /// the half that bites is a field going missing. That is silent for an `Option`, which reads as
-    /// `None`, and fatal for anything required: while `vision` was required here, meka 0.70 moving
+    /// `None`, and fatal for anything required: while `vision` was required here, Meka 0.70 moving
     /// it to `/v1/profiles` stopped the whole body decoding, and `doctor` lost its version and
     /// scope checks with it.
     #[test]
@@ -1400,9 +1400,9 @@ mod tests {
         assert_eq!(info.version, "0.69.0");
     }
 
-    /// Every field on [`ReadyStatus`] defaults, so a name meka does not send reads as `false`
+    /// Every field on [`ReadyStatus`] defaults, so a name Meka does not send reads as `false`
     /// rather than an error, and `doctor` fails the run over it. The flag has to be read under the
-    /// name meka uses.
+    /// name Meka uses.
     #[test]
     fn readiness_reads_the_configured_profile_flag() {
         let body = r#"{"status":"ok","session_db":true,"profile_configured":true,
@@ -1411,7 +1411,7 @@ mod tests {
         assert!(ready.profile_configured);
     }
 
-    /// meka 0.76 renamed the field from `cwd`. Read under the old name it is an absent `Option`, so
+    /// Meka 0.76 renamed the field from `cwd`. Read under the old name it is an absent `Option`, so
     /// every session would show no directory rather than fail to decode.
     #[test]
     fn a_session_reads_its_working_directory_under_the_name_meka_sends() {
@@ -1422,7 +1422,7 @@ mod tests {
         assert_eq!(info.working_directory.as_deref(), Some("/srv/agent"));
     }
 
-    /// meka omits the level for a row that records none. A required field here would turn `doctor`
+    /// Meka omits the level for a row that records none. A required field here would turn `doctor`
     /// reporting on somebody else's session into a decode error.
     #[test]
     fn a_session_that_records_no_level_still_reads() {
@@ -1464,12 +1464,12 @@ mod tests {
             find_profile(&parsed.profiles, Some("gone")).is_none(),
             "a profile that has left the config is not stood in for by another"
         );
-        // meka omits `model` for a profile that configures none, rather than sending null.
+        // Meka omits `model` for a profile that configures none, rather than sending null.
         assert_eq!(parsed.profiles[0].model, None);
     }
 
-    /// meka 0.89 renamed the default's flag from `active`. Read under one name alone, a `doctor`
-    /// run against the other meka finds no default and fails, saying creating the session will.
+    /// Meka 0.89 renamed the default's flag from `active`. Read under one name alone, a `doctor`
+    /// run against the other Meka finds no default and fails, saying creating the session will.
     #[test]
     fn the_default_profile_reads_under_either_name() {
         for flag in ["default", "active"] {
@@ -1479,7 +1479,7 @@ mod tests {
         }
     }
 
-    /// A profile naming an account `config.toml` does not have. meka lists it with no `backend`
+    /// A profile naming an account `config.toml` does not have. Meka lists it with no `backend`
     /// rather than dropping it, and reports the dangling account beside the table, so a required
     /// field here would turn the row that explains the misconfiguration into a decode error.
     #[test]
@@ -1496,7 +1496,7 @@ mod tests {
         assert_eq!(rendered, "t (409): d");
     }
 
-    /// meka's own `detail` for a 502 says that the provider failed the turn and not why, so the
+    /// Meka's own `detail` for a 502 says that the provider failed the turn and not why, so the
     /// owner's notice is only worth reading if the relayed upstream text rides along with it.
     #[test]
     fn the_upstream_response_reaches_whoever_reads_the_failure() {
@@ -1513,7 +1513,7 @@ mod tests {
         );
     }
 
-    /// meka bounds this at 4 KiB for its log. The owner's notice puts it mid-message and appends
+    /// Meka bounds this at 4 KiB for its log. The owner's notice puts it mid-message and appends
     /// the attempt count and affected conversations after it, so an unbounded one pushes those past
     /// Telegram's 4096 characters and into a second message the operator may never read.
     #[test]
@@ -1532,7 +1532,7 @@ mod tests {
         assert!(rendered.contains("The provider said: éé"));
     }
 
-    /// The whole body meka sends, rather than a hand-built struct, so a rename on either side is
+    /// The whole body Meka sends, rather than a hand-built struct, so a rename on either side is
     /// caught here instead of by an operator reading a notice that stopped naming the cause.
     #[test]
     fn a_real_502_body_parses_into_both_new_fields() {

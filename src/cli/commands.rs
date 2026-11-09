@@ -1,7 +1,7 @@
 //! Implementations of the operator subcommands.
 //!
 //! None of these talk to a running daemon. They read the SQLite database directly (WAL permits
-//! concurrent readers) and call meka's HTTP API themselves, so every command works whether the
+//! concurrent readers) and call Meka's HTTP API themselves, so every command works whether the
 //! bridge is up or down. That avoids inventing a control socket, and it means a wedged daemon can
 //! still be inspected.
 
@@ -18,31 +18,31 @@ use crate::{
     watch::{WatchField, WatchMode},
 };
 
-/// Starter config written by `mekabridge config init`.
+/// Starter config written by `meka-bridge config init`.
 const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 
-/// The oldest meka this bridge can drive, as `(major, minor)`.
+/// The oldest Meka this bridge can drive, as `(major, minor)`.
 ///
-/// A floor rather than a recommendation. meka 0.80 runs every process it starts at the highest
+/// A floor rather than a recommendation. Meka 0.80 runs every process it starts at the highest
 /// `oom_score_adj`, which the `meka.service` unit in the book relies on to keep a runaway command
-/// from taking meka down. meka 0.79 speaks MCP 2026-07-28 to this bridge, which keeps no session,
-/// so a bridge restart costs no reconnect: every tool call stands alone. meka 0.78 reports a failed
+/// from taking Meka down. Meka 0.79 speaks MCP 2026-07-28 to this bridge, which keeps no session,
+/// so a bridge restart costs no reconnect: every tool call stands alone. Meka 0.78 reports a failed
 /// attempt at an item as `inbox.deferred` and the error it gave an item up on, which is how the
-/// owner hears of an outage while meka is still retrying rather than when it stops. meka 0.76
+/// owner hears of an outage while Meka is still retrying rather than when it stops. Meka 0.76
 /// renamed a session's `cwd` to `working_directory` and refuses a field it does not know, so an
-/// older meka refuses to create the session this bridge asks for whenever `[session].cwd` is set.
-/// meka 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way this
-/// bridge hears of one; an older meka says it in a notice, so a hole opened while the feed is read
+/// older Meka refuses to create the session this bridge asks for whenever `[session].cwd` is set.
+/// Meka 0.71 reports a hole in the session feed as a `feed.gap` event, which is the only way this
+/// bridge hears of one; an older Meka says it in a notice, so a hole opened while the feed is read
 /// slowly is found only when the hand-overs it left waiting are asked about, an hour or so later.
-/// Before 0.70 meka did not report `vision` per profile, which is where this bridge reads it, so
+/// Before 0.70 Meka did not report `vision` per profile, which is where this bridge reads it, so
 /// `attachment_view` never shows the agent an image. Before 0.55 nothing works at all: messages are
-/// handed over through the session inbox, which an older meka answers with a 404, and a session's
+/// handed over through the session inbox, which an older Meka answers with a 404, and a session's
 /// stream was a view of one turn that closed at its terminal rather than a feed of every turn.
 const MEKA_MINIMUM: (u64, u64) = (0, 80);
 
 /// Whose profile `doctor` judges vision on.
 enum VisionSubject {
-    /// No session yet, or one meka has forgotten, so the next starts on the default profile.
+    /// No session yet, or one Meka has forgotten, so the next starts on the default profile.
     Default,
     /// The bound session, on the profile it records.
     Session { id: uuid::Uuid, profile: String },
@@ -50,7 +50,7 @@ enum VisionSubject {
 
 /// Whether `version` is older than [`MEKA_MINIMUM`], or `None` when it cannot be read as one.
 ///
-/// Unreadable is no opinion rather than a failure. The field carries meka's own package version
+/// Unreadable is no opinion rather than a failure. The field carries Meka's own package version
 /// today, and a `doctor` that failed a deployment over a version string it did not recognise would
 /// be wrong more often than this check is right.
 fn meka_is_too_old(version: &str) -> Option<bool> {
@@ -86,15 +86,15 @@ pub fn verdict(checks: &[Check]) -> (usize, usize) {
     (failures, warnings)
 }
 
-/// Decide what meka's readiness answer means.
+/// Decide what Meka's readiness answer means.
 ///
 /// Pure, and separate from [`doctor`], so it can be tested at all. `doctor` talks to the store, to
-/// meka, and to every configured channel, so its exit status says only that *something* is wrong: a
+/// Meka, and to every configured channel, so its exit status says only that *something* is wrong: a
 /// test asserting `is_err()` against a readiness body passes just as well when the readiness checks
 /// are deleted, because a channel with a placeholder token fails alongside them.
 pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
     let mut checks = Vec::new();
-    // meka answers 503 with this same body, naming which subsystem is the blocker, so a readiness
+    // Meka answers 503 with this same body, naming which subsystem is the blocker, so a readiness
     // that is not `ok` has to count against the run.
     if ready.status == "ok" {
         checks.push(Check::Ok(format!("readiness: {}", ready.status)));
@@ -102,26 +102,26 @@ pub fn assess_readiness(ready: &crate::meka::ReadyStatus) -> Vec<Check> {
         checks.push(Check::Warn(format!("readiness: {}", ready.status)));
     }
     if !ready.session_db {
-        // meka could not read its own session store, so no turn can run and nothing here recovers
+        // Meka could not read its own session store, so no turn can run and nothing here recovers
         // on its own.
         checks.push(Check::Fail(
-            "meka cannot reach its session database; no turn can run".to_string(),
+            "Meka cannot reach its session database; no turn can run".to_string(),
         ));
     }
     if !ready.profile_configured {
-        // Likewise terminal: without a profile meka cannot serve a single turn. Reported as a
+        // Likewise terminal: without a profile Meka cannot serve a single turn. Reported as a
         // warning, `doctor` exited 0 against it, which is the opposite of what a gate wants.
         checks.push(Check::Fail(
-            "meka reports no profile is configured; no turn can run".to_string(),
+            "Meka reports no profile is configured; no turn can run".to_string(),
         ));
     }
     if !ready.mcp_servers_healthy {
-        // Usually meka having started before this bridge was listening, which it retries out of on
-        // its own, so a warning. Worth saying that this flag only counts servers meka was told are
-        // required: with the entry for this bridge left at the default, meka reports itself healthy
+        // Usually Meka having started before this bridge was listening, which it retries out of on
+        // its own, so a warning. Worth saying that this flag only counts servers Meka was told are
+        // required: with the entry for this bridge left at the default, Meka reports itself healthy
         // while running turns that have no way to answer anybody, and this line never appears.
         checks.push(Check::Warn(
-            "meka reports an unhealthy required MCP server. If that is this bridge, it should \
+            "Meka reports an unhealthy required MCP server. If that is this bridge, it should \
              reconnect on its own within a few minutes; turns are refused until it does."
                 .to_string(),
         ));
@@ -145,7 +145,7 @@ fn report(checks: &[Check]) -> (usize, usize) {
 /// one, so the two cannot disagree.
 ///
 /// `None` when there is nothing to say here: a default profile that is missing is reported with the
-/// profiles. A session's profile that meka no longer has is a failure, because meka cannot run that
+/// profiles. A session's profile that Meka no longer has is a failure, because Meka cannot run that
 /// session, so nothing handed to it is ever answered.
 fn assess_vision(profiles: &[Profile], subject: &VisionSubject) -> Option<Check> {
     let name = match subject {
@@ -166,16 +166,16 @@ fn assess_vision(profiles: &[Profile], subject: &VisionSubject) -> Option<Check>
         None => match subject {
             VisionSubject::Default => None,
             VisionSubject::Session { id, profile } => Some(Check::Fail(format!(
-                "the session is on profile {profile:?}, which meka does not have, so no turn can \
-                 run on it; move it to one meka has with PATCH /v1/sessions/{id} and a `profile`"
+                "the session is on profile {profile:?}, which Meka does not have, so no turn can \
+                 run on it; move it to one Meka has with PATCH /v1/sessions/{id} and a `profile`"
             ))),
         },
     }
 }
 
-/// Decide what the scopes meka reports for `[meka].token` mean.
+/// Decide what the scopes Meka reports for `[meka].token` mean.
 ///
-/// `None` when meka said nothing, which only a meka too old for this bridge does, and the version
+/// `None` when Meka said nothing, which only a Meka too old for this bridge does, and the version
 /// check already fails that one. It is not a token with nothing.
 ///
 /// Worth a round trip because it is the one thing about the token nothing else here can check.
@@ -201,7 +201,7 @@ pub fn assess_scopes(scopes: &[String]) -> Option<Check> {
     Some(Check::Fail(format!(
         "the token is missing {}. `sessions:w` creates the session and puts a message in its \
          inbox; `sessions:r` opens the session feed, the only thing that says what became of one. \
-         Add both to this token's `scopes` under [[serve.tokens]] in meka's config",
+         Add both to this token's `scopes` under [[serve.tokens]] in Meka's config",
         missing.join(" and ")
     )))
 }
@@ -241,7 +241,7 @@ async fn assess_owner_conversation(
                 .map(|title| format!(" ({title})"))
                 .unwrap_or_default();
             // Worth printing even when it did not change: seeing the resolved id is how an operator
-            // matches this against what `mekabridge conversations list` shows.
+            // matches this against what `meka-bridge conversations list` shows.
             let resolved = if info.id.as_str() == owner {
                 String::new()
             } else {
@@ -302,7 +302,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             println!("  ok     database at {}", config.storage.path.display());
             match store.queue_stats().await {
                 Ok(stats) => println!(
-                    "  ok     queue: {} pending, {} rendered for meka, {} with meka, {} failed",
+                    "  ok     queue: {} pending, {} rendered for Meka, {} with Meka, {} failed",
                     stats.pending, stats.in_flight, stats.posted, stats.failed
                 ),
                 Err(error) => {
@@ -315,7 +315,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                     println!("  ok     no conversation overrides the default");
                 }
                 Ok(policies) => println!(
-                    "  ok     {} conversation(s) have a policy of their own; `mekabridge policy \
+                    "  ok     {} conversation(s) have a policy of their own; `meka-bridge policy \
                      list` shows them",
                     policies.len()
                 ),
@@ -353,10 +353,10 @@ pub async fn doctor(config: &Config) -> Result<()> {
         }
     }
 
-    println!("meka at {}", config.meka.base_url);
+    println!("Meka at {}", config.meka.base_url);
     let meka = MekaClient::new(&config.meka)?;
     // Carried out of the match so the verdict can be printed under `session`, next to the other
-    // two permission checks. Empty means meka could not be reached, or is too old to say, and both
+    // two permission checks. Empty means Meka could not be reached, or is too old to say, and both
     // read the same way: no opinion, so no verdict.
     let mut enabled_permissions: Vec<String> = Vec::new();
     // Carried out for the vision verdict, which is about the profile the bridge's session is on and
@@ -367,13 +367,13 @@ pub async fn doctor(config: &Config) -> Result<()> {
         Ok(info) => {
             println!("  ok     reachable, version {}", info.version);
             if meka_is_too_old(&info.version) == Some(true) {
-                // Ahead of everything else this block reports, which assumes a meka this bridge can
+                // Ahead of everything else this block reports, which assumes a Meka this bridge can
                 // drive and is misleading about one it cannot.
                 println!(
-                    "  fail   this bridge needs meka {}.{} or later. Before 0.80 a runaway shell \
-                     command can take meka down with it under the book's meka.service, before \
-                     0.79 a bridge restart leaves meka to reconnect, before 0.78 the owner hears \
-                     of an outage only once meka stops retrying, before 0.76 meka refuses to \
+                    "  fail   this bridge needs Meka {}.{} or later. Before 0.80 a runaway shell \
+                     command can take Meka down with it under the book's meka.service, before \
+                     0.79 a bridge restart leaves Meka to reconnect, before 0.78 the owner hears \
+                     of an outage only once Meka stops retrying, before 0.76 Meka refuses to \
                      create a session in [session].cwd, before 0.71 it reports a hole in the \
                      session feed in a way this bridge no longer reads, before 0.70 \
                      attachment_view never shows the agent an image, and before 0.55 no message \
@@ -395,7 +395,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
                         profile.name,
                         profile.account,
                         // Absent where the profile names an account `config.toml` does not have,
-                        // which is why it is worth printing rather than eliding: meka starts on
+                        // which is why it is worth printing rather than eliding: Meka starts on
                         // that config and refuses the session.
                         profile
                             .backend
@@ -404,12 +404,12 @@ pub async fn doctor(config: &Config) -> Result<()> {
                         profile.model.as_deref().unwrap_or("(none configured)")
                     ),
                     None => {
-                        // The bridge creates its session without naming a profile, so meka has to
+                        // The bridge creates its session without naming a profile, so Meka has to
                         // have one to fall back on. Nothing marked the default means either no
-                        // profile is configured, which meka 0.85 starts on, or several are with no
-                        // default chosen between them, and meka defers that failure to the first
+                        // profile is configured, which Meka 0.85 starts on, or several are with no
+                        // default chosen between them, and Meka defers that failure to the first
                         // session rather than refusing to start, so this surfaces at the first
-                        // message otherwise. The remedies are meka's own wording: a command is what
+                        // message otherwise. The remedies are Meka's own wording: a command is what
                         // writes the file, and sending an operator to hand-edit it instead is worse
                         // advice.
                         //
@@ -417,12 +417,12 @@ pub async fn doctor(config: &Config) -> Result<()> {
                         // /v1/config/reload`, which takes a `config:w` token few operators hold, so
                         // the restart is part of the remedy.
                         let remedy = if listed.is_empty() {
-                            "meka has no profile, so creating the bridge's session will fail; run \
+                            "Meka has no profile, so creating the bridge's session will fail; run \
                              `meka account add <name>` and `meka profile add <name>`, then restart \
-                             meka"
+                             Meka"
                         } else {
-                            "meka has no default profile, so creating the bridge's session will \
-                             fail; run `meka profile use <name>`, then restart meka"
+                            "Meka has no default profile, so creating the bridge's session will \
+                             fail; run `meka profile use <name>`, then restart Meka"
                         };
                         println!("  fail   {remedy}");
                         failures += 1;
@@ -471,7 +471,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
         }
         Ok(Some(session_id)) => match meka.session(session_id).await {
             Ok(info) => {
-                // meka omits the level for a row that records none. Not a session this bridge made,
+                // Meka omits the level for a row that records none. Not a session this bridge made,
                 // which always names one, so there is no level to hold against the ladder below and
                 // saying so beats inventing one.
                 let level = info.permission.as_deref();
@@ -495,7 +495,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             }
             Err(error) if error.is_session_missing() => {
                 println!(
-                    "  warn   meka no longer knows session {session_id}; a replacement will be created"
+                    "  warn   Meka no longer knows session {session_id}; a replacement will be created"
                 );
                 warnings += 1;
                 vision_subject = Some(VisionSubject::Default);
@@ -644,7 +644,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             Ok(listener) => {
                 drop(listener);
                 println!(
-                    "  ok     {}{} is free (meka should use transport = \"http\", url = \
+                    "  ok     {}{} is free (Meka should use transport = \"http\", url = \
                      \"http://{}{}\")",
                     config.mcp.bind, config.mcp.path, config.mcp.bind, config.mcp.path
                 );
@@ -652,7 +652,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             Err(error) => {
                 // A daemon already holding the port is the common case and is fine.
                 println!(
-                    "  warn   could not bind {}: {error}. This is expected if mekabridge is \
+                    "  warn   could not bind {}: {error}. This is expected if Meka Bridge is \
                      already running.",
                     config.mcp.bind
                 );
@@ -693,20 +693,20 @@ fn permission_problem(level: &str) -> Option<&'static str> {
     }
 }
 
-/// Why meka will refuse to create a session at `level`, or `None` if it will accept one.
+/// Why Meka will refuse to create a session at `level`, or `None` if it will accept one.
 ///
 /// Separate from [`permission_problem`], which asks whether a level suits *this bridge*. This is
-/// the earlier failure: meka checks `[permissions].enabled` before anything else, so a level
+/// the earlier failure: Meka checks `[permissions].enabled` before anything else, so a level
 /// outside it is a 422 on the first message rather than an agent behaving oddly.
 ///
-/// An empty `enabled` means no opinion, from a meka that did not report the field or could not be
+/// An empty `enabled` means no opinion, from a Meka that did not report the field or could not be
 /// reached, and yields no verdict rather than a guess.
 fn level_meka_will_not_create(level: &str, enabled: &[String]) -> Option<String> {
     if enabled.is_empty() || enabled.iter().any(|allowed| allowed == level) {
         return None;
     }
     Some(format!(
-        "meka will not create a session at {level:?}; it enables {}. Add it to meka's \
+        "Meka will not create a session at {level:?}; it enables {}. Add it to Meka's \
          [permissions].enabled, or set [session].permission to one of those.",
         enabled.join(", ")
     ))
@@ -719,7 +719,7 @@ fn level_meka_will_not_create(level: &str, enabled: &[String]) -> Option<String>
 ///
 /// Only the last step of the chain is surprising. `readOnlyHint: false` resolves to `unrestricted`,
 /// and `Permission::allows` then treats `workspace` and `unrestricted` as equal, which reads like
-/// `workspace` is enough. But an MCP tool runs in its server's own process, which meka does not
+/// `workspace` is enough. But an MCP tool runs in its server's own process, which Meka does not
 /// sandbox, so a second gate refuses anything needing `unrestricted` from a `workspace` session
 /// rather than promise a confinement it cannot apply.
 fn moderation_reach(level: &str, admin_tools: bool) -> Option<String> {
@@ -727,9 +727,9 @@ fn moderation_reach(level: &str, admin_tools: bool) -> Option<String> {
         return None;
     }
     Some(format!(
-        "the moderation tools are registered but do not run at {level:?}: meka resolves them to \
+        "the moderation tools are registered but do not run at {level:?}: Meka resolves them to \
          `unrestricted` and refuses them below it. Raise [session].permission, or grant them \
-         individually with meka's [mcp.servers.*].tool_permissions"
+         individually with Meka's [mcp.servers.*].tool_permissions"
     ))
 }
 
@@ -749,7 +749,7 @@ pub async fn status(config: &Config) -> Result<()> {
         None => println!("last turn:     never"),
     }
     println!(
-        "queue:         {} pending, {} rendered for meka, {} with meka, {} delivered, {} failed",
+        "queue:         {} pending, {} rendered for Meka, {} with Meka, {} delivered, {} failed",
         stats.pending, stats.in_flight, stats.posted, stats.done, stats.failed
     );
     println!("conversations: {}", conversations.len());
@@ -771,13 +771,13 @@ pub async fn queue_list(config: &Config, limit: usize) -> Result<()> {
     let store = Store::open(&config.storage.path).await?;
     let stats = store.queue_stats().await?;
     println!(
-        "{} pending, {} rendered for meka, {} with meka, {} delivered, {} failed",
+        "{} pending, {} rendered for Meka, {} with Meka, {} delivered, {} failed",
         stats.pending, stats.in_flight, stats.posted, stats.done, stats.failed
     );
     // Claiming would mark rows in flight, which is exactly what an inspection command must not do,
     // so this peeks at pending rows without touching their state.
     let mut rows = store.peek_pending(limit).await?;
-    // What meka has, and what is rendered and waiting on it. An operator watching a stuck queue
+    // What Meka has, and what is rendered and waiting on it. An operator watching a stuck queue
     // needs the reason, and the reason is on the row.
     rows.extend(store.rows_in(QueueState::InFlight).await?);
     rows.extend(store.rows_in(QueueState::Posted).await?);
@@ -790,8 +790,8 @@ pub async fn queue_list(config: &Config, limit: usize) -> Result<()> {
     for row in rows.iter().take(limit) {
         let state = match row.state {
             QueueState::Pending => "waiting to be claimed".to_string(),
-            QueueState::InFlight => "rendered, waiting on meka".to_string(),
-            QueueState::Posted => format!("with meka as {}", row.item_id.as_deref().unwrap_or("?")),
+            QueueState::InFlight => "rendered, waiting on Meka".to_string(),
+            QueueState::Posted => format!("with Meka as {}", row.item_id.as_deref().unwrap_or("?")),
             other => other.as_str().to_string(),
         };
         println!(
@@ -928,7 +928,7 @@ pub async fn policy_set(
     let conversation = crate::channel::ConversationId::parse(conversation).ok_or_else(|| {
         BridgeError::config(format!(
             "{conversation:?} is not a conversation id; the form is <channel>:<chat>, as printed by \
-             `mekabridge conversations list`"
+             `meka-bridge conversations list`"
         ))
     })?;
     // The row a pre-emptive policy mints needs the platform, which only the config can say.
@@ -1070,7 +1070,7 @@ pub async fn watch_write(
             let parsed = crate::channel::ConversationId::parse(conversation).ok_or_else(|| {
                 BridgeError::config(format!(
                     "{conversation:?} is not a conversation id; the form is <channel>:<chat>, as \
-                     printed by `mekabridge conversations list`"
+                     printed by `meka-bridge conversations list`"
                 ))
             })?;
             let platform = config
@@ -1201,7 +1201,7 @@ pub fn unseen(config_path: Option<&Path>, scope: &BacklogScope) -> std::process:
         for (id, summary) in &report.conversations {
             if summary.count == 0 && store.conversation(id).await?.is_none() {
                 eprintln!(
-                    "mekabridge: nothing has ever been recorded from {id}, so this will report \
+                    "meka-bridge: nothing has ever been recorded from {id}, so this will report \
                      nothing about it until something is"
                 );
             }
@@ -1234,7 +1234,7 @@ pub fn unseen(config_path: Option<&Path>, scope: &BacklogScope) -> std::process:
             }
         }
         Err(error) => {
-            eprintln!("mekabridge: {error}");
+            eprintln!("meka-bridge: {error}");
             std::process::ExitCode::from(UNAVAILABLE)
         }
     }
@@ -1325,14 +1325,14 @@ pub async fn session_show(config: &Config) -> Result<()> {
                     "idle"
                 }
             );
-            // What meka still holds for the agent, which is not the same as what this bridge is
+            // What Meka still holds for the agent, which is not the same as what this bridge is
             // waiting on: another client of the same session can put something here too.
             match info.inbox_pending {
                 Some(pending) => println!("inbox:      {pending} waiting to be read"),
                 None => println!("inbox:      not reported (the session is not loaded)"),
             }
         }
-        Err(error) => println!("meka:       could not read it ({error})"),
+        Err(error) => println!("Meka:       could not read it ({error})"),
     }
     Ok(())
 }
@@ -1346,7 +1346,7 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
         ));
     }
     let store = Store::open(&config.storage.path).await?;
-    // Every hand-over out belongs to the session being unbound: one meka has will be read by a
+    // Every hand-over out belongs to the session being unbound: one Meka has will be read by a
     // session nothing will ever ask about again, and one it has not is addressed to a session that
     // is about to stop existing. Both are closed here, and their messages go back among what the
     // agent has not seen, so the replacement meets them as a backlog rather than not at all.
@@ -1385,7 +1385,7 @@ pub async fn session_reset(config: &Config, confirmed: bool) -> Result<()> {
                 );
             }
             println!(
-                "note: the session still exists in meka. Delete it there if you want the history \
+                "note: the session still exists in Meka. Delete it there if you want the history \
                  gone."
             );
         }
@@ -1403,7 +1403,7 @@ pub async fn cancel(config: &Config) -> Result<()> {
     };
     let meka = MekaClient::new(&config.meka)?;
     meka.cancel_turn(session_id, None).await?;
-    // meka's cancel is idempotent and returns 204 whether or not a turn was in flight, so there is
+    // Meka's cancel is idempotent and returns 204 whether or not a turn was in flight, so there is
     // nothing more definite to report.
     println!("cancellation sent for session {session_id}");
     Ok(())
@@ -1424,7 +1424,7 @@ pub fn config_init(path: &Path, force: bool) -> Result<()> {
     }
     std::fs::write(path, CONFIG_TEMPLATE)?;
     println!("wrote {}", path.display());
-    println!("edit it, then run `mekabridge doctor` to check the setup");
+    println!("edit it, then run `meka-bridge doctor` to check the setup");
     Ok(())
 }
 
@@ -1707,7 +1707,7 @@ mod tests {
     async fn a_resolved_owner_conversation_reports_the_id_it_resolved_to() {
         // The dialling address is not the id anything else will show, so printing only the
         // configured one would leave an operator unable to match this against
-        // `mekabridge conversations list`.
+        // `meka-bridge conversations list`.
         let checks = owner_checks(
             Platform::Discord,
             Answer::Reaches(ConversationInfo {
@@ -1809,7 +1809,7 @@ mod tests {
     fn a_failing_check_is_what_makes_doctor_exit_non_zero() {
         // `assess_readiness` is well covered, but what `doctor` *does* with a `Fail` is the whole
         // point: it is the deployment gate's exit code. Counting one as a warning leaves the gate
-        // green against a meka that cannot serve a turn, which is the bug the extraction was made
+        // green against a Meka that cannot serve a turn, which is the bug the extraction was made
         // to fix and the one line the extraction does not itself cover.
         let checks = assess_readiness(&readiness("degraded", false, false, false));
         let failures = checks
@@ -1844,20 +1844,20 @@ mod tests {
                 "the token holds sessions:r and sessions:w".to_string()
             ))
         );
-        // Scopes it holds beyond the two are meka's business, not this bridge's.
+        // Scopes it holds beyond the two are Meka's business, not this bridge's.
         assert!(matches!(
             assess_scopes(&held(&["sessions:r", "sessions:w", "memory:r"])),
             Some(Check::Ok(_))
         ));
         // The two shapes that reach here: the classic one that hands nothing over, and a token
-        // scoped to some other part of meka entirely. A token holding `sessions:w` alone never gets
+        // scoped to some other part of Meka entirely. A token holding `sessions:w` alone never gets
         // this far, since `/v1/info` itself takes a read scope, but it must not read as ok either.
         for short in [
             held(&["sessions:r"]),
             held(&["memory:r"]),
             held(&["sessions:w"]),
         ] {
-            let check = assess_scopes(&short).expect("meka named the scopes");
+            let check = assess_scopes(&short).expect("Meka named the scopes");
             assert!(
                 matches!(check, Check::Fail(_)),
                 "a token holding only {short:?} passed"
@@ -1868,7 +1868,7 @@ mod tests {
                 "the failure must count against the exit code"
             );
         }
-        // No scopes at all is a meka that could not be reached, or one too old to report them,
+        // No scopes at all is a Meka that could not be reached, or one too old to report them,
         // which the version floor already fails. Neither says the token holds nothing.
         assert_eq!(assess_scopes(&[]), None);
     }
@@ -1878,9 +1878,9 @@ mod tests {
         assert_eq!(assess_readiness(&readiness("ok", true, true, true)), vec![
             Check::Ok("readiness: ok".to_string())
         ]);
-        // A status meka itself never sends still has to register: reading the body rather than the
+        // A status Meka itself never sends still has to register: reading the body rather than the
         // status is what made the answer legible, and printing it under `ok` regardless would let a
-        // gate go green against a meka that said it was degraded.
+        // gate go green against a Meka that said it was degraded.
         assert!(
             assess_readiness(&readiness("degraded", true, true, true))
                 .iter()
@@ -1926,7 +1926,7 @@ mod tests {
             assess_vision(&profiles, &VisionSubject::Default),
             Some(Check::Ok(line)) if line.contains("profile work")
         ));
-        // A profile meka no longer has is a session it cannot run, which is a failure rather than a
+        // A profile Meka no longer has is a session it cannot run, which is a failure rather than a
         // missing line.
         assert!(matches!(
             assess_vision(&profiles, &session("gone")),
@@ -1938,7 +1938,7 @@ mod tests {
 
     #[test]
     fn a_meka_below_the_floor_is_caught_before_the_first_message() {
-        // The failure it prevents is quiet until it is not: a meka before 0.80 can be taken down by
+        // The failure it prevents is quiet until it is not: a Meka before 0.80 can be taken down by
         // a runaway command the book's unit expects it to survive, one before 0.79 reconnects to
         // the bridge after its every restart, one before 0.78 keeps the owner in the dark for the
         // hour it retries a turn, one from 0.71 to 0.75 refuses the next session it is asked to
@@ -1969,9 +1969,9 @@ mod tests {
 
     #[test]
     fn moderation_is_only_within_reach_at_unrestricted() {
-        // `workspace` is the trap: meka's `allows` treats it as equal to `unrestricted`, so the
+        // `workspace` is the trap: Meka's `allows` treats it as equal to `unrestricted`, so the
         // level looks sufficient, and a second gate refuses the call because an MCP tool runs
-        // outside anything meka can confine.
+        // outside anything Meka can confine.
         assert!(moderation_reach("unrestricted", true).is_none());
         for level in ["read", "workspace"] {
             let reach = moderation_reach(level, true)
@@ -1982,7 +1982,7 @@ mod tests {
 
     #[test]
     fn a_level_meka_does_not_enable_is_caught_before_the_first_message() {
-        // An operator who narrowed `[permissions].enabled` on meka's side and left this bridge
+        // An operator who narrowed `[permissions].enabled` on Meka's side and left this bridge
         // asking for a rung outside it. Without this the session is refused at creation, on the
         // first message, long after `doctor` said everything was fine.
         let enabled: Vec<String> = ["none", "read"]
@@ -1993,14 +1993,14 @@ mod tests {
         let refused = level_meka_will_not_create("unrestricted", &enabled)
             .expect("unrestricted is not enabled");
         assert!(refused.contains("unrestricted"), "{refused}");
-        // The way out has to name what meka would accept; "not enabled" alone leaves the operator
+        // The way out has to name what Meka would accept; "not enabled" alone leaves the operator
         // guessing which words to try.
         assert!(refused.contains("read"), "{refused}");
     }
 
     #[test]
     fn a_meka_with_no_opinion_draws_no_verdict() {
-        // Empty covers two cases that must not become a guess: a meka too old to report the field,
+        // Empty covers two cases that must not become a guess: a Meka too old to report the field,
         // and one `doctor` could not reach at all. Failing either would make `doctor` red over a
         // configuration that is fine.
         for level in ["read", "workspace", "unrestricted", "nonsense"] {
@@ -2041,7 +2041,7 @@ mod tests {
             std::env::set_var("MEKA_BRIDGE_TOKEN", "test-token");
             std::env::set_var("TELEGRAM_BOT_TOKEN", "123:test");
         }
-        let config = Config::from_toml(CONFIG_TEMPLATE, Path::new("/etc/mekabridge/config.toml"))
+        let config = Config::from_toml(CONFIG_TEMPLATE, Path::new("/etc/meka-bridge/config.toml"))
             .expect("the shipped template must parse and validate");
         assert_eq!(config.channels.len(), 1);
     }

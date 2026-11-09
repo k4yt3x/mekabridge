@@ -11,7 +11,7 @@ token = "${DISCORD_BOT_TOKEN}"
 allowed_users = ["245119312739729408"]
 ```
 
-Then enable the **Message Content** intent on the Bot page, under Privileged Gateway Intents. mekabridge asks for it by default, and a bot that asks for an intent it has not been granted does not degrade: Discord closes the gateway with a `4014` at startup. Set `message_content = false` if you would rather run without it, and read [Without the message content intent](#without-the-message-content-intent) first.
+Then enable the **Message Content** intent on the Bot page, under Privileged Gateway Intents. Meka Bridge asks for it by default, and a bot that asks for an intent it has not been granted does not degrade: Discord closes the gateway with a `4014` at startup. Set `message_content = false` if you would rather run without it, and read [Without the message content intent](#without-the-message-content-intent) first.
 
 Invite the bot with the `bot` scope and, at minimum, View Channels, Send Messages, Read Message History, and Add Reactions. Add the moderation permissions only if you want the agent moderating: Timeout Members for `restrict`, Kick Members, Ban Members, Manage Roles, Pin Messages, and Manage Channels for slowmode.
 
@@ -37,14 +37,14 @@ The bridge opens the direct-message channel, sends, and records the conversation
 
 ## The allowlist
 
-A bot token is a public entry point, and Discord's reach is wider than Telegram's: **anybody who shares a server with the bot can open a direct message with it.** In one busy server that is thousands of people. mekabridge refuses to start with an empty allowlist for that reason, and `allowed_users` gates direct messages as well as anything else.
+A bot token is a public entry point, and Discord's reach is wider than Telegram's: **anybody who shares a server with the bot can open a direct message with it.** In one busy server that is thousands of people. Meka Bridge refuses to start with an empty allowlist for that reason, and `allowed_users` gates direct messages as well as anything else.
 
 Four grants, checked from the narrowest to the widest:
 
 - `allowed_users` admits specific people **in a direct message**, and nowhere else. Since anyone sharing a server with the bot can open a DM, this is the list that decides who may do so; it grants nothing inside a server.
 - `allowed_roles` admits anyone holding one of these roles. Cheap and idiomatic: the roles ride along on every server message, so no lookup is needed. It reads as `role allowlist` rather than `user allowlist`, because anybody who can hand out the role can hand out access with it.
 - `allowed_channels` admits everyone in these channels. A thread inherits the standing of the channel it was started in.
-- `allowed_guilds` admits **every member of the server**. This is much the largest grant, and `mekabridge doctor` and startup both say so.
+- `allowed_guilds` admits **every member of the server**. This is much the largest grant, and `meka-bridge doctor` and startup both say so.
 - `allow_all` admits everyone, for a public bot.
 
 Messages from outside the allowlist are dropped at debug level with no reply, so a stranger learns nothing about whether the bot is live.
@@ -64,7 +64,7 @@ What deliberately does not: `@everyone`, `@here`, and role pings. Those are broa
 
 Nor does an ordinary message, however soon after the agent last spoke there. Until 0.7.0 a five-minute window followed the agent's own message and delivered everything said in the channel meanwhile, which in a busy channel meant delivering the channel.
 
-Everything withheld is still recorded, and the mention that wakes the agent arrives with a count of what it missed and the last few messages. Use `mekabridge policy set discord:<id> active` to hear a channel in full, or `block` to record nothing at all. The agent can follow a channel on past a mention itself; see [Group attention](./group-attention.md).
+Everything withheld is still recorded, and the mention that wakes the agent arrives with a count of what it missed and the last few messages. Use `meka-bridge policy set discord:<id> active` to hear a channel in full, or `block` to record nothing at all. The agent can follow a channel on past a mention itself; see [Group attention](./group-attention.md).
 
 ## Waiting for somebody to finish
 
@@ -145,7 +145,7 @@ Available when `admin_tools` is on, which is the default. Discord refuses each c
 | `chat_set` | Name, topic, and slowmode | Slowmode is Discord-only, 0 to 6 hours |
 | `member_get` | Standing, roles, and timeout state | Omit `user_id` to ask about the bot itself. Permissions are computed for the specific channel, including its overwrites |
 
-An operator can undo any of it from the Discord client, and `mekabridge policy` lifts a mute or a block the agent set on itself.
+An operator can undo any of it from the Discord client, and `meka-bridge policy` lifts a mute or a block the agent set on itself.
 
 ## History
 
@@ -169,7 +169,7 @@ The bridge records what it sees, the same as on Telegram, and `history_read` and
 
 **Listing everyone needs the Server Members intent.** Omitting `query` walks the full roster, which Discord restricts to applications with **Server Members** enabled on the Bot page, under Privileged Gateway Intents. Once a bot is in 100 or more servers, Discord must approve it. Without it the call fails with an error naming that switch and pointing at the search, rather than returning a short list that reads like the whole server.
 
-Unlike Message Content, this one carries no startup risk. Discord gates the HTTP API on the application setting alone, "independently of Gateway restrictions, and unaffected by which intents your app passes in the `intents` parameter when Identifying". So mekabridge never asks for it at the gateway, enabling it changes nothing about how the bridge connects, and it cannot produce a `4014`.
+Unlike Message Content, this one carries no startup risk. Discord gates the HTTP API on the application setting alone, "independently of Gateway restrictions, and unaffected by which intents your app passes in the `intents` parameter when Identifying". So Meka Bridge never asks for it at the gateway, enabling it changes nothing about how the bridge connects, and it cannot produce a `4014`.
 
 `total` comes back either way, from Discord's own approximate count, so the size of a server is knowable even when its roster is not.
 
@@ -206,7 +206,7 @@ Each file is read whole into memory to be uploaded, unlike Telegram's, which str
 
 Setting `message_content = false` is supported and coherent, but narrower than it sounds. Discord blanks `content`, `embeds`, and `attachments` on every server message **except** those that mention the bot, replies to it, and direct messages.
 
-So the agent is still woken by name and still reads the message that woke it. What it loses is everything else: the muted-channel backlog is empty, `history_read` has nothing to show about what led up to a mention, and Discord's own search refuses to answer. `mekabridge doctor` warns while this is the case.
+So the agent is still woken by name and still reads the message that woke it. What it loses is everything else: the muted-channel backlog is empty, `history_read` has nothing to show about what led up to a mention, and Discord's own search refuses to answer. `meka-bridge doctor` warns while this is the case.
 
 ## Limits worth knowing
 

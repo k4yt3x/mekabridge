@@ -1,6 +1,6 @@
 //! End-to-end tests for the inbound and outbound paths.
 //!
-//! A stub meka (a real axum server speaking the real inbox and feed wire formats) stands in for the
+//! A stub Meka (a real axum server speaking the real inbox and feed wire formats) stands in for the
 //! agent, and a `MockChannel` stands in for Telegram. Together they let the whole loop run against
 //! real code: events land in the durable queue, the session task binds them into a hand-over and
 //! posts it to the inbox, the session feed says what became of it, and the sink delivers what the
@@ -23,7 +23,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{Router, extract::State, response::IntoResponse, routing::post};
 use chrono::Utc;
-use mekabridge::{
+use meka_bridge::{
     bridge::{
         BridgeSink, ChannelAccounts,
         feed::feed_reader,
@@ -61,11 +61,11 @@ const ONE_PIXEL_PNG: &[u8] = &[
 /// different next, which is the whole of what these tests are about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FailureKind {
-    /// meka's own fault rather than the upstream's. Nothing was written, so the same batch is
+    /// Meka's own fault rather than the upstream's. Nothing was written, so the same batch is
     /// posted again under the same key.
     #[default]
     Transient,
-    /// meka's classifier labelled an upstream failure transient and gave it a type saying so,
+    /// Meka's classifier labelled an upstream failure transient and gave it a type saying so,
     /// which is the signal the backoff exists to act on. Carries the upstream's text and a
     /// `retry_after`, as a 502 does whenever `[serve] relay_provider_errors` is left on.
     RateLimited,
@@ -74,7 +74,7 @@ enum FailureKind {
     Unrepairable,
     /// A rotated token. Nothing to wait for.
     Auth,
-    /// Another meka process holds the session: a wait rather than a failure.
+    /// Another Meka process holds the session: a wait rather than a failure.
     Locked,
 }
 
@@ -108,7 +108,7 @@ impl FailureKind {
             Self::Locked => (
                 409,
                 r#"{"type":"https://meka.so/errors/session-locked","title":"Session locked",
-                    "status":409,"detail":"another meka process holds this session"}"#,
+                    "status":409,"detail":"another Meka process holds this session"}"#,
             ),
         }
     }
@@ -116,7 +116,7 @@ impl FailureKind {
 
 /// What the stub's inbox driver does with an item it accepted.
 ///
-/// meka decides this, not the client: an item is read by a turn, or withdrawn, or given up on, and
+/// Meka decides this, not the client: an item is read by a turn, or withdrawn, or given up on, and
 /// the feed is the only place any of it is reported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TurnScript {
@@ -125,7 +125,7 @@ enum TurnScript {
     Answer,
     /// The model reads the item and says nothing at all, which is legal.
     Silent,
-    /// The model reads the item and comes back with meka's empty-response stand-in, having called
+    /// The model reads the item and comes back with Meka's empty-response stand-in, having called
     /// nothing. Provably inert, so the messages may be offered again.
     Empty,
     /// The model reads the item and the turn then fails, with nothing sent.
@@ -139,15 +139,15 @@ enum TurnScript {
     /// The item is taken back before the model reads it, which is what cancelling the turn it
     /// opened does.
     Withdraw,
-    /// meka gives up on the item after its retry ceiling.
+    /// Meka gives up on the item after its retry ceiling.
     GiveUp,
     /// A turn on the item fails before the model reads anything, in a way waiting can change, so
-    /// meka puts it back and says when it tries again.
+    /// Meka puts it back and says when it tries again.
     Defer,
     /// A turn that writes a send call's arguments slowly, so the composing window has real
     /// duration on the wire. The tool it calls is [`MekaRecorder::compose_tool`].
     Compose,
-    /// Nothing happens: the item sits `pending` on meka's side, as one waiting out a turn the
+    /// Nothing happens: the item sits `pending` on Meka's side, as one waiting out a turn the
     /// bridge cannot see does.
     Hold,
 }
@@ -171,7 +171,7 @@ impl Frame {
 
 /// The stub's session feed: everything it has ever emitted, and a broadcast to whoever is attached.
 ///
-/// Ids run across the whole session and the ring spans turns, as meka's does, so an attach naming
+/// Ids run across the whole session and the ring spans turns, as Meka's does, so an attach naming
 /// an id from an earlier turn resumes across them.
 #[derive(Debug)]
 struct Feed {
@@ -201,7 +201,7 @@ impl Default for Feed {
 }
 
 impl Feed {
-    /// Emit one event, stamping in the `turn_id` and `session_id` every meka event carries.
+    /// Emit one event, stamping in the `turn_id` and `session_id` every Meka event carries.
     fn push(&self, name: &str, turn: Option<&str>, mut data: serde_json::Value) {
         if let Some(object) = data.as_object_mut() {
             if let Some(turn) = turn {
@@ -219,7 +219,7 @@ impl Feed {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(frame.clone());
         // An error here means nobody is attached, which is ordinary between connections: the ring
-        // still holds the frame and the next attach replays it, exactly as meka's does.
+        // still holds the frame and the next attach replays it, exactly as Meka's does.
         let _ = self.sender.send(frame);
     }
 
@@ -245,7 +245,7 @@ impl Feed {
     }
 }
 
-/// What the stub meka observed, so tests can assert on what the agent would have been handed.
+/// What the stub Meka observed, so tests can assert on what the agent would have been handed.
 #[derive(Default)]
 struct MekaRecorder {
     /// Every body `POST /v1/sessions` accepted, in order.
@@ -265,15 +265,15 @@ struct MekaRecorder {
     /// `class` and `source` off each post, so a test can pin the contract rather than the body.
     classes: Mutex<Vec<(String, String)>>,
     /// The item each `Idempotency-Key` was answered with, so a replay answers the same item, as
-    /// meka's row-scoped key does across a restart.
+    /// Meka's row-scoped key does across a restart.
     by_key: Mutex<HashMap<String, String>>,
     /// Each item's state, which is what a replayed key reports.
     states: Mutex<HashMap<String, String>>,
-    /// The error each item meka gave up on was given up on with, which a replayed key reports as
+    /// The error each item Meka gave up on was given up on with, which a replayed key reports as
     /// its `last_error`. An item withdrawn without one was taken back unread instead.
     given_up: Mutex<HashMap<String, serde_json::Value>>,
     /// The `retry_until` every answer to a post carries, or none at all, which is how a row posted
-    /// before the bridge kept meka's deadline reads.
+    /// before the bridge kept Meka's deadline reads.
     deadline: Mutex<Option<String>>,
     /// Posts to refuse before accepting anything.
     fail_first: Mutex<usize>,
@@ -300,8 +300,8 @@ struct MekaRecorder {
     /// files" case, which must draw nothing.
     compose_tool: Mutex<String>,
     /// Whether the composing call is abandoned and replaced by a different one, which is what a
-    /// caller sees when meka retries the provider round. `tool_call.composing` deliberately does
-    /// not mark the attempt as having produced output, so the whole window it opens is one meka
+    /// caller sees when Meka retries the provider round. `tool_call.composing` deliberately does
+    /// not mark the attempt as having produced output, so the whole window it opens is one Meka
     /// will retry from; the event already sent cannot be withdrawn, and the retry mints fresh ids.
     compose_retry: Mutex<bool>,
     /// How far the current scripted turn has got, so a test can wait for the phase it cares about
@@ -313,14 +313,14 @@ struct MekaRecorder {
     /// `Last-Event-ID` values seen on the feed, so a test can assert the bridge resumed from the
     /// right place rather than replaying from the start.
     attaches: Mutex<Vec<Option<u64>>>,
-    /// Whether the next attach meets a meka that has restarted, which opens the feed with a
+    /// Whether the next attach meets a Meka that has restarted, which opens the feed with a
     /// `feed.gap` carrying no count, since the position the client resumed from is one it never
     /// issued.
     feed_gap: Mutex<bool>,
-    /// Feed attaches to refuse with a 404, standing in for a session meka has lost.
+    /// Feed attaches to refuse with a 404, standing in for a session Meka has lost.
     feed_404_first: Mutex<usize>,
-    /// Whether the feed is served where meka served it before 0.89, at `/stream`, leaving `/feed`
-    /// a path this meka has no route for.
+    /// Whether the feed is served where Meka served it before 0.89, at `/stream`, leaving `/feed`
+    /// a path this Meka has no route for.
     feed_before_0_89: Mutex<bool>,
     /// The route each feed request asked at, `feed` or `stream`, one answered with a bare 404
     /// included.
@@ -331,7 +331,7 @@ struct MekaRecorder {
     /// that is not JSON at all.
     garbled_frame: Mutex<bool>,
     /// Whether the turn runs before the 202 is answered, so the feed reports the item's whole life
-    /// while the client is still waiting to learn its id. Ordinary on a fast local meka, and the
+    /// while the client is still waiting to learn its id. Ordinary on a fast local Meka, and the
     /// one ordering a client cannot control.
     run_before_answering: Mutex<bool>,
     /// `POST /cancel` calls.
@@ -344,22 +344,22 @@ struct MekaRecorder {
     session_profiles: Mutex<HashMap<String, String>>,
     /// The turn running right now, if any: its id and the items it opened on.
     ///
-    /// meka runs one turn at a time per session and reads every item waiting for it into that
+    /// Meka runs one turn at a time per session and reads every item waiting for it into that
     /// turn. Whichever item's driver gets here first takes the lot; one that arrives while the
     /// turn runs is appended to it at the next round boundary rather than opening a turn of
     /// its own.
     ///
     /// The items are held because a feed attaching mid-turn is told them: see [`open_feed`]. Only
-    /// the ones it opened on, which is the source meka records once and never revises.
+    /// the ones it opened on, which is the source Meka records once and never revises.
     in_turn: Mutex<Option<(String, Vec<String>)>>,
-    /// Each item as `(id, body)`, in the order meka accepted them, which is the order a turn reads
+    /// Each item as `(id, body)`, in the order Meka accepted them, which is the order a turn reads
     /// them in.
     by_item: Mutex<Vec<(String, String)>>,
     /// What each turn read, in the order the turns ran: the turn's id and the bodies of the items
     /// it was handed, including any appended after it started.
     ///
     /// The batching assertion the suite actually cares about. One item per message is the contract
-    /// with meka; one turn per burst is what it buys, and only the server can say whether it held.
+    /// with Meka; one turn per burst is what it buys, and only the server can say whether it held.
     turns_read: Mutex<Vec<(String, Vec<String>)>>,
 }
 
@@ -389,7 +389,7 @@ impl MekaRecorder {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(item_id)
         {
-            // Put back to wait out its next attempt, which meka reports as waiting like any other.
+            // Put back to wait out its next attempt, which Meka reports as waiting like any other.
             Some(state) if state == "deferred" => "pending".to_string(),
             Some(state) => state.clone(),
             None => "pending".to_string(),
@@ -398,7 +398,7 @@ impl MekaRecorder {
 
     /// Note that `turn` read these items, which is what a batching assertion is really about.
     ///
-    /// Keyed on the turn rather than appended blindly, so items meka hands to a turn already
+    /// Keyed on the turn rather than appended blindly, so items Meka hands to a turn already
     /// running land in that turn's list instead of reading as a turn of their own.
     fn read_in(&self, turn: &str, items: &[String]) {
         let bodies: Vec<String> = {
@@ -428,7 +428,7 @@ impl MekaRecorder {
 
     /// Take every item still waiting, stamping it with `state`, oldest first.
     ///
-    /// Ordered by when meka accepted them rather than by id, which carries a uuid, because the
+    /// Ordered by when Meka accepted them rather than by id, which carries a uuid, because the
     /// order a turn reads them in is the order they were said in.
     fn take_waiting(&self, state: &str) -> Vec<String> {
         let accepted: Vec<String> = self
@@ -460,8 +460,8 @@ impl MekaRecorder {
     }
 }
 
-/// `POST /v1/sessions`, refusing a field it does not know with a 422 as meka does for every request
-/// body. That refusal is how meka 0.76 renaming `cwd` to `working_directory` reached a bridge still
+/// `POST /v1/sessions`, refusing a field it does not know with a 422 as Meka does for every request
+/// body. That refusal is how Meka 0.76 renaming `cwd` to `working_directory` reached a bridge still
 /// sending the old name.
 async fn create_session(
     State(recorder): State<Arc<MekaRecorder>>,
@@ -669,11 +669,11 @@ async fn enqueue_item(
 /// A `retry_until` for a test that needs one far off.
 const RETRY_UNTIL: &str = "2099-01-01T00:00:00Z";
 
-/// meka's sentence for an item it ran out of time on.
+/// Meka's sentence for an item it ran out of time on.
 const GIVE_UP_REASON: &str =
     "no turn could deliver it in 7 attempt(s) within the retry ceiling of 1 hour";
 
-/// An error as meka keeps it on an item it gave up on, which is what a replayed key answers with:
+/// An error as Meka keeps it on an item it gave up on, which is what a replayed key answers with:
 /// the Problem Detail's `type`, `title`, `status` and `detail`, without the upstream's own text the
 /// feed's copy carries.
 fn as_recorded(error: &serde_json::Value) -> serde_json::Value {
@@ -697,7 +697,7 @@ fn quota_error() -> serde_json::Value {
     })
 }
 
-/// meka's inbox drain: the turn everything waiting is read into, and what the feed says about it.
+/// Meka's inbox drain: the turn everything waiting is read into, and what the feed says about it.
 ///
 /// One turn takes every item waiting for it, which is what makes a burst of messages cost one
 /// provider round trip rather than one each, and one that lands while a turn runs is appended to
@@ -709,7 +709,7 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let feed = Arc::clone(&recorder.feed);
 
-    // Neither of these opens a turn: meka withdraws the item and says so, with nothing running.
+    // Neither of these opens a turn: Meka withdraws the item and says so, with nothing running.
     match script {
         TurnScript::Hold => return,
         TurnScript::Withdraw => {
@@ -801,11 +801,11 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
         // Nothing is waiting, which is what most ticks find.
         Ok(None) => return,
         Err(turn) => {
-            // Appended to the turn already under way, which meka reads at its next round boundary.
+            // Appended to the turn already under way, which Meka reads at its next round boundary.
             let appended = recorder.take_waiting("delivered");
             if !appended.is_empty() {
                 recorder.read_in(&turn, &appended);
-                // Not added to what the turn names on a reattach. meka records the source once,
+                // Not added to what the turn names on a reattach. Meka records the source once,
                 // when the turn opens, so an item appended at a round boundary is never in it; a
                 // client that reattaches after one learns of it from its `inbox.delivered`.
                 feed.push(
@@ -863,7 +863,7 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
         let _ = feed.sender.send(frame);
     }
 
-    let send_tool = "mcp__mekabridge__message_send";
+    let send_tool = "mcp__meka-bridge__message_send";
     let sent = |id: &str| serde_json::json!({ "id": id, "name": send_tool, "input": {}, "display_summary": null });
     match script {
         TurnScript::Answer => {
@@ -970,7 +970,7 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
             {
                 // The call being written is abandoned and a different one takes its place, which
-                // is what meka's own retry looks like from here: no closing event for `c1`, ever.
+                // is what Meka's own retry looks like from here: no closing event for `c1`, ever.
                 feed.push(
                     "tool_call.composing",
                     Some(&turn),
@@ -1014,7 +1014,7 @@ fn finish(feed: &Feed, turn: &str, stop_reason: &str) {
         "stop_reason": stop_reason,
         "usage": { "input_tokens": 1, "output_tokens": 1 },
     });
-    // Named only when a fallback served the turn, as meka does.
+    // Named only when a fallback served the turn, as Meka does.
     if let Some(profile) = feed
         .fallback
         .lock()
@@ -1026,7 +1026,7 @@ fn finish(feed: &Feed, turn: &str, stop_reason: &str) {
     feed.push("turn.finished", Some(turn), data);
 }
 
-/// `GET /v1/sessions/{id}/feed`, where meka 0.89 serves the feed.
+/// `GET /v1/sessions/{id}/feed`, where Meka 0.89 serves the feed.
 async fn open_feed_at_feed(
     State(recorder): State<Arc<MekaRecorder>>,
     headers: axum::http::HeaderMap,
@@ -1034,7 +1034,7 @@ async fn open_feed_at_feed(
     open_feed_at(recorder, headers, "feed").await
 }
 
-/// `GET /v1/sessions/{id}/stream`, where meka served the feed before 0.89.
+/// `GET /v1/sessions/{id}/stream`, where Meka served the feed before 0.89.
 async fn open_feed_at_stream(
     State(recorder): State<Arc<MekaRecorder>>,
     headers: axum::http::HeaderMap,
@@ -1042,8 +1042,8 @@ async fn open_feed_at_stream(
     open_feed_at(recorder, headers, "stream").await
 }
 
-/// The feed at `route`, or the bare 404 meka's router gives a path it has no route for when this
-/// meka serves the feed at the other.
+/// The feed at `route`, or the bare 404 Meka's router gives a path it has no route for when this
+/// Meka serves the feed at the other.
 async fn open_feed_at(
     recorder: Arc<MekaRecorder>,
     headers: axum::http::HeaderMap,
@@ -1101,7 +1101,7 @@ async fn open_feed(
         .map_or(last_event_id.unwrap_or(0), |frame| frame.id);
 
     let mut opening = vec!["retry: 3000\n\n".to_string()];
-    // What meka opens a feed with when a turn is already running: the turn it joined, `resumed` to
+    // What Meka opens a feed with when a turn is already running: the turn it joined, `resumed` to
     // tell it from one beginning, and the source that turn was opened on. Synthesised rather than
     // replayed, so it carries no `id:` and no `started_at`, and it comes before the `feed.gap` and
     // the backlog.
@@ -1128,7 +1128,7 @@ async fn open_feed(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
         recorder.set(&recorder.feed_gap, false);
-        // What a restarted meka opens with: the client's position is one it never issued, so the
+        // What a restarted Meka opens with: the client's position is one it never issued, so the
         // hole cannot be counted. Deliberately carries no `id:`, since the hole is the connection's
         // rather than the session's, so a client cannot move its position onto it.
         opening.push("event: feed.gap\ndata: {\"session_id\":\"s\"}\n\n".to_string());
@@ -1193,7 +1193,7 @@ async fn cancel_turn(State(recorder): State<Arc<MekaRecorder>>) -> impl IntoResp
     axum::http::StatusCode::NO_CONTENT
 }
 
-/// `GET /v1/health/ready`. meka answers 503 with the *same* body it sends on 200, naming which
+/// `GET /v1/health/ready`. Meka answers 503 with the *same* body it sends on 200, naming which
 /// subsystem is the blocker, rather than a Problem Detail.
 async fn ready(State(recorder): State<Arc<MekaRecorder>>) -> axum::response::Response {
     let answer = recorder
@@ -1259,13 +1259,13 @@ async fn profiles() -> impl IntoResponse {
     }))
 }
 
-/// Start a stub meka on an ephemeral port.
-/// How long meka's inbox drain takes to notice an item.
+/// Start a stub Meka on an ephemeral port.
+/// How long Meka's inbox drain takes to notice an item.
 ///
 /// A turn does not begin the instant an item lands: the drain has to wake, the session has to load,
 /// and the provider round trip has to start. That gap is why a burst of messages the bridge posts
 /// one after another is read by one turn, and a stub that opened a turn the instant it answered a
-/// 202 would model a meka nobody runs.
+/// 202 would model a Meka nobody runs.
 const INBOX_DRAIN: Duration = Duration::from_millis(30);
 
 async fn start_meka(recorder: Arc<MekaRecorder>) -> (SocketAddr, CancellationToken) {
@@ -1323,10 +1323,10 @@ const POSTING_STALL: Duration = Duration::from_secs(1);
 /// Hold the drain while the bridge is partway through posting a batch it claimed whole.
 ///
 /// The bridge posts a batch one item at a time with a commit after each, and a drain tick landing
-/// between two would split it across turns. meka reads the late ones at the next round boundary of
+/// between two would split it across turns. Meka reads the late ones at the next round boundary of
 /// the same turn, which a stub whose turns end the moment they open cannot model. Waiting on a gap
 /// between posts instead was tried and lost to stalls on the shared runners, so this waits on the
-/// bridge's own record of what it rendered and meka has not yet accepted.
+/// bridge's own record of what it rendered and Meka has not yet accepted.
 async fn wait_for_posting_to_stop(recorder: &MekaRecorder) {
     let Some(store) = recorder.bridge_store.get() else {
         return;
@@ -1372,7 +1372,7 @@ struct MockChannel {
     deletes: Mutex<Vec<Vec<String>>>,
     /// The fresh sessions not yet caught up from, for `catch_up`. Recorded by hand, by
     /// [`MockChannel::open_session`].
-    openings: Arc<mekabridge::channel::Openings>,
+    openings: Arc<meka_bridge::channel::Openings>,
     /// Conversations whose next `backfill` fails, once each.
     fail_backfill_once: Mutex<std::collections::HashSet<String>>,
     /// What `backfill` finds in each conversation.
@@ -1416,7 +1416,7 @@ impl MockChannel {
             activities: Mutex::new(Vec::new()),
             files: Mutex::new(std::collections::HashMap::new()),
             deletes: Mutex::new(Vec::new()),
-            openings: Arc::new(mekabridge::channel::Openings::default()),
+            openings: Arc::new(meka_bridge::channel::Openings::default()),
             fail_backfill_once: Mutex::new(std::collections::HashSet::new()),
             missed: Mutex::new(std::collections::HashMap::new()),
             backfills: Mutex::new(Vec::new()),
@@ -1817,8 +1817,8 @@ impl Channel for MockChannel {
         })
     }
 
-    fn catch_up(&self) -> Option<mekabridge::channel::CatchUp> {
-        Some(mekabridge::channel::CatchUp {
+    fn catch_up(&self) -> Option<meka_bridge::channel::CatchUp> {
+        Some(meka_bridge::channel::CatchUp {
             openings: Arc::clone(&self.openings),
             window: Duration::from_secs(24 * 60 * 60),
         })
@@ -1830,7 +1830,7 @@ impl Channel for MockChannel {
         after: Option<&str>,
         _since: chrono::DateTime<Utc>,
         _limit: usize,
-    ) -> Result<mekabridge::channel::Backfill, ChannelError> {
+    ) -> Result<meka_bridge::channel::Backfill, ChannelError> {
         self.backfills
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1853,23 +1853,23 @@ impl Channel for MockChannel {
             .get(conversation.as_str())
             .cloned()
             .unwrap_or_default();
-        Ok(mekabridge::channel::Backfill {
+        Ok(meka_bridge::channel::Backfill {
             events,
             truncated: false,
         })
     }
 }
 
-/// Build a sink with a scratch attachment directory and a meka client pointed nowhere.
+/// Build a sink with a scratch attachment directory and a Meka client pointed nowhere.
 ///
-/// The address is unreachable on purpose: only the fetch tools consult meka (for the vision flag),
+/// The address is unreachable on purpose: only the fetch tools consult Meka (for the vision flag),
 /// and a failed probe degrades to "describe rather than show", which is the behaviour under test in
 /// the cases that use this.
 async fn sink_for(store: Store, channels: Arc<ChannelRegistry>) -> BridgeSink {
     sink_with_storage(
         store,
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::new(Presence::default()),
     )
     .await
@@ -1891,7 +1891,7 @@ async fn sink_with_storage(
     .await
 }
 
-/// The same, pointed at a meka that answers, so the vision probe succeeds and `attachment_view`
+/// The same, pointed at a Meka that answers, so the vision probe succeeds and `attachment_view`
 /// reaches the code that decides between an image and a description.
 async fn sink_against_meka(
     store: Store,
@@ -1902,7 +1902,7 @@ async fn sink_against_meka(
 ) -> BridgeSink {
     let accounts = mock_accounts(&store).await;
     let storage = StorageConfig {
-        path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+        path: std::path::PathBuf::from("/tmp/meka-bridge-unused.db"),
         attachment_dir,
         attachment_max_bytes: 20 * 1024 * 1024,
         attachment_retention: Duration::from_secs(86_400),
@@ -1911,7 +1911,7 @@ async fn sink_against_meka(
     let meka = MekaClient::new(
         &config_for(
             meka_address,
-            std::path::Path::new("/tmp/mekabridge-unused.db"),
+            std::path::Path::new("/tmp/meka-bridge-unused.db"),
             false,
         )
         .meka,
@@ -2094,7 +2094,7 @@ struct Setup {
     /// Whether the bridge announces a message being written in the originating chats. Off for most
     /// of the suite, so it is not measuring presence it does not care about.
     typing_indicator: bool,
-    /// The first wait before a hand-over meka did not accept is posted again. Scaled down from the
+    /// The first wait before a hand-over Meka did not accept is posted again. Scaled down from the
     /// shipped ten seconds, but not as far as the floor: a test that asserts a wait happened has
     /// to be able to tell it from the round trip it replaced.
     retry_base: Duration,
@@ -2103,7 +2103,7 @@ struct Setup {
     hand_over_within: Duration,
     /// Extra offers of a message whose item was taken back unread, or whose turn came back empty.
     max_offers: u32,
-    /// How often meka is asked about a hand-over it has held too long. The shipped five minutes
+    /// How often Meka is asked about a hand-over it has held too long. The shipped five minutes
     /// would have the one test that needs the sweep sleeping through it.
     straggler_sweep: Duration,
     /// Zero writes no message history at all, which is what makes an undeliverable message
@@ -2204,7 +2204,7 @@ impl Harness {
         Self::start_all(0, 0, TurnScript::Answer, setup).await
     }
 
-    /// A harness whose accepted items meet `script` on meka's side.
+    /// A harness whose accepted items meet `script` on Meka's side.
     async fn start_script(script: TurnScript) -> Self {
         Self::start_all(0, 0, script, Setup::default()).await
     }
@@ -2345,7 +2345,7 @@ impl Harness {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The inbox items meka accepted, in order, one per message.
+    /// The inbox items Meka accepted, in order, one per message.
     fn items(&self) -> Vec<String> {
         self.recorder
             .items
@@ -2448,7 +2448,7 @@ impl Drop for Harness {
     }
 }
 
-/// Start the feed reader and the session task over one store, the way [`mekabridge::bridge::run`]
+/// Start the feed reader and the session task over one store, the way [`meka_bridge::bridge::run`]
 /// does.
 #[allow(
     clippy::too_many_arguments,
@@ -2532,7 +2532,7 @@ async fn an_inbound_message_becomes_a_turn_carrying_its_routing_header() {
         "got:\n{envelope}"
     );
     assert!(
-        envelope.contains("[mekabridge] You are @mockbot on mock."),
+        envelope.contains("[Meka Bridge] You are @mockbot on mock."),
         "got:\n{envelope}"
     );
 }
@@ -2567,7 +2567,7 @@ async fn the_session_is_created_in_the_configured_working_directory() {
 #[tokio::test]
 async fn the_queue_is_drained_once_the_model_has_read_the_batch() {
     // Delivered means the model read it, which the feed says outright. Nothing is inferred from
-    // the hand-over being accepted: an item meka has is an item meka may yet give up on.
+    // the hand-over being accepted: an item Meka has is an item Meka may yet give up on.
     let harness = Harness::start().await;
     harness
         .sender
@@ -2576,7 +2576,7 @@ async fn the_queue_is_drained_once_the_model_has_read_the_batch() {
         .expect("queued");
     harness
         .wait_until(
-            "the turn to be recorded for `mekabridge status`",
+            "the turn to be recorded for `meka-bridge status`",
             async |store| store.last_turn_at().await.is_ok_and(|at| at.is_some()),
         )
         .await;
@@ -2617,7 +2617,7 @@ async fn every_turn_names_the_account_the_agent_appears_as() {
     let turns = harness.items();
     for (index, turn) in turns.iter().take(2).enumerate() {
         assert!(
-            turn.contains("[mekabridge] You are @mockbot on mock."),
+            turn.contains("[Meka Bridge] You are @mockbot on mock."),
             "turn {} must name the bot's own account:\n{}",
             index + 1,
             turn
@@ -2656,7 +2656,7 @@ async fn duplicate_deliveries_are_ignored() {
 
 #[tokio::test]
 async fn a_hand_over_meka_never_accepts_is_given_up_on() {
-    // meka out of reach for the whole hour a batch has to be accepted in, scaled down here. Every
+    // Meka out of reach for the whole hour a batch has to be accepted in, scaled down here. Every
     // post is refused, so nothing ever reaches the agent and the messages have to end up somewhere
     // rather than being posted for ever.
     let harness = Harness::start_failing(FailureKind::Transient, Setup {
@@ -2687,8 +2687,8 @@ async fn a_hand_over_meka_never_accepts_is_given_up_on() {
 
 #[tokio::test]
 async fn a_second_post_waits_rather_than_going_straight_back() {
-    // A hand-over meka refused used to be offered again on the very next pass. For the failure the
-    // backoff exists for, meka out of reach, that spends every attempt inside the same outage and
+    // A hand-over Meka refused used to be offered again on the very next pass. For the failure the
+    // backoff exists for, Meka out of reach, that spends every attempt inside the same outage and
     // the message is declared undeliverable seconds after it arrived.
     let harness = Harness::start_failing(FailureKind::Transient, Setup {
         hand_over_within: Duration::from_secs(30),
@@ -2743,7 +2743,7 @@ async fn an_item_taken_back_before_the_model_read_it_is_offered_again() {
         0,
         "an item nobody read must not be counted as delivered"
     );
-    // A new hand-over each time, since meka refuses the same key with other words and the envelope
+    // A new hand-over each time, since Meka refuses the same key with other words and the envelope
     // is rebuilt from whatever is waiting now.
     let keys = harness.keys();
     assert_ne!(keys[0], keys[1], "got {keys:?}");
@@ -2790,7 +2790,7 @@ async fn a_turn_cancelled_after_the_model_read_a_batch_does_not_offer_it_again()
 #[tokio::test]
 async fn an_unrepairable_refusal_is_not_posted_again_at_all() {
     // A conversation that no longer fits the model's window will not fit on the next attempt
-    // either, which is why meka gave it a type away from `provider`. Spending the hour on it only
+    // either, which is why Meka gave it a type away from `provider`. Spending the hour on it only
     // delays the notice that says an operator is needed.
     let harness = Harness::start_failing(FailureKind::Unrepairable, Setup::default()).await;
     harness
@@ -2815,7 +2815,7 @@ async fn an_unrepairable_refusal_is_not_posted_again_at_all() {
 
 #[tokio::test]
 async fn a_turn_that_failed_after_the_agent_acted_does_not_offer_the_batch_again() {
-    // meka only retries an upstream failure while nothing has reached its frontend, so one that
+    // Meka only retries an upstream failure while nothing has reached its frontend, so one that
     // gets as far as a `turn.failed` on the feed may well have a sent message and a shell command
     // behind it. Offering the batch again would repeat both, and the agent would have no memory of
     // the first run to tell it from the second.
@@ -2844,9 +2844,9 @@ async fn a_turn_that_failed_after_the_agent_acted_does_not_offer_the_batch_again
 #[tokio::test]
 async fn a_message_meka_gave_up_on_is_owed_to_the_agent_again() {
     // A message is marked seen the moment it is queued, on the assumption that the agent is about
-    // to be handed it. meka giving up on the item is exactly where that assumption fails, and
+    // to be handed it. Meka giving up on the item is exactly where that assumption fails, and
     // without putting it back the message is neither delivered nor owed: absent from `unseen`,
-    // from the missed-context lookback, and from the `mekabridge unseen` predicate.
+    // from the missed-context lookback, and from the `meka-bridge unseen` predicate.
     let harness = Harness::start_script(TurnScript::GiveUp).await;
     harness
         .sender
@@ -2922,14 +2922,14 @@ async fn the_owner_hears_what_the_chat_is_spared() {
         .expect("the owner must be told");
     assert!(
         owner.1.contains("7 attempt(s)"),
-        "the owner needs meka's own reason: {:?}",
+        "the owner needs Meka's own reason: {:?}",
         owner.1
     );
     // And the cause behind it, which the reason alone does not name: seven attempts read the same
     // whether the quota ran out or a credential was revoked.
     assert!(
         owner.1.contains("402 insufficient credits"),
-        "the owner needs the error meka gave it up on: {:?}",
+        "the owner needs the error Meka gave it up on: {:?}",
         owner.1
     );
     assert!(
@@ -2946,7 +2946,7 @@ async fn the_owner_hears_what_the_chat_is_spared() {
 
 #[tokio::test]
 async fn the_owner_hears_of_a_failing_turn_while_meka_is_still_retrying_it() {
-    // meka keeps trying a turn an outage or a spent quota fails, for as long as its retry ceiling
+    // Meka keeps trying a turn an outage or a spent quota fails, for as long as its retry ceiling
     // allows. Told only when it gives up, an owner learned of an outage an hour after the chats
     // went quiet, which from where they sit looked like nothing at all.
     let harness = Harness::start_script_with(TurnScript::Defer, Setup::with_owner()).await;
@@ -2979,7 +2979,7 @@ async fn the_owner_hears_of_a_failing_turn_while_meka_is_still_retrying_it() {
         .expect("told")
         .1;
     for expected in [
-        // When meka tries next, and when it stops, both in meka's own words.
+        // When Meka tries next, and when it stops, both in Meka's own words.
         "try again at 2098-12-31 23:10:00 UTC",
         "still failing by 2099-01-01 00:00:00 UTC",
         // What is wrong, which is the part the owner can act on.
@@ -2994,18 +2994,18 @@ async fn the_owner_hears_of_a_failing_turn_while_meka_is_still_retrying_it() {
     assert!(
         sent.iter()
             .all(|(conversation, _)| conversation == "mock:99"),
-        "only the owner hears of a turn meka is still retrying: {sent:?}"
+        "only the owner hears of a turn Meka is still retrying: {sent:?}"
     );
     assert_eq!(
         harness.store.queue_stats().await.expect("stats").failed,
         0,
-        "nothing is given up on while meka still has it"
+        "nothing is given up on while Meka still has it"
     );
 }
 
 #[tokio::test]
 async fn a_give_up_after_a_deferral_still_reaches_the_owner() {
-    // meka gives an item up minutes after the last deferral it reports. Sharing one notice window,
+    // Meka gives an item up minutes after the last deferral it reports. Sharing one notice window,
     // the deferral would have silenced the give-up, leaving the owner told "will try again" and
     // never told that it stopped.
     let harness = Harness::start_script_with(TurnScript::Defer, Setup::with_owner()).await;
@@ -3194,8 +3194,8 @@ async fn a_deferral_for_a_message_already_settled_is_not_reported() {
 
 #[tokio::test]
 async fn a_message_meka_gave_up_on_unheard_meets_the_end_it_would_have_met_live() {
-    // meka gave the item up while the feed was down, so the `inbox.failed` saying so was missed.
-    // Asked about it on the reconnect, meka answers with the error it gave the item up on. Taken
+    // Meka gave the item up while the feed was down, so the `inbox.failed` saying so was missed.
+    // Asked about it on the reconnect, Meka answers with the error it gave the item up on. Taken
     // for an item withdrawn unread, the message used to be posted afresh into the same failure;
     // it now fails the way the missed event would have failed it, and the owner hears why.
     let harness = Harness::start_script_with(TurnScript::Hold, Setup::with_owner()).await;
@@ -3244,7 +3244,7 @@ async fn a_message_meka_gave_up_on_unheard_meets_the_end_it_would_have_met_live(
         .find(|(conversation, _)| conversation == "mock:99")
         .expect("told")
         .1;
-    // The error as meka recorded it on the item, which keeps its own sentence but not the
+    // The error as Meka recorded it on the item, which keeps its own sentence but not the
     // provider's words: those ride the feed's `inbox.failed` alone.
     assert!(
         owner.contains("the provider refused for quota or billing"),
@@ -3505,7 +3505,7 @@ async fn a_rate_limited_post_is_tried_again() {
 
 #[tokio::test]
 async fn a_transient_refusal_is_recovered_by_the_next_post() {
-    // The same batch, under the same key and byte for byte, which is what lets meka answer a post
+    // The same batch, under the same key and byte for byte, which is what lets Meka answer a post
     // it has already seen with the item it already made rather than a second copy.
     let harness = Harness::start_flaky(1).await;
     harness
@@ -3859,7 +3859,7 @@ async fn a_burst_typed_over_several_seconds_still_becomes_one_turn() {
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
 
-    // The turn rather than the first item, which a slow commit can leave alone at meka for longer
+    // The turn rather than the first item, which a slow commit can leave alone at Meka for longer
     // than the sleep below while the stub waits for the rest of the batch.
     harness
         .wait_for("a turn", |harness| !harness.turns().is_empty())
@@ -3919,14 +3919,14 @@ async fn a_chat_that_never_goes_quiet_is_released_by_the_ceiling() {
 async fn a_hand_over_posted_before_a_restart_is_settled_by_the_replay() {
     // The whole reason the key and the body are written down. A bridge that stops between posting
     // an item and hearing what became of it has no way to tell, on the next start, whether the
-    // agent read it: the feed events it missed are in meka's ring, and the item is answerable by
-    // its key. So it posts the same bytes under the same key, meka answers with the item it
+    // agent read it: the feed events it missed are in Meka's ring, and the item is answerable by
+    // its key. So it posts the same bytes under the same key, Meka answers with the item it
     // already made and that item's state, and the batch is settled without a second copy reaching
     // anybody.
     let directory = tempfile::tempdir().expect("tempdir");
     let database = directory.path().join("state.db");
     let recorder = Arc::new(MekaRecorder::default());
-    // Held on meka's side, so the first run stops with the item still waiting to be read.
+    // Held on Meka's side, so the first run stops with the item still waiting to be read.
     recorder.set(&recorder.script, TurnScript::Hold);
     let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
     let config = Arc::new(config_for(meka_address, &database, false));
@@ -4689,10 +4689,11 @@ async fn a_blocked_conversation_never_reaches_the_agent_and_keeps_nothing() {
 async fn the_indicator_is_up_only_while_the_model_writes_the_message() {
     // The whole point of the rework. The indicator used to be raised on `turn.started` and held for
     // the life of the turn, so a chat saw "typing" through a dozen tool calls and however long the
-    // agent spent reading. It now tracks the one interval meka can actually vouch for: between
+    // agent spent reading. It now tracks the one interval Meka can actually vouch for: between
     // `tool_call.composing` and `tool_call.executing` on a send call.
     let harness =
-        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(900)).await;
+        Harness::start_composing("mcp__meka-bridge__message_send", Duration::from_millis(900))
+            .await;
     harness
         .sender
         .send(message("what did the log say?", "1"))
@@ -4850,7 +4851,7 @@ async fn await_history(harness: &Harness, expected: usize, label: &str) {
 async fn every_envelope_is_posted_as_a_steer_from_this_bridge_under_a_key() {
     // The whole contract with the inbox in one assertion. `steer` is what reaches a turn that is
     // already running, at its next round boundary, rather than waiting for it to end; `source` is
-    // what meka writes into the header above the envelope, so the agent reads one name for this
+    // what Meka writes into the header above the envelope, so the agent reads one name for this
     // bridge; and the key is what makes a post safe to repeat after an ambiguous failure or a
     // restart on either side.
     let harness = Harness::start().await;
@@ -4871,20 +4872,20 @@ async fn every_envelope_is_posted_as_a_steer_from_this_bridge_under_a_key() {
         .clone();
     assert_eq!(posted, vec![(
         "steer".to_string(),
-        "mekabridge".to_string()
+        "Meka Bridge".to_string()
     )]);
     let key = harness.keys().first().cloned().expect("one key");
     assert!(!key.is_empty(), "every post carries a key");
     assert!(
         key.is_ascii() && key.len() <= 255,
-        "meka refuses a key outside that: {key:?}"
+        "Meka refuses a key outside that: {key:?}"
     );
 }
 
 #[tokio::test]
 async fn a_backlog_survives_a_batch_the_model_never_read() {
     // A conversation's backlog is announced once, in the envelope, and it used to be spent as soon
-    // as meka took the turn. An item taken back before the model read it leaves nobody having been
+    // as Meka took the turn. An item taken back before the model read it leaves nobody having been
     // told, so spending it there loses those messages from every path that would have found them
     // again.
     let harness = Harness::start_script_with(TurnScript::Withdraw, Setup {
@@ -5108,7 +5109,7 @@ async fn a_muted_conversation_stays_quiet_even_moments_after_the_agent_speaks() 
 #[tokio::test]
 async fn a_batch_that_never_reached_the_model_owes_its_backlog_back() {
     // The backlog and the count of what the queue shed are each stated once, in the envelope, and
-    // both used to be spent the moment it was rendered. A batch meka never accepted was read by
+    // both used to be spent the moment it was rendered. A batch Meka never accepted was read by
     // nobody, so both are owed again: otherwise the next envelope tells the agent "nothing has
     // been said there since you last looked" about a chat with four messages waiting, and they are
     // then gone from `unseen` and from every future lookback with nothing to point at them.
@@ -5154,7 +5155,7 @@ async fn a_batch_that_never_reached_the_model_owes_its_backlog_back() {
         .expect("summary");
     assert_eq!(
         summary.count, 5,
-        "the backlog was spent by a hand-over meka never accepted"
+        "the backlog was spent by a hand-over Meka never accepted"
     );
 }
 
@@ -5423,10 +5424,10 @@ async fn the_sink_lists_conversations_for_the_agent() {
     assert_eq!(listed[0].title.as_deref(), Some("Alice"));
 }
 
-/// meka 0.89 moved the feed from `/stream` to `/feed` and left nothing at the old path. The route
-/// that answered last is asked first, by every clone of the client, so a bridge on either meka
-/// meets one bare 404 at most, and another only when meka is upgraded or downgraded under it. A
-/// problem from the other route is meka's answer about the session, so a session an older meka lost
+/// Meka 0.89 moved the feed from `/stream` to `/feed` and left nothing at the old path. The route
+/// that answered last is asked first, by every clone of the client, so a bridge on either Meka
+/// meets one bare 404 at most, and another only when Meka is upgraded or downgraded under it. A
+/// problem from the other route is Meka's answer about the session, so a session an older Meka lost
 /// is still reported as gone, and the route that said so is the one asked next.
 #[tokio::test]
 async fn the_feed_is_opened_wherever_this_meka_serves_it() {
@@ -5436,7 +5437,7 @@ async fn the_feed_is_opened_wherever_this_meka_serves_it() {
     let meka = MekaClient::new(
         &config_for(
             address,
-            &std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+            &std::path::PathBuf::from("/tmp/meka-bridge-unused.db"),
             false,
         )
         .meka,
@@ -5465,7 +5466,7 @@ async fn the_feed_is_opened_wherever_this_meka_serves_it() {
             client
                 .open_feed(session, None)
                 .await
-                .expect("a meka before 0.89 serves the feed at /stream"),
+                .expect("a Meka before 0.89 serves the feed at /stream"),
         );
     }
     assert_eq!(routes(), ["feed", "stream", "stream", "stream"]);
@@ -5474,7 +5475,7 @@ async fn the_feed_is_opened_wherever_this_meka_serves_it() {
     drop(
         meka.open_feed(session, Some(7))
             .await
-            .expect("an upgraded meka serves it at /feed"),
+            .expect("an upgraded Meka serves it at /feed"),
     );
     assert_eq!(routes(), [
         "feed", "stream", "stream", "stream", "stream", "feed"
@@ -5499,14 +5500,14 @@ async fn every_feed_event_names_the_session_it_was_read_from() {
     // is thousands deep, so a rebind leaves the old session's feed still draining into a task that
     // has moved on. Without the name there is nothing to tell those events from the new session's,
     // and one of their ids reaching the feed position would reopen the new feed from a number that
-    // means nothing in its numbering -- meka would then replay nothing until the new session's own
+    // means nothing in its numbering -- Meka would then replay nothing until the new session's own
     // ids overtook it.
     let recorder = Arc::new(MekaRecorder::default());
     let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
     let meka = MekaClient::new(
         &config_for(
             address,
-            &std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
+            &std::path::PathBuf::from("/tmp/meka-bridge-unused.db"),
             false,
         )
         .meka,
@@ -5533,10 +5534,10 @@ async fn every_feed_event_names_the_session_it_was_read_from() {
         }
     });
 
-    let named = async |feed: &mut mpsc::Receiver<mekabridge::bridge::feed::FeedEvent>| {
+    let named = async |feed: &mut mpsc::Receiver<meka_bridge::bridge::feed::FeedEvent>| {
         match tokio::time::timeout(Duration::from_secs(5), feed.recv()).await {
-            Ok(Some(mekabridge::bridge::feed::FeedEvent::Connected { session, .. }))
-            | Ok(Some(mekabridge::bridge::feed::FeedEvent::Item { session, .. })) => Some(session),
+            Ok(Some(meka_bridge::bridge::feed::FeedEvent::Connected { session, .. }))
+            | Ok(Some(meka_bridge::bridge::feed::FeedEvent::Item { session, .. })) => Some(session),
             other => panic!("expected a named feed event, got {other:?}"),
         }
     };
@@ -5572,9 +5573,9 @@ async fn every_feed_event_names_the_session_it_was_read_from() {
 
 #[tokio::test]
 async fn a_forgotten_session_is_replaced_and_the_batch_handed_to_the_new_one() {
-    // meka losing the session (its row deleted, or its database replaced) must not lose the
+    // Meka losing the session (its row deleted, or its database replaced) must not lose the
     // message: a replacement is bound and the same batch is posted into it, under the same key,
-    // since meka scopes a key per session and the new one has never seen it.
+    // since Meka scopes a key per session and the new one has never seen it.
     let harness = Harness::start_forgetting(1).await;
     harness
         .sender
@@ -5588,7 +5589,7 @@ async fn a_forgotten_session_is_replaced_and_the_batch_handed_to_the_new_one() {
 
     // One item, however many requests it took. A rebind reopens the feed, and a connection that
     // opens after a hand-over went out asks about it, since its outcome may have been reported
-    // while nothing was listening; meka answers that with the item it already has rather than a
+    // while nothing was listening; Meka answers that with the item it already has rather than a
     // second copy, which is the whole reason the key is on the row.
     let items = harness.items();
     assert_eq!(items.len(), 1, "the replacement was sent a second copy");
@@ -5634,7 +5635,7 @@ async fn whether_an_image_is_shown_is_the_calling_session_s_profile_s_answer() {
 
     let account = mock_account(&store).await;
     let handle = store
-        .register_attachment(mekabridge::store::AttachmentRecord {
+        .register_attachment(meka_bridge::store::AttachmentRecord {
             conversation: "mock:1".to_string(),
             account,
             message_id: "1".to_string(),
@@ -5693,7 +5694,7 @@ async fn whether_an_image_is_shown_is_the_calling_session_s_profile_s_answer() {
         "an earlier answer was kept after the session moved: {viewed:?}"
     );
 
-    // On a profile meka does not have, the check failed: the model is not known to be blind.
+    // On a profile Meka does not have, the check failed: the model is not known to be blind.
     move_to(&worker, "gone");
     let viewed = sink
         .attachment_view(&handle, Some(&worker))
@@ -5742,7 +5743,7 @@ async fn a_video_preview_is_not_refused_on_the_size_of_the_video() {
 
     let account = mock_account(&store).await;
     let handle = store
-        .register_attachment(mekabridge::store::AttachmentRecord {
+        .register_attachment(meka_bridge::store::AttachmentRecord {
             conversation: "mock:1".to_string(),
             account,
             message_id: "1".to_string(),
@@ -5788,21 +5789,21 @@ async fn meka_being_unreachable_is_posted_again_rather_than_given_up_on() {
     // Problem Detail, so which *errors* reach the give-up path was never checked -- and that path
     // marks every row failed: unseen, the chat apologised to, the owner told a message could not
     // be delivered. Classifying a transport error as permanent therefore declares every queued
-    // message undeliverable within a second of meka restarting.
+    // message undeliverable within a second of Meka restarting.
     let harness = Harness::start_with_setup(Setup {
         hand_over_within: Duration::from_secs(30),
         ..Setup::default()
     })
     .await;
     // Stopped once the session is bound, which is where a restart in the middle of a working day
-    // leaves things. A meka that was never reachable is a different case: nothing is bound, so
+    // leaves things. A Meka that was never reachable is a different case: nothing is bound, so
     // nothing is claimed and there is no hand-over to charge.
     harness
         .wait_until("the session to be bound", async |store| {
             store.session_id().await.is_ok_and(|id| id.is_some())
         })
         .await;
-    // Stop the stub so the connection itself is refused, which is what a restarting meka looks
+    // Stop the stub so the connection itself is refused, which is what a restarting Meka looks
     // like from here. Nothing is scripted to fail: the failure is the socket.
     harness.meka_shutdown.cancel();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -5840,7 +5841,7 @@ async fn meka_being_unreachable_is_posted_again_rather_than_given_up_on() {
 #[tokio::test]
 async fn a_frame_this_build_cannot_read_is_skipped_and_the_feed_carries_on() {
     // A frame the parser cannot read decides nothing on its own, and reconnecting would replay it
-    // out of meka's ring to fail on it identically. Skipping it costs at most one event; dropping
+    // out of Meka's ring to fail on it identically. Skipping it costs at most one event; dropping
     // the feed over it costs every outcome after it, which for a session that runs turns nobody
     // here started is everything.
     let harness = Harness::start().await;
@@ -5877,7 +5878,7 @@ async fn a_frame_this_build_cannot_read_is_skipped_and_the_feed_carries_on() {
 
 #[tokio::test]
 async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
-    // meka answers 503 with the same body it sends on 200, naming which subsystem is the blocker,
+    // Meka answers 503 with the same body it sends on 200, naming which subsystem is the blocker,
     // and not as a Problem Detail. Handed to the shared decode path that becomes "unexpected body",
     // retried on the way, so the one response worth reading is the one that could not be read.
     let recorder = Arc::new(MekaRecorder::default());
@@ -5893,21 +5894,21 @@ async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
     let (address, shutdown) = start_meka(Arc::clone(&recorder)).await;
     let directory = tempfile::tempdir().expect("tempdir");
     let config = config_for(address, &directory.path().join("state.db"), false);
-    let meka = mekabridge::meka::MekaClient::new(&config.meka).expect("client");
+    let meka = meka_bridge::meka::MekaClient::new(&config.meka).expect("client");
 
     let ready = meka
         .ready()
         .await
-        .expect("meka's own 503 carries an answer");
+        .expect("Meka's own 503 carries an answer");
     assert_eq!(ready.status, "degraded");
     assert!(
         !ready.session_db,
-        "the blocker meka named was lost on the way"
+        "the blocker Meka named was lost on the way"
     );
     assert!(ready.profile_configured);
 
-    // A 503 that is *not* meka's own answer is a different thing entirely: something in front of
-    // meka, which is worth retrying rather than reporting as a considered verdict.
+    // A 503 that is *not* Meka's own answer is a different thing entirely: something in front of
+    // Meka, which is worth retrying rather than reporting as a considered verdict.
     *recorder
         .readiness
         .lock()
@@ -5929,20 +5930,21 @@ async fn a_degraded_readiness_is_read_rather_than_reported_as_a_broken_probe() {
     ));
     meka.ready()
         .await
-        .expect_err("a proxy's JSON 503 was read as meka's own diagnosis");
+        .expect_err("a proxy's JSON 503 was read as Meka's own diagnosis");
 
     shutdown.cancel();
 }
 
 #[tokio::test]
 async fn an_abandoned_composing_call_still_closes_the_indicator() {
-    // meka emits `tool_call.composing` without marking the attempt as having produced output, on
+    // Meka emits `tool_call.composing` without marking the attempt as having produced output, on
     // purpose: a call whose arguments never finish is still safe to retry. That makes the composing
-    // window exactly the window meka retries, and a retry comes back with fresh ids -- so the
+    // window exactly the window Meka retries, and a retry comes back with fresh ids -- so the
     // `executing` matching the id that opened the window never arrives. Waiting for it left the
     // indicator refreshing until the turn ended, which is the behaviour this whole rework removed.
     let harness =
-        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(700)).await;
+        Harness::start_composing("mcp__meka-bridge__message_send", Duration::from_millis(700))
+            .await;
     harness.recorder.set(&harness.recorder.compose_retry, true);
     harness
         .sender
@@ -5990,8 +5992,8 @@ async fn attachments_are_announced_with_a_handle_and_nothing_is_downloaded() {
         let InboundEvent::Message(inner) = &mut event else {
             panic!("a message was built just above");
         };
-        inner.attachments = vec![mekabridge::channel::Attachment {
-            kind: mekabridge::channel::AttachmentKind::Photo,
+        inner.attachments = vec![meka_bridge::channel::Attachment {
+            kind: meka_bridge::channel::AttachmentKind::Photo,
             file_name: Some("photo.jpg".to_string()),
             media_type: Some("image/jpeg".to_string()),
             bytes: Some(4096),
@@ -6040,7 +6042,7 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
 
     let account = mock_account(&store).await;
     let handle = store
-        .register_attachment(mekabridge::store::AttachmentRecord {
+        .register_attachment(meka_bridge::store::AttachmentRecord {
             conversation: "mock:1".to_string(),
             account,
             message_id: "1".to_string(),
@@ -6067,7 +6069,7 @@ async fn the_agent_can_view_an_attachment_as_an_image() {
     )
     .await;
 
-    // meka is unreachable here, so the vision probe fails and the sink degrades to a description
+    // Meka is unreachable here, so the vision probe fails and the sink degrades to a description
     // rather than pretending the model can see, or telling it the model cannot, which would stay in
     // its history as a fact.
     let viewed = sink.attachment_view(&handle, None).await.expect("resolves");
@@ -6126,7 +6128,7 @@ async fn a_file_send_with_no_files_is_refused_by_the_sink() {
     let sink = sink_with_storage(
         store,
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::new(Presence::default()),
     )
     .await;
@@ -6160,7 +6162,7 @@ async fn the_preview_switch_survives_the_whole_outbound_path() {
     let sink = sink_with_storage(
         store,
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::new(Presence::default()),
     )
     .await;
@@ -6245,7 +6247,7 @@ async fn sending_a_message_stops_the_typing_indicator() {
     let sink = sink_with_storage(
         store,
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::clone(&presence),
     )
     .await;
@@ -6282,7 +6284,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
     let sink = sink_with_storage(
         store,
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::clone(&presence),
     )
     .await;
@@ -6306,7 +6308,7 @@ async fn sending_a_file_also_silences_the_typing_indicator() {
 async fn a_message_arriving_mid_turn_is_handed_over_without_waiting_for_the_turn() {
     // What the inbox replaces. A turn already running used to mean the next message waited for it
     // to end, and the envelope after carried a `late:` line saying the reply had been written
-    // without it. Now it is handed over while the turn runs, and meka reads it at that turn's next
+    // without it. Now it is handed over while the turn runs, and Meka reads it at that turn's next
     // round boundary under a header of its own.
     //
     // A turn far longer than the bound below, so waiting for it can never pass for a loaded machine
@@ -6354,8 +6356,8 @@ async fn sink_with_retention(
 ) -> BridgeSink {
     let accounts = mock_accounts(&store).await;
     let storage = StorageConfig {
-        path: std::path::PathBuf::from("/tmp/mekabridge-unused.db"),
-        attachment_dir: std::env::temp_dir().join("mekabridge-test-attachments"),
+        path: std::path::PathBuf::from("/tmp/meka-bridge-unused.db"),
+        attachment_dir: std::env::temp_dir().join("meka-bridge-test-attachments"),
         attachment_max_bytes: 20 * 1024 * 1024,
         attachment_retention: Duration::from_secs(86_400),
         history_retention,
@@ -6363,7 +6365,7 @@ async fn sink_with_retention(
     let meka = MekaClient::new(
         &config_for(
             ([127, 0, 0, 1], 1).into(),
-            std::path::Path::new("/tmp/mekabridge-unused.db"),
+            std::path::Path::new("/tmp/meka-bridge-unused.db"),
             false,
         )
         .meka,
@@ -6394,7 +6396,7 @@ async fn own_message_harness() -> (BridgeSink, Arc<MockChannel>, Store) {
     let sink = sink_with_storage(
         store.clone(),
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::new(Presence::default()),
     )
     .await;
@@ -6578,7 +6580,7 @@ async fn a_batch_deletion_goes_in_one_call_and_marks_every_row() {
         .expect("conversation");
     for message_id in ["s1", "s2", "s3"] {
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: "mock:1".to_string(),
                 account,
@@ -6635,7 +6637,7 @@ async fn the_sender_filter_reaches_the_store_through_the_sink() {
         .expect("conversation");
     for (message_id, sender_id) in [("a", "42"), ("b", "99"), ("c", "99")] {
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: "mock:1".to_string(),
                 account,
@@ -6693,12 +6695,12 @@ fn platform_message(message_id: &str, minutes_ago: i64) -> FoundMessage {
 /// Record `message_id` in `mock:1` as said `minutes_ago`.
 async fn record_said(
     store: &Store,
-    account: mekabridge::store::AccountId,
+    account: meka_bridge::store::AccountId,
     message_id: &str,
     minutes_ago: i64,
 ) {
     store
-        .record_message(mekabridge::store::MessageRecord {
+        .record_message(meka_bridge::store::MessageRecord {
             id: 0,
             conversation: "mock:1".to_string(),
             account,
@@ -6723,7 +6725,7 @@ async fn record_said(
         .expect("record");
 }
 
-fn ids_of(page: &mekabridge::mcp::HistoryPage) -> Vec<&str> {
+fn ids_of(page: &meka_bridge::mcp::HistoryPage) -> Vec<&str> {
     page.entries
         .iter()
         .map(|entry| entry.message_id.as_str())
@@ -6786,7 +6788,7 @@ async fn reading_back_past_the_record_carries_on_into_the_platforms_history() {
         .expect("read runs");
     assert_eq!(ids_of(&older), ["p1"]);
     let platform_time =
-        mekabridge::mcp::platform_cursor_time(platform.cursor).expect("a platform cursor");
+        meka_bridge::mcp::platform_cursor_time(platform.cursor).expect("a platform cursor");
     assert_eq!(
         channel.history_reads().last(),
         Some(&(Some(platform_time), 4))
@@ -6815,7 +6817,7 @@ async fn a_cursor_from_inside_the_record_reads_the_record() {
     record_said(&store, account, "r3", 10).await;
     channel.hold_history(vec![platform_message("p1", 300)]);
     let found_by_search =
-        mekabridge::mcp::platform_cursor(Utc::now() - chrono::Duration::minutes(20));
+        meka_bridge::mcp::platform_cursor(Utc::now() - chrono::Duration::minutes(20));
 
     let page = sink
         .history_read("mock:1", &[], 2, Some(found_by_search), None, None)
@@ -6940,7 +6942,7 @@ async fn reading_a_chat_through_the_sink_clears_what_it_owed() {
         .expect("conversation");
     for message_id in ["a", "b", "c"] {
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: "mock:1".to_string(),
                 account,
@@ -7008,7 +7010,7 @@ async fn particular_messages_come_from_the_record_and_then_from_the_platform() {
         .await
         .expect("conversation");
     store
-        .record_message(mekabridge::store::MessageRecord {
+        .record_message(meka_bridge::store::MessageRecord {
             id: 0,
             conversation: "mock:1".to_string(),
             account,
@@ -7105,7 +7107,7 @@ async fn particular_messages_come_from_the_record_and_then_from_the_platform() {
 
 #[tokio::test]
 async fn a_backlog_question_covers_the_chats_its_scope_chooses() {
-    use mekabridge::store::BacklogScope;
+    use meka_bridge::store::BacklogScope;
 
     let store = Store::open_in_memory().await.expect("store");
     let account = mock_account(&store).await;
@@ -7123,7 +7125,7 @@ async fn a_backlog_question_covers_the_chats_its_scope_chooses() {
             .await
             .expect("conversation");
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: address.to_string(),
                 account,
@@ -7157,11 +7159,11 @@ async fn a_backlog_question_covers_the_chats_its_scope_chooses() {
         channel: Policy::Mute,
     };
     let ask = async |scope: BacklogScope| {
-        mekabridge::bridge::backlog(&store, defaults, &scope)
+        meka_bridge::bridge::backlog(&store, defaults, &scope)
             .await
             .expect("backlog")
     };
-    let chats = |report: &mekabridge::store::BacklogReport| {
+    let chats = |report: &meka_bridge::store::BacklogReport| {
         report.conversations.keys().cloned().collect::<Vec<_>>()
     };
 
@@ -7236,7 +7238,7 @@ async fn a_fresh_session_catches_up_each_chat_from_the_newest_message_recorded_i
             .await
             .expect("conversation");
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: address.to_string(),
                 account,
@@ -7283,12 +7285,12 @@ async fn a_fresh_session_catches_up_each_chat_from_the_newest_message_recorded_i
         .insert("mock:2".to_string());
     let (sender, mut receiver) = mpsc::channel(16);
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(mekabridge::bridge::catch_up_on_reconnect(
+    let task = tokio::spawn(meka_bridge::bridge::catch_up_on_reconnect(
         store.clone(),
         Arc::clone(&channel) as Arc<dyn Channel>,
         channel.catch_up().expect("this channel catches up"),
         sender,
-        mekabridge::bridge::CatchUpSettings {
+        meka_bridge::bridge::CatchUpSettings {
             default_policy: DefaultPolicy {
                 direct: Policy::Active,
                 group: Policy::Mute,
@@ -7371,7 +7373,7 @@ async fn only_the_bridges_own_session_reading_clears_what_it_owed() {
         .expect("conversation");
     for message_id in ["a", "b", "c"] {
         store
-            .record_message(mekabridge::store::MessageRecord {
+            .record_message(meka_bridge::store::MessageRecord {
                 id: 0,
                 conversation: "mock:1".to_string(),
                 account,
@@ -7442,7 +7444,7 @@ async fn a_blocked_chat_owes_nothing_in_the_conversation_list_either() {
         .await
         .expect("conversation");
     store
-        .record_message(mekabridge::store::MessageRecord {
+        .record_message(meka_bridge::store::MessageRecord {
             id: 0,
             conversation: "mock:1".to_string(),
             account,
@@ -7566,7 +7568,7 @@ async fn a_platform_search_hit_the_bot_wrote_is_marked_as_its_own() {
         .await
         .expect("conversation");
     store
-        .record_message(mekabridge::store::MessageRecord {
+        .record_message(meka_bridge::store::MessageRecord {
             id: 0,
             conversation: "mock:1".to_string(),
             account: mock_account(&store).await,
@@ -7723,7 +7725,7 @@ async fn the_bridges_own_apology_is_recorded_like_anything_else_it_says() {
 
 #[tokio::test]
 async fn an_item_the_feed_reports_before_its_receipt_is_still_settled() {
-    // The ordering no client controls. meka answers the post once the item is durable, and the
+    // The ordering no client controls. Meka answers the post once the item is durable, and the
     // turn it opens can be underway, delivered and finished before that answer has travelled back
     // over a second connection. The feed reader hands its events straight on, so they are waiting
     // in front of the session task before it has learned the item's id at all.
@@ -7787,7 +7789,7 @@ async fn a_hand_over_meka_never_saw_is_posted_again_after_a_restart() {
             .await
             .expect("claimed");
         let seq = claimed.first().expect("a row was claimed").seq;
-        let key = format!("mekabridge-{}", uuid::Uuid::new_v4());
+        let key = format!("meka-bridge-{}", uuid::Uuid::new_v4());
         assert!(
             store
                 .hold(
@@ -7838,13 +7840,13 @@ async fn a_hand_over_meka_never_saw_is_posted_again_after_a_restart() {
 
 #[tokio::test]
 async fn a_replay_that_lost_events_makes_the_bridge_ask_about_what_it_has_out() {
-    // meka's ring is bounded, so a resume, or a reader that fell behind, can be told with a
+    // Meka's ring is bounded, so a resume, or a reader that fell behind, can be told with a
     // `feed.gap` that events are gone rather than handed a transcript that silently skips. Among
     // them can be the one event that says a batch was read, and nothing else ever will: the
     // turn is over, and waiting for an outcome that has been and gone leaves the messages in
-    // flight for ever. Asking meka about the item under its own key is what settles it, and
-    // costs one request that changes nothing on meka's side.
-    // Well past the wait below, so the sweep that asks about anything meka has held too long cannot
+    // flight for ever. Asking Meka about the item under its own key is what settles it, and
+    // costs one request that changes nothing on Meka's side.
+    // Well past the wait below, so the sweep that asks about anything Meka has held too long cannot
     // settle this first and pass the test without the gap ever being read.
     let harness = Harness::start_script_with(TurnScript::Hold, Setup {
         hand_over_within: Duration::from_secs(30),
@@ -7891,7 +7893,7 @@ async fn a_replay_that_lost_events_makes_the_bridge_ask_about_what_it_has_out() 
 
 #[tokio::test]
 async fn a_feed_meka_restarted_under_is_resumed_from_the_new_numbering() {
-    // A restarted meka numbers its events from the start again, and says so by opening the feed
+    // A restarted Meka numbers its events from the start again, and says so by opening the feed
     // with a `feed.gap` it cannot count. The position the bridge held belongs to the old process:
     // kept, it outranks every new id until they pass it, so every reconnect reads as another hole,
     // and one after they pass it resumes from it and skips what lies below without a word.
@@ -7968,7 +7970,7 @@ async fn a_feed_meka_restarted_under_is_resumed_from_the_new_numbering() {
 async fn a_dropped_feed_is_reopened_from_where_it_left_off() {
     // The feed is the only thing that says what became of a batch, so losing it is not something
     // to be reported and given up on. It is reopened from the last event the session task acted
-    // on, and meka replays what was missed across turns rather than from the beginning, which is
+    // on, and Meka replays what was missed across turns rather than from the beginning, which is
     // what stops a reconnect re-reading outcomes the bridge has already acted on.
     let harness = Harness::start().await;
     harness
@@ -8017,15 +8019,17 @@ async fn a_dropped_feed_is_reopened_from_where_it_left_off() {
 
 #[tokio::test]
 async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
-    // meka opens a feed that attached mid-turn with a `turn.started` for the turn it joined, marked
+    // Meka opens a feed that attached mid-turn with a `turn.started` for the turn it joined, marked
     // `resumed`, and that announcement names the source too: for this bridge, the inbox items the
     // turn was opened on. So the arm that handles a turn beginning is now entered twice for one
     // turn, and everything it is trusted not to disturb has to survive being entered again -- the
     // message is read once, the turn is one turn, and what the turn is known to be answering is
     // still known, which is what lets the indicator go up for the message it writes afterwards.
-    let harness =
-        Harness::start_composing("mcp__mekabridge__message_send", Duration::from_millis(1500))
-            .await;
+    let harness = Harness::start_composing(
+        "mcp__meka-bridge__message_send",
+        Duration::from_millis(1500),
+    )
+    .await;
     harness
         .sender
         .send(message("what did the log say?", "1"))
@@ -8078,7 +8082,7 @@ async fn a_feed_that_rejoins_a_turn_mid_flight_takes_up_where_it_left_off() {
 async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_write() {
     // Why the resumed announcement is worth reading rather than merely tolerating. Whom the turn is
     // answering was known to a typist that died with the process, and the turn is still running:
-    // meka names that turn's items on the feed the new process attaches to, and there is nowhere
+    // Meka names that turn's items on the feed the new process attaches to, and there is nowhere
     // else for it to learn them. Without it the send this turn composes next raises no indicator,
     // because a turn this bridge was handed nothing for has nobody waiting on it.
     let directory = tempfile::tempdir().expect("tempdir");
@@ -8090,7 +8094,7 @@ async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_writ
     recorder.set(&recorder.compose_for, Duration::from_millis(2000));
     recorder.set(
         &recorder.compose_tool,
-        "mcp__mekabridge__message_send".to_string(),
+        "mcp__meka-bridge__message_send".to_string(),
     );
     let (meka_address, meka_shutdown) = start_meka(Arc::clone(&recorder)).await;
     let config = Arc::new(config_for(meka_address, &database, true));
@@ -8151,7 +8155,7 @@ async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_writ
 
 #[tokio::test]
 async fn a_model_that_came_back_empty_has_its_batch_offered_again() {
-    // meka streams a bracketed stand-in when a turn yields no content at all. Paired with no tool
+    // Meka streams a bracketed stand-in when a turn yields no content at all. Paired with no tool
     // calls that is provably inert: nothing was sent and nothing ran, so offering the messages
     // again repeats nothing, and is far better than leaving somebody who has just messaged the bot
     // in silence.
@@ -8286,7 +8290,7 @@ async fn a_refusal_that_needs_an_operator_is_given_up_on_at_once() {
 
 #[tokio::test]
 async fn a_session_another_process_holds_is_waited_out_rather_than_failed() {
-    // A REPL open on the bridge's session is the ordinary way here: meka refuses the post before
+    // A REPL open on the bridge's session is the ordinary way here: Meka refuses the post before
     // anything is written, and its own driver asks a held session again every ten seconds until
     // the holder lets go. A wait, not a delivery failure, so the batch keeps its place.
     let harness = Harness::start_failing(FailureKind::Locked, Setup {
@@ -8319,7 +8323,7 @@ async fn a_session_another_process_holds_is_waited_out_rather_than_failed() {
 #[tokio::test]
 async fn nothing_overtakes_a_hand_over_meka_has_not_accepted() {
     // The queue is claimed in order and one hand-over is offered at a time, so a chat whose
-    // envelope is waiting on an unreachable meka is not passed by a chat that arrived after it.
+    // envelope is waiting on an unreachable Meka is not passed by a chat that arrived after it.
     // Releasing the later one would hand the agent the second half of the morning before the
     // first, and there is nothing to be gained by it: whatever is refusing the first will refuse
     // the second.
@@ -8549,7 +8553,7 @@ async fn one_hand_over_dying_leaves_the_other_holding_its_own_slice() {
         .wait_for("the second hand-over", |harness| harness.items().len() >= 2)
         .await;
 
-    // meka gives up on the first item alone, which is what its own hour of retries running out
+    // Meka gives up on the first item alone, which is what its own hour of retries running out
     // looks like on the feed.
     let first = harness
         .recorder
@@ -8579,7 +8583,7 @@ async fn one_hand_over_dying_leaves_the_other_holding_its_own_slice() {
             .expect("summary")
             .count,
         4,
-        "the three withheld messages and the mention that died, and not the one still with meka"
+        "the three withheld messages and the mention that died, and not the one still with Meka"
     );
 }
 
@@ -8587,7 +8591,7 @@ async fn one_hand_over_dying_leaves_the_other_holding_its_own_slice() {
 async fn a_turn_is_told_apart_from_a_batch_settled_a_moment_before_it_reported() {
     // The association between a turn and the batches it read is what the owner notice and the
     // second offer both hang on, and nothing else carries it. A reconnect that spans a delivery
-    // settles the batch by asking meka, so the `inbox.delivered` that follows in the replay finds
+    // settles the batch by asking Meka, so the `inbox.delivered` that follows in the replay finds
     // it already closed; taking that as "this turn read nothing of ours" loses the notice for a
     // turn that died half-way through work it had really been given.
     let harness = Harness::start_script_with(TurnScript::Hold, Setup::with_owner()).await;
@@ -8660,9 +8664,9 @@ async fn a_turn_is_told_apart_from_a_batch_settled_a_moment_before_it_reported()
 #[tokio::test]
 async fn a_batch_meka_has_held_too_long_is_asked_about_without_a_reconnect() {
     // The outcome of a hand-over arrives once. A store error while writing it down is logged and
-    // nothing re-drives it, the feed position moves past the event, and meka never sends it again.
+    // nothing re-drives it, the feed position moves past the event, and Meka never sends it again.
     // On a connection that stays up for days those rows would sit in flight for days: invisible to
-    // the queue's own readiness, still charged against the depth, reaching nobody. meka gives up
+    // the queue's own readiness, still charged against the depth, reaching nobody. Meka gives up
     // on an item within the hour, so anything older than that has an outcome that has been and
     // gone, and is worth one question.
     let harness = Harness::start_script_with(TurnScript::Hold, Setup {
@@ -8698,7 +8702,7 @@ async fn a_batch_meka_has_held_too_long_is_asked_about_without_a_reconnect() {
         .send(message_elsewhere("unrelated", "2"))
         .await
         .expect("queued");
-    // The straggler is the only row that can reach done, since meka holds the message that woke the
+    // The straggler is the only row that can reach done, since Meka holds the message that woke the
     // loop like any other. Nothing is asserted about rows in flight: by now that message is on its
     // way over, and a slow commit leaves it there long enough to be counted.
     harness
@@ -8711,8 +8715,8 @@ async fn a_batch_meka_has_held_too_long_is_asked_about_without_a_reconnect() {
 
 #[tokio::test]
 async fn a_batch_past_the_deadline_meka_gave_for_it_is_asked_about() {
-    // meka's ceiling is its own setting, so the hour this bridge assumes is only a fallback. A row
-    // carries the deadline meka answered its post with, and past that deadline the outcome has been
+    // Meka's ceiling is its own setting, so the hour this bridge assumes is only a fallback. A row
+    // carries the deadline Meka answered its post with, and past that deadline the outcome has been
     // and gone whatever the bridge's own `hand_over_within` says, which is held at an hour here so
     // the deadline is the only thing that can make the row due.
     let harness = Harness::start_script_with(TurnScript::Hold, Setup {
@@ -8764,7 +8768,7 @@ async fn sink_over(store: &Store) -> BridgeSink {
     sink_with_storage(
         store.clone(),
         channels,
-        std::env::temp_dir().join("mekabridge-test-attachments"),
+        std::env::temp_dir().join("meka-bridge-test-attachments"),
         Arc::new(Presence::default()),
     )
     .await
@@ -8775,7 +8779,7 @@ fn forwarded_from_bob(text: &str, message_id: &str) -> InboundEvent {
     let InboundEvent::Message(inner) = &mut event else {
         panic!("a message was built just above");
     };
-    inner.forwarded_from = Some(mekabridge::channel::ForwardOrigin::User {
+    inner.forwarded_from = Some(meka_bridge::channel::ForwardOrigin::User {
         name: "Bob".to_string(),
         id: Some("999".to_string()),
         username: Some("bob".to_string()),
@@ -8919,7 +8923,7 @@ async fn a_file_opened_by_handle_says_whose_it_is() {
     let channels = Arc::new(ChannelRegistry::from_channels([
         Arc::clone(&channel) as Arc<dyn Channel>
     ]));
-    let register = |message_id: &str| mekabridge::store::AttachmentRecord {
+    let register = |message_id: &str| meka_bridge::store::AttachmentRecord {
         conversation: "mock:1".to_string(),
         account,
         message_id: message_id.to_string(),
@@ -8943,7 +8947,7 @@ async fn a_file_opened_by_handle_says_whose_it_is() {
         .await
         .expect("registers");
     store
-        .record_message(mekabridge::store::MessageRecord {
+        .record_message(meka_bridge::store::MessageRecord {
             id: 0,
             conversation: "mock:1".to_string(),
             account,
@@ -8962,8 +8966,8 @@ async fn a_file_opened_by_handle_says_whose_it_is() {
             superseded_at: None,
             timestamp: Utc::now(),
             previous_account: false,
-            labels: mekabridge::channel::MessageLabels {
-                forwarded_from: Some(mekabridge::channel::ForwardOrigin::User {
+            labels: meka_bridge::channel::MessageLabels {
+                forwarded_from: Some(meka_bridge::channel::ForwardOrigin::User {
                     name: "Mallory".to_string(),
                     id: Some("666".to_string()),
                     username: None,

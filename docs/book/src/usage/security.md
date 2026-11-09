@@ -2,11 +2,11 @@
 
 ## The trust model in one paragraph
 
-The allowlist decides who may reach the agent. Everything after that is the agent's judgement, shaped by the instructions you give it in meka's config. The bridge enforces no per-sender policy of its own: it reports who is talking and how they got in, and supplies tools. If you need "this person may ask for anything, that one may only ask about order status", write that in the agent's instructions, because nothing in the bridge will do it for you.
+The allowlist decides who may reach the agent. Everything after that is the agent's judgement, shaped by the instructions you give it in Meka's config. The bridge enforces no per-sender policy of its own: it reports who is talking and how they got in, and supplies tools. If you need "this person may ask for anything, that one may only ask about order status", write that in the agent's instructions, because nothing in the bridge will do it for you.
 
 ## The allowlist
 
-A bot token is a public entry point. Anyone who learns the bot's name can message it, so mekabridge refuses to start without an allowlist:
+A bot token is a public entry point. Anyone who learns the bot's name can message it, so Meka Bridge refuses to start without an allowlist:
 
 | Setting | Admits | Platform |
 |---|---|---|
@@ -58,8 +58,8 @@ What neither prevents is an admitted sender persuading the agent to do something
 Each of these logs at warn, which is often the only surviving record. Recovery is out of band:
 
 ```console
-$ mekabridge policy list        # the defaults, and every conversation ruled on individually
-$ mekabridge policy clear telegram:-1001234567890
+$ meka-bridge policy list        # the defaults, and every conversation ruled on individually
+$ meka-bridge policy clear telegram:-1001234567890
 ```
 
 Telegram supplies one guardrail free: a bot administrator cannot ban, restrict, or demote another administrator, so the owner of a group cannot be evicted by their own bot.
@@ -75,9 +75,9 @@ Turn it off when the bot is an administrator for a different reason. Promoting a
 admin_tools = false
 ```
 
-That removes them from `tools/list` entirely rather than failing at call time, so the agent never offers a capability the deployment does not want. With a Claude profile on meka before 0.86, turning it off after the agent has loaded one of them makes Claude refuse every later turn in that session; `mekabridge session reset` starts another. See [meka Integration](./meka-integration.md).
+That removes them from `tools/list` entirely rather than failing at call time, so the agent never offers a capability the deployment does not want. With a Claude profile on Meka before 0.86, turning it off after the agent has loaded one of them makes Claude refuse every later turn in that session; `meka-bridge session reset` starts another. See [Meka Integration](./meka-integration.md).
 
-For a finer grain, meka can raise the required permission on individual tools:
+For a finer grain, Meka can raise the required permission on individual tools:
 
 ```toml
 [mcp.servers.tool_permissions]
@@ -86,13 +86,13 @@ member_moderate = "unrestricted"
 
 Note that this only helps if the session is *not* already at `unrestricted`, and running there unlocks unconfined file modification and shell access too. Config is usually the better lever.
 
-It works in the other direction as well, and that is the more useful one here: `tool_permissions` is the first step of meka's resolution chain, so naming a tool `"read"` puts it back within reach of a `read` session. That is how a deployment moderates without handing the agent an unrestricted machine.
+It works in the other direction as well, and that is the more useful one here: `tool_permissions` is the first step of Meka's resolution chain, so naming a tool `"read"` puts it back within reach of a `read` session. That is how a deployment moderates without handing the agent an unrestricted machine.
 
-Whether the agent says what it is about to do before a ban or a purge is up to its instructions. meka's system prompt carries no conduct, so if you want the agent to explain a consequential or destructive action before taking it, put that line in meka's standing instructions.
+Whether the agent says what it is about to do before a ban or a purge is up to its instructions. Meka's system prompt carries no conduct, so if you want the agent to explain a consequential or destructive action before taking it, put that line in Meka's standing instructions.
 
 ## Privacy mode
 
-A Telegram bot in a group sees only messages that mention it or reply to it, unless privacy mode is off (`/setprivacy` in @BotFather) or the bot is an administrator. It is on by default and looks exactly like a broken allowlist from the outside. `mekabridge doctor` reports it.
+A Telegram bot in a group sees only messages that mention it or reply to it, unless privacy mode is off (`/setprivacy` in @BotFather) or the bot is an administrator. It is on by default and looks exactly like a broken allowlist from the outside. `meka-bridge doctor` reports it.
 
 Since 0.3.0 the recommended setting is **off**. Privacy mode and the `mute` policy limit what wakes the agent in the same way, but privacy mode does it by never delivering the message at all, so nothing is recorded and `history_read` comes back empty exactly when the agent is trying to work out what a mention referred to. `mute` withholds the turn and keeps the message.
 
@@ -113,15 +113,15 @@ Retention bounds what is on disk, not what the agent can read on Discord. There,
 
 ## What the agent can reach on your machine
 
-The bridge runs at meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` or `chat_set`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.
+The bridge runs at Meka's `read` permission by default. That covers the conversational tools, because they change nothing locally, but **not** `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` or `chat_set`: those are annotated as destructive and need `unrestricted`, so at the default the agent can talk in a group it administers but cannot ban, purge or rename.
 
 Weigh that trade before raising the level. `unrestricted` is the whole machine, not just the moderation tools, so a deployment that wants the agent banning people and nothing more is better served by the `tool_permissions` override above than by moving the session. Five things to know either way:
 
-- **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from meka's, so it includes the bridge's own config, any `token_file`, and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those. The one exception is a process's own directory under `/proc`, refused whatever path names it, because its `environ` holds every `${VAR}` token; that makes the environment the one place a credential is out of `file_send`'s reach.
+- **`file_send` reads any path the bridge process can read**, and sends it to a chat. Under the systemd units in [Operations](./operations.md) that is a different user from Meka's, so it includes the bridge's own config, any `token_file`, and its database. Anyone who can talk the agent into a `file_send` call can exfiltrate those. The one exception is a process's own directory under `/proc`, refused whatever path names it, because its `environ` holds every `${VAR}` token; that makes the environment the one place a credential is out of `file_send`'s reach.
 - **`attachment_download` writes** into `[storage].attachment_dir`, bounded by `attachment_max_bytes` and swept on `attachment_retention`.
-- **meka's `[permissions].confine_reads` does not bind `file_send`, and neither does a sub-agent's scope.** Both confine meka's own file tools and commands; `file_send` reads in the bridge's process, with the bridge's rights. Keeping the agent out of a directory therefore means keeping the bridge out of it too, as the systemd units do for home directories with a user of its own and `ProtectHome=true`, or taking `file_send` away with `tool_permissions`.
-- **At `unrestricted`, meka's conversation tools read every session in its store.** `session_list`, `session_search`, `conversation_search` and `conversation_read` reach any session meka holds, the operator's own coding sessions included, and not only this bridge's. Below `unrestricted` they reach the session and its sub-agents alone. Anyone who can talk to the agent can ask it to relay what it finds there to the chat they are in, which is one more reason to reach the moderation tools through `tool_permissions` rather than by raising the session.
-- **meka's `[permissions].network = "none"` does not take the bridge off the network.** It cuts off meka's confined commands and its `web_fetch`; the bridge is a process of its own whose every send reaches a chat platform, so a session cut off that way can still pass what it reads to any chat the bot is in. A sub-agent spawned with `network: "none"` keeps this server unless its `allow_servers` leaves it out or its `deny_servers` names it.
+- **Meka's `[permissions].confine_reads` does not bind `file_send`, and neither does a sub-agent's scope.** Both confine Meka's own file tools and commands; `file_send` reads in the bridge's process, with the bridge's rights. Keeping the agent out of a directory therefore means keeping the bridge out of it too, as the systemd units do for home directories with a user of its own and `ProtectHome=true`, or taking `file_send` away with `tool_permissions`.
+- **At `unrestricted`, Meka's conversation tools read every session in its store.** `session_list`, `session_search`, `conversation_search` and `conversation_read` reach any session Meka holds, the operator's own coding sessions included, and not only this bridge's. Below `unrestricted` they reach the session and its sub-agents alone. Anyone who can talk to the agent can ask it to relay what it finds there to the chat they are in, which is one more reason to reach the moderation tools through `tool_permissions` rather than by raising the session.
+- **Meka's `[permissions].network = "none"` does not take the bridge off the network.** It cuts off Meka's confined commands and its `web_fetch`; the bridge is a process of its own whose every send reaches a chat platform, so a session cut off that way can still pass what it reads to any chat the bot is in. A sub-agent spawned with `network: "none"` keeps this server unless its `allow_servers` leaves it out or its `deny_servers` names it.
 
 Confine the bridge with the systemd hardening in [Operations](./operations.md), and keep `[session].cwd` pointed at a directory that holds nothing you would mind the agent reading aloud.
 
@@ -138,7 +138,7 @@ Anyone who can reach it can send messages as the agent. It binds to loopback by 
 ```toml
 [mcp]
 bind = "0.0.0.0:9100"
-token = "${MEKABRIDGE_MCP_TOKEN}"
+token = "${MEKA_BRIDGE_MCP_TOKEN}"
 allowed_hosts = ["bridge.internal"]
 ```
 

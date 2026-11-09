@@ -2,11 +2,11 @@
 
 These are the only way a message reaches a person. The bridge never authors chat content of its own.
 
-meka namespaces them by the server name from its config, so with `name = "mekabridge"` the agent sees `mcp__mekabridge__message_send`.
+Meka namespaces them by the server name from its config, so with `name = "meka-bridge"` the agent sees `mcp__meka-bridge__message_send`.
 
 ## Why routing is explicit
 
-meka's MCP client sends a progress token, a tool-use id and the calling session's id in `_meta` on a `tools/call`, and nothing else. The bridge's one session talks to everybody, so none of that says which conversation a call belongs to.
+Meka's MCP client sends a progress token, a tool-use id and the calling session's id in `_meta` on a `tools/call`, and nothing else. The bridge's one session talks to everybody, so none of that says which conversation a call belongs to.
 
 Every send therefore takes a `conversation` id. The agent reads it off the header attached to each inbound message, looks it up with `conversation_list`, or is simply told one in its own instructions. That constraint is also what makes the interesting behaviour possible: because the target is always explicit, replying to somebody else, replying on a different platform, or messaging first are all the same operation.
 
@@ -130,15 +130,15 @@ Both are attention management, not access control. An allowlist decides who may 
 
 Muting a one-to-one chat is refused: every message there is addressed to the agent, so it would change nothing, and reporting success for a no-op is worse than saying so.
 
-`conversation_unmute` and `conversation_unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `mekabridge policy clear`.
+`conversation_unmute` and `conversation_unblock` both set the conversation to `active`, which is an explicit override rather than a return to the default. That distinction matters when the default for the chat's kind is `mute`: to go back to following the default, an operator uses `meka-bridge policy clear`.
 
 `duration` on `conversation_unmute` is how the agent joins a discussion it has been pulled into without having to remember to mute the room afterwards. When it lapses the conversation falls back to the configured default for its kind rather than to whatever preceded it, and the agent is told: the message that discovers the expiry is delivered even if nothing in it addresses the agent, because a notice nobody is woken for is a notice nobody reads. See [Group attention](./group-attention.md).
 
 A decision the agent made can only be undone by the agent or by an operator. That matters if it silences the conversation you would use to ask it to stop:
 
 ```console
-$ mekabridge policy list
-$ mekabridge policy clear telegram:-1001234567890
+$ meka-bridge policy list
+$ meka-bridge policy clear telegram:-1001234567890
 ```
 
 ## `watch_write`, `watch_delete`, and `watch_list`
@@ -167,7 +167,7 @@ A match decides only that a message is **worth a turn**. What it means is judged
 
 At most 500 watches and 2000 patterns across them, each at most 256 characters, matched with a linear-time engine so a badly written rule cannot hang the bridge. A pattern that will not compile is refused when it is written, and the refusal names the pattern rather than the rule.
 
-`mekabridge watch list`, `mekabridge watch write` and `mekabridge watch delete` are the operator's side of the same controls, with `--patterns-file` for a rule set kept in a file. See [Group attention](./group-attention.md#watches).
+`meka-bridge watch list`, `meka-bridge watch write` and `meka-bridge watch delete` are the operator's side of the same controls, with `--patterns-file` for a rule set kept in a file. See [Group attention](./group-attention.md#watches).
 
 ## `backlog_check`
 
@@ -203,13 +203,13 @@ The three fields answer different questions, and only two of them are worth watc
 |-------|-------|---------------|
 | `latest` | When somebody else last said something that still stands, shown or not. Moves when somebody speaks, and also when a message is deleted or a chat joins or leaves the chats asked about, as a mute set or lapsing does under `policy: "mute"` | `is: "changed"`, to fire once per new message |
 | `newest` | When the most recent unseen message arrived. Present only while something is unseen | `is: "not_empty"`, to fire until every unseen message has been read, which can mean paging back with `before` |
-| `unseen` | How many messages are waiting. Falls whenever the agent reads or is handed a chat | Nothing. Watched for a change it fires on the reading, and meka counts even `0` as present, so `not_empty` fires every time |
+| `unseen` | How many messages are waiting. Falls whenever the agent reads or is handed a chat | Nothing. Watched for a change it fires on the reading, and Meka counts even `0` as present, so `not_empty` fires every time |
 
 The watcher most agents want is every chat that does not wake them, which a chat muted later joins without being named:
 
 ```
 gate: {
-  check: { tool: "mcp__mekabridge__backlog_check", arguments: { policy: "mute" } },
+  check: { tool: "mcp__meka-bridge__backlog_check", arguments: { policy: "mute" } },
   when: { at: "/latest", is: "changed" }
 }
 ```
@@ -411,7 +411,7 @@ Look at a picture, without writing anything to disk.
 |----------|------|---------|
 | `attachment` | string | The handle in square brackets on an `attachment:` line |
 
-Returns the image itself, which meka forwards to the provider as a multimodal block, so the agent sees the picture in that same call.
+Returns the image itself, which Meka forwards to the provider as a multimodal block, so the agent sees the picture in that same call.
 
 Prefer triaging from the `attachment:` line first. It carries the media type, pixel size, running time and byte count, which is usually enough to decide whether a file is worth looking at, and what an agent looks at stays in its context for the life of the session.
 
@@ -427,7 +427,7 @@ Write a file to disk and get its path back.
 |----------|------|---------|
 | `attachment` | string | The handle in square brackets on an `attachment:` line |
 
-For the cases where the agent needs the file rather than a look at it: reading a document, running a tool over an archive. Files land in `[storage].attachment_dir` and are bounded by `attachment_max_bytes`. Calling it twice returns the same path without fetching again. Below `unrestricted`, with meka's `confine_reads` on or in a sub-agent given a scope of its own, the agent can read the file only once that directory is readable to it; see [meka Integration](./meka-integration.md#attachments).
+For the cases where the agent needs the file rather than a look at it: reading a document, running a tool over an archive. Files land in `[storage].attachment_dir` and are bounded by `attachment_max_bytes`. Calling it twice returns the same path without fetching again. Below `unrestricted`, with Meka's `confine_reads` on or in a sub-agent given a scope of its own, the agent can read the file only once that directory is readable to it; see [Meka Integration](./meka-integration.md#attachments).
 
 ## `conversation_list`
 
@@ -460,11 +460,11 @@ Only two things are refused here: an id that is not well formed, and one naming 
 
 ## Permission level
 
-Most tools are annotated `readOnlyHint: true`. meka derives a tool's required permission from that annotation, and gating replying behind a higher level would leave a bridge running at `read` understanding every message and unable to answer any of them.
+Most tools are annotated `readOnlyHint: true`. Meka derives a tool's required permission from that annotation, and gating replying behind a higher level would leave a bridge running at `read` understanding every message and unable to answer any of them.
 
 Five are the exception and need `unrestricted`: `member_moderate`, `message_delete`, `member_set_rights`, `member_set_roles` and `chat_set`. Each takes irreversible action on somebody else's account or on the room itself, so a `read` session can talk but cannot ban. The line is what a tool can do to other people, not whether it changes anything at all: `conversation_mute` and `conversation_block` modify plenty, but only this bridge's own record of what it forwards.
 
-`workspace` is not enough for those five, which surprises people: meka refuses an unsandboxed MCP tool at the one level whose promise is confinement. [meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) has the reasoning and the `tool_permissions` escape hatch.
+`workspace` is not enough for those five, which surprises people: Meka refuses an unsandboxed MCP tool at the one level whose promise is confinement. [Meka Integration](./meka-integration.md#why-unrestricted-and-not-workspace) has the reasoning and the `tool_permissions` escape hatch.
 
 `attachment_download` is the only one that genuinely writes, and only into `[storage].attachment_dir`, which exists for exactly that, is bounded by `attachment_max_bytes`, and is swept on `attachment_retention`.
 
@@ -483,4 +483,4 @@ transport = "stdio"
 
 ## Version skew
 
-The bridge and meka are separate processes, each linking whatever rmcp it likes, and the two settle on a protocol between them: since meka 0.79 by a `server/discover` probe, which this server answers, so the two speak MCP 2026-07-28 with no session and every call carrying its own `_meta`; an older client still gets the `initialize` handshake. meka has moved its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, so what the bridge owes is a surface that survives the negotiation rather than one that matches a crate version. Both eras are covered by integration tests on every `cargo test`: a real rmcp 2.x client, one major version behind the server's own, asserting that the handshake, the tool list, the annotations, and the input schemas survive the gap, and a 2026-07-28 client asserting that a call still names the meka session it came from.
+The bridge and Meka are separate processes, each linking whatever rmcp it likes, and the two settle on a protocol between them: since Meka 0.79 by a `server/discover` probe, which this server answers, so the two speak MCP 2026-07-28 with no session and every call carrying its own `_meta`; an older client still gets the `initialize` handshake. Meka has moved its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, so what the bridge owes is a surface that survives the negotiation rather than one that matches a crate version. Both eras are covered by integration tests on every `cargo test`: a real rmcp 2.x client, one major version behind the server's own, asserting that the handshake, the tool list, the annotations, and the input schemas survive the gap, and a 2026-07-28 client asserting that a call still names the Meka session it came from.

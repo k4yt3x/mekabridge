@@ -1,4 +1,4 @@
--- Initial mekabridge schema.
+-- Initial Meka Bridge schema.
 --
 -- Applied by src/store.rs when `user_version` is 0. Never edit this file after release; add a new
 -- migration instead, since existing databases only run the statements they have not seen.

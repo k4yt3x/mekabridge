@@ -1,17 +1,17 @@
-//! Interop between mekabridge's MCP server and an MCP client that is not the one it was built
+//! Interop between Meka Bridge's MCP server and an MCP client that is not the one it was built
 //! against.
 //!
 //! The two are separate processes, each free to link whatever rmcp it likes, and the protocol
 //! negotiates a mutually supported version, at `initialize` in the older era and by a
-//! `server/discover` probe in 2026-07-28, which meka speaks from 0.79. What this bridge owes is a
+//! `server/discover` probe in 2026-07-28, which Meka speaks from 0.79. What this bridge owes is a
 //! surface that survives that negotiation rather than one that happens to match a crate version:
-//! meka has moved its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, and each move is the kind of
+//! Meka has moved its own pin through 1.3, 1.5, 1.7, 2.1, 3.1 and 3.5, and each move is the kind of
 //! thing that breaks quietly. So these tests drive the real server over a real socket with a real
 //! rmcp 2.x client, one major behind the server's own, on every `cargo test`; the 2026-07-28 tests
 //! at the end use this crate's own rmcp, since no older one speaks that era.
 //!
-//! The client is deliberately not the version meka pins today, which is the same major as the
-//! server's. Pinning the test to whatever meka currently links would make it agree with the server
+//! The client is deliberately not the version Meka pins today, which is the same major as the
+//! server's. Pinning the test to whatever Meka currently links would make it agree with the server
 //! by construction, which is the one thing it must not do.
 
 // Integration tests live in their own crate, so the `allow-*-in-tests` clippy settings that cover
@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mekabridge::{
+use meka_bridge::{
     channel::MemberStatus,
     config::{McpConfig, McpTransport},
     mcp::{
@@ -45,7 +45,7 @@ const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
 #[derive(Default)]
 struct RecordingSink {
     sent: Mutex<Vec<(String, String)>>,
-    /// The meka session each send named, in the order they arrived.
+    /// The Meka session each send named, in the order they arrived.
     sessions: Mutex<Vec<Option<String>>>,
     reactions: Mutex<Vec<(String, Option<String>)>>,
     edits: Mutex<Vec<(String, String, String)>>,
@@ -106,7 +106,7 @@ impl OutboundSink for RecordingSink {
         _conversation: &str,
         _paths: &[std::path::PathBuf],
         _caption: Option<&str>,
-        _options: mekabridge::mcp::FileOptions,
+        _options: meka_bridge::mcp::FileOptions,
         _session: Option<&str>,
     ) -> Result<Vec<String>, SinkError> {
         Ok(vec!["2001".to_string()])
@@ -167,7 +167,7 @@ impl OutboundSink for RecordingSink {
             return Err(SinkError::UnknownAttachment(handle.to_string()));
         }
         Ok(DownloadedAttachment {
-            path: std::path::PathBuf::from("/var/lib/mekabridge/attachments/q3.pdf"),
+            path: std::path::PathBuf::from("/var/lib/meka-bridge/attachments/q3.pdf"),
             bytes: 8_400_000,
             media_type: Some("application/pdf".to_string()),
             source: "This file came with message 41 in telegram:111, sent by \"Alice\" (id 111)."
@@ -545,8 +545,8 @@ async fn handshake_succeeds_across_the_version_gap() {
         instructions.contains("`admitted:`"),
         "instructions should explain the envelope headers, got: {instructions}"
     );
-    // The server names itself, not the SDK it is built on, which is what meka's server list shows.
-    assert_eq!(info.server_info.name, "mekabridge");
+    // The server names itself, not the SDK it is built on, which is what Meka's server list shows.
+    assert_eq!(info.server_info.name, "meka-bridge");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
 
     client.cancel().await.expect("clean shutdown");
@@ -685,7 +685,7 @@ async fn all_tools_are_visible_to_an_older_client() {
             "{} lost its description across the version gap",
             tool.name
         );
-        // meka resolves each tool's required permission from `readOnlyHint` when config does not
+        // Meka resolves each tool's required permission from `readOnlyHint` when config does not
         // override it, so the annotation has to survive the version gap intact or the permission
         // model changes silently. The conversational surface is read-only on purpose -- classifying
         // the send tools as writes would leave a bridge at `read` unable to answer anybody -- while
@@ -971,7 +971,7 @@ async fn the_watch_tools_round_trip_across_the_version_gap() {
 
 #[tokio::test]
 async fn the_backlog_result_is_a_document_a_gate_can_point_into() {
-    // meka's scheduler parses a tool result's text as JSON when there is no structured content and
+    // Meka's scheduler parses a tool result's text as JSON when there is no structured content and
     // then resolves a JSON pointer into it. If this came back as prose, every gate built on it
     // would be declined as "the probe did not return JSON" rather than simply not firing.
     let harness = start().await;
@@ -1150,7 +1150,7 @@ async fn react_round_trips_across_the_version_gap() {
 
 #[tokio::test]
 async fn view_attachment_returns_a_real_image_block_to_an_older_client() {
-    // The assumption the deferred-attachment design rests on: meka forwards an MCP image block
+    // The assumption the deferred-attachment design rests on: Meka forwards an MCP image block
     // straight through as a multimodal block, so the agent sees a picture in one tool call. If the
     // block arrives as text across the version gap, "show me" quietly stops working.
     let harness = start().await;
@@ -1313,7 +1313,7 @@ async fn bearer_token_gates_the_endpoint() {
         transport: McpTransport::Http,
         bind: ([127, 0, 0, 1], 0).into(),
         path: "/mcp".to_string(),
-        token: Some(mekabridge::config::secret::Secret::new("s3cret", "test")),
+        token: Some(meka_bridge::config::secret::Secret::new("s3cret", "test")),
         allowed_hosts: Vec::new(),
         health: true,
     };
@@ -1352,9 +1352,9 @@ async fn bearer_token_gates_the_endpoint() {
 
 // The 2026-07-28 era.
 //
-// meka 0.79 opens every connect with `server/discover`, and since this server answers it, the two
+// Meka 0.79 opens every connect with `server/discover`, and since this server answers it, the two
 // speak 2026-07-28: no `initialize`, no session, every request carrying its own `_meta`. The tests
-// above drive the older era across a version gap; these drive the newer one, which is what meka
+// above drive the older era across a version gap; these drive the newer one, which is what Meka
 // speaks to this bridge now. The client is this crate's own rmcp, so they make no claim about a
 // version gap, only about the era.
 
@@ -1373,7 +1373,7 @@ async fn connect_2026(
 
 #[tokio::test]
 async fn a_2026_07_28_call_still_names_the_session_it_came_from() {
-    // Every message the agent sends is recorded with the meka session that asked, and the vision
+    // Every message the agent sends is recorded with the Meka session that asked, and the vision
     // check reads the same field. In this era there is no session on the connection to fall back
     // on, so `_meta` on each request is the only place it can arrive.
     let harness = start().await;
@@ -1406,11 +1406,11 @@ async fn a_2026_07_28_call_still_names_the_session_it_came_from() {
 
 #[tokio::test]
 async fn the_notification_stream_is_acknowledged_empty_and_ends_with_the_server() {
-    // meka opens one `subscriptions/listen` per connection. Refused, rmcp logs a warning on the
+    // Meka opens one `subscriptions/listen` per connection. Refused, rmcp logs a warning on the
     // bridge for each; acknowledged with nothing in it, the stream idles. Idling must not hold up
     // a shutdown, since the server waits for open requests to finish and this one never would on
     // its own. And the end has to say it was meant: a stream cut off without its final result is
-    // one meka warns about as ending abruptly. The acknowledgment itself is empty whatever the
+    // one Meka warns about as ending abruptly. The acknowledgment itself is empty whatever the
     // bridge answers, since rmcp trims it to what the server advertises; the graceful end is what
     // this asserts.
     let mut harness = start().await;

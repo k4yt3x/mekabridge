@@ -31,7 +31,7 @@
 
 ALTER TABLE messages ADD COLUMN own INTEGER NOT NULL DEFAULT 0;
 
--- The meka session that sent it, for an outbound row. The bridge owns one permanent session, but
+-- The Meka session that sent it, for an outbound row. The bridge owns one permanent session, but
 -- scheduled and isolated ones speak on the same account, and without this the history says the bot
 -- said something while nothing says which of them did.
 ALTER TABLE messages ADD COLUMN session_id TEXT;

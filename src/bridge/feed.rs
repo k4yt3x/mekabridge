@@ -2,13 +2,13 @@
 //! turn, for as long as the bridge runs.
 //!
 //! The reader does one thing: keep the connection open and hand every frame to the session task as
-//! fast as it arrives. It never touches the store and decides nothing, which is what keeps meka's
+//! fast as it arrives. It never touches the store and decides nothing, which is what keeps Meka's
 //! per-consumer buffer drained while the session task is busy with a request of its own. A reader
-//! that falls behind is caught up from meka's replay ring, and told with a `feed.gap` once the ring
+//! that falls behind is caught up from Meka's replay ring, and told with a `feed.gap` once the ring
 //! no longer reaches back far enough, but a model streaming a reply produces frames faster than a
 //! request round trip, so the two have to be separate tasks.
 //!
-//! A dropped connection is reopened from the last id the session task handled, and meka replays
+//! A dropped connection is reopened from the last id the session task handled, and Meka replays
 //! what was missed, across turns. The reader says when a connection has spoken, since that is when
 //! the session task reconciles what it was waiting on, whether or not the replay had a hole in it.
 
@@ -47,7 +47,7 @@ pub enum FeedEvent {
     /// because a session that is quiet for hours is the ordinary case and a hand-over whose fate
     /// was missed cannot wait for somebody to speak.
     Connected { session: Uuid, at: DateTime<Utc> },
-    /// meka says the session the feed was opened on no longer exists. Named, because a post may
+    /// Meka says the session the feed was opened on no longer exists. Named, because a post may
     /// have hit the same 404 first and bound a replacement already.
     SessionGone { session: Uuid },
 }
@@ -111,7 +111,7 @@ pub async fn feed_reader(
             }
             Err(error) if error.is_session_missing() => {
                 tracing::warn!(
-                    "meka no longer knows session {session_id}, so its feed cannot be opened"
+                    "Meka no longer knows session {session_id}, so its feed cannot be opened"
                 );
                 if sender
                     .send(FeedEvent::SessionGone {
@@ -186,7 +186,7 @@ pub async fn feed_reader(
                     }
                 }
                 // A frame this build cannot read decides nothing on its own, and reconnecting
-                // would replay it out of meka's ring to fail identically.
+                // would replay it out of Meka's ring to fail identically.
                 Some(Err(MekaError::Decode(reason))) => {
                     tracing::warn!("skipping a feed frame this build cannot read: {reason}");
                 }
@@ -215,7 +215,7 @@ pub async fn feed_reader(
 
 /// How long to wait before the next attempt, after `failures` in a row.
 ///
-/// Doubles from one second and is capped; jittered so a bridge and a meka restarting together
+/// Doubles from one second and is capped; jittered so a bridge and a Meka restarting together
 /// under systemd do not retry in lockstep.
 fn reconnect_delay(failures: u32) -> Duration {
     use rand::RngExt as _;

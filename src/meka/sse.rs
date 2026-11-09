@@ -1,8 +1,8 @@
-//! Turn events, and the mapping from meka's SSE wire format onto them.
+//! Turn events, and the mapping from Meka's SSE wire format onto them.
 //!
-//! meka names each event (`assistant_text.delta`, `tool_call.executing`, `inbox.delivered`, ...)
+//! Meka names each event (`assistant_text.delta`, `tool_call.executing`, `inbox.delivered`, ...)
 //! and puts a JSON object in `data`. Unrecognised names become [`TurnEvent::Unknown`] rather than
-//! an error, so a meka that grows a new event type does not break a running bridge.
+//! an error, so a Meka that grows a new event type does not break a running bridge.
 //!
 //! The events come off a session feed rather than one turn's stream: every payload carries the
 //! `turn_id` of the turn it belongs to, and the feed carries turns nobody here started, so the id
@@ -13,9 +13,9 @@ use serde::Deserialize;
 /// Who started a turn, off `turn.started`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnSource {
-    /// A client's own turn: `POST /turns`, or `POST /turn` before meka 0.89.
+    /// A client's own turn: `POST /turns`, or `POST /turn` before Meka 0.89.
     Client,
-    /// meka opened the turn on waiting inbox items, which it names.
+    /// Meka opened the turn on waiting inbox items, which it names.
     Inbox { item_ids: Vec<String> },
     /// A scheduled job fired.
     Schedule { job_id: String },
@@ -32,7 +32,7 @@ pub enum TurnEvent {
     Started {
         started_at: String,
         source: TurnSource,
-        /// Whether this is the announcement meka synthesises for a turn already running when the
+        /// Whether this is the announcement Meka synthesises for a turn already running when the
         /// feed attached, rather than a turn beginning. It carries no id and no time, and names
         /// the turn's source as a real one does; everything after it is the real thing.
         resumed: bool,
@@ -76,10 +76,10 @@ pub enum TurnEvent {
     ContextCompacted {
         /// What set it going: `reactive` or `proactive` when the window filled, `emergency` when
         /// the provider refused a request as too large, `manual`, `requested` by the agent, or
-        /// `retention`. Empty from a meka before 0.84.
+        /// `retention`. Empty from a Meka before 0.84.
         trigger: String,
         source: String,
-        /// How many messages the compaction took out of the window. meka 0.89 stopped sending it.
+        /// How many messages the compaction took out of the window. Meka 0.89 stopped sending it.
         replaced_count: Option<u64>,
         generation: u64,
     },
@@ -95,11 +95,11 @@ pub enum TurnEvent {
         interrupted: bool,
     },
     /// Emitted when a gated tool needs approval, which for this bridge means the session has
-    /// meka's `approvals` switch on. `approval.requested` from meka 0.89, `permission_required`
+    /// Meka's `approvals` switch on. `approval.requested` from Meka 0.89, `permission_required`
     /// before it, with the same fields.
     ///
     /// The turn does not stall on it. Every session here is created with
-    /// `supports_permission_prompts: false`, which meka answers by denying the call at once with a
+    /// `supports_permission_prompts: false`, which Meka answers by denying the call at once with a
     /// notice rather than parking it on the SSE channel for the 30 minutes a request stays
     /// answerable. So this arrives as a record of a call that was refused, and the level is what
     /// needs raising.
@@ -115,8 +115,8 @@ pub enum TurnEvent {
     InboxDelivered {
         item_ids: Vec<String>,
     },
-    /// A turn on these items failed in a way waiting can change, so meka put them back and tries
-    /// again at `not_before`. Nothing has reached the model; the items are still meka's to deliver
+    /// A turn on these items failed in a way waiting can change, so Meka put them back and tries
+    /// again at `not_before`. Nothing has reached the model; the items are still Meka's to deliver
     /// or give up on.
     InboxDeferred {
         item_ids: Vec<String>,
@@ -124,7 +124,7 @@ pub enum TurnEvent {
         /// The failed turn's Problem Detail.
         error: serde_json::Value,
     },
-    /// meka gave up on an inbox item and withdrew it: its retry ceiling passed, or its turn failed
+    /// Meka gave up on an inbox item and withdrew it: its retry ceiling passed, or its turn failed
     /// in a way no retry would change.
     InboxFailed {
         item_id: String,
@@ -139,7 +139,7 @@ pub enum TurnEvent {
     },
     /// This connection's copy of the feed has a hole: the replay no longer reached the position it
     /// resumed from, or what it fell behind by while connected. `dropped` is how many events, when
-    /// meka can count them.
+    /// Meka can count them.
     ///
     /// About the connection rather than the session, so it carries no `id` and no turn, and the
     /// feed position does not move on it.
@@ -170,7 +170,7 @@ pub enum TurnEvent {
 
 impl TurnEvent {
     /// Whether this event ends a turn. `turn.finished`, `turn.failed`, and `turn.canceled` are
-    /// terminal per meka's HTTP API. The feed itself carries on past them.
+    /// terminal per Meka's HTTP API. The feed itself carries on past them.
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -401,7 +401,7 @@ mod tests {
                 assert_eq!(usage.output_tokens, 3);
                 assert_eq!(usage.cache_read_input_tokens, 0);
                 assert_eq!(refusal_text, None);
-                // The session's own profile served it, which meka says by leaving this out.
+                // The session's own profile served it, which Meka says by leaving this out.
                 assert_eq!(profile, None);
             }
             other => panic!("expected Finished, got {other:?}"),
@@ -451,16 +451,16 @@ mod tests {
         assert_eq!(
             event(
                 "tool_call.composing",
-                r#"{"id":"tu_1","name":"mcp__mekabridge__message_send"}"#,
+                r#"{"id":"tu_1","name":"mcp__meka-bridge__message_send"}"#,
             ),
             TurnEvent::ToolCallComposing {
                 id: "tu_1".to_string(),
-                name: "mcp__mekabridge__message_send".to_string()
+                name: "mcp__meka-bridge__message_send".to_string()
             }
         );
     }
 
-    /// What meka 0.89 sends, which no longer counts the messages the compaction replaced.
+    /// What Meka 0.89 sends, which no longer counts the messages the compaction replaced.
     #[test]
     fn parses_a_compaction() {
         let data = r#"{"compaction_id":"c1","trigger":"reactive","source":"checkpoint",
@@ -477,7 +477,7 @@ mod tests {
         );
     }
 
-    /// What a meka before 0.84 sends, which names no trigger and counts the replaced messages.
+    /// What a Meka before 0.84 sends, which names no trigger and counts the replaced messages.
     #[test]
     fn a_compaction_from_an_older_meka_still_parses() {
         let data = r#"{"source":"summarizer","replaced_count":42,"generation":3}"#;
@@ -492,8 +492,8 @@ mod tests {
         );
     }
 
-    /// meka 0.89 renamed `permission_required` to `approval.requested` and kept its fields, so a
-    /// request parked on a session that opted into approvals is reported on either meka.
+    /// Meka 0.89 renamed `permission_required` to `approval.requested` and kept its fields, so a
+    /// request parked on a session that opted into approvals is reported on either Meka.
     #[test]
     fn parses_an_approval_request_under_either_name() {
         let data = r#"{"request_id":"r1","tool_name":"shell_execute","input":{},
@@ -525,7 +525,7 @@ mod tests {
         );
     }
 
-    /// Every shape meka's `turn.started` takes, flattened into the payload beside `turn_id`. The
+    /// Every shape Meka's `turn.started` takes, flattened into the payload beside `turn_id`. The
     /// inbox one is the only one this bridge acts on: its `item_ids` are what tie a turn back to
     /// the items that woke it.
     #[test]
@@ -689,7 +689,7 @@ mod tests {
     }
 
     /// Progress on a tool call the agent is running, which this bridge ignores on purpose rather
-    /// than by oversight. It is for a client drawing the call, and nothing here draws one; meka
+    /// than by oversight. It is for a client drawing the call, and nothing here draws one; Meka
     /// sends it with no `id:` and keeps it out of its replay ring, so reading it changes neither
     /// the feed position nor what a reconnect is handed.
     #[test]
@@ -701,7 +701,7 @@ mod tests {
         assert!(!parsed.is_terminal());
     }
 
-    /// The events meka 0.70 added to the session feed, none of which this bridge acts on. A nudge
+    /// The events Meka 0.70 added to the session feed, none of which this bridge acts on. A nudge
     /// in particular arrives inside a turn that carries on, so it must not read as that turn
     /// ending.
     #[test]
@@ -740,9 +740,9 @@ mod tests {
         }
     }
 
-    /// How meka says some of the feed is gone. Missing it is not a parse failure but a hand-over
+    /// How Meka says some of the feed is gone. Missing it is not a parse failure but a hand-over
     /// left waiting on an outcome that has been and gone, so the event has to be read, with and
-    /// without the count meka gives only when it can.
+    /// without the count Meka gives only when it can.
     #[test]
     fn a_hole_in_the_feed_is_read_whether_or_not_it_is_counted() {
         let counted = parse("feed.gap", r#"{"session_id":"s","dropped":12}"#)
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn missing_fields_degrade_to_empty_rather_than_failing() {
-        // meka is the only producer, but a partial frame should not take down a running bridge.
+        // Meka is the only producer, but a partial frame should not take down a running bridge.
         assert_eq!(
             event("tool_call.executing", "{}"),
             TurnEvent::ToolCallStarted {

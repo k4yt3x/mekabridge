@@ -2,7 +2,7 @@
 //!
 //! The daemon is the default subcommand; everything else is an operator tool. Those tools
 //! deliberately need no IPC with a running daemon: they read the SQLite database (WAL allows
-//! concurrent readers) and talk to meka's HTTP API directly, so `mekabridge status` works whether
+//! concurrent readers) and talk to Meka's HTTP API directly, so `meka-bridge status` works whether
 //! or not the daemon is up.
 
 pub mod commands;
@@ -22,9 +22,9 @@ use crate::{
 /// Default row cap for the listing commands.
 const DEFAULT_LIST_LIMIT: usize = 50;
 
-/// Relay between the meka agent and third-party chat platforms.
+/// Relay between the Meka agent and third-party chat platforms.
 #[derive(Debug, Parser)]
-#[command(name = "mekabridge", version, about, long_about = None)]
+#[command(name = "meka-bridge", version, about, long_about = None)]
 pub struct Cli {
     /// Path to config.toml. Defaults to the platform config directory.
     #[arg(
@@ -32,7 +32,7 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        env = "MEKABRIDGE_CONFIG"
+        env = "MEKA_BRIDGE_CONFIG"
     )]
     pub config: Option<PathBuf>,
 
@@ -69,7 +69,7 @@ pub enum Command {
     /// Run the bridge daemon. This is the default when no subcommand is given.
     Run,
 
-    /// Check configuration, meka, channels, and the MCP endpoint.
+    /// Check configuration, Meka, channels, and the MCP endpoint.
     Doctor,
 
     /// Show the session, queue depth, and known conversations.
@@ -254,7 +254,7 @@ pub enum WatchCommand {
 
     /// Remove a watch by name.
     Delete {
-        /// Watch name, as printed by `mekabridge watch list`.
+        /// Watch name, as printed by `meka-bridge watch list`.
         name: String,
     },
 }
@@ -410,7 +410,7 @@ impl Cli {
                         println!("warning: {warning}");
                     }
                     println!(
-                        "configuration is valid: {} channel(s), meka at {}",
+                        "configuration is valid: {} channel(s), Meka at {}",
                         config.channels.len(),
                         config.meka.base_url
                     );
@@ -433,7 +433,7 @@ impl Cli {
     }
 }
 
-/// Run the operator subcommands, which are async because they touch SQLite and meka.
+/// Run the operator subcommands, which are async because they touch SQLite and Meka.
 async fn dispatch(command: Command, config: Config) -> Result<()> {
     match command {
         Command::Doctor => commands::doctor(&config).await,
@@ -520,7 +520,7 @@ fn resolve_config_path(override_path: Option<&std::path::Path>) -> Result<PathBu
 
 /// Build a runtime for one command.
 ///
-/// Created here rather than with `#[tokio::main]` so `mekabridge config path`, which touches
+/// Created here rather than with `#[tokio::main]` so `meka-bridge config path`, which touches
 /// nothing async, does not pay for a thread pool.
 fn block_on<T, F: Future<Output = Result<T>>>(future: F) -> Result<T> {
     let runtime = tokio::runtime::Runtime::new()?;
@@ -529,7 +529,7 @@ fn block_on<T, F: Future<Output = Result<T>>>(future: F) -> Result<T> {
 
 /// Let a closed pipe end the process, as every other command-line tool does.
 ///
-/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns `mekabridge conversations list | head`
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns `meka-bridge conversations list | head`
 /// into a panic on the first write past the closed pipe.
 ///
 /// Called from `main` rather than [`Cli::run`], because `--help` prints before `run` is reached.
@@ -546,7 +546,7 @@ pub fn exit_quietly_on_broken_pipe() {
 
 /// Hold rmcp at `warn` where the directive would let its `info` through.
 ///
-/// meka 0.79 speaks MCP 2026-07-28 to this bridge, which has no session, so rmcp serves every
+/// Meka 0.79 speaks MCP 2026-07-28 to this bridge, which has no session, so rmcp serves every
 /// request on its own and logs each at `info` as it starts and ends: three lines a tool call, which
 /// buried everything else at the default level. Only a directive whose catch-all level is `info`
 /// or more verbose is touched, so a quieter one stays exactly as quiet, and one that names rmcp,
@@ -573,11 +573,11 @@ fn quiet_rmcp(directive: String) -> String {
 
 /// Drops the one line rmcp writes at `error` when the client it was answering has already gone.
 ///
-/// meka holds a notification stream open on every connection and closes it when it restarts or
+/// Meka holds a notification stream open on every connection and closes it when it restarts or
 /// replaces the connection. rmcp is then left with the stream's final result to send into a channel
 /// the closed request took with it, and reports that, as `failed to send pending response during
 /// drain` or `fail to response message` depending on which of its loops gets there first, with
-/// `channel closed`: an error on this bridge for every meka restart, about nothing that went wrong.
+/// `channel closed`: an error on this bridge for every Meka restart, about nothing that went wrong.
 /// Matched on rmcp's own words and nothing broader, so a change in them lets the line through again
 /// rather than hiding anything else.
 struct QuietClosedPeer;
@@ -639,8 +639,8 @@ fn init_logging(config: &Config, verbose: u8, format_override: Option<LogFormatA
         Err(_) => {
             let directive = match verbose {
                 0 => quiet_rmcp(config.log.level.clone()),
-                1 => quiet_rmcp("mekabridge=debug,info".to_string()),
-                _ => "mekabridge=trace,debug".to_string(),
+                1 => quiet_rmcp("meka_bridge=debug,info".to_string()),
+                _ => "meka_bridge=trace,debug".to_string(),
             };
             EnvFilter::new(directive)
         }
@@ -672,8 +672,8 @@ mod tests {
     fn rmcp_is_held_at_warn_only_where_its_info_would_get_through() {
         assert_eq!(quiet_rmcp("info".to_string()), "info,rmcp=warn");
         assert_eq!(
-            quiet_rmcp("mekabridge=debug,info".to_string()),
-            "mekabridge=debug,info,rmcp=warn"
+            quiet_rmcp("meka_bridge=debug,info".to_string()),
+            "meka_bridge=debug,info,rmcp=warn"
         );
         assert_eq!(quiet_rmcp("DEBUG".to_string()), "DEBUG,rmcp=warn");
         assert_eq!(quiet_rmcp("3".to_string()), "3,rmcp=warn");
@@ -686,8 +686,8 @@ mod tests {
         // `EnvFilter` does not trim, so ` info` after a comma names a target, and this directive
         // has no catch-all level for rmcp's `info` to get through.
         assert_eq!(
-            quiet_rmcp("mekabridge=debug, info".to_string()),
-            "mekabridge=debug, info"
+            quiet_rmcp("meka_bridge=debug, info".to_string()),
+            "meka_bridge=debug, info"
         );
         // Another crate whose name merely starts the same way is not rmcp.
         assert_eq!(
@@ -703,7 +703,7 @@ mod tests {
             "off",
             "",
             "2",
-            "mekabridge=debug,teloxide=warn",
+            "meka_bridge=debug,teloxide=warn",
         ] {
             assert_eq!(quiet_rmcp(quiet.to_string()), quiet, "{quiet:?}");
         }
@@ -745,7 +745,7 @@ mod tests {
             tracing::error!(target: "rmcp::service", error = %other, "failed to send pending response during drain");
             // As is anything else rmcp says at error, and anybody else's line in those words.
             tracing::error!(target: "rmcp::service", error = %closed, "failed to serve a request");
-            tracing::error!(target: "mekabridge", error = %closed, "failed to send pending response during drain");
+            tracing::error!(target: "meka_bridge", error = %closed, "failed to send pending response during drain");
         });
         assert_eq!(
             *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn no_subcommand_runs_the_daemon() {
-        let cli = Cli::try_parse_from(["mekabridge"]).expect("parses");
+        let cli = Cli::try_parse_from(["meka-bridge"]).expect("parses");
         assert!(cli.command.is_none());
     }
 
@@ -767,18 +767,18 @@ mod tests {
     fn the_config_path_can_come_from_the_environment() {
         // systemd units set this rather than threading a flag through ExecStart.
         // SAFETY: single-threaded test section.
-        unsafe { std::env::set_var("MEKABRIDGE_CONFIG", "/etc/mekabridge/from-env.toml") };
-        let cli = Cli::try_parse_from(["mekabridge", "status"]).expect("parses");
+        unsafe { std::env::set_var("MEKA_BRIDGE_CONFIG", "/etc/meka-bridge/from-env.toml") };
+        let cli = Cli::try_parse_from(["meka-bridge", "status"]).expect("parses");
         assert_eq!(
             cli.config.as_deref(),
-            Some(std::path::Path::new("/etc/mekabridge/from-env.toml"))
+            Some(std::path::Path::new("/etc/meka-bridge/from-env.toml"))
         );
-        unsafe { std::env::remove_var("MEKABRIDGE_CONFIG") };
+        unsafe { std::env::remove_var("MEKA_BRIDGE_CONFIG") };
     }
 
     #[test]
     fn global_flags_work_after_a_subcommand() {
-        let cli = Cli::try_parse_from(["mekabridge", "status", "--config", "/tmp/x.toml", "-vv"])
+        let cli = Cli::try_parse_from(["meka-bridge", "status", "--config", "/tmp/x.toml", "-vv"])
             .expect("parses");
         assert_eq!(
             cli.config.as_deref(),
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn unseen_takes_the_same_scope_as_the_tool() {
-        let cli = Cli::try_parse_from(["mekabridge", "unseen", "telegram:1", "telegram:2"])
+        let cli = Cli::try_parse_from(["meka-bridge", "unseen", "telegram:1", "telegram:2"])
             .expect("parses");
         match cli.command {
             Some(Command::Unseen { conversations, .. }) => {
@@ -800,7 +800,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "mekabridge",
+            "meka-bridge",
             "unseen",
             "--exclude",
             "telegram:3",
@@ -822,12 +822,12 @@ mod tests {
 
         // Naming chats and narrowing every chat are refused together, as the tool refuses them.
         assert!(
-            Cli::try_parse_from(["mekabridge", "unseen", "telegram:1", "--policy", "mute"])
+            Cli::try_parse_from(["meka-bridge", "unseen", "telegram:1", "--policy", "mute"])
                 .is_err()
         );
         assert!(
             Cli::try_parse_from([
-                "mekabridge",
+                "meka-bridge",
                 "unseen",
                 "telegram:1",
                 "--exclude",
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn destructive_commands_require_confirmation_flags() {
-        let cli = Cli::try_parse_from(["mekabridge", "queue", "clear"]).expect("parses");
+        let cli = Cli::try_parse_from(["meka-bridge", "queue", "clear"]).expect("parses");
         match cli.command {
             Some(Command::Queue {
                 command: QueueCommand::Clear { yes },
@@ -847,7 +847,7 @@ mod tests {
             other => panic!("unexpected parse: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["mekabridge", "session", "reset"]).expect("parses");
+        let cli = Cli::try_parse_from(["meka-bridge", "session", "reset"]).expect("parses");
         match cli.command {
             Some(Command::Session {
                 command: SessionCommand::Reset { yes },
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn list_limits_have_a_default() {
-        let cli = Cli::try_parse_from(["mekabridge", "queue", "list"]).expect("parses");
+        let cli = Cli::try_parse_from(["meka-bridge", "queue", "list"]).expect("parses");
         match cli.command {
             Some(Command::Queue {
                 command: QueueCommand::List { limit },

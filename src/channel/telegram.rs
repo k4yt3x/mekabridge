@@ -2510,7 +2510,7 @@ mod tests {
         let config = crate::config::Config::from_toml(
             "[meka]\ntoken = \"t\"\n\n[[channels.telegram]]\nid = \"telegram\"\ntoken = \
              \"t\"\nallowed_users = [1]\n",
-            std::path::Path::new("/etc/mekabridge/config.toml"),
+            std::path::Path::new("/etc/meka-bridge/config.toml"),
         )
         .expect("minimal config is valid");
         let crate::config::PlatformConfig::Telegram(telegram) = &config.channels[0].platform else {

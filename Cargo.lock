@@ -1355,8 +1355,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "mekabridge"
-version = "0.24.4"
+name = "meka-bridge"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "async-trait",

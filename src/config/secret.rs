@@ -1,6 +1,6 @@
 //! Credential handling.
 //!
-//! Every secret mekabridge holds (the meka bearer token, bot tokens, the MCP endpoint token) is
+//! Every secret Meka Bridge holds (the Meka bearer token, bot tokens, the MCP endpoint token) is
 //! wrapped in [`Secret`], whose `Debug` and `Display` impls redact. That way a config struct can be
 //! `{:?}`-logged wholesale without auditing each field, which is the failure mode plain `String`
 //! secrets eventually hit.
@@ -166,19 +166,20 @@ mod tests {
     #[test]
     fn substitute_env_expands_and_keeps_surrounding_text() {
         // SAFETY: single-threaded test process section; no other thread reads the environment here.
-        unsafe { std::env::set_var("MEKABRIDGE_TEST_SUBST", "middle") };
-        let out = substitute_env("[test]", "left-${MEKABRIDGE_TEST_SUBST}-right").expect("expands");
+        unsafe { std::env::set_var("MEKA_BRIDGE_TEST_SUBST", "middle") };
+        let out =
+            substitute_env("[test]", "left-${MEKA_BRIDGE_TEST_SUBST}-right").expect("expands");
         assert_eq!(out, "left-middle-right");
     }
 
     #[test]
     fn substitute_env_reports_missing_variable() {
-        let error = substitute_env("[test]", "${MEKABRIDGE_TEST_DEFINITELY_UNSET}")
+        let error = substitute_env("[test]", "${MEKA_BRIDGE_TEST_DEFINITELY_UNSET}")
             .expect_err("must fail on unset variable");
         assert!(
             error
                 .to_string()
-                .contains("MEKABRIDGE_TEST_DEFINITELY_UNSET")
+                .contains("MEKA_BRIDGE_TEST_DEFINITELY_UNSET")
         );
     }
 

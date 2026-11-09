@@ -1,18 +1,18 @@
 [package]
-name = "mekabridge"
-version = "0.24.4"
+name = "meka-bridge"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "A bridge between the meka agent and third-party messaging platforms"
-repository = "https://github.com/k4yt3x/mekabridge"
+description = "A bridge between the Meka agent and third-party messaging platforms"
+repository = "https://github.com/k4yt3x/meka-bridge"
 
 [lib]
-name = "mekabridge"
-path = "src/mekabridge.rs"
+name = "meka_bridge"
+path = "src/meka_bridge.rs"
 
 [[bin]]
-name = "mekabridge"
+name = "meka-bridge"
 path = "src/main.rs"
 
 [dependencies]

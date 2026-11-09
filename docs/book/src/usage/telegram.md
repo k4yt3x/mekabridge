@@ -15,7 +15,7 @@ Message the bot once before expecting the agent to reach you. Telegram bots cann
 
 ## The allowlist
 
-A bot token is a public entry point: anyone who guesses or discovers the bot's name can message it. mekabridge refuses to start with an empty allowlist for that reason.
+A bot token is a public entry point: anyone who guesses or discovers the bot's name can message it. Meka Bridge refuses to start with an empty allowlist for that reason.
 
 - `allowed_users` admits specific people **in their own chat with the bot**, and nowhere else. It says who may talk to the agent, not which rooms it listens in.
 - `allowed_chats` admits a whole group or channel, so every member of it can talk to the agent. Group ids are negative, for example `-1001234567890`. **This is the only way to be heard in a group**, including for people already on `allowed_users`.
@@ -69,7 +69,7 @@ Group messages work the same as direct ones. Forum topics get their own conversa
 
 The `chat` line names a topic after its group, `group "Deploy Crew › Releases"`, once the bridge has seen the topic's name. Telegram has no way to look one up: the name comes only with the message that opened or renamed the topic, and with every message in it that replies to nothing, which carries the name the topic was opened with. So after a restart a topic reads as its group alone until the next such message, and one renamed since it was opened reads by its first name until it is renamed again, in `conversation_list` too. General has no id of its own and reads as the group.
 
-**Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `history_read` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `mekabridge doctor` warns while privacy mode is on.
+**Turn privacy mode off** (`/setprivacy` in @BotFather, then remove and re-add the bot to each group). With it on, Telegram delivers only commands, mentions, and replies to the bot, which sounds like the same thing the `mute` policy does but is not: privacy mode never delivers the rest at all, so nothing is recorded and `history_read` has nothing to show when a mention arrives halfway through a discussion. The policy withholds the turn and keeps the message. `meka-bridge doctor` warns while privacy mode is on.
 
 Being added to or removed from a group is logged. If the group is not allowlisted the log line is a warning, because from the outside that state looks identical to a broken bot.
 
@@ -139,7 +139,7 @@ waiting to see whether more is coming. `[bridge].settle` does not apply.
 
 The trade is that two messages a few seconds apart are handed over separately, and the agent may
 answer the first before reading the second. If the second lands while the agent is still working on
-the first, meka reads it into that same turn at its next round boundary, under a header saying it
+the first, Meka reads it into that same turn at its next round boundary, under a header saying it
 arrived while the agent was working, so the agent can account for it before it finishes or revise
 with `message_edit`. The alternative was a fixed wait on every message, which is a long time to sit
 still for somebody who only ever meant to send one. See [Group attention](./group-attention.md).
@@ -150,11 +150,11 @@ photo followed by a separate turn carrying the rest.
 
 ## Muting and blocking a chat
 
-`conversation_mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `conversation_block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `conversation_unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `mekabridge policy list` and `mekabridge policy clear` are the operator's way back if the agent rules on something it should not have.
+`conversation_mute` turns a chat down to mentions only, and nothing else in that chat wakes the agent; `conversation_block` stops it reaching the agent at all and keeps nothing. Both can carry a duration, as can `conversation_unmute`, which is how the agent hears a room in full for a while without having to remember to quieten it again. See [Group attention](./group-attention.md). `meka-bridge policy list` and `meka-bridge policy clear` are the operator's way back if the agent rules on something it should not have.
 
 ## Formatting
 
-The agent writes Markdown. mekabridge renders it into Telegram's HTML subset, which has no headings, lists, tables, or images. The mapping:
+The agent writes Markdown. Meka Bridge renders it into Telegram's HTML subset, which has no headings, lists, tables, or images. The mapping:
 
 | Markdown | Telegram |
 |----------|----------|
@@ -226,22 +226,22 @@ Outbound calls go through teloxide's `Throttle` adaptor. Telegram allows roughly
 
 ## Typing indicators
 
-While the model is writing a message, the chats it is answering show a typing indicator, refreshed every four seconds because Telegram clears it after about five. Not while the agent reads, searches or thinks: only in the interval meka reports between a send tool's arguments starting and finishing.
+While the model is writing a message, the chats it is answering show a typing indicator, refreshed every four seconds because Telegram clears it after about five. Not while the agent reads, searches or thinks: only in the interval Meka reports between a send tool's arguments starting and finishing.
 
 It stops on whichever comes first:
 
-- **The arguments are written.** Whatever tool meka announces next closes the window, which is also what covers a call the model abandoned halfway.
+- **The arguments are written.** Whatever tool Meka announces next closes the window, which is also what covers a call the model abandoned halfway.
 - **The agent sends a message there.** Telegram already clears the status when a message from the bot arrives, so re-arming it afterwards would tell somebody who was just answered that a second message is coming.
 - **`[bridge].typing_max` passes**, two minutes by default. It is the only thing that closes a window whose closing event never arrives.
 
-The restraint is deliberate. The indicator is a claim that a message is about to arrive, and the bridge can only make it for the moment meka says the model is writing one: the agent is free to read something and say nothing, which is a supported outcome. Showing "typing" for a whole turn that ends in silence is worse than showing nothing, because it is a promise the bridge was never in a position to make.
+The restraint is deliberate. The indicator is a claim that a message is about to arrive, and the bridge can only make it for the moment Meka says the model is writing one: the agent is free to read something and say nothing, which is a supported outcome. Showing "typing" for a whole turn that ends in silence is worse than showing nothing, because it is a promise the bridge was never in a position to make.
 
 Sending a file declares the upload instead, so a large attachment shows "sending a photo" or "sending a file" rather than transferring in silence.
 
-This is the one thing mekabridge emits without the agent asking. It is presence rather than content, so it does not compete with the agent's decision about whether to reply. Turn it off entirely with `[bridge].typing_indicator = false`.
+This is the one thing Meka Bridge emits without the agent asking. It is presence rather than content, so it does not compete with the agent's decision about whether to reply. Turn it off entirely with `[bridge].typing_indicator = false`.
 
 ### On a "thinking" indicator
 
 There isn't one. `sendChatAction` accepts ten values, all naming a kind of message about to arrive, and none of them mean "reasoning".
 
-Telegram did build something for this: Bot API 10.1 added **rich messages**, which stream AI-generated replies and include a dedicated thinking block. mekabridge cannot use it. teloxide supports Bot API 9.1, and reaching rich messages would mean hand-rolling those calls against the raw HTTP API.
+Telegram did build something for this: Bot API 10.1 added **rich messages**, which stream AI-generated replies and include a dedicated thinking block. Meka Bridge cannot use it. teloxide supports Bot API 9.1, and reaching rich messages would mean hand-rolling those calls against the raw HTTP API.

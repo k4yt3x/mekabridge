@@ -860,6 +860,17 @@ pub struct FoundMessage {
     /// What the platform's own record says about the message beyond its sender and text. Never an
     /// admission, since the bridge did not receive it.
     pub labels: MessageLabels,
+    /// The reactions on it as the platform counts them now, one per emoji.
+    pub reactions: Vec<ReactionTally>,
+}
+
+/// How many reactions of one emoji a message the platform found carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionTally {
+    pub emoji: String,
+    pub count: u64,
+    /// Whether the bot's own account is among them.
+    pub own: bool,
 }
 
 /// How a channel that loses what is said while it is disconnected asks to be caught up.
@@ -1094,6 +1105,102 @@ pub fn revision_of(edited_at: Option<DateTime<Utc>>) -> i64 {
     edited_at.map_or(0, |edited_at| edited_at.timestamp_millis())
 }
 
+/// A change to the reactions on one message, as [`InboundEvent::Reaction`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionUpdate {
+    /// The conversation the message is in. On a platform whose reaction updates do not say which
+    /// thread the message is in, the chat itself, and the bridge files the reaction under the
+    /// thread it recorded the message in.
+    pub conversation: ConversationId,
+    /// The chat's shape, which decides the conversation's policy where nobody has ruled on it.
+    pub chat_kind: ChatKind,
+    /// Platform-native id of the message reacted to.
+    pub message_id: String,
+    pub change: ReactionChange,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl ReactionUpdate {
+    /// Whether this only takes reactions away, which needs nobody admitted: taking back a reaction
+    /// the bridge never recorded changes nothing.
+    pub fn removes_only(&self) -> bool {
+        match &self.change {
+            ReactionChange::Remove { .. }
+            | ReactionChange::ClearAll
+            | ReactionChange::ClearEmoji { .. } => true,
+            ReactionChange::Set { emoji, .. } => emoji.is_empty(),
+            ReactionChange::Add { .. } | ReactionChange::Counts { .. } => false,
+        }
+    }
+}
+
+/// An emoji a reaction is made with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionEmoji {
+    /// What identifies it on a message: the character itself, or a custom emoji's platform id.
+    /// Not the name, which a server can change or, by deleting the emoji, take away, while
+    /// reactions made with it stay on the message.
+    pub id: String,
+    /// How a person sees it: the character itself, a Discord server's own emoji by its `:name:`,
+    /// and anything the platform does not name described in words.
+    pub name: String,
+}
+
+impl ReactionEmoji {
+    /// An emoji that is a character, which is both what identifies it and what it looks like.
+    pub fn character(character: &str) -> Self {
+        Self {
+            id: character.to_string(),
+            name: character.to_string(),
+        }
+    }
+}
+
+/// What happened to a message's reactions, in the shapes the platforms report it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReactionChange {
+    /// `reactor` added `emoji`, keeping whatever else they had on the message.
+    Add {
+        reactor: Sender,
+        emoji: ReactionEmoji,
+        /// A Discord super reaction, which somebody can add beside an ordinary one of the same
+        /// emoji and take back separately.
+        #[serde(default, skip_serializing_if = "is_false")]
+        super_reaction: bool,
+    },
+    /// The account `reactor_id` took `emoji` back.
+    Remove {
+        reactor_id: String,
+        emoji: ReactionEmoji,
+        #[serde(default, skip_serializing_if = "is_false")]
+        super_reaction: bool,
+    },
+    /// `reactor`'s reactions on the message are now exactly `emoji`, and none when the list is
+    /// empty. Telegram reports every change this way.
+    Set {
+        reactor: Sender,
+        emoji: Vec<ReactionEmoji>,
+    },
+    /// Every reaction on the message was removed.
+    ClearAll,
+    /// Every reaction of one emoji on the message was removed.
+    ClearEmoji { emoji: ReactionEmoji },
+    /// How many reactions of each emoji the message has now, from a platform that does not say who
+    /// made them: Telegram's channels, where reactions are anonymous.
+    Counts { counts: Vec<(ReactionEmoji, u64)> },
+}
+
+/// What a reaction the agent made left the bot's own reactions on the message as, which differs by
+/// platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnReaction {
+    /// The emoji was added beside whatever the bot already had there.
+    Added(String),
+    /// The bot's reactions there are now exactly these, and none when the list is empty.
+    Now(Vec<String>),
+}
+
 /// Something that happened and should eventually reach the agent.
 ///
 /// An enum rather than a bare message so a scheduler (waking the agent on a timer) or a system
@@ -1130,6 +1237,13 @@ pub enum InboundEvent {
         author: String,
         timestamp: DateTime<Utc>,
     },
+    /// Somebody's reactions to a message changed.
+    ///
+    /// Never queued and never shown to the agent as it happens. A reaction is how somebody answers
+    /// without asking for anything back, and in a busy room reactions outnumber messages, so waking
+    /// the agent for one would have it answering acknowledgements. It is recorded instead, under
+    /// the same policy as a message, and the history tools show it on the message it was made to.
+    Reaction(Box<ReactionUpdate>),
 }
 
 impl InboundEvent {
@@ -1137,6 +1251,7 @@ impl InboundEvent {
     pub const fn conversation(&self) -> &ConversationId {
         match self {
             Self::Message(message) => &message.conversation,
+            Self::Reaction(update) => &update.conversation,
             Self::Retraction { conversation, .. } | Self::Typing { conversation, .. } => {
                 conversation
             }
@@ -1146,6 +1261,7 @@ impl InboundEvent {
     pub const fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::Message(message) => message.timestamp,
+            Self::Reaction(update) => update.timestamp,
             Self::Retraction { timestamp, .. } | Self::Typing { timestamp, .. } => *timestamp,
         }
     }
@@ -1580,7 +1696,8 @@ pub trait Channel: Send + Sync + 'static {
     /// decision, not the platform's.
     async fn fetch(&self, file_ref: &str, max_bytes: u64) -> Result<FetchedFile, ChannelError>;
 
-    /// Attach a reaction to one message, or clear it with `None`.
+    /// Attach a reaction to one message, or clear it with `None`, returning what that left the
+    /// bot's own reactions there as.
     ///
     /// Only ever called because the agent asked. The bridge does not acknowledge messages on its
     /// own: a reaction is content, and deciding whether to respond at all is the agent's.
@@ -1589,7 +1706,7 @@ pub trait Channel: Send + Sync + 'static {
         conversation: &ConversationId,
         message_id: &str,
         emoji: Option<&str>,
-    ) -> Result<(), ChannelError>;
+    ) -> Result<OwnReaction, ChannelError>;
 
     /// Replace the text of a message the bot sent.
     ///

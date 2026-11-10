@@ -14,7 +14,7 @@ use crate::{
     config::{Config, McpTransport, PlatformConfig},
     error::{BridgeError, Result},
     meka::{MekaClient, Profile, find_profile},
-    store::{BacklogScope, NewWatch, Policy, QueueState, Store, WatchOutcome},
+    store::{BacklogScope, NewWatch, Policy, QueueState, ReactionTarget, Store, WatchOutcome},
     watch::{WatchField, WatchMode},
 };
 
@@ -1260,7 +1260,16 @@ pub async fn history_show(
         println!("nothing recorded");
         return Ok(());
     }
-    for message in messages {
+    let targets: Vec<ReactionTarget> = messages
+        .iter()
+        .map(|message| ReactionTarget {
+            conversation: message.conversation.clone(),
+            account: message.account,
+            message_id: message.message_id.clone(),
+        })
+        .collect();
+    let reactions = store.reactions(&targets).await?;
+    for (message, target) in messages.into_iter().zip(targets) {
         let marker = if message.addressed { "@" } else { " " };
         let seen = if message.seen { " " } else { "*" };
         // The bridge's own messages read as an ordinary participant otherwise, distinguishable
@@ -1292,6 +1301,21 @@ pub async fn history_show(
             line.describe(),
             line.text_part()
         );
+        if let Some(recorded) = reactions.get(&target) {
+            // Quoted for the reason the text is: a server names its own emoji.
+            let summary: Vec<String> = crate::bridge::summarise_reactions(recorded)
+                .iter()
+                .map(|reaction| {
+                    let yours = if reaction.you {
+                        " (yours among them)"
+                    } else {
+                        ""
+                    };
+                    format!("{:?} {}{yours}", reaction.emoji, reaction.count)
+                })
+                .collect();
+            println!("      reactions: {}", summary.join(", "));
+        }
     }
     println!("\n* not yet shown to the agent, @ addressed to it, > sent by the agent");
     Ok(())
@@ -1563,8 +1587,8 @@ mod tests {
             _conversation: &ConversationId,
             _message_id: &str,
             _emoji: Option<&str>,
-        ) -> StdResult<(), ChannelError> {
-            Ok(())
+        ) -> StdResult<crate::channel::OwnReaction, ChannelError> {
+            Ok(crate::channel::OwnReaction::Now(Vec::new()))
         }
 
         async fn describe_conversation(

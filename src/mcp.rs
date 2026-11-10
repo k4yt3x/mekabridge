@@ -541,8 +541,43 @@ pub struct HistoryEntry {
     /// absence of `forwarded_from`, `reply_to` and the rest says nothing.
     #[serde(skip_serializing_if = "is_false")]
     pub labels_unreadable: bool,
+    /// The reactions on it, one per emoji in the order each was first used. On a recorded message,
+    /// those the platform told the bridge about; on an unrecorded one, the platform's count.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<HistoryReaction>,
     /// Opaque marker for paging. Pass the oldest one back as `before` to read further back.
     pub cursor: i64,
+}
+
+/// The reactions of one emoji on a history entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryReaction {
+    pub emoji: String,
+    /// How many there are, the agent's own included.
+    pub count: u64,
+    /// Who made them, the agent aside: at most ten, and none where the platform does not say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<HistoryReactor>,
+    /// Whether the agent's own account is among them.
+    #[serde(skip_serializing_if = "is_false")]
+    pub you: bool,
+}
+
+/// Somebody who reacted, named as fully as a sender is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryReactor {
+    /// Absent where the platform did not name them, as Discord does not in a direct message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Their account id, or the id of the chat they reacted as.
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub bot: bool,
+    /// Whether they reacted as a chat rather than as a person's account.
+    #[serde(skip_serializing_if = "is_false")]
+    pub as_chat: bool,
 }
 
 /// What a history entry replies to, named as fully as its own sender is.
@@ -2429,8 +2464,10 @@ impl BridgeMcpServer {
                        the original. `forwarded_from` means the sender is passing on words written \
                        where it names, by whoever it names; `reply_to` names what a message answered and who wrote that; \
                        `admitted` and `sender_allowlisted` say how far its sender was vetted, as \
-                       the header of a message that wakes you does. One marked \
-                       `previous_account` went through a bot account this channel no longer uses, \
+                       the header of a message that wakes you does. `reactions` lists each emoji \
+                       on a message with its count, who reacted, and `you` where yours is among \
+                       them; a reaction never wakes you, so this is where you see them. One \
+                       marked `previous_account` went through a bot account this channel no longer uses, \
                        so its `message_id` cannot be replied to, reacted to, edited or deleted. \
                        One marked `unrecorded` came from Discord rather than this bridge's \
                        record, so its files cannot be opened and its cursor cannot be passed as \
@@ -2594,8 +2631,8 @@ impl BridgeMcpServer {
                        answer \"have I already said this?\" across every session sharing this \
                        account. Deleted and superseded messages still match, and say so. A hit \
                        carries the same labels as a history_read entry: who forwarded it, what it \
-                       answered, when it was edited, how its sender was let in. Unlike \
-                       history_read, a search marks nothing as seen.",
+                       answered, when it was edited, how its sender was let in, its reactions. \
+                       Unlike history_read, a search marks nothing as seen.",
         annotations(
             title = "Search history",
             read_only_hint = true,

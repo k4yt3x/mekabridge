@@ -34,14 +34,15 @@ use meka_bridge::{
         Activity, Admission, Attachment, AttachmentKind, Channel, ChannelCapabilities,
         ChannelError, ChannelId, ChannelIdentity, ChannelRegistry, ChatKind, ConversationId,
         FetchedFile, FileOptions, FoundMessage, HistoryRead, InboundEvent, InboundMessage,
-        Platform, SendOptions, Sender, SentMessage,
+        OwnReaction, Platform, ReactionChange, ReactionEmoji, ReactionTally, ReactionUpdate,
+        SendOptions, Sender, SentMessage,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     mcp::{OutboundSink, ViewedAttachment},
     meka::MekaClient,
     store::{
         AccountId, AccountIdentity, ConversationRecord, HandOver, MessageKey, NewWatch, Policy,
-        QueueState, QueueStats, Store, WatchOutcome,
+        QueueState, QueueStats, ReactionTarget, Store, WatchOutcome,
     },
     watch::{WatchField, WatchMode},
 };
@@ -1678,7 +1679,7 @@ impl Channel for MockChannel {
         conversation: &ConversationId,
         message_id: &str,
         emoji: Option<&str>,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<OwnReaction, ChannelError> {
         let mut reactions = self
             .reactions
             .lock()
@@ -1688,7 +1689,12 @@ impl Channel for MockChannel {
             message_id.to_string(),
             emoji.map(str::to_string),
         ));
-        Ok(())
+        // Discord's shape: a reaction is added beside the others, and clearing takes all of the
+        // bot's own away.
+        Ok(match emoji {
+            Some(emoji) => OwnReaction::Added(emoji.to_string()),
+            None => OwnReaction::Now(Vec::new()),
+        })
     }
 
     async fn search_messages(
@@ -1710,6 +1716,7 @@ impl Channel for MockChannel {
             timestamp: Utc::now(),
             edited_at: None,
             labels: Default::default(),
+            reactions: Vec::new(),
         }])
     }
 
@@ -4843,6 +4850,332 @@ async fn a_retracted_message_is_marked_rather_than_erased() {
     }
 }
 
+/// Bob, who reacts. Not Alice, whose id the mock bot shares.
+fn bob() -> Sender {
+    Sender {
+        id: "2".to_string(),
+        display_name: "Bob".to_string(),
+        username: Some("bob".to_string()),
+        is_bot: false,
+        on_behalf_of_chat: false,
+        anonymous_admin: false,
+        signature: None,
+    }
+}
+
+/// A change to the reactions on message `message_id` in `mock:1`.
+fn reaction(message_id: &str, change: ReactionChange) -> InboundEvent {
+    InboundEvent::Reaction(Box::new(ReactionUpdate {
+        conversation: ConversationId::parse("mock:1").expect("valid"),
+        chat_kind: ChatKind::Direct,
+        message_id: message_id.to_string(),
+        change,
+        timestamp: Utc::now(),
+    }))
+}
+
+fn bob_adds(emoji: &str) -> ReactionChange {
+    ReactionChange::Add {
+        reactor: bob(),
+        emoji: ReactionEmoji::character(emoji),
+        super_reaction: false,
+    }
+}
+
+/// Poll until the reactions recorded on message 77 in `mock:1` are exactly `expected`.
+async fn await_reactions(harness: &Harness, expected: &[&str], label: &str) {
+    let account = mock_account(&harness.store).await;
+    let target = ReactionTarget {
+        conversation: "mock:1".to_string(),
+        account,
+        message_id: "77".to_string(),
+    };
+    harness
+        .wait_until(label, async |store| {
+            let recorded = store
+                .reactions(std::slice::from_ref(&target))
+                .await
+                .expect("read")
+                .remove(&target)
+                .unwrap_or_default();
+            let emoji: Vec<&str> = recorded
+                .reactions
+                .iter()
+                .map(|reaction| reaction.emoji.name.as_str())
+                .collect();
+            emoji == expected
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_reaction_is_recorded_on_its_message_and_wakes_nobody() {
+    // A reaction answers without asking for anything back, so none is handed to the agent. It is
+    // kept on the message it was made to, which is where history shows it, beside the agent's own.
+    let harness = Harness::start().await;
+    harness
+        .sender
+        .send(message("ship it?", "77"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the message to be handed over", |harness| {
+            harness.items().len() == 1
+        })
+        .await;
+
+    harness
+        .sender
+        .send(reaction("77", bob_adds("👍")))
+        .await
+        .expect("queued");
+    await_reactions(&harness, &["👍"], "the reaction to be recorded").await;
+
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&harness.channel) as Arc<dyn Channel>,
+    ]));
+    let sink = sink_for(harness.store.clone(), channels).await;
+    sink.message_react("mock:1", "77", Some("👍"))
+        .await
+        .expect("the agent reacts");
+    let page = sink
+        .history_read("mock:1", &[], 10, None, None, None)
+        .await
+        .expect("read runs");
+    let entry = page.entries.first().expect("the message reads back");
+    let [reaction] = entry.reactions.as_slice() else {
+        panic!("one emoji's reactions, got {:?}", entry.reactions);
+    };
+    assert_eq!((reaction.emoji.as_str(), reaction.count), ("👍", 2));
+    assert!(
+        reaction.you,
+        "the agent's own reaction is marked as its own"
+    );
+    let named: Vec<(Option<&str>, &str)> = reaction
+        .by
+        .iter()
+        .map(|reactor| (reactor.name.as_deref(), reactor.id.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        [(Some("Bob"), "2")],
+        "and not listed among the others"
+    );
+
+    // Paced on the next message rather than on a timer: whatever the reaction had queued would
+    // be handed over ahead of it.
+    harness
+        .sender
+        .send(message("anyone?", "78"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the next message to be handed over", |harness| {
+            harness.items().len() >= 2
+        })
+        .await;
+    let items = harness.items();
+    assert_eq!(items.len(), 2, "a reaction must not wake the agent");
+    assert!(
+        items.last().is_some_and(|item| item.contains("anyone?")),
+        "{items:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_wording_of_an_edited_message_shows_its_reactions_once() {
+    // An edit is a row of its own carrying the same message id, and the reactions belong to the
+    // message, so both rows ask for the same ones.
+    let harness = Harness::start().await;
+    harness
+        .sender
+        .send(message("ship it?", "77"))
+        .await
+        .expect("queued");
+    await_history(&harness, 1, "the original to be recorded").await;
+    let InboundEvent::Message(mut edit) = message("ship it today?", "77") else {
+        unreachable!("the fixture is a message");
+    };
+    edit.edited_at = Some(Utc::now());
+    harness
+        .sender
+        .send(InboundEvent::Message(edit))
+        .await
+        .expect("queued");
+    await_history(&harness, 2, "the edit to be recorded").await;
+    harness
+        .sender
+        .send(reaction("77", bob_adds("👍")))
+        .await
+        .expect("queued");
+    await_reactions(&harness, &["👍"], "the reaction to be recorded").await;
+
+    let channels = Arc::new(ChannelRegistry::from_channels([
+        Arc::clone(&harness.channel) as Arc<dyn Channel>,
+    ]));
+    let sink = sink_for(harness.store.clone(), channels).await;
+    let page = sink
+        .history_read("mock:1", &[], 10, None, None, None)
+        .await
+        .expect("read runs");
+    assert_eq!(page.entries.len(), 2);
+    for entry in &page.entries {
+        let counts: Vec<u64> = entry
+            .reactions
+            .iter()
+            .map(|reaction| reaction.count)
+            .collect();
+        assert_eq!(counts, [1], "{:?}", entry.text);
+    }
+}
+
+#[tokio::test]
+async fn a_blocked_chat_keeps_no_reaction_but_still_loses_one_taken_back() {
+    let harness = Harness::start().await;
+    harness
+        .sender
+        .send(message("before the block", "77"))
+        .await
+        .expect("queued");
+    await_history(&harness, 1, "the message to be recorded").await;
+    harness
+        .sender
+        .send(reaction("77", bob_adds("👀")))
+        .await
+        .expect("queued");
+    await_reactions(&harness, &["👀"], "the reaction before the block").await;
+
+    harness
+        .store
+        .set_policy("mock:1", "telegram", Policy::Block, None, None, Utc::now())
+        .await
+        .expect("block");
+    harness
+        .sender
+        .send(reaction("77", bob_adds("👍")))
+        .await
+        .expect("queued");
+    harness
+        .sender
+        .send(reaction("77", ReactionChange::Remove {
+            reactor_id: "2".to_string(),
+            emoji: ReactionEmoji::character("👀"),
+            super_reaction: false,
+        }))
+        .await
+        .expect("queued");
+    // Handled in order, so once the removal has landed the addition before it has been decided.
+    await_reactions(
+        &harness,
+        &[],
+        "the removal to land and the addition to be refused",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_reaction_named_by_its_chat_is_kept_by_the_topic_it_was_made_in() {
+    // Telegram names the chat and not the topic, and a topic is a conversation of its own with its
+    // own policy, which is the one that decides.
+    let harness = Harness::start().await;
+    let InboundEvent::Message(mut said) = message("in the topic", "31") else {
+        unreachable!("the fixture is a message");
+    };
+    said.conversation = ConversationId::parse("mock:-100:77").expect("valid");
+    said.chat_kind = ChatKind::Group;
+    harness
+        .sender
+        .send(InboundEvent::Message(said))
+        .await
+        .expect("queued");
+    let account = mock_account(&harness.store).await;
+    let on_31 = |address: &str| ReactionTarget {
+        conversation: address.to_string(),
+        account,
+        message_id: "31".to_string(),
+    };
+    let topic = on_31("mock:-100:77");
+    let reactors_in_topic = async |store: &Store| -> Vec<String> {
+        store
+            .reactions(std::slice::from_ref(&topic))
+            .await
+            .expect("read")
+            .remove(&topic)
+            .unwrap_or_default()
+            .reactions
+            .into_iter()
+            .map(|reaction| reaction.reactor_id)
+            .collect()
+    };
+    let in_chat = |reactor: Sender, emoji: &[&str]| {
+        InboundEvent::Reaction(Box::new(ReactionUpdate {
+            conversation: ConversationId::parse("mock:-100").expect("valid"),
+            chat_kind: ChatKind::Group,
+            message_id: "31".to_string(),
+            change: ReactionChange::Set {
+                reactor,
+                emoji: emoji
+                    .iter()
+                    .map(|emoji| ReactionEmoji::character(emoji))
+                    .collect(),
+            },
+            timestamp: Utc::now(),
+        }))
+    };
+    harness
+        .wait_until("the topic's message to be recorded", async |store| {
+            store
+                .history("mock:-100:77", &[], 10, None, None)
+                .await
+                .is_ok_and(|rows| rows.len() == 1)
+        })
+        .await;
+    harness
+        .sender
+        .send(in_chat(bob(), &["👍"]))
+        .await
+        .expect("queued");
+    harness
+        .wait_until("the reaction to land on the topic", async |store| {
+            reactors_in_topic(store).await == ["2"]
+        })
+        .await;
+
+    // Blocking the topic, and only the topic, refuses the next one there.
+    harness
+        .store
+        .set_policy(
+            "mock:-100:77",
+            "telegram",
+            Policy::Block,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("block");
+    let carol = Sender {
+        id: "3".to_string(),
+        ..bob()
+    };
+    harness
+        .sender
+        .send(in_chat(carol, &["🎉"]))
+        .await
+        .expect("queued");
+    harness
+        .sender
+        .send(in_chat(bob(), &[]))
+        .await
+        .expect("queued");
+    harness
+        .wait_until(
+            "the removal to land and the blocked addition to be refused",
+            async |store| reactors_in_topic(store).await.is_empty(),
+        )
+        .await;
+}
+
 /// Poll until the recorded history for `mock:1` is exactly `expected` messages long.
 ///
 /// The harness's own `wait_for` takes a synchronous predicate, and reading the store is not.
@@ -6705,6 +7038,7 @@ fn platform_message(message_id: &str, minutes_ago: i64) -> FoundMessage {
         timestamp: Utc::now() - chrono::Duration::minutes(minutes_ago),
         edited_at: None,
         labels: Default::default(),
+        reactions: Vec::new(),
     }
 }
 
@@ -6882,6 +7216,37 @@ async fn a_read_the_record_fills_does_not_ask_the_platform() {
         .await
         .expect("read runs");
     assert!(channel.history_reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_message_read_from_the_platform_carries_the_platforms_count_of_its_reactions() {
+    let (sink, channel, store) = own_message_harness().await;
+    store
+        .upsert_conversation(direct_conversation("mock:1"))
+        .await
+        .expect("conversation");
+    let mut found = platform_message("p1", 20);
+    found.reactions = vec![ReactionTally {
+        emoji: ":party:".to_string(),
+        count: 4,
+        own: true,
+    }];
+    channel.hold_history(vec![found]);
+
+    let page = sink
+        .history_read("mock:1", &[], 20, None, None, None)
+        .await
+        .expect("read runs");
+    let entry = page.entries.first().expect("the platform's message");
+    let [reaction] = entry.reactions.as_slice() else {
+        panic!("one emoji's reactions, got {:?}", entry.reactions);
+    };
+    assert_eq!((reaction.emoji.as_str(), reaction.count), (":party:", 4));
+    assert!(reaction.you);
+    assert!(
+        reaction.by.is_empty(),
+        "the platform counts reactions without naming who made them"
+    );
 }
 
 #[tokio::test]
@@ -7095,6 +7460,7 @@ async fn particular_messages_come_from_the_record_and_then_from_the_platform() {
             timestamp: Utc::now() - chrono::Duration::days(400),
             edited_at: None,
             labels: Default::default(),
+            reactions: Vec::new(),
         })],
     ));
     let lookup = sink

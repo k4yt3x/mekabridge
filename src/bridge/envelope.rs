@@ -231,10 +231,13 @@ impl Item<'_> {
         }
         match self.event {
             InboundEvent::Message(message) => self.render_message(message, &mut out),
-            // Neither is ever queued, so neither is ever rendered. Both are handled by the writer
-            // and go no further: a retraction drops the recorded copy, and a typing notice only
-            // decides how long this conversation waits to be claimed.
-            InboundEvent::Retraction { .. } | InboundEvent::Typing { .. } => {}
+            // None of these is ever queued, so none is ever rendered. The writer handles each and
+            // it goes no further: a retraction marks the recorded copy, a reaction is recorded on
+            // its message, and a typing notice only decides how long this conversation waits to be
+            // claimed.
+            InboundEvent::Retraction { .. }
+            | InboundEvent::Reaction(_)
+            | InboundEvent::Typing { .. } => {}
         }
         out
     }

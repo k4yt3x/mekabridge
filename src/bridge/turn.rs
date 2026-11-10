@@ -516,8 +516,8 @@ mod tests {
             _conversation: &ConversationId,
             _message_id: &str,
             _emoji: Option<&str>,
-        ) -> Result<(), ChannelError> {
-            Ok(())
+        ) -> Result<crate::channel::OwnReaction, ChannelError> {
+            Ok(crate::channel::OwnReaction::Now(Vec::new()))
         }
 
         async fn set_activity(

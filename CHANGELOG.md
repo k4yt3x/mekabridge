@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-11-10
+
 ### Added
 
 - `wake_on_held_roles` lets a Discord mention of a role the bot holds wake the agent, labelled so.
+- Reactions are recorded and shown by `history_read` and `history_search`, never waking the agent.
+- On Telegram, reactions are recorded only from chats where the bot is an administrator.
+- `meka-bridge history` lists the reactions recorded on each message.
 
 ### Fixed
 
@@ -692,7 +697,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.1...HEAD
+[0.25.1]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...0.25.1
 [0.25.0]: https://github.com/k4yt3x/meka-bridge/compare/0.24.4...0.25.0
 [0.24.4]: https://github.com/k4yt3x/meka-bridge/compare/0.24.3...0.24.4
 [0.24.3]: https://github.com/k4yt3x/meka-bridge/compare/0.24.2...0.24.3

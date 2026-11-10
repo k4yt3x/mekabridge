@@ -38,7 +38,7 @@ use rusqlite::{
 use uuid::Uuid;
 
 use crate::{
-    channel::MessageLabels,
+    channel::{MessageLabels, ReactionChange, ReactionEmoji, Sender},
     watch::{MAX_PATTERNS, MAX_WATCHES, WatchField, WatchMode},
 };
 
@@ -60,6 +60,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema_012.sql"),
     include_str!("store/schema_013.sql"),
     include_str!("store/schema_014.sql"),
+    include_str!("store/schema_015.sql"),
 ];
 
 /// Attempts at the WAL pragma before giving up, and how long to wait between them.
@@ -526,6 +527,41 @@ impl MessageRecord {
             revision: self.revision,
         }
     }
+}
+
+/// Which message reactions are on: the address of the conversation it was recorded in, the
+/// account that saw it, and the platform's id for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReactionTarget {
+    pub conversation: String,
+    pub account: AccountId,
+    pub message_id: String,
+}
+
+/// One reaction as the bridge recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionRecord {
+    /// Named as it was when the reaction was made.
+    pub emoji: ReactionEmoji,
+    /// The platform's id for whoever reacted, or for the chat they reacted as.
+    pub reactor_id: String,
+    /// `None` where the platform did not name them.
+    pub reactor_name: Option<String>,
+    pub reactor_username: Option<String>,
+    pub reactor_bot: bool,
+    /// Whether they reacted as a chat rather than as a person's account.
+    pub reactor_as_chat: bool,
+    /// Whether the account the message is recorded under made it, which is to say the agent.
+    pub own: bool,
+}
+
+/// What the bridge recorded about the reactions on one message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedReactions {
+    /// In the order they were made.
+    pub reactions: Vec<ReactionRecord>,
+    /// How many of each emoji there are, from a platform that does not say who reacted.
+    pub counts: Vec<(ReactionEmoji, u64)>,
 }
 
 /// A message waiting to be handed to the agent, and, once claimed, the hand-over it became.
@@ -3005,6 +3041,319 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Drop recorded reactions, and anonymous counts, made before `before`.
+    ///
+    /// By when each was made rather than by the message it is on, so a reaction stays exactly as
+    /// long as a message said at the same moment would.
+    pub async fn prune_reactions(&self, before: DateTime<Utc>) -> Result<usize> {
+        let before = to_rfc3339(before);
+        let deleted = self
+            .connection
+            .call(move |connection| {
+                let reactions =
+                    connection.execute("DELETE FROM reactions WHERE reacted_at < ?1", [&before])?;
+                let counts = connection
+                    .execute("DELETE FROM reaction_counts WHERE counted_at < ?1", [
+                        &before,
+                    ])?;
+                Ok(reactions + counts)
+            })
+            .await?;
+        Ok(deleted)
+    }
+
+    /// The conversation a reaction to `message_id` belongs in: the one at `address`, or one
+    /// beneath it, that this account recorded the message in, and `address` itself when it
+    /// recorded the message in neither.
+    ///
+    /// Telegram's reaction updates name the chat and not the topic, while a topic is a
+    /// conversation of its own, so without this a reaction to something said in a topic would be
+    /// filed under the chat, where reading the topic never finds it. Asked for the agent's own
+    /// reactions too, which may name the chat for the same reason.
+    pub async fn reaction_conversation(
+        &self,
+        address: &str,
+        account: AccountId,
+        message_id: &str,
+    ) -> Result<String> {
+        let address = address.to_string();
+        let message_id = message_id.to_string();
+        let fallback = address.clone();
+        let found: Option<String> = self
+            .connection
+            .call(move |connection| {
+                // `;` is the character after `:`, so the range holds exactly the addresses beneath
+                // this one and is read from the address index. As a join on `messages` instead,
+                // SQLite scans every message for the id rather than the few conversations.
+                connection
+                    .query_row(
+                        "SELECT c.address FROM conversations c
+                         WHERE (c.address = ?1
+                                OR (c.address >= ?1 || ':' AND c.address < ?1 || ';'))
+                           AND EXISTS (SELECT 1 FROM messages m
+                                       WHERE m.conversation_id = c.id AND m.message_id = ?3
+                                         AND m.account_id = ?2)
+                         ORDER BY c.address = ?1 DESC
+                         LIMIT 1",
+                        rusqlite::params![address, account, message_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
+            .await?;
+        Ok(found.unwrap_or(fallback))
+    }
+
+    /// Apply a change to the reactions on one message.
+    ///
+    /// Nothing is written for a conversation the address book has never seen, rather than the
+    /// write being refused: a reaction arrives without the title and shape a conversation is
+    /// filed with, and one to a message in a chat nobody has spoken in since the bridge arrived
+    /// is not worth minting the chat for.
+    ///
+    /// Adding is idempotent, and keeps when the reaction was first made.
+    pub async fn record_reaction(
+        &self,
+        address: &str,
+        account: AccountId,
+        message_id: &str,
+        change: &ReactionChange,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let address = address.to_string();
+        let message_id = message_id.to_string();
+        let change = change.clone();
+        let at = to_rfc3339(at);
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let target = rusqlite::params![address, account, message_id];
+                match change {
+                    ReactionChange::Add {
+                        reactor,
+                        emoji,
+                        super_reaction,
+                    } => {
+                        add_reaction(
+                            &transaction,
+                            &address,
+                            account,
+                            &message_id,
+                            &reactor,
+                            &emoji,
+                            super_reaction,
+                            &at,
+                        )?;
+                    }
+                    ReactionChange::Remove {
+                        reactor_id,
+                        emoji,
+                        super_reaction,
+                    } => {
+                        transaction.execute(
+                            &format!(
+                                "DELETE FROM reactions
+                                 WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                                   AND message_id = ?3 AND reactor_id = ?4 AND emoji = ?5
+                                   AND super_reaction = ?6"
+                            ),
+                            rusqlite::params![
+                                address,
+                                account,
+                                message_id,
+                                reactor_id,
+                                emoji.id,
+                                super_reaction
+                            ],
+                        )?;
+                    }
+                    ReactionChange::Set { reactor, emoji } => {
+                        let kept = serde_json::Value::Array(
+                            emoji
+                                .iter()
+                                .map(|emoji| serde_json::Value::String(emoji.id.clone()))
+                                .collect(),
+                        )
+                        .to_string();
+                        transaction.execute(
+                            &format!(
+                                "DELETE FROM reactions
+                                 WHERE conversation_id = {CONVERSATION_ID_OF} AND account_id = ?2
+                                   AND message_id = ?3 AND reactor_id = ?4
+                                   AND emoji NOT IN (SELECT value FROM json_each(?5))"
+                            ),
+                            rusqlite::params![address, account, message_id, reactor.id, kept],
+                        )?;
+                        for emoji in &emoji {
+                            add_reaction(
+                                &transaction,
+                                &address,
+                                account,
+                                &message_id,
+                                &reactor,
+                                emoji,
+                                false,
+                                &at,
+                            )?;
+                        }
+                    }
+                    ReactionChange::ClearAll => {
+                        for table in ["reactions", "reaction_counts"] {
+                            transaction.execute(
+                                &format!(
+                                    "DELETE FROM {table}
+                                     WHERE conversation_id = {CONVERSATION_ID_OF}
+                                       AND account_id = ?2 AND message_id = ?3"
+                                ),
+                                target,
+                            )?;
+                        }
+                    }
+                    ReactionChange::ClearEmoji { emoji } => {
+                        for table in ["reactions", "reaction_counts"] {
+                            transaction.execute(
+                                &format!(
+                                    "DELETE FROM {table}
+                                     WHERE conversation_id = {CONVERSATION_ID_OF}
+                                       AND account_id = ?2 AND message_id = ?3 AND emoji = ?4"
+                                ),
+                                rusqlite::params![address, account, message_id, emoji.id],
+                            )?;
+                        }
+                    }
+                    ReactionChange::Counts { counts } => {
+                        transaction.execute(
+                            &format!(
+                                "DELETE FROM reaction_counts
+                                 WHERE conversation_id = {CONVERSATION_ID_OF}
+                                   AND account_id = ?2 AND message_id = ?3"
+                            ),
+                            target,
+                        )?;
+                        for (emoji, count) in counts.iter().filter(|(_, count)| *count > 0) {
+                            transaction.execute(
+                                "INSERT INTO reaction_counts
+                                     (conversation_id, account_id, message_id, emoji, emoji_name,
+                                      count, counted_at)
+                                 SELECT id, ?2, ?3, ?4, ?5, ?6, ?7 FROM conversations
+                                 WHERE address = ?1",
+                                rusqlite::params![
+                                    address,
+                                    account,
+                                    message_id,
+                                    emoji.id,
+                                    emoji.name,
+                                    i64::try_from(*count).unwrap_or(i64::MAX),
+                                    at
+                                ],
+                            )?;
+                        }
+                    }
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The reactions recorded on each of `targets`, for those that have any.
+    ///
+    /// A target named more than once is read once. Every wording of an edited message names the
+    /// same one, and each repeat in the list the statement joins against would return every row
+    /// again.
+    pub async fn reactions(
+        &self,
+        targets: &[ReactionTarget],
+    ) -> Result<HashMap<ReactionTarget, RecordedReactions>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let distinct: std::collections::HashSet<&ReactionTarget> = targets.iter().collect();
+        // A JSON array of `[address, account, message id]` triples, for the reason
+        // `senders_json` gives: the number is not known when the statement is written.
+        let wanted = serde_json::Value::Array(
+            distinct
+                .into_iter()
+                .map(|target| {
+                    serde_json::json!([target.conversation, target.account.0, target.message_id])
+                })
+                .collect(),
+        )
+        .to_string();
+        let (reactions, counts) = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT c.address, r.account_id, r.message_id, r.emoji, r.emoji_name,
+                            r.reactor_id, r.reactor_name, r.reactor_username, r.reactor_bot,
+                            r.reactor_as_chat, r.reactor_id = a.platform_id
+                     FROM json_each(?1) w
+                     JOIN conversations c ON c.address = json_extract(w.value, '$[0]')
+                     JOIN reactions r ON r.conversation_id = c.id
+                                     AND r.account_id = json_extract(w.value, '$[1]')
+                                     AND r.message_id = json_extract(w.value, '$[2]')
+                     JOIN accounts a ON a.id = r.account_id
+                     ORDER BY r.reacted_at, r.rowid",
+                )?;
+                let reactions = statement
+                    .query_map([&wanted], |row| {
+                        let target = ReactionTarget {
+                            conversation: row.get(0)?,
+                            account: row.get(1)?,
+                            message_id: row.get(2)?,
+                        };
+                        Ok((target, ReactionRecord {
+                            emoji: ReactionEmoji {
+                                id: row.get(3)?,
+                                name: row.get(4)?,
+                            },
+                            reactor_id: row.get(5)?,
+                            reactor_name: row.get(6)?,
+                            reactor_username: row.get(7)?,
+                            reactor_bot: row.get(8)?,
+                            reactor_as_chat: row.get(9)?,
+                            own: row.get(10)?,
+                        }))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut statement = connection.prepare(
+                    "SELECT c.address, k.account_id, k.message_id, k.emoji, k.emoji_name, k.count
+                     FROM json_each(?1) w
+                     JOIN conversations c ON c.address = json_extract(w.value, '$[0]')
+                     JOIN reaction_counts k ON k.conversation_id = c.id
+                                           AND k.account_id = json_extract(w.value, '$[1]')
+                                           AND k.message_id = json_extract(w.value, '$[2]')
+                     ORDER BY k.count DESC, k.emoji_name",
+                )?;
+                let counts = statement
+                    .query_map([&wanted], |row| {
+                        let target = ReactionTarget {
+                            conversation: row.get(0)?,
+                            account: row.get(1)?,
+                            message_id: row.get(2)?,
+                        };
+                        let emoji = ReactionEmoji {
+                            id: row.get(3)?,
+                            name: row.get(4)?,
+                        };
+                        let count: i64 = row.get(5)?;
+                        Ok((target, (emoji, count.max(0) as u64)))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok((reactions, counts))
+            })
+            .await?;
+        let mut recorded: HashMap<ReactionTarget, RecordedReactions> = HashMap::new();
+        for (target, reaction) in reactions {
+            recorded.entry(target).or_default().reactions.push(reaction);
+        }
+        for (target, count) in counts {
+            recorded.entry(target).or_default().counts.push(count);
+        }
+        Ok(recorded)
+    }
+
     /// Mark one recorded message deleted, because the platform says it is gone.
     ///
     /// The row and its text stay. A message the agent has been handed is in its session for good,
@@ -3318,6 +3667,45 @@ impl Store {
             .await?;
         Ok(paths.into_iter().map(PathBuf::from).collect())
     }
+}
+
+/// Record that `reactor` reacted to a message with `emoji`, unless that is already on file.
+///
+/// Written through the conversation's address, so a conversation the address book has never seen
+/// selects no row and nothing is written.
+#[allow(clippy::too_many_arguments)]
+fn add_reaction(
+    connection: &rusqlite::Connection,
+    address: &str,
+    account: AccountId,
+    message_id: &str,
+    reactor: &Sender,
+    emoji: &ReactionEmoji,
+    super_reaction: bool,
+    at: &str,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO reactions
+             (conversation_id, account_id, message_id, reactor_id, reactor_name, reactor_username,
+              reactor_bot, reactor_as_chat, emoji, emoji_name, super_reaction, reacted_at)
+         SELECT id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 FROM conversations
+         WHERE address = ?1
+         ON CONFLICT DO NOTHING",
+        rusqlite::params![
+            address,
+            account,
+            message_id,
+            reactor.id,
+            (!reactor.display_name.is_empty()).then_some(reactor.display_name.as_str()),
+            reactor.username,
+            reactor.is_bot,
+            reactor.on_behalf_of_chat,
+            emoji.id,
+            emoji.name,
+            super_reaction,
+            at,
+        ],
+    )
 }
 
 /// A [`MessageKey`] that owns its strings, so it can be moved onto the connection thread.
@@ -5029,6 +5417,295 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1, "the pruned row must leave the index too");
         assert_eq!(hits[0].message_id, "2");
+    }
+
+    fn reactor(id: &str, name: &str) -> Sender {
+        Sender {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            username: None,
+            is_bot: false,
+            on_behalf_of_chat: false,
+            anonymous_admin: false,
+            signature: None,
+        }
+    }
+
+    fn added(id: &str, emoji: &str, super_reaction: bool) -> ReactionChange {
+        ReactionChange::Add {
+            reactor: reactor(id, "Somebody"),
+            emoji: ReactionEmoji::character(emoji),
+            super_reaction,
+        }
+    }
+
+    fn on(account: AccountId, conversation: &str, message_id: &str) -> ReactionTarget {
+        ReactionTarget {
+            conversation: conversation.to_string(),
+            account,
+            message_id: message_id.to_string(),
+        }
+    }
+
+    /// What is recorded on message 31 in `telegram:1`, as `(reactor, emoji, own)` in the order
+    /// made, and the anonymous counts.
+    async fn reactions_on_31(
+        store: &Store,
+        account: AccountId,
+    ) -> (Vec<(String, String, bool)>, Vec<(String, u64)>) {
+        let target = on(account, "telegram:1", "31");
+        let mut recorded = store
+            .reactions(std::slice::from_ref(&target))
+            .await
+            .expect("read");
+        let recorded = recorded.remove(&target).unwrap_or_default();
+        let reactions = recorded
+            .reactions
+            .into_iter()
+            .map(|reaction| (reaction.reactor_id, reaction.emoji.name, reaction.own))
+            .collect();
+        let counts = recorded
+            .counts
+            .into_iter()
+            .map(|(emoji, count)| (emoji.name, count))
+            .collect();
+        (reactions, counts)
+    }
+
+    async fn react(store: &Store, account: AccountId, change: ReactionChange, at: DateTime<Utc>) {
+        store
+            .record_reaction("telegram:1", account, "31", &change, at)
+            .await
+            .expect("recorded");
+    }
+
+    #[tokio::test]
+    async fn a_reaction_is_kept_once_and_taken_back_by_its_own_kind() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        react(&store, account, added("5", "👍", false), now()).await;
+        react(&store, account, added("5", "👍", false), now()).await;
+        react(&store, account, added("5", "👍", true), now()).await;
+        // The seeded account's own platform id, which is how the agent's own reaction is told
+        // apart on read.
+        react(&store, account, added("111", "👍", false), now()).await;
+        react(
+            &store,
+            account,
+            ReactionChange::Remove {
+                reactor_id: "5".to_string(),
+                emoji: ReactionEmoji::character("👍"),
+                super_reaction: true,
+            },
+            now(),
+        )
+        .await;
+        let (reactions, _) = reactions_on_31(&store, account).await;
+        assert_eq!(
+            reactions,
+            [
+                ("5".to_string(), "👍".to_string(), false),
+                ("111".to_string(), "👍".to_string(), true),
+            ],
+            "a redelivery adds nothing, and taking back the super reaction leaves the ordinary one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reactors_whole_set_replaces_theirs_and_nobody_elses() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        react(&store, account, added("5", "👀", false), now()).await;
+        react(&store, account, added("6", "👀", false), now()).await;
+        let set = |emoji: &[&str]| ReactionChange::Set {
+            reactor: reactor("5", "Ana"),
+            emoji: emoji
+                .iter()
+                .map(|emoji| ReactionEmoji::character(emoji))
+                .collect(),
+        };
+        react(&store, account, set(&["👍", "🔥"]), now()).await;
+        let (reactions, _) = reactions_on_31(&store, account).await;
+        let mut held: Vec<(String, String)> = reactions
+            .into_iter()
+            .map(|(reactor, emoji, _)| (reactor, emoji))
+            .collect();
+        held.sort();
+        assert_eq!(held, [
+            ("5".to_string(), "👍".to_string()),
+            ("5".to_string(), "🔥".to_string()),
+            ("6".to_string(), "👀".to_string()),
+        ]);
+
+        react(&store, account, set(&[]), now()).await;
+        let (reactions, _) = reactions_on_31(&store, account).await;
+        assert_eq!(reactions, [("6".to_string(), "👀".to_string(), false)]);
+    }
+
+    #[tokio::test]
+    async fn clearing_reactions_takes_the_anonymous_counts_with_them() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        react(&store, account, added("5", "👍", false), now()).await;
+        react(&store, account, added("6", "🔥", false), now()).await;
+        let counts = |counts: &[(&str, u64)]| ReactionChange::Counts {
+            counts: counts
+                .iter()
+                .map(|(emoji, count)| (ReactionEmoji::character(emoji), *count))
+                .collect(),
+        };
+        react(&store, account, counts(&[("👍", 3), ("🎉", 2)]), now()).await;
+        react(
+            &store,
+            account,
+            ReactionChange::ClearEmoji {
+                emoji: ReactionEmoji::character("👍"),
+            },
+            now(),
+        )
+        .await;
+        assert_eq!(
+            reactions_on_31(&store, account).await,
+            (vec![("6".to_string(), "🔥".to_string(), false)], vec![(
+                "🎉".to_string(),
+                2
+            )])
+        );
+
+        // A new count replaces the old one whole, so an emoji nobody uses any more is gone.
+        react(&store, account, counts(&[("🎉", 0), ("❤", 1)]), now()).await;
+        assert_eq!(reactions_on_31(&store, account).await.1, [(
+            "❤".to_string(),
+            1
+        )]);
+
+        react(&store, account, ReactionChange::ClearAll, now()).await;
+        assert_eq!(reactions_on_31(&store, account).await, (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_renamed_emoji_is_still_the_one_taken_back() {
+        // A server can rename its emoji, or delete it and leave it unnamed, while reactions made
+        // with it stay on the message, so what was recorded under one name is taken back under
+        // another.
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let party = |name: &str| ReactionEmoji {
+            id: "31".to_string(),
+            name: name.to_string(),
+        };
+        let add = |reactor_id: &str, name: &str| ReactionChange::Add {
+            reactor: reactor(reactor_id, "Somebody"),
+            emoji: party(name),
+            super_reaction: false,
+        };
+        react(&store, account, add("5", ":party:"), now()).await;
+        react(&store, account, add("6", ":celebrate:"), now()).await;
+        react(
+            &store,
+            account,
+            ReactionChange::Remove {
+                reactor_id: "5".to_string(),
+                emoji: party(":celebrate:"),
+                super_reaction: false,
+            },
+            now(),
+        )
+        .await;
+        assert_eq!(reactions_on_31(&store, account).await.0, [(
+            "6".to_string(),
+            ":celebrate:".to_string(),
+            false
+        )]);
+        react(
+            &store,
+            account,
+            ReactionChange::ClearEmoji {
+                emoji: party("custom emoji 31"),
+            },
+            now(),
+        )
+        .await;
+        assert!(reactions_on_31(&store, account).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reaction_in_a_chat_nobody_filed_writes_nothing() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        store
+            .record_reaction("telegram:9", account, "31", &added("5", "👍", false), now())
+            .await
+            .expect("not an error, since there is nothing to file it under");
+        let target = on(account, "telegram:9", "31");
+        assert!(store.reactions(&[target]).await.expect("read").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reaction_belongs_in_the_topic_its_message_was_recorded_in() {
+        let (store, account) = seeded(&[
+            "telegram:-100",
+            "telegram:-100:77",
+            "telegram:-1000",
+            "telegram:-101",
+        ])
+        .await;
+        for (conversation, message_id) in [
+            ("telegram:-100:77", "31"),
+            ("telegram:-1000", "33"),
+            ("telegram:-101", "34"),
+        ] {
+            store
+                .record_message(message(account, conversation, message_id, "said"))
+                .await
+                .expect("record");
+        }
+        let place = |message_id: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .reaction_conversation("telegram:-100", account, message_id)
+                    .await
+                    .expect("resolve")
+            }
+        };
+        assert_eq!(place("31").await, "telegram:-100:77");
+        assert_eq!(
+            place("32").await,
+            "telegram:-100",
+            "a message never recorded stays in the chat the reaction named"
+        );
+        assert_eq!(
+            place("33").await,
+            "telegram:-100",
+            "a group whose id merely starts the same is not beneath this one"
+        );
+        assert_eq!(
+            place("34").await,
+            "telegram:-100",
+            "nor is one whose id sorts after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_reactions_goes_by_when_each_was_made() {
+        let (store, account) = seeded(&["telegram:1"]).await;
+        let long_ago = now() - chrono::Duration::days(40);
+        react(&store, account, added("5", "👍", false), long_ago).await;
+        react(&store, account, added("6", "🔥", false), now()).await;
+        react(
+            &store,
+            account,
+            ReactionChange::Counts {
+                counts: vec![(ReactionEmoji::character("🎉"), 2)],
+            },
+            long_ago,
+        )
+        .await;
+        let pruned = store
+            .prune_reactions(now() - chrono::Duration::days(30))
+            .await
+            .expect("prune");
+        assert_eq!(pruned, 2);
+        assert_eq!(
+            reactions_on_31(&store, account).await,
+            (vec![("6".to_string(), "🔥".to_string(), false)], vec![])
+        );
     }
 
     #[tokio::test]

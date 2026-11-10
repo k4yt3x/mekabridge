@@ -83,6 +83,8 @@ In the other direction the agent can revise its own messages with `message_edit`
 
 The agent can react to any message with `message_react`. Reactions are its decision alone: the bridge never acknowledges anything on its own, because a reaction is content and deciding whether to respond at all belongs to the agent.
 
+**Other people's reactions are recorded only where the bot is an administrator.** The bridge asks for them, but Telegram sends a bot reactions only from chats where it is an administrator, and never one another bot made. Where they arrive, each is recorded on its message and shown by the history tools, as described under [Reactions](./mcp-tools.md#reactions), and none wakes the agent. In a channel, where reactions are anonymous, Telegram sends only how many of each there are, so `by` is empty there. Telegram keeps what happened while the bridge was down for up to a day and hands it over once it is back, but the Bot API has no way to ask what reactions a message has, so one made during a longer outage, or before the bridge arrived, stays unknown. The agent's own reactions are recorded wherever it makes them.
+
 ## Moderation
 
 With `admin_tools` on (the default) and the bot made an administrator, the agent can moderate a group: restrict, ban, unban, or kick members, promote and demote administrators, pin messages, and set the title.

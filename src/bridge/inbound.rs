@@ -32,7 +32,7 @@ use crate::{
         feed::FeedEvent,
         turn::{TurnTally, TurnTypist},
     },
-    channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage},
+    channel::{ChannelRegistry, ConversationId, InboundEvent, InboundMessage, ReactionUpdate},
     config::Config,
     meka::{
         InboxReceipt, InboxState, MekaClient, MekaError, ProblemDetail, ProblemKind, StreamItem,
@@ -240,8 +240,8 @@ pub async fn writer(
     let mut watches = Watches::default();
     while let Some(mut event) = events.recv().await {
         let conversation = event.conversation().clone();
-        // Only a message is ever queued. The other two are handled here and go no further, so this
-        // is one exhaustive match rather than a let-else with a fallback: a variant added later has
+        // Only a message is ever queued. The others are handled here and go no further, so this is
+        // one exhaustive match rather than a let-else with a fallback: a variant added later has
         // to be given a decision rather than falling into a catch-all that silently drops it.
         let message = match &mut event {
             InboundEvent::Message(message) => message,
@@ -278,6 +278,24 @@ pub async fn writer(
                         "failed to mark a deleted message: {}",
                         error
                     ),
+                }
+                continue;
+            }
+            InboundEvent::Reaction(update) => {
+                let Some(account) = accounts.get(conversation.channel()) else {
+                    tracing::error!(
+                        conversation = %conversation,
+                        "no account is registered for this channel, so a reaction cannot be \
+                         recorded"
+                    );
+                    continue;
+                };
+                if let Err(error) = record_reaction(&store, &config, account, update).await {
+                    tracing::error!(
+                        conversation = %conversation,
+                        "failed to record a reaction: {}",
+                        error
+                    );
                 }
                 continue;
             }
@@ -416,6 +434,63 @@ pub async fn writer(
         }
     }
     tracing::info!("inbound writer stopped: all channels have shut down");
+}
+
+/// Record a change to a message's reactions, under the policy a message from the same place is
+/// recorded under.
+///
+/// A blocked conversation keeps no reaction, as it keeps no message. Anything else keeps them all,
+/// muted or not, since a reaction never wakes the agent and what one says is read back from
+/// history. Taking reactions away is applied whatever the policy, because it can only remove what
+/// was recorded.
+///
+/// The policy is read without being expired, which is the message gate's to do: it hands the
+/// notice that a decision lapsed to the message that discovered it, and a reaction has nowhere to
+/// carry one.
+async fn record_reaction(
+    store: &Store,
+    config: &Config,
+    account: AccountId,
+    update: &ReactionUpdate,
+) -> Result<(), crate::store::StoreError> {
+    if config.storage.history_retention.is_zero() {
+        return Ok(());
+    }
+    let conversation = store
+        .reaction_conversation(update.conversation.as_str(), account, &update.message_id)
+        .await?;
+    if !update.removes_only() {
+        let policy = match store.policy(&conversation).await {
+            Ok(Some(record)) if !record.expired(Utc::now()) => record.policy,
+            Ok(_) => config.bridge.default_policy.for_kind(update.chat_kind),
+            // Failing open, as the message gate does.
+            Err(error) => {
+                tracing::error!(
+                    conversation = %conversation,
+                    "could not read the conversation's policy, so a reaction is recorded as \
+                     though it were not blocked: {}",
+                    error
+                );
+                Policy::Active
+            }
+        };
+        if policy == Policy::Block {
+            tracing::trace!(
+                conversation = %conversation,
+                "discarding a reaction in a blocked conversation"
+            );
+            return Ok(());
+        }
+    }
+    store
+        .record_reaction(
+            &conversation,
+            account,
+            &update.message_id,
+            &update.change,
+            update.timestamp,
+        )
+        .await
 }
 
 /// What the gate decided should happen to one message.

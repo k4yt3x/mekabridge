@@ -72,6 +72,8 @@ The bridge never reacts on its own. Like sending, this happens only because the 
 
 Telegram accepts a fixed set of emoji and allows bots one reaction per message. The set changes, so the bridge does not keep its own copy: it sends what the agent chose and passes Telegram's rejection back verbatim.
 
+The reaction is recorded like the agent's messages are, so `history_read` shows it on the message with `you` set. See [Reactions](#reactions).
+
 ## `message_edit`
 
 Replace the text of a message the agent sent.
@@ -268,6 +270,21 @@ Four fields say what has happened to a message since:
 | `deleted` | The platform says it has since been retracted. The text is kept and still searchable |
 | `superseded` | A later edit replaced this wording. The revision is a separate entry under the same `message_id`, with an `edited_at` of its own |
 | `previous_account` | It went through a bot account this channel no longer uses, because the bot was deleted and recreated. Its `message_id` belongs to that account, so replying to it, reacting to it, editing it, or deleting it from the current one fails |
+
+### Reactions
+
+Each entry carries the reactions on its message in `reactions`, one per emoji in the order each was first used, and omitted when there are none:
+
+| Field | Meaning |
+|-------|---------|
+| `emoji` | The emoji itself. A Discord server's own emoji reads as its `:name:`, and one the platform does not name is described in words, such as a Telegram custom emoji |
+| `count` | How many there are, the agent's own included |
+| `by` | Who made them, leaving out the agent: at most ten, each with `name` and `id`, and `username`, `bot` and `as_chat` (reacted as a chat rather than as a person) where they apply. `name` is absent where the platform did not give one, as Discord does not in a direct message. Absent when nobody is named |
+| `you` | The agent's own account is among them |
+
+A reaction never wakes the agent, whatever the chat's policy: somebody reacting is answering without asking for anything back, and in a busy room reactions outnumber messages. The bridge records them instead, in every chat it records messages from and under the same rules. The reactor must be admitted as their message would be, a blocked chat keeps none, and `history_retention` removes a reaction when it would remove a message said at the same moment. Taking a reaction back applies whoever does it. Reactions are not searchable and are never unseen, so they leave `backlog_check` and its `latest` marker alone, and a scheduled job watching a chat does not fire because somebody reacted.
+
+On a recorded message, `reactions` holds what the platform told the bridge. Telegram keeps what happened while the bridge was down for up to a day and hands it over once it is back, and Discord replays it only when a dropped connection resumes, so a reaction made during a longer outage, across a restart on Discord, or before the bridge arrived, is missing. An `unrecorded` entry from Discord carries Discord's own count instead, with `count` and `you` but nobody in `by`. Telegram sends a bot other people's reactions only from chats where it is an administrator; see [Telegram](./telegram.md#editing-and-reactions).
 
 ### Whose words, and what they answered
 

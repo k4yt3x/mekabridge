@@ -32,10 +32,11 @@ use teloxide::{
     },
     prelude::Requester,
     types::{
-        AllowedUpdate, ChatAction, ChatId, ChatPermissions, FileId, InputFile, InputMedia,
-        InputMediaDocument, InputMediaPhoto, LinkPreviewOptions, MediaKind, Message,
-        MessageEntityKind, MessageId, MessageKind, MessageOrigin, ParseMode, ReactionType,
-        Recipient, ReplyParameters, ThreadId, UpdateKind, UserId,
+        AllowedUpdate, Chat, ChatAction, ChatId, ChatPermissions, FileId, InputFile, InputMedia,
+        InputMediaDocument, InputMediaPhoto, LinkPreviewOptions, MaybeAnonymousUser, MediaKind,
+        Message, MessageEntityKind, MessageId, MessageKind, MessageOrigin,
+        MessageReactionCountUpdated, MessageReactionUpdated, ParseMode, ReactionType, Recipient,
+        ReplyParameters, ThreadId, UpdateKind, UserId,
     },
     update_listeners::{AsUpdateStream, Polling},
 };
@@ -48,7 +49,8 @@ use crate::{
         ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings,
         ConversationId, ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, InboundEvent,
         InboundMessage, MemberAction, MemberCoverage, MemberInfo, MemberListing, MemberRight,
-        MemberStatus, Platform, ReplyContext, SendOptions, Sender, SentMessage, describe_account,
+        MemberStatus, OwnReaction, Platform, ReactionChange, ReactionEmoji, ReactionUpdate,
+        ReplyContext, SendOptions, Sender, SentMessage, describe_account,
     },
     config::{TelegramConfig, TelegramParseMode},
 };
@@ -581,13 +583,7 @@ impl TelegramChannel {
             thread.map(|thread| thread.0.0.to_string()).as_deref(),
         );
 
-        let chat_kind = if message.chat.is_private() {
-            ChatKind::Direct
-        } else if message.chat.is_channel() {
-            ChatKind::Channel
-        } else {
-            ChatKind::Group
-        };
+        let chat_kind = chat_kind_of(&message.chat);
 
         let sender = sender_of(message);
         let reply_to = reply_context(message);
@@ -639,6 +635,63 @@ impl TelegramChannel {
             notes,
             attachments,
             timestamp: message.date,
+        })))
+    }
+
+    /// Somebody's reactions to a message, or `None` when they are not somebody this channel
+    /// admits.
+    ///
+    /// Telegram reports the reactor's whole set as it now stands rather than what was added or
+    /// taken away, and names no topic, so the reaction is placed in the chat and the bridge files
+    /// it under the topic it recorded the message in. Taking every reaction back is let through
+    /// without asking who did it, since it can only remove what was recorded.
+    fn reaction_changed(&self, update: &MessageReactionUpdated) -> Option<InboundEvent> {
+        let reactor = match &update.actor {
+            MaybeAnonymousUser::User(user) => user_sender(user, None),
+            MaybeAnonymousUser::Chat(chat) => chat_sender(chat, &update.chat, None),
+        };
+        let reaction = ReactionUpdate {
+            conversation: ConversationId::new(&self.id, &update.chat.id.0.to_string(), None),
+            chat_kind: chat_kind_of(&update.chat),
+            message_id: update.message_id.0.to_string(),
+            change: ReactionChange::Set {
+                reactor,
+                emoji: update.new_reaction.iter().map(reaction_emoji).collect(),
+            },
+            timestamp: update.date,
+        };
+        let user_id = update.user().map(|user| user.id.0 as i64);
+        if !reaction.removes_only()
+            && self
+                .admission(user_id, update.chat.id.0, update.chat.is_private())
+                .is_none()
+        {
+            tracing::trace!(
+                channel = %self.id,
+                chat_id = update.chat.id.0,
+                user_id = ?user_id,
+                "dropping a reaction from outside the allowlist"
+            );
+            return None;
+        }
+        Some(InboundEvent::Reaction(Box::new(reaction)))
+    }
+
+    /// How many anonymous reactions a message now has, in a chat this channel admits.
+    fn reactions_counted(&self, update: &MessageReactionCountUpdated) -> Option<InboundEvent> {
+        self.admission(None, update.chat.id.0, update.chat.is_private())?;
+        Some(InboundEvent::Reaction(Box::new(ReactionUpdate {
+            conversation: ConversationId::new(&self.id, &update.chat.id.0.to_string(), None),
+            chat_kind: chat_kind_of(&update.chat),
+            message_id: update.message_id.0.to_string(),
+            change: ReactionChange::Counts {
+                counts: update
+                    .reactions
+                    .iter()
+                    .map(|count| (reaction_emoji(&count.r#type), count.total_count))
+                    .collect(),
+            },
+            timestamp: update.date,
         })))
     }
 }
@@ -697,13 +750,17 @@ impl Channel for TelegramChannel {
 
         // Named explicitly rather than left to teloxide's inference. Telegram withholds several
         // update kinds unless they are requested, and asking for only what is consumed keeps the
-        // long poll from carrying traffic that would be discarded anyway.
+        // long poll from carrying traffic that would be discarded anyway. The two reaction kinds
+        // are among the withheld ones, and even requested they arrive only from chats where the
+        // bot is an administrator.
         let mut listener = Polling::builder(self.bot.clone())
             .timeout(self.poll_timeout)
             .allowed_updates(vec![
                 AllowedUpdate::Message,
                 AllowedUpdate::EditedMessage,
                 AllowedUpdate::MyChatMember,
+                AllowedUpdate::MessageReaction,
+                AllowedUpdate::MessageReactionCount,
             ])
             .build();
         let mut updates = Box::pin(listener.as_stream());
@@ -732,15 +789,19 @@ impl Channel for TelegramChannel {
                     continue;
                 }
             };
-            let message = match &update.kind {
-                UpdateKind::Message(message) | UpdateKind::EditedMessage(message) => message,
+            let event = match &update.kind {
+                UpdateKind::Message(message) | UpdateKind::EditedMessage(message) => {
+                    self.to_event(message).await
+                }
+                UpdateKind::MessageReaction(update) => self.reaction_changed(update),
+                UpdateKind::MessageReactionCount(update) => self.reactions_counted(update),
                 UpdateKind::MyChatMember(update) => {
                     self.note_membership_change(update);
                     continue;
                 }
                 _ => continue,
             };
-            if let Some(event) = self.to_event(message).await
+            if let Some(event) = event
                 && sink.send(event).await.is_err()
             {
                 tracing::info!(channel = %self.id, "bridge stopped accepting updates");
@@ -982,7 +1043,7 @@ impl Channel for TelegramChannel {
         conversation: &ConversationId,
         message_id: &str,
         emoji: Option<&str>,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<OwnReaction, ChannelError> {
         let (chat, _thread) = self.target(conversation)?;
         let message_id = self.message_id(message_id)?;
 
@@ -1001,8 +1062,11 @@ impl Channel for TelegramChannel {
             .set_message_reaction(Recipient::Id(chat), message_id)
             .reaction(reactions)
             .await
-            .map(|_| ())
-            .map_err(|error| self.delivery_error(&error))
+            .map_err(|error| self.delivery_error(&error))?;
+        // A bot's reaction replaces whatever it had there, and none means none.
+        Ok(OwnReaction::Now(
+            emoji.map(str::to_string).into_iter().collect(),
+        ))
     }
 
     async fn edit_text(
@@ -1707,30 +1771,69 @@ fn sender_of(message: &Message) -> Sender {
     // An administrator's custom title on an anonymous post, or the author a channel signs with.
     let signature = message.author_signature().map(str::to_string);
     if let Some(user) = author_account(message) {
-        return Sender {
-            id: user.id.0.to_string(),
-            display_name: display_name(user),
-            username: user.username.clone(),
-            is_bot: user.is_bot,
-            on_behalf_of_chat: false,
-            anonymous_admin: false,
-            signature,
-        };
+        return user_sender(user, signature);
     }
     // Posted as a chat: an anonymous admin as the group, somebody as their own channel, a channel
     // post as the channel, or one auto-forwarded into its discussion group. A channel post can
     // arrive with no `sender_chat` at all, in which case the channel itself is what spoke.
     let chat = message.sender_chat.as_ref().unwrap_or(&message.chat);
+    chat_sender(chat, &message.chat, signature)
+}
+
+/// A person's account, named as a sender.
+fn user_sender(user: &teloxide::types::User, signature: Option<String>) -> Sender {
+    Sender {
+        id: user.id.0.to_string(),
+        display_name: display_name(user),
+        username: user.username.clone(),
+        is_bot: user.is_bot,
+        on_behalf_of_chat: false,
+        anonymous_admin: false,
+        signature,
+    }
+}
+
+/// `chat` acting under its own name in `place`, named as a sender.
+fn chat_sender(chat: &Chat, place: &Chat, signature: Option<String>) -> Sender {
     Sender {
         id: chat.id.0.to_string(),
         display_name: chat.title().unwrap_or("an unnamed chat").to_string(),
         username: chat.username().map(str::to_string),
         is_bot: false,
         on_behalf_of_chat: true,
-        // Only a group's administrators can post as the group, which says more about how far to
-        // trust the message than the group's name does.
-        anonymous_admin: !message.chat.is_channel() && chat.id == message.chat.id,
+        // Only a group's administrators can act as the group, which says more about how far to
+        // trust them than the group's name does.
+        anonymous_admin: !place.is_channel() && chat.id == place.id,
         signature,
+    }
+}
+
+/// The bridge's notion of a chat's shape.
+fn chat_kind_of(chat: &Chat) -> ChatKind {
+    if chat.is_private() {
+        ChatKind::Direct
+    } else if chat.is_channel() {
+        ChatKind::Channel
+    } else {
+        ChatKind::Group
+    }
+}
+
+/// The emoji a reaction is made with.
+fn reaction_emoji(reaction: &ReactionType) -> ReactionEmoji {
+    match reaction {
+        ReactionType::Emoji { emoji } => ReactionEmoji::character(emoji),
+        // Telegram names a custom emoji only through a sticker lookup, which one reaction is not
+        // worth a request for.
+        ReactionType::CustomEmoji { custom_emoji_id } => ReactionEmoji {
+            id: custom_emoji_id.0.clone(),
+            name: format!("custom emoji {}", custom_emoji_id.0),
+        },
+        // Stars somebody paid, of which a message has one kind.
+        ReactionType::Paid => ReactionEmoji {
+            id: "paid".to_string(),
+            name: "⭐ (paid)".to_string(),
+        },
     }
 }
 
@@ -3419,6 +3522,96 @@ mod tests {
             .await
             .expect("event");
         assert!(inbound(event).sender.is_bot);
+    }
+
+    /// `actor` changing their reactions on message 31 in group `chat_id` to `new`.
+    fn reaction_in(chat_id: i64, actor: serde_json::Value, new: &[&str]) -> MessageReactionUpdated {
+        let mut update = serde_json::json!({
+            "chat": {"id": chat_id, "type": "supergroup", "title": "Deploys"},
+            "message_id": 31,
+            "date": 1_754_400_000,
+            "old_reaction": [{"type": "emoji", "emoji": "👀"}],
+            "new_reaction": new
+                .iter()
+                .map(|emoji| serde_json::json!({"type": "emoji", "emoji": emoji}))
+                .collect::<Vec<_>>(),
+        });
+        if let (Some(update), Some(actor)) = (update.as_object_mut(), actor.as_object()) {
+            update.extend(actor.clone());
+        }
+        serde_json::from_value(update).expect("the fixture deserializes")
+    }
+
+    fn ana() -> serde_json::Value {
+        serde_json::json!({"user": {"id": 5, "is_bot": false, "first_name": "Ana"}})
+    }
+
+    #[tokio::test]
+    async fn a_reaction_is_admitted_as_its_reactor_would_be() {
+        // Group -100 is allowlisted, so somebody in it is heard whoever they are, and -200 is not.
+        let channel = channel(vec![], vec![-100]);
+        assert!(
+            channel
+                .reaction_changed(&reaction_in(-200, ana(), &["👍"]))
+                .is_none(),
+            "a reaction from outside the allowlist must not be recorded"
+        );
+        let Some(InboundEvent::Reaction(update)) =
+            channel.reaction_changed(&reaction_in(-100, ana(), &["👍", "🔥"]))
+        else {
+            panic!("a reaction in an allowlisted group is reported");
+        };
+        assert_eq!(update.conversation.as_str(), "telegram:-100");
+        assert_eq!(update.message_id, "31");
+        let ReactionChange::Set { reactor, emoji } = &update.change else {
+            panic!(
+                "Telegram reports the reactor's whole set, got {:?}",
+                update.change
+            );
+        };
+        assert_eq!(
+            (reactor.id.as_str(), reactor.display_name.as_str()),
+            ("5", "Ana")
+        );
+        assert_eq!(emoji, &[
+            ReactionEmoji::character("👍"),
+            ReactionEmoji::character("🔥")
+        ]);
+    }
+
+    #[tokio::test]
+    async fn taking_every_reaction_back_needs_nobody_admitted() {
+        // It can only remove what was recorded, and refusing it would leave a reaction recorded
+        // that is no longer there.
+        let channel = channel(vec![], vec![]);
+        assert!(
+            channel
+                .reaction_changed(&reaction_in(-200, ana(), &[]))
+                .is_some(),
+            "a removal must be reported from anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reaction_made_as_a_chat_is_named_as_that_chat() {
+        let channel = channel(vec![], vec![-100]);
+        let actor = serde_json::json!({
+            "actor_chat": {"id": -100, "type": "supergroup", "title": "Deploys"},
+        });
+        let Some(InboundEvent::Reaction(update)) =
+            channel.reaction_changed(&reaction_in(-100, actor, &["👍"]))
+        else {
+            panic!("a reaction in an allowlisted group is reported");
+        };
+        let ReactionChange::Set { reactor, .. } = &update.change else {
+            panic!("expected the reactor's set, got {:?}", update.change);
+        };
+        assert!(reactor.on_behalf_of_chat, "the group reacted, not a person");
+        assert!(
+            reactor.anonymous_admin,
+            "only its administrators can react as the group"
+        );
+        assert_eq!(reactor.id, "-100");
     }
 
     #[tokio::test]

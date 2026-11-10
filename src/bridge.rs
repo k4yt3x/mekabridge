@@ -33,18 +33,20 @@ use crate::{
     },
     channel::{
         Channel, ChannelError, ChannelRegistry, ChatKind, ConversationId, FileOptions,
-        FoundMessage, InboundEvent, Platform, SendOptions,
+        FoundMessage, InboundEvent, OwnReaction, Platform, ReactionChange, ReactionEmoji,
+        SendOptions, Sender,
     },
     config::{Config, DefaultPolicy, StorageConfig},
     error::Result,
     mcp::{
         ConversationSummary, DownloadedAttachment, HistoryEntry, HistoryLookup, HistoryPage,
-        MissingMessage, OutboundSink, SinkError, ToolSurface, ViewedAttachment, serve,
+        HistoryReaction, HistoryReactor, MissingMessage, OutboundSink, SinkError, ToolSurface,
+        ViewedAttachment, serve,
     },
     meka::{MekaClient, find_profile},
     store::{
-        AccountId, AccountIdentity, BacklogReport, BacklogScope, MessageKey, NewWatch, Policy,
-        Store, WatchOutcome, WatchRecord,
+        AccountId, AccountIdentity, BacklogReport, BacklogScope, MessageKey, MessageRecord,
+        NewWatch, Policy, ReactionTarget, RecordedReactions, Store, WatchOutcome, WatchRecord,
     },
     watch::{WatchField, WatchMode},
 };
@@ -504,11 +506,18 @@ async fn janitor(store: Store, config: Arc<Config>, shutdown: CancellationToken)
         // side effect of changing a setting.
         if !config.storage.history_retention.is_zero() {
             match chrono::Duration::from_std(config.storage.history_retention) {
-                Ok(retention) => match store.prune_messages(Utc::now() - retention).await {
-                    Ok(0) => {}
-                    Ok(count) => tracing::debug!(count, "pruned recorded messages"),
-                    Err(error) => tracing::error!("history prune failed: {}", error),
-                },
+                Ok(retention) => {
+                    match store.prune_messages(Utc::now() - retention).await {
+                        Ok(0) => {}
+                        Ok(count) => tracing::debug!(count, "pruned recorded messages"),
+                        Err(error) => tracing::error!("history prune failed: {}", error),
+                    }
+                    match store.prune_reactions(Utc::now() - retention).await {
+                        Ok(0) => {}
+                        Ok(count) => tracing::debug!(count, "pruned recorded reactions"),
+                        Err(error) => tracing::error!("reaction prune failed: {}", error),
+                    }
+                }
                 Err(error) => {
                     tracing::error!("[storage].history_retention is out of range: {}", error);
                 }
@@ -994,6 +1003,127 @@ impl BridgeSink {
         .await;
     }
 
+    /// Record a reaction the agent made, the way its messages are recorded: whatever the
+    /// conversation's policy, since it is the agent's own.
+    ///
+    /// Errors are logged rather than propagated, because the reaction has already been made.
+    async fn note_reacted(
+        &self,
+        conversation: &ConversationId,
+        message_id: &str,
+        made: OwnReaction,
+    ) {
+        if self.storage.history_retention.is_zero() {
+            return;
+        }
+        let channel = conversation.channel();
+        let account = self.accounts.get(channel);
+        let record = match self.store.current_account(channel).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    conversation = %conversation,
+                    "not recording a reaction the agent made: its account could not be read: {}",
+                    error
+                );
+                return;
+            }
+        };
+        let (Some(account), Some(record)) = (account, record) else {
+            tracing::warn!(
+                conversation = %conversation,
+                "not recording a reaction the agent made: the channel's account is unknown"
+            );
+            return;
+        };
+        // Named as the account is everywhere else, though only its id matters: that is what marks
+        // the reaction as the agent's own when it is read back.
+        let reactor = Sender {
+            id: record.platform_id.clone(),
+            display_name: record
+                .display_name
+                .clone()
+                .or_else(|| record.username.clone())
+                .unwrap_or_else(|| record.platform_id.clone()),
+            username: record.username.clone(),
+            is_bot: true,
+            on_behalf_of_chat: false,
+            anonymous_admin: false,
+            signature: None,
+        };
+        // The agent reacts with characters on every platform, never a server's own emoji.
+        let change = match made {
+            OwnReaction::Added(emoji) => ReactionChange::Add {
+                reactor,
+                emoji: ReactionEmoji::character(&emoji),
+                super_reaction: false,
+            },
+            OwnReaction::Now(emoji) => ReactionChange::Set {
+                reactor,
+                emoji: emoji
+                    .iter()
+                    .map(|emoji| ReactionEmoji::character(emoji))
+                    .collect(),
+            },
+        };
+        let recorded = async {
+            let canonical = self.canonical(conversation).await;
+            let address = self
+                .store
+                .reaction_conversation(canonical.as_str(), account, message_id)
+                .await?;
+            self.store
+                .record_reaction(&address, account, message_id, &change, Utc::now())
+                .await
+        }
+        .await;
+        if let Err(error) = recorded {
+            tracing::warn!(
+                conversation = %conversation,
+                "could not record a reaction the agent made: {}",
+                error
+            );
+        }
+    }
+
+    /// Translate stored messages into what the history tools hand back, each with the reactions
+    /// recorded on it.
+    ///
+    /// Every wording of an edited message shows the same reactions, since they were made to the
+    /// message. A failure to read them leaves the entries without any rather than failing the
+    /// read, which is worth more than they are.
+    async fn recorded_entries(&self, records: Vec<MessageRecord>) -> Vec<HistoryEntry> {
+        let targets: Vec<ReactionTarget> = records
+            .iter()
+            .map(|record| ReactionTarget {
+                conversation: record.conversation.clone(),
+                account: record.account,
+                message_id: record.message_id.clone(),
+            })
+            .collect();
+        let recorded = match self.store.reactions(&targets).await {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                tracing::warn!(
+                    "could not read the reactions on what history returned: {}",
+                    error
+                );
+                HashMap::new()
+            }
+        };
+        records
+            .into_iter()
+            .zip(targets)
+            .map(|(record, target)| {
+                let mut entry = history_entry(record);
+                if let Some(reactions) = recorded.get(&target) {
+                    entry.reactions = summarise_reactions(reactions);
+                }
+                entry
+            })
+            .collect()
+    }
+
     /// Stamp the conversation as one the agent has written in, minting it if it is new.
     async fn touch_outbound(
         &self,
@@ -1226,7 +1356,7 @@ impl OutboundSink for BridgeSink {
                 conversation.channel()
             )));
         }
-        channel
+        let made = channel
             .react(&conversation, message_id, emoji)
             .await
             .map_err(|error| SinkError::Delivery(error.to_string()))?;
@@ -1239,6 +1369,7 @@ impl OutboundSink for BridgeSink {
             emoji = ?emoji,
             "the agent reacted to a message"
         );
+        self.note_reacted(&conversation, message_id, made).await;
         Ok(())
     }
 
@@ -1802,7 +1933,7 @@ impl OutboundSink for BridgeSink {
             self.mark_read(&conversation, &ids).await;
         }
         let mut page = HistoryPage {
-            entries: records.into_iter().map(history_entry).collect(),
+            entries: self.recorded_entries(records).await,
             platform_read: false,
             resume_cursor: None,
         };
@@ -1880,7 +2011,7 @@ impl OutboundSink for BridgeSink {
             .map(|record| record.message_id.clone())
             .collect();
         let mut lookup = HistoryLookup {
-            entries: records.into_iter().map(history_entry).collect(),
+            entries: self.recorded_entries(records).await,
             missing: Vec::new(),
         };
 
@@ -1961,7 +2092,7 @@ impl OutboundSink for BridgeSink {
                     SinkError::Internal(message)
                 }
             })?;
-        let mut entries: Vec<HistoryEntry> = records.into_iter().map(history_entry).collect();
+        let mut entries = self.recorded_entries(records).await;
 
         // Ask the platform too, when it keeps a record of its own and the search is aimed at one
         // chat. Discord's reaches back before the bot ever joined, which nothing the bridge holds
@@ -2405,11 +2536,91 @@ fn platform_entry(conversation: &ConversationId, message: FoundMessage) -> Histo
         cursor: crate::mcp::platform_cursor(message.timestamp),
         timestamp: message.timestamp.to_rfc3339(),
         edited_at: message.edited_at.map(|at| at.to_rfc3339()),
+        reactions: message
+            .reactions
+            .into_iter()
+            .map(|tally| HistoryReaction {
+                emoji: tally.emoji,
+                count: tally.count,
+                by: Vec::new(),
+                you: tally.own,
+            })
+            .collect(),
         // Everything the labels say, which `label` fills in below.
         ..HistoryEntry::default()
     };
     entry.label(&message.labels);
     entry
+}
+
+/// Most reactors a history entry names per emoji. The count says how many there were in all.
+const REACTORS_NAMED: usize = 10;
+
+/// The reactions recorded on one message, one entry per emoji in the order each was first used.
+///
+/// Counted by reaction rather than by person, as the platforms count them, so somebody's ordinary
+/// and super reaction of one emoji are two. A platform's anonymous count stands where it is the
+/// larger, which is wherever it is the only one.
+///
+/// Grouped by what identifies an emoji rather than by its name, and named as the most recent
+/// reaction named it: a server that renames its emoji leaves reactions made before and after with
+/// different names for the one emoji.
+pub(crate) fn summarise_reactions(recorded: &RecordedReactions) -> Vec<HistoryReaction> {
+    let mut summary: Vec<HistoryReaction> = Vec::new();
+    // What identifies each entry's emoji, in step with `summary`.
+    let mut ids: Vec<&str> = Vec::new();
+    for reaction in &recorded.reactions {
+        let index = match ids.iter().position(|id| *id == reaction.emoji.id) {
+            Some(index) => index,
+            None => {
+                ids.push(&reaction.emoji.id);
+                summary.push(HistoryReaction {
+                    emoji: String::new(),
+                    count: 0,
+                    by: Vec::new(),
+                    you: false,
+                });
+                summary.len() - 1
+            }
+        };
+        let Some(entry) = summary.get_mut(index) else {
+            continue;
+        };
+        entry.emoji.clone_from(&reaction.emoji.name);
+        entry.count += 1;
+        if reaction.own {
+            entry.you = true;
+        } else if entry.by.len() < REACTORS_NAMED
+            && !entry.by.iter().any(|by| by.id == reaction.reactor_id)
+        {
+            entry.by.push(HistoryReactor {
+                name: reaction.reactor_name.clone(),
+                id: reaction.reactor_id.clone(),
+                username: reaction.reactor_username.clone(),
+                bot: reaction.reactor_bot,
+                as_chat: reaction.reactor_as_chat,
+            });
+        }
+    }
+    for (emoji, count) in &recorded.counts {
+        match ids
+            .iter()
+            .position(|id| *id == emoji.id)
+            .and_then(|index| summary.get_mut(index))
+        {
+            Some(existing) => existing.count = existing.count.max(*count),
+            None => {
+                ids.push(&emoji.id);
+                summary.push(HistoryReaction {
+                    emoji: emoji.name.clone(),
+                    count: *count,
+                    by: Vec::new(),
+                    you: false,
+                });
+            }
+        }
+    }
+    summary
 }
 
 /// Translate a stored message into what the history tools hand back.
@@ -2584,7 +2795,36 @@ impl BridgeSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_BUFFER, MAX_VIEW_BASE64_BYTES, MAX_VIEW_BYTES, sanitize_file_stem};
+    use super::{
+        EVENT_BUFFER, MAX_VIEW_BASE64_BYTES, MAX_VIEW_BYTES, RecordedReactions, sanitize_file_stem,
+        summarise_reactions,
+    };
+    use crate::{channel::ReactionEmoji, store::ReactionRecord};
+
+    #[test]
+    fn an_emoji_renamed_between_reactions_is_listed_once_by_its_latest_name() {
+        let made = |reactor: &str, name: &str| ReactionRecord {
+            emoji: ReactionEmoji {
+                id: "31".to_string(),
+                name: name.to_string(),
+            },
+            reactor_id: reactor.to_string(),
+            reactor_name: None,
+            reactor_username: None,
+            reactor_bot: false,
+            reactor_as_chat: false,
+            own: false,
+        };
+        let summary = summarise_reactions(&RecordedReactions {
+            reactions: vec![made("5", ":party:"), made("6", ":celebrate:")],
+            counts: Vec::new(),
+        });
+        let listed: Vec<(&str, u64)> = summary
+            .iter()
+            .map(|reaction| (reaction.emoji.as_str(), reaction.count))
+            .collect();
+        assert_eq!(listed, [(":celebrate:", 2)]);
+    }
 
     /// Read the disposition without disturbing it, so no window exists where a concurrent test
     /// writing to a closed pipe would take the whole process down.

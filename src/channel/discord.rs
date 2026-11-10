@@ -45,7 +45,7 @@ use twilight_model::{
         },
     },
     gateway::{
-        CloseCode,
+        CloseCode, GatewayReaction,
         payload::outgoing::UpdatePresence,
         presence::{ActivityType, MinimalActivity, Status},
     },
@@ -65,8 +65,9 @@ use crate::{
         ChannelCapabilities, ChannelError, ChannelId, ChannelIdentity, ChatKind, ChatSettings,
         ConversationId, ConversationInfo, FetchedFile, FileOptions, ForwardOrigin, FoundMessage,
         HistoryRead, InboundEvent, InboundMessage, Invocation, MemberAction, MemberCoverage,
-        MemberInfo, MemberListing, MemberStatus, MessageLabels, Openings, Platform, Presence,
-        ReplyContext, SendOptions, Sender, SentMessage,
+        MemberInfo, MemberListing, MemberStatus, MessageLabels, Openings, OwnReaction, Platform,
+        Presence, ReactionChange, ReactionEmoji, ReactionTally, ReactionUpdate, ReplyContext,
+        SendOptions, Sender, SentMessage,
         discord::{cache::NameCache, presence::PresenceCache},
     },
     config::DiscordConfig,
@@ -143,6 +144,10 @@ const WANTED_EVENTS: EventTypeFlags = EventTypeFlags::READY
     .union(EventTypeFlags::MESSAGE_DELETE)
     .union(EventTypeFlags::MESSAGE_DELETE_BULK)
     .union(EventTypeFlags::TYPING_START)
+    .union(EventTypeFlags::REACTION_ADD)
+    .union(EventTypeFlags::REACTION_REMOVE)
+    .union(EventTypeFlags::REACTION_REMOVE_ALL)
+    .union(EventTypeFlags::REACTION_REMOVE_EMOJI)
     .union(EventTypeFlags::GUILD_CREATE)
     .union(EventTypeFlags::GUILD_UPDATE)
     .union(EventTypeFlags::GUILD_DELETE)
@@ -343,15 +348,17 @@ impl DiscordChannel {
     /// along on every guild message, and the REST member lookup works without it, so requesting a
     /// second privileged intent would buy nothing this connector uses.
     const fn intents(&self) -> Intents {
-        // The two typing intents are unprivileged, so unlike `MESSAGE_CONTENT` and
+        // The typing and reaction intents are unprivileged, so unlike `MESSAGE_CONTENT` and
         // `GUILD_PRESENCES` they need no portal toggle and cannot close the gateway with a 4014.
-        // They are what lets a conversation be held until somebody stops composing rather than
+        // Typing is what lets a conversation be held until somebody stops composing rather than
         // until a guessed timer expires, which is a distinction Telegram cannot offer at all.
         let base = Intents::GUILDS
             .union(Intents::GUILD_MESSAGES)
             .union(Intents::DIRECT_MESSAGES)
             .union(Intents::GUILD_MESSAGE_TYPING)
-            .union(Intents::DIRECT_MESSAGE_TYPING);
+            .union(Intents::DIRECT_MESSAGE_TYPING)
+            .union(Intents::GUILD_MESSAGE_REACTIONS)
+            .union(Intents::DIRECT_MESSAGE_REACTIONS);
         let base = if self.message_content {
             base.union(Intents::MESSAGE_CONTENT)
         } else {
@@ -550,6 +557,7 @@ impl DiscordChannel {
                 ..MessageLabels::default()
             },
             sender_name: author.display_name,
+            reactions: tallies_of(message),
         })
     }
 
@@ -972,15 +980,7 @@ impl DiscordChannel {
             .as_ref()
             .map(|member| member.roles.clone())
             .unwrap_or_default();
-        // Discord announces server channels over the gateway but not direct-message channels, so
-        // the cache has nothing to say about a DM. The absent `guild_id` is the reliable signal,
-        // and without this a DM would be filed as an unknown room and shown that way in the
-        // chat list.
-        let chat_kind = match channel_kind {
-            Some(kind) => chat_kind(Some(kind)),
-            None if message.guild_id.is_none() => ChatKind::Direct,
-            None => ChatKind::Unknown,
-        };
+        let chat_kind = chat_kind_in(channel_kind, message.guild_id);
         let sender_allowlisted = self.allowed_users.contains(&message.author.id);
         let Some(admission) = self.admission(
             message.author.id,
@@ -1346,6 +1346,53 @@ impl DiscordChannel {
             Event::MessageDeleteBulk(bulk) => {
                 self.retract(bulk.channel_id, bulk.ids, sink).await;
             }
+            Event::ReactionAdd(reaction) => {
+                // The bot's own reactions come back over the gateway. They are recorded when the
+                // agent makes them, the same as its messages, and are not somebody else's.
+                if self.identity.get() == Some(&reaction.user_id) {
+                    return;
+                }
+                if let Some(event) = self.reaction_added(&reaction.0) {
+                    self.deliver(event, sink).await;
+                }
+            }
+            // Not filtered for the bot's own: a moderator taking the bot's reaction away arrives
+            // only this way.
+            Event::ReactionRemove(reaction) => {
+                let change = ReactionChange::Remove {
+                    reactor_id: reaction.user_id.to_string(),
+                    emoji: emoji_of(&reaction.emoji),
+                    super_reaction: reaction.burst,
+                };
+                let event = self.reaction_update(
+                    reaction.channel_id,
+                    reaction.guild_id,
+                    reaction.message_id,
+                    change,
+                );
+                self.deliver(event, sink).await;
+            }
+            Event::ReactionRemoveAll(removal) => {
+                let event = self.reaction_update(
+                    removal.channel_id,
+                    removal.guild_id,
+                    removal.message_id,
+                    ReactionChange::ClearAll,
+                );
+                self.deliver(event, sink).await;
+            }
+            Event::ReactionRemoveEmoji(removal) => {
+                let change = ReactionChange::ClearEmoji {
+                    emoji: emoji_of(&removal.emoji),
+                };
+                let event = self.reaction_update(
+                    removal.channel_id,
+                    Some(removal.guild_id),
+                    removal.message_id,
+                    change,
+                );
+                self.deliver(event, sink).await;
+            }
             _ => {}
         }
     }
@@ -1370,6 +1417,68 @@ impl DiscordChannel {
             };
             self.deliver(event, sink).await;
         }
+    }
+
+    /// A reaction somebody added, or `None` when they are not somebody this channel admits.
+    ///
+    /// Admitted exactly as their message would be, roles included, which ride along on a reaction
+    /// in a server as they do on a message. No channel is looked up here, unlike for a message: a
+    /// reaction in a thread the gateway never announced is one to a message whose own arrival
+    /// would have placed it, and a busy server adds reactions far faster than the gateway loop can
+    /// afford to wait on lookups.
+    fn reaction_added(&self, reaction: &GatewayReaction) -> Option<InboundEvent> {
+        let chat_kind = chat_kind_in(self.names.kind_of(reaction.channel_id), reaction.guild_id);
+        let roles = reaction
+            .member
+            .as_ref()
+            .map(|member| member.roles.as_slice())
+            .unwrap_or_default();
+        if self
+            .admission(
+                reaction.user_id,
+                reaction.channel_id,
+                reaction.guild_id,
+                roles,
+                chat_kind == ChatKind::Direct,
+            )
+            .is_none()
+        {
+            tracing::trace!(
+                channel = %self.id,
+                discord_channel = %reaction.channel_id,
+                user_id = %reaction.user_id,
+                "dropping a reaction from outside the allowlist"
+            );
+            return None;
+        }
+        let change = ReactionChange::Add {
+            reactor: reactor_of(reaction),
+            emoji: emoji_of(&reaction.emoji),
+            super_reaction: reaction.burst,
+        };
+        Some(self.reaction_update(
+            reaction.channel_id,
+            reaction.guild_id,
+            reaction.message_id,
+            change,
+        ))
+    }
+
+    /// A change to the reactions on one message, placed the way a message from there would be.
+    fn reaction_update(
+        &self,
+        channel_id: Id<ChannelMarker>,
+        guild_id: Option<Id<GuildMarker>>,
+        message_id: Id<MessageMarker>,
+        change: ReactionChange,
+    ) -> InboundEvent {
+        InboundEvent::Reaction(Box::new(ReactionUpdate {
+            conversation: ConversationId::new(&self.id, &channel_id.to_string(), None),
+            chat_kind: chat_kind_in(self.names.kind_of(channel_id), guild_id),
+            message_id: message_id.to_string(),
+            change,
+            timestamp: Utc::now(),
+        }))
     }
 
     async fn deliver(&self, event: InboundEvent, sink: &mpsc::Sender<InboundEvent>) {
@@ -1652,6 +1761,70 @@ impl DiscordChannel {
             .await?;
         Ok(permissions.contains(Permissions::READ_MESSAGE_HISTORY))
     }
+}
+
+/// The shape of the chat something arrived in, from the cached channel type and the server it
+/// came from.
+///
+/// Discord announces server channels over the gateway but not direct-message channels, so the
+/// cache has nothing to say about a DM. The absent `guild_id` is the reliable signal, and without
+/// this a DM would be filed as an unknown room and shown that way in the chat list.
+fn chat_kind_in(kind: Option<ChannelType>, guild_id: Option<Id<GuildMarker>>) -> ChatKind {
+    match kind {
+        Some(kind) => chat_kind(Some(kind)),
+        None if guild_id.is_none() => ChatKind::Direct,
+        None => ChatKind::Unknown,
+    }
+}
+
+/// The emoji a reaction is made with. A server's own emoji is identified by its id and named by its
+/// `:name:`, which is how mentions of one are rendered in text too.
+fn emoji_of(emoji: &EmojiReactionType) -> ReactionEmoji {
+    match emoji {
+        EmojiReactionType::Unicode { name } => ReactionEmoji::character(name),
+        EmojiReactionType::Custom { id, name, .. } => ReactionEmoji {
+            id: id.to_string(),
+            name: match name {
+                Some(name) => format!(":{name}:"),
+                // An emoji since deleted from its server, which Discord no longer names.
+                None => format!("custom emoji {id}"),
+            },
+        },
+    }
+}
+
+/// Who added a reaction, as far as the gateway says. A reaction in a direct message carries no
+/// member, and with it no name, so only the id is known there.
+fn reactor_of(reaction: &GatewayReaction) -> Sender {
+    let user = reaction.member.as_ref().map(|member| &member.user);
+    Sender {
+        id: reaction.user_id.to_string(),
+        display_name: reaction
+            .member
+            .as_ref()
+            .and_then(|member| member.nick.clone())
+            .or_else(|| user.and_then(|user| user.global_name.clone()))
+            .or_else(|| user.map(|user| user.name.clone()))
+            .unwrap_or_default(),
+        username: user.map(|user| user.name.clone()),
+        is_bot: user.is_some_and(|user| user.bot),
+        on_behalf_of_chat: false,
+        anonymous_admin: false,
+        signature: None,
+    }
+}
+
+/// The reactions Discord counts on a message it returned, one per emoji.
+fn tallies_of(message: &Message) -> Vec<ReactionTally> {
+    message
+        .reactions
+        .iter()
+        .map(|reaction| ReactionTally {
+            emoji: emoji_of(&reaction.emoji).name,
+            count: reaction.count,
+            own: reaction.me || reaction.me_burst,
+        })
+        .collect()
 }
 
 /// Discord's channel type, as the bridge's notion of a chat's shape.
@@ -1947,7 +2120,39 @@ fn found_message(
             ..MessageLabels::default()
         },
         sender_name: author.name,
+        reactions: json_tallies(value),
     })
+}
+
+/// The reactions on a message in Discord's JSON, one per emoji, as [`tallies_of`] reads them from
+/// a typed message.
+fn json_tallies(message: &serde_json::Value) -> Vec<ReactionTally> {
+    let Some(reactions) = message
+        .get("reactions")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    reactions
+        .iter()
+        .filter_map(|reaction| {
+            // A reaction whose emoji cannot be read is left out of the count rather than failing
+            // the search it came back with, as a hit that cannot be attributed is.
+            let emoji =
+                serde_json::from_value::<EmojiReactionType>(reaction.get("emoji")?.clone()).ok()?;
+            let flag = |key: &str| {
+                reaction
+                    .get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            Some(ReactionTally {
+                emoji: emoji_of(&emoji).name,
+                count: reaction.get("count")?.as_u64()?,
+                own: flag("me") || flag("me_burst"),
+            })
+        })
+        .collect()
 }
 
 /// A message's author as Discord's JSON gives it, for the paths that read JSON rather than a
@@ -2556,7 +2761,7 @@ impl Channel for DiscordChannel {
         conversation: &ConversationId,
         message_id: &str,
         emoji: Option<&str>,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<OwnReaction, ChannelError> {
         let channel_id = self.target(conversation).await?;
         let message_id = self.parse_message(message_id)?;
         match emoji {
@@ -2566,6 +2771,7 @@ impl Channel for DiscordChannel {
                     .create_reaction(channel_id, message_id, &reaction)
                     .await
                     .map_err(|error| self.delivery_error("adding the reaction", &error))?;
+                Ok(OwnReaction::Added(emoji.to_string()))
             }
             None => {
                 // Discord has no "clear whatever I put here", so the bot's own reactions are read
@@ -2593,9 +2799,9 @@ impl Channel for DiscordChannel {
                         .await
                         .map_err(|error| self.delivery_error("clearing the reaction", &error))?;
                 }
+                Ok(OwnReaction::Now(Vec::new()))
             }
         }
-        Ok(())
     }
 
     async fn edit_text(
@@ -4319,6 +4525,198 @@ mod tests {
         );
     }
 
+    /// Somebody adding `emoji` to message 777 in channel 555 of server `guild_id`.
+    fn reaction_add(user_id: u64, guild_id: u64, emoji: serde_json::Value) -> Event {
+        let reaction: GatewayReaction = serde_json::from_value(serde_json::json!({
+            "burst": false,
+            "channel_id": "555",
+            "emoji": emoji,
+            "guild_id": guild_id.to_string(),
+            "member": {
+                "user": {
+                    "id": user_id.to_string(),
+                    "username": "alice",
+                    "global_name": "Alice",
+                    "discriminator": "0",
+                    "avatar": null,
+                },
+                "roles": [],
+                "joined_at": "2020-01-01T00:00:00.000000+00:00",
+                "deaf": false,
+                "mute": false,
+                "flags": 0,
+            },
+            "message_id": "777",
+            "user_id": user_id.to_string(),
+        }))
+        .expect("the fixture deserializes");
+        Event::ReactionAdd(Box::new(
+            twilight_model::gateway::payload::incoming::ReactionAdd(reaction),
+        ))
+    }
+
+    fn reaction_of(event: InboundEvent) -> ReactionUpdate {
+        let InboundEvent::Reaction(update) = event else {
+            panic!("expected a reaction, got {event:?}");
+        };
+        *update
+    }
+
+    #[tokio::test]
+    async fn a_reaction_is_admitted_as_its_reactor_would_be() {
+        // The server is allowlisted, so its members are heard, and their reactions with them.
+        let channel = identified();
+        let (sender, mut receiver) = mpsc::channel(4);
+        channel
+            .handle(
+                reaction_add(5, 900, serde_json::json!({"id": "31", "name": "party"})),
+                &sender,
+            )
+            .await;
+        let update = reaction_of(receiver.try_recv().expect("the reaction is reported"));
+        assert_eq!(update.conversation.as_str(), "discord:555");
+        assert_eq!(update.message_id, "777");
+        let ReactionChange::Add { reactor, emoji, .. } = update.change else {
+            panic!("expected an added reaction, got {:?}", update.change);
+        };
+        assert_eq!(
+            emoji,
+            ReactionEmoji {
+                id: "31".to_string(),
+                name: ":party:".to_string(),
+            },
+            "a server's own emoji is named as text names it, and known by its id"
+        );
+        assert_eq!(
+            (reactor.id.as_str(), reactor.display_name.as_str()),
+            ("5", "Alice")
+        );
+
+        // Somebody in a server nobody allowlisted is not heard, so neither is what they react.
+        channel
+            .handle(
+                reaction_add(5, 901, serde_json::json!({"name": "👍"})),
+                &sender,
+            )
+            .await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "a reaction from outside the allowlist must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reaction_in_a_direct_message_is_admitted_by_the_user_allowlist() {
+        // Discord sends no server and no member with one, so it is placed and admitted as a direct
+        // message by the missing server, the way a message is.
+        let channel = identified();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let in_dm = |user_id: &str| {
+            let reaction: GatewayReaction = serde_json::from_value(serde_json::json!({
+                "burst": false,
+                "channel_id": "556",
+                "emoji": {"id": null, "name": "👍"},
+                "message_id": "778",
+                "user_id": user_id,
+            }))
+            .expect("the fixture deserializes");
+            Event::ReactionAdd(Box::new(
+                twilight_model::gateway::payload::incoming::ReactionAdd(reaction),
+            ))
+        };
+        channel.handle(in_dm("1"), &sender).await;
+        let update = reaction_of(receiver.try_recv().expect("the reaction is reported"));
+        assert_eq!(update.chat_kind, ChatKind::Direct);
+        let ReactionChange::Add { reactor, .. } = update.change else {
+            panic!("expected an added reaction, got {:?}", update.change);
+        };
+        assert_eq!(
+            (reactor.id.as_str(), reactor.display_name.as_str()),
+            ("1", ""),
+            "named by id alone, since Discord sends no name"
+        );
+
+        channel.handle(in_dm("2"), &sender).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "a stranger's reaction in a direct message must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bots_own_reaction_is_not_reported_back_but_its_removal_is() {
+        // Its own reactions are recorded when the agent makes them. Taking one away arrives only
+        // over the gateway, and a moderator can do that to the bot as to anybody.
+        let channel = identified();
+        let (sender, mut receiver) = mpsc::channel(4);
+        channel
+            .handle(
+                reaction_add(99, 900, serde_json::json!({"name": "👍"})),
+                &sender,
+            )
+            .await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "the bot's own reaction must not come back as somebody else's"
+        );
+
+        let removal: twilight_model::gateway::payload::incoming::ReactionRemove =
+            serde_json::from_value(serde_json::json!({
+                "burst": false,
+                "channel_id": "555",
+                "emoji": {"name": "👍"},
+                "guild_id": "900",
+                "message_id": "777",
+                "user_id": "99",
+            }))
+            .expect("the fixture deserializes");
+        channel
+            .handle(Event::ReactionRemove(Box::new(removal)), &sender)
+            .await;
+        let update = reaction_of(receiver.try_recv().expect("the removal is reported"));
+        assert_eq!(update.change, ReactionChange::Remove {
+            reactor_id: "99".to_string(),
+            emoji: ReactionEmoji::character("👍"),
+            super_reaction: false,
+        });
+    }
+
+    #[test]
+    fn the_reactions_on_a_message_in_discords_json_are_counted() {
+        let message = serde_json::json!({
+            "reactions": [
+                {"count": 3, "me": true, "me_burst": false, "emoji": {"id": null, "name": "👍"}},
+                {"count": 1, "me": false, "me_burst": false, "emoji": {"id": "31", "name": "party"}},
+            ],
+        });
+        assert_eq!(json_tallies(&message), [
+            ReactionTally {
+                emoji: "👍".to_string(),
+                count: 3,
+                own: true,
+            },
+            ReactionTally {
+                emoji: ":party:".to_string(),
+                count: 1,
+                own: false,
+            },
+        ]);
+    }
+
+    #[test]
+    fn reaction_events_are_asked_for_from_the_gateway() {
+        // As for typing: the handler tests call `handle` directly, so without this they would pass
+        // while no reaction ever arrived.
+        for flag in [
+            EventTypeFlags::REACTION_ADD,
+            EventTypeFlags::REACTION_REMOVE,
+            EventTypeFlags::REACTION_REMOVE_ALL,
+            EventTypeFlags::REACTION_REMOVE_EMOJI,
+        ] {
+            assert!(WANTED_EVENTS.contains(flag), "{flag:?} is not asked for");
+        }
+    }
+
     #[test]
     fn typing_events_are_asked_for_from_the_gateway() {
         // The intent decides whether Discord sends these at all; this flag decides whether the
@@ -4329,7 +4727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_typing_intents_are_requested_and_are_not_privileged() {
+    async fn the_typing_and_reaction_intents_are_requested_and_are_not_privileged() {
         // Unprivileged, so unlike MESSAGE_CONTENT they need no portal toggle and cannot close the
         // gateway with a 4014. Asserted because getting this wrong fails at startup for every
         // deployment rather than degrading.
@@ -4337,6 +4735,8 @@ mod tests {
         let intents = channel.intents();
         assert!(intents.contains(Intents::GUILD_MESSAGE_TYPING));
         assert!(intents.contains(Intents::DIRECT_MESSAGE_TYPING));
+        assert!(intents.contains(Intents::GUILD_MESSAGE_REACTIONS));
+        assert!(intents.contains(Intents::DIRECT_MESSAGE_REACTIONS));
 
         // The fixture asks for `MESSAGE_CONTENT` and nothing else privileged, so that is the whole
         // of what may appear here. Asserted as an equality rather than as an absence, or a future
@@ -4347,7 +4747,7 @@ mod tests {
         assert_eq!(
             intents.intersection(privileged),
             Intents::MESSAGE_CONTENT,
-            "the typing intents must not drag a privileged one along with them"
+            "the typing and reaction intents must not drag a privileged one along with them"
         );
     }
 

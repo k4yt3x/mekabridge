@@ -151,11 +151,13 @@ An operator can undo any of it from the Discord client, and `meka-bridge policy`
 
 ## History
 
-The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds five things on top.
+The bridge records what it sees, the same as on Telegram, and `history_read` and `history_search` reach it. Discord adds six things on top.
 
 **Deletions are honoured.** Discord tells the bridge when a message is deleted, so the recorded copy is marked `deleted` rather than removed: the agent is never handed it back as missed context, but `history_read` and `history_search` still reach it and say it was retracted. Telegram reports nothing, so its archive cannot do this.
 
 **`history_search` also asks Discord.** When the search names one conversation, the bridge queries Discord's own guild search alongside its local index and merges the results. That reaches messages from before the bot ever joined, which nothing the bridge recorded can. It needs the message content intent and Read Message History, it does not cover direct messages, and a freshly joined server answers nothing until Discord finishes indexing it. All three are handled by falling back to the local results rather than failing the search.
+
+**Reactions are recorded.** The bridge asks for `GUILD_MESSAGE_REACTIONS` and `DIRECT_MESSAGE_REACTIONS`, which are unprivileged like the typing intents, and records each reaction from somebody the allowlist admits, along with every reaction taken back, removed by a moderator, or cleared. They never wake the agent; the history tools show them on the message, as described under [Reactions](./mcp-tools.md#reactions). An `unrecorded` entry carries Discord's own count instead. A reaction in a direct message names its reactor by id alone, since Discord sends no name with it. Unlike messages, reactions made while the bridge was disconnected are not fetched back; only a resumed connection replays them.
 
 **`history_read` asks Discord for a message it never recorded.** Given `message_ids`, it answers from the record first and asks Discord for the rest, one request each, so a message somebody linked from before the bot joined can still be read. Telegram gives a bot no such lookup.
 

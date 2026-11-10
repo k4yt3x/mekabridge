@@ -2008,6 +2008,7 @@ fn message(text: &str, message_id: &str) -> InboundEvent {
         sender_allowlisted: true,
         sender_roles: Vec::new(),
         addressed: false,
+        pinged_roles: Vec::new(),
         matches: Vec::new(),
         text: text.to_string(),
         reply_to: None,

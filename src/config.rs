@@ -370,6 +370,14 @@ pub struct DiscordConfig {
     pub mention_everyone: bool,
     /// Allow an outgoing message to ping a role.
     pub mention_roles: bool,
+    /// Count a mention of a role the bot holds as addressing the agent, as a mention of the bot
+    /// does.
+    ///
+    /// Off by default because a role ping reaches everyone holding the role, and the bridge cannot
+    /// see how many that is without the privileged members intent: a role every member is given
+    /// would make each ping of it a turn, as `@everyone` would. The role the server made for the
+    /// bot itself counts either way, since only the bot holds it.
+    pub wake_on_held_roles: bool,
     /// How far back to fetch what was said while the gateway was not connected, each time it
     /// connects afresh. Zero turns it off.
     ///
@@ -668,6 +676,8 @@ struct FileDiscord {
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: bool,
+    #[serde(default)]
+    wake_on_held_roles: bool,
     #[serde(default = "default_backfill", with = "humantime_serde")]
     backfill: Duration,
 }
@@ -1001,6 +1011,7 @@ impl FileConfig {
                     presence: discord.presence,
                     mention_everyone: discord.mention_everyone,
                     mention_roles: discord.mention_roles,
+                    wake_on_held_roles: discord.wake_on_held_roles,
                     backfill: discord.backfill,
                 }),
             });

@@ -342,9 +342,7 @@ impl Item<'_> {
                 message
                     .sender_roles
                     .iter()
-                    // Quoted, since a role is named by whoever runs the server, and one called
-                    // "Moderators, Owner" would otherwise read as two.
-                    .map(|role| format!("{:?}", one_line(&sanitize(role, self.nonce))))
+                    .map(|role| role_label(role, self.nonce))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -380,7 +378,7 @@ impl Item<'_> {
         // from one that merely happened in front of the agent. Skipped in a direct chat, where
         // there is only ever one answer and it would be noise on every message.
         if message.chat_kind != ChatKind::Direct {
-            let _ = writeln!(out, "woke you: {}", describe_wake(message));
+            let _ = writeln!(out, "woke you: {}", describe_wake(message, self.nonce));
         }
 
         if let Some(origin) = &message.forwarded_from {
@@ -470,16 +468,36 @@ fn format_identities(identities: &[(String, Option<String>)]) -> Option<String> 
 /// delivery does not make it wrong.
 ///
 /// The connector reports one bit for `addressed`, so that wording is hedged where it cannot know
-/// which signal fired; guessing confidently would be worse.
+/// which signal fired; guessing confidently would be worse. A role ping is the exception and is
+/// said exactly: the connector names the roles only when they alone addressed the message, and the
+/// agent needs to know it was pinged as one of everyone holding them rather than named.
 ///
 /// A watch is the one reason the agent cannot work out for itself. It set the rule, but it has no
 /// way to see which rule a given message tripped, and that is exactly what it needs in order to
 /// retune one that is firing too often.
-fn describe_wake(message: &InboundMessage) -> String {
-    let addressed = match (message.addressed, &message.reply_to) {
-        (true, Some(_)) => Some("you were named, or this replies to something you said"),
-        (true, None) => Some("you were named"),
-        (false, _) => None,
+fn describe_wake(message: &InboundMessage, nonce: &str) -> String {
+    let addressed = match (
+        message.addressed,
+        message.pinged_roles.as_slice(),
+        &message.reply_to,
+    ) {
+        (false, ..) => None,
+        (true, [], Some(_)) => {
+            Some("you were named, or this replies to something you said".to_string())
+        }
+        (true, [], None) => Some("you were named".to_string()),
+        (true, [role], _) => Some(format!(
+            "a role you hold was mentioned, {}, which pings everyone holding it",
+            role_label(role, nonce)
+        )),
+        (true, roles, _) => Some(format!(
+            "roles you hold were mentioned, {}, which ping everyone holding them",
+            roles
+                .iter()
+                .map(|role| role_label(role, nonce))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     };
     match (addressed, describe_watches(&message.matches)) {
         (Some(addressed), Some(watches)) => format!("{addressed}, and {watches}"),
@@ -542,6 +560,12 @@ fn describe_hit(hit: &WatchHit) -> String {
         WatchHit::All(1) => "its 1 pattern".to_string(),
         WatchHit::All(count) => format!("all {count} patterns"),
     }
+}
+
+/// A role's name as a header line prints it: quoted, since a role is named by whoever runs the
+/// server, and one called "Moderators, Owner" would otherwise read as two.
+fn role_label(role: &str, nonce: &str) -> String {
+    format!("{:?}", one_line(&sanitize(role, nonce)))
 }
 
 /// A watch name as the wake line prints it.
@@ -715,6 +739,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            pinged_roles: Vec::new(),
             matches: Vec::new(),
             sender_roles: Vec::new(),
             text: text.to_string(),
@@ -795,6 +820,35 @@ mod tests {
         let rendered = render(message);
         assert!(
             rendered.contains("woke you: you were named"),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_ping_of_a_role_the_agent_holds_says_it_was_one_of_many() {
+        // Named and pinged with a crowd call for different answers, and the text alone cannot tell
+        // them apart: clients show both as an @name.
+        let mut message = message("can someone look at the deploy?");
+        message.chat_kind = ChatKind::Group;
+        message.addressed = true;
+        message.pinged_roles = vec!["On call".to_string()];
+        let rendered = render(message.clone());
+        assert!(
+            rendered.contains(
+                "woke you: a role you hold was mentioned, \"On call\", which pings everyone \
+                 holding it"
+            ),
+            "got {rendered}"
+        );
+        assert!(!rendered.contains("you were named"), "got {rendered}");
+
+        message.pinged_roles = vec!["On call".to_string(), "Moderators, Owner".to_string()];
+        let rendered = render(message);
+        assert!(
+            rendered.contains(
+                "woke you: roles you hold were mentioned, \"On call\", \"Moderators, Owner\", \
+                 which ping everyone holding them"
+            ),
             "got {rendered}"
         );
     }
@@ -1037,6 +1091,8 @@ mod tests {
         message.sender.username = Some(poison("bob"));
         message.sender.id = poison("1");
         message.sender_roles = vec![poison("Mods")];
+        message.addressed = true;
+        message.pinged_roles = vec![poison("On call")];
         message.chat_kind = ChatKind::Group;
         message.chat_title = Some(poison("Ops"));
         message.message_id = poison("42");

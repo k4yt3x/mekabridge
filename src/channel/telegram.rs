@@ -621,6 +621,7 @@ impl TelegramChannel {
             admission,
             sender_allowlisted,
             addressed: self.addressed(message),
+            pinged_roles: Vec::new(),
             // Filled by the gate, which is the only thing that knows what is being watched.
             matches: Vec::new(),
             sender_roles: Vec::new(),

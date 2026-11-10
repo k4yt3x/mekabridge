@@ -479,6 +479,7 @@ mod tests {
             admission: Admission::Chat,
             sender_allowlisted: false,
             addressed: false,
+            pinged_roles: Vec::new(),
             matches: Vec::new(),
             sender_roles: Vec::new(),
             text: text.to_string(),

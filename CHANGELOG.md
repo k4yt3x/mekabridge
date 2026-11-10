@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `wake_on_held_roles` lets a Discord mention of a role the bot holds wake the agent, labelled so.
+
 ### Fixed
 
 - Messages the model answers with an empty reply are offered again on Meka 0.92, as before.
 - Messages are no longer offered again after a hole in the session feed hid what their turn did.
+- On Discord, a mention of the role the server made for the bot wakes the agent, as a mention does.
 
 ## [0.25.0] - 2026-11-09
 

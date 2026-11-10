@@ -1017,6 +1017,14 @@ pub struct InboundMessage {
     /// they are decoded after an upgrade.
     #[serde(default)]
     pub addressed: bool,
+    /// Roles the agent holds whose mention is what addressed this message to it, by name.
+    ///
+    /// Set only when nothing more personal did, a mention of the agent itself or a reply to it,
+    /// and only on a platform that counts such roles: a role ping reaches everyone holding the
+    /// role, so the agent is told it was one of many rather than named. Empty everywhere else,
+    /// which is also how a message queued by an earlier release decodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinged_roles: Vec<String>,
     /// Watches the agent set that this message matched, in the order they were created.
     ///
     /// Empty on every message from a conversation that is not muted, since a watch decides nothing
@@ -2072,6 +2080,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            pinged_roles: Vec::new(),
             matches: Vec::new(),
             sender_roles: Vec::new(),
             text: "hello".to_string(),

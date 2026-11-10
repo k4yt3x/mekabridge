@@ -5,11 +5,13 @@
 //! create/update/delete events keep that current, so this is the gateway's own state mirrored.
 //! Fetching the same names over REST would be several round trips per line of chat.
 //!
-//! Deliberately holds nothing about people. Member names come from the message that mentions them,
-//! and keeping a list would need a second privileged intent for data the bridge already has.
+//! Deliberately holds nothing about people but the bot itself. Member names come from the message
+//! that mentions them, and keeping a list would need a second privileged intent for data the bridge
+//! already has. The bot's own roles are the exception: they decide which role mentions address it,
+//! and Discord announces them without that intent.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -18,7 +20,7 @@ use twilight_model::{
     guild::{Guild, Role},
     id::{
         Id,
-        marker::{ChannelMarker, GuildMarker, RoleMarker},
+        marker::{ChannelMarker, GuildMarker, RoleMarker, UserMarker},
     },
 };
 
@@ -26,7 +28,27 @@ use twilight_model::{
 #[derive(Debug, Default)]
 struct GuildEntry {
     name: String,
-    roles: HashMap<Id<RoleMarker>, String>,
+    roles: HashMap<Id<RoleMarker>, RoleEntry>,
+    /// The roles the bot itself holds here, from its own member object.
+    held: HashSet<Id<RoleMarker>>,
+}
+
+/// What is known about one role.
+#[derive(Debug)]
+struct RoleEntry {
+    name: String,
+    /// The bot this role was made for, when the server made it for one: the role Discord creates
+    /// when a bot joins with permissions, which only that bot holds.
+    bot: Option<Id<UserMarker>>,
+}
+
+impl RoleEntry {
+    fn of(role: &Role) -> Self {
+        Self {
+            name: role.name.clone(),
+            bot: role.tags.as_ref().and_then(|tags| tags.bot_id),
+        }
+    }
 }
 
 /// What is known about one channel, thread, or forum post.
@@ -60,8 +82,9 @@ impl NameCache {
                 roles: guild
                     .roles
                     .iter()
-                    .map(|role| (role.id, role.name.clone()))
+                    .map(|role| (role.id, RoleEntry::of(role)))
                     .collect(),
+                held: HashSet::new(),
             });
         }
         for channel in guild.channels.iter().chain(guild.threads.iter()) {
@@ -92,7 +115,7 @@ impl NameCache {
                 .entry(guild_id)
                 .or_default()
                 .roles
-                .insert(role.id, role.name.clone());
+                .insert(role.id, RoleEntry::of(role));
         }
     }
 
@@ -101,7 +124,46 @@ impl NameCache {
             && let Some(guild) = guilds.get_mut(&guild_id)
         {
             guild.roles.remove(&role_id);
+            guild.held.remove(&role_id);
         }
+    }
+
+    /// Take the roles the bot holds in a server, in place of whatever was known.
+    ///
+    /// Only for a server already announced: an update about one the cache does not hold would
+    /// otherwise make up a nameless server for it, which `doctor` would count.
+    pub fn set_held_roles(&self, guild_id: Id<GuildMarker>, roles: &[Id<RoleMarker>]) {
+        if let Ok(mut guilds) = self.guilds.write()
+            && let Some(guild) = guilds.get_mut(&guild_id)
+        {
+            guild.held = roles.iter().copied().collect();
+        }
+    }
+
+    /// Whether a role is the one the server made for `bot`, which nobody else can hold.
+    pub fn is_role_of_bot(
+        &self,
+        guild_id: Id<GuildMarker>,
+        role_id: Id<RoleMarker>,
+        bot: Id<UserMarker>,
+    ) -> bool {
+        let Ok(guilds) = self.guilds.read() else {
+            return false;
+        };
+        guilds
+            .get(&guild_id)
+            .and_then(|guild| guild.roles.get(&role_id))
+            .is_some_and(|role| role.bot == Some(bot))
+    }
+
+    /// Whether the bot holds a role in a server.
+    pub fn bot_holds(&self, guild_id: Id<GuildMarker>, role_id: Id<RoleMarker>) -> bool {
+        let Ok(guilds) = self.guilds.read() else {
+            return false;
+        };
+        guilds
+            .get(&guild_id)
+            .is_some_and(|guild| guild.held.contains(&role_id))
     }
 
     pub fn insert_channel(&self, channel: &Channel) {
@@ -153,7 +215,7 @@ impl NameCache {
         guilds
             .get(&guild_id)
             .and_then(|guild| guild.roles.get(&role_id))
-            .cloned()
+            .map(|role| role.name.clone())
     }
 
     /// Names for a member's roles, in the order the member object listed them.
@@ -169,7 +231,7 @@ impl NameCache {
         };
         roles
             .iter()
-            .filter_map(|role| guild.roles.get(role).cloned())
+            .filter_map(|role| guild.roles.get(role).map(|role| role.name.clone()))
             .collect()
     }
 
@@ -183,7 +245,7 @@ impl NameCache {
             guild
                 .roles
                 .iter()
-                .find(|(_, role_name)| role_name.eq_ignore_ascii_case(name))
+                .find(|(_, role)| role.name.eq_ignore_ascii_case(name))
                 .map(|(id, _)| *id)
         })
     }
@@ -195,7 +257,7 @@ impl NameCache {
         };
         let mut names: Vec<String> = guilds
             .get(&guild_id)
-            .map(|guild| guild.roles.values().cloned().collect())
+            .map(|guild| guild.roles.values().map(|role| role.name.clone()).collect())
             .unwrap_or_default();
         names.sort();
         names
@@ -404,6 +466,29 @@ mod tests {
         cache.insert_role(Id::new(900), &role);
         let names = cache.role_names(Id::new(900), &[Id::new(555), Id::new(556)]);
         assert_eq!(names, vec!["Moderators".to_string()]);
+    }
+
+    #[test]
+    fn what_the_bot_holds_goes_with_the_role_and_with_the_server() {
+        let cache = cache_with_guild();
+        cache.set_held_roles(Id::new(900), &[Id::new(555), Id::new(556)]);
+        cache.remove_role(Id::new(900), Id::new(555));
+        assert!(
+            !cache.bot_holds(Id::new(900), Id::new(555)),
+            "a deleted role is held by nobody"
+        );
+        assert!(cache.bot_holds(Id::new(900), Id::new(556)));
+        cache.remove_guild(Id::new(900));
+        assert!(
+            !cache.bot_holds(Id::new(900), Id::new(556)),
+            "nor is any role of a server it left"
+        );
+        cache.set_held_roles(Id::new(900), &[Id::new(556)]);
+        assert_eq!(
+            cache.size(),
+            (0, 0),
+            "an update about a server nobody announced makes none up"
+        );
     }
 
     #[test]

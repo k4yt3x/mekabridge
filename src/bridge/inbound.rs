@@ -3229,6 +3229,7 @@ mod tests {
             admission: Admission::User,
             sender_allowlisted: true,
             addressed: false,
+            pinged_roles: Vec::new(),
             matches: Vec::new(),
             sender_roles: Vec::new(),
             text: "look".to_string(),

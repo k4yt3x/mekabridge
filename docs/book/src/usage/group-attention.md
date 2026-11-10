@@ -13,7 +13,8 @@ because the agent is the only party that knows whether it is done.
 
 In a conversation on `mute`, which is the default for groups and server channels:
 
-- Somebody **names** it.
+- Somebody **names** it. On Discord that includes a mention of the role the server made for the
+  bot, which clients show as its name, and, with `wake_on_held_roles`, of a role it holds.
 - Somebody uses their client's **reply** button on one of its messages. This counts even with the
   ping turned off on Discord, because answering the agent is addressing it however the client
   renders it.
@@ -21,7 +22,7 @@ In a conversation on `mute`, which is the default for groups and server channels
 
 That is the whole list. Somebody answering the agent in ordinary prose, without naming it and
 without using reply, does not reach it, and neither does a follow-up typed straight after it has
-spoken. `@everyone`, `@here`, and role pings deliberately do not count either.
+spoken. `@everyone`, `@here`, and other role pings deliberately do not count either.
 
 The first two are somebody else's decision about the agent. The third is the agent's own, which is
 why it is the only one that can be set and unset at runtime.
@@ -51,6 +52,7 @@ Every message from a chat that is not one-to-one carries a `woke you:` line:
 ```
 woke you: you were named
 woke you: you were named, or this replies to something you said
+woke you: a role you hold was mentioned, "On call", which pings everyone holding it
 woke you: nothing here named you; this chat was being heard in full when it arrived
 woke you: this matched your watch "spam-signatures" (`看我简介`, spam signature) in the text
 woke you: this matched your watch "pump-and-dump" (all 3 patterns) in the text

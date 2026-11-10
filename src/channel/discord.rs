@@ -156,7 +156,40 @@ const WANTED_EVENTS: EventTypeFlags = EventTypeFlags::READY
     .union(EventTypeFlags::ROLE_CREATE)
     .union(EventTypeFlags::ROLE_UPDATE)
     .union(EventTypeFlags::ROLE_DELETE)
+    // Only ever the bot's own member: Discord sends it whatever the intents, and nobody else's
+    // without the members intent, which this connector does not ask for.
+    .union(EventTypeFlags::MEMBER_UPDATE)
     .union(EventTypeFlags::PRESENCE_UPDATE);
+
+/// What made a message address the bot. The debug log names it, and the agent is told when it was a
+/// role the bot holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Address {
+    /// A direct message, where there is nobody else it could be for.
+    DirectMessage,
+    /// The bot was mentioned, or replied to with the ping left on.
+    Mention,
+    /// The role the server made for the bot was mentioned, which clients show as the bot's own
+    /// name.
+    OwnRole,
+    /// A reply to something the bot said, with the ping turned off.
+    Reply,
+    /// Roles the bot holds were mentioned, by name, where `wake_on_held_roles` counts them.
+    HeldRoles(Vec<String>),
+}
+
+impl Address {
+    /// What the debug log calls it.
+    const fn signal(&self) -> &'static str {
+        match self {
+            Self::DirectMessage => "direct message",
+            Self::Mention => "mention",
+            Self::OwnRole => "the bot's own role",
+            Self::Reply => "reply",
+            Self::HeldRoles(_) => "a role the bot holds",
+        }
+    }
+}
 
 pub struct DiscordChannel {
     id: ChannelId,
@@ -174,11 +207,13 @@ pub struct DiscordChannel {
     presence: bool,
     mention_everyone: bool,
     mention_roles: bool,
+    /// See [`DiscordConfig::wake_on_held_roles`].
+    wake_on_held_roles: bool,
     names: Arc<NameCache>,
     /// Who is online, accumulated from the gateway. Empty and unused unless `presence` is set.
     presences: Arc<PresenceCache>,
     /// The bot's own account id, filled by [`Channel::run`] before the first event is read. It is
-    /// what `addressed` compares against, and what keeps the bot from answering itself.
+    /// what `address` compares against, and what keeps the bot from answering itself.
     identity: tokio::sync::OnceCell<Id<UserMarker>>,
     /// Direct-message channels already opened, so dialling the same person twice costs one call.
     dm_channels: RwLock<HashMap<Id<UserMarker>, Id<ChannelMarker>>>,
@@ -244,6 +279,7 @@ impl DiscordChannel {
             presence: config.presence,
             mention_everyone: config.mention_everyone,
             mention_roles: config.mention_roles,
+            wake_on_held_roles: config.wake_on_held_roles,
             names: NameCache::new(),
             presences: Arc::new(PresenceCache::default()),
             identity: tokio::sync::OnceCell::new(),
@@ -578,20 +614,25 @@ impl DiscordChannel {
         })
     }
 
-    /// Whether this message was aimed at the bot rather than merely said in front of it.
+    /// What aimed this message at the bot rather than merely saying it in front of it, or `None`.
     ///
     /// Discord answers this natively. `mentions` is a resolved array of user objects on every
     /// message, and replying with the ping left on puts the person being replied to in it, so one
-    /// id comparison covers both being named and being answered. No text is searched and no
-    /// username is compared.
+    /// id comparison covers both being named and being answered. `mention_roles` is the same for
+    /// roles. No text is searched and no name is compared.
     ///
-    /// Role pings and `@everyone` deliberately do not count. Both are broadcasts rather than
-    /// address, and counting them would make one `@everyone` in a large server the cheapest
-    /// possible way for anyone to force a turn.
-    fn addressed(&self, message: &Message, channel_kind: Option<ChannelType>) -> bool {
+    /// `@everyone` and role pings are broadcasts rather than address, and counting them would make
+    /// one `@everyone` in a large server the cheapest possible way for anyone to force a turn. Two
+    /// kinds of role are not broadcasts in that sense: the one the server made for the bot, which
+    /// only the bot holds and clients show as its name, and, where `wake_on_held_roles` is on, a
+    /// role the bot was given, which pings it among everyone else holding it.
+    fn address(&self, message: &Message, channel_kind: Option<ChannelType>) -> Option<Address> {
         // In a direct message there is nobody else it could be for.
-        if matches!(channel_kind, Some(ChannelType::Private)) || message.guild_id.is_none() {
-            return true;
+        let Some(guild_id) = message.guild_id else {
+            return Some(Address::DirectMessage);
+        };
+        if matches!(channel_kind, Some(ChannelType::Private)) {
+            return Some(Address::DirectMessage);
         }
         let Some(me) = self.identity.get() else {
             tracing::warn!(
@@ -599,19 +640,41 @@ impl DiscordChannel {
                 "the bot's own identity is unknown, so mentions cannot be recognised; treating \
                  this message as not addressed to it"
             );
-            return false;
+            return None;
         };
         if message.mentions.iter().any(|mention| mention.id == *me) {
-            return true;
+            return Some(Address::Mention);
+        }
+        if message
+            .mention_roles
+            .iter()
+            .any(|role| self.names.is_role_of_bot(guild_id, *role, *me))
+        {
+            return Some(Address::OwnRole);
         }
         // A reply with the ping turned off is not in `mentions`, but answering the agent is still
         // addressing it. Only a reply: a thread's stand-in for its first message references that
         // message too, without answering anybody.
-        message.kind == MessageType::Reply
+        if message.kind == MessageType::Reply
             && message
                 .referenced_message
                 .as_ref()
                 .is_some_and(|replied| replied.author.id == *me)
+        {
+            return Some(Address::Reply);
+        }
+        if !self.wake_on_held_roles {
+            return None;
+        }
+        // A held role the cache cannot name does not count: the agent is told which role woke it,
+        // and a role it cannot be told about is one it has no way to judge.
+        let held: Vec<String> = message
+            .mention_roles
+            .iter()
+            .filter(|role| self.names.bot_holds(guild_id, **role))
+            .filter_map(|role| self.names.role_name(guild_id, *role))
+            .collect();
+        (!held.is_empty()).then_some(Address::HeldRoles(held))
     }
 
     /// Resolve a conversation id to the channel a message would go to.
@@ -942,6 +1005,16 @@ impl DiscordChannel {
         let reply_to = self.reply_of(message);
 
         let edited_at = message.edited_timestamp.and_then(timestamp_to_chrono);
+        let address = self.address(message, channel_kind);
+        if let Some(address) = &address {
+            tracing::debug!(
+                channel = %self.id,
+                discord_channel = %message.channel_id,
+                message_id = %message.id,
+                signal = address.signal(),
+                "a message addressed the bot"
+            );
+        }
 
         Some(InboundEvent::Message(Box::new(InboundMessage {
             channel: self.id.clone(),
@@ -958,7 +1031,11 @@ impl DiscordChannel {
             sender: sender_of(message),
             admission,
             sender_allowlisted,
-            addressed: self.addressed(message, channel_kind),
+            addressed: address.is_some(),
+            pinged_roles: match address {
+                Some(Address::HeldRoles(names)) => names,
+                _ => Vec::new(),
+            },
             // Filled by the gate, which is the only thing that knows what is being watched.
             matches: Vec::new(),
             sender_roles: message
@@ -1153,6 +1230,19 @@ impl DiscordChannel {
                     *guild
                 {
                     self.names.insert_guild(&guild);
+                    // Discord includes the bot's own member in every server it announces, whatever
+                    // the intents.
+                    if let Some(me) = self.identity.get() {
+                        match guild.members.iter().find(|member| member.user.id == *me) {
+                            Some(own) => self.names.set_held_roles(guild.id, &own.roles),
+                            None => tracing::debug!(
+                                channel = %self.id,
+                                guild_id = %guild.id,
+                                "Discord announced a server without the bot's own member, so the \
+                                 roles it holds there are unknown until they change"
+                            ),
+                        }
+                    }
                     // Skipped entirely when the intent is off, because nothing reads the cache
                     // in that case: `presence_of` answers `None` before it is consulted. Seeding
                     // anyway would hold a map of every member of every server for no reader.
@@ -1219,6 +1309,11 @@ impl DiscordChannel {
             Event::RoleCreate(role) => self.names.insert_role(role.guild_id, &role.role),
             Event::RoleUpdate(role) => self.names.insert_role(role.guild_id, &role.role),
             Event::RoleDelete(role) => self.names.remove_role(role.guild_id, role.role_id),
+            Event::MemberUpdate(update) => {
+                if self.identity.get().is_some_and(|me| *me == update.user.id) {
+                    self.names.set_held_roles(update.guild_id, &update.roles);
+                }
+            }
             Event::MessageCreate(message) => {
                 self.place_arrival(&message.0).await;
                 let kind = self.names.kind_of(message.channel_id);
@@ -2029,7 +2124,7 @@ impl Channel for DiscordChannel {
         sink: mpsc::Sender<InboundEvent>,
         shutdown: CancellationToken,
     ) -> Result<(), ChannelError> {
-        // Primed before the first event, because `addressed` compares against it and a message
+        // Primed before the first event, because `address` compares against it and a message
         // arriving first would be judged as not addressed to a bot whose id is unknown.
         let identity = self.probe().await?;
         let me = identity
@@ -3442,12 +3537,13 @@ mod tests {
             presence: false,
             mention_everyone: false,
             mention_roles: false,
+            wake_on_held_roles: false,
             backfill: Duration::from_secs(24 * 60 * 60),
         };
         DiscordChannel::new(ChannelId::new("discord"), &config).expect("constructs")
     }
 
-    /// A channel that knows who it is, which is what `addressed` needs.
+    /// A channel that knows who it is, which is what `address` needs.
     fn identified() -> DiscordChannel {
         // Granted the server as well as the person: the user list no longer admits anybody in a
         // server channel, and these fixtures are server messages.
@@ -3615,7 +3711,10 @@ mod tests {
                 "public_flags": 0,
             }],
         }));
-        assert!(channel.addressed(&message, Some(ChannelType::GuildText)));
+        assert_eq!(
+            channel.address(&message, Some(ChannelType::GuildText)),
+            Some(Address::Mention)
+        );
     }
 
     #[tokio::test]
@@ -3646,7 +3745,10 @@ mod tests {
                 "type": 0,
             },
         }));
-        assert!(channel.addressed(&message, Some(ChannelType::GuildText)));
+        assert_eq!(
+            channel.address(&message, Some(ChannelType::GuildText)),
+            Some(Address::Reply)
+        );
     }
 
     /// A message Discord nested inside another, as the one a reply answers.
@@ -3961,23 +4063,219 @@ mod tests {
             "mention_everyone": true,
             "mention_roles": ["555"],
         }));
-        assert!(!channel.addressed(&message, Some(ChannelType::GuildText)));
+        assert_eq!(
+            channel.address(&message, Some(ChannelType::GuildText)),
+            None
+        );
     }
 
     #[tokio::test]
     async fn ordinary_chatter_does_not_wake_the_agent() {
         let channel = identified();
-        assert!(!channel.addressed(
-            &message(serde_json::json!({})),
-            Some(ChannelType::GuildText)
-        ));
+        assert_eq!(
+            channel.address(
+                &message(serde_json::json!({})),
+                Some(ChannelType::GuildText)
+            ),
+            None
+        );
     }
 
     #[tokio::test]
     async fn a_direct_message_is_always_addressed() {
         let channel = identified();
         let message = message(serde_json::json!({"guild_id": null}));
-        assert!(channel.addressed(&message, Some(ChannelType::Private)));
+        assert_eq!(
+            channel.address(&message, Some(ChannelType::Private)),
+            Some(Address::DirectMessage)
+        );
+    }
+
+    /// A role in server 900, made for `bot` when one is named.
+    fn server_role(id: &str, name: &str, bot: Option<&str>) -> twilight_model::guild::Role {
+        let mut value = serde_json::json!({
+            "id": id,
+            "name": name,
+            "color": 0,
+            "colors": {"primary_color": 0},
+            "flags": 0,
+            "hoist": false,
+            "managed": bot.is_some(),
+            "mentionable": true,
+            "permissions": "0",
+            "position": 1,
+        });
+        if let Some(bot) = bot {
+            value["tags"] = serde_json::json!({ "bot_id": bot });
+        }
+        serde_json::from_value(value).expect("a role fixture deserializes")
+    }
+
+    /// A message in server 900 pinging these roles.
+    fn pinging(roles: &[&str]) -> Message {
+        message(serde_json::json!({ "mention_roles": roles }))
+    }
+
+    #[tokio::test]
+    async fn the_role_made_for_the_bot_names_it() {
+        // Clients show it as the bot's own name, and only the bot holds it, so it is not a
+        // broadcast whatever role pings are otherwise.
+        let channel = identified();
+        channel
+            .names
+            .insert_role(Id::new(900), &server_role("777", "Stella", Some("99")));
+        channel
+            .names
+            .insert_role(Id::new(900), &server_role("778", "OtherBot", Some("42")));
+        assert_eq!(
+            channel.address(&pinging(&["777"]), Some(ChannelType::GuildText)),
+            Some(Address::OwnRole)
+        );
+        assert_eq!(
+            channel.address(&pinging(&["778"]), Some(ChannelType::GuildText)),
+            None,
+            "another bot's role is that bot's"
+        );
+        let Some(InboundEvent::Message(event)) =
+            channel.to_event(&pinging(&["777"]), Some(ChannelType::GuildText))
+        else {
+            panic!("the message is delivered");
+        };
+        assert!(event.addressed);
+        assert!(
+            event.pinged_roles.is_empty(),
+            "the agent was named, not pinged with a crowd"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_role_the_bot_holds_wakes_it_only_where_that_is_switched_on() {
+        let mut channel = identified();
+        channel
+            .names
+            .insert_role(Id::new(900), &server_role("555", "On call", None));
+        channel
+            .names
+            .insert_role(Id::new(900), &server_role("556", "Design", None));
+        channel.names.set_held_roles(Id::new(900), &[Id::new(555)]);
+        assert_eq!(
+            channel.address(&pinging(&["555"]), Some(ChannelType::GuildText)),
+            None,
+            "off by default, as a broadcast"
+        );
+
+        channel.wake_on_held_roles = true;
+        assert_eq!(
+            channel.address(&pinging(&["555", "556"]), Some(ChannelType::GuildText)),
+            Some(Address::HeldRoles(vec!["On call".to_string()]))
+        );
+        assert_eq!(
+            channel.address(&pinging(&["556"]), Some(ChannelType::GuildText)),
+            None,
+            "a role the bot does not hold pings other people"
+        );
+        // Named as well as pinged, it was named.
+        let mut named = pinging(&["555"]);
+        named.mentions = message(serde_json::json!({
+            "mentions": [{
+                "id": "99",
+                "username": "mekabot",
+                "discriminator": "0",
+                "avatar": null,
+                "bot": true,
+                "public_flags": 0,
+            }],
+        }))
+        .mentions;
+        assert_eq!(
+            channel.address(&named, Some(ChannelType::GuildText)),
+            Some(Address::Mention)
+        );
+        let Some(InboundEvent::Message(event)) =
+            channel.to_event(&pinging(&["555"]), Some(ChannelType::GuildText))
+        else {
+            panic!("the message is delivered");
+        };
+        assert!(event.addressed);
+        assert_eq!(event.pinged_roles, vec!["On call".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_bot_learns_its_own_roles_from_the_gateway() {
+        let channel = identified();
+        let (sender, _receiver) = mpsc::channel(4);
+        let member = |id: &str, roles: &[&str]| {
+            serde_json::json!({
+                "user": {
+                    "id": id, "username": "someone", "discriminator": "0", "avatar": null,
+                },
+                "roles": roles,
+                "joined_at": "2026-01-01T00:00:00.000000+00:00",
+                "deaf": false,
+                "mute": false,
+                "flags": 0,
+            })
+        };
+        let guild: twilight_model::guild::Guild = serde_json::from_value(serde_json::json!({
+            "id": "900",
+            "name": "Acme Corp",
+            "afk_timeout": 300,
+            "default_message_notifications": 0,
+            "explicit_content_filter": 0,
+            "features": [],
+            "icon": null,
+            "mfa_level": 0,
+            "nsfw_level": 0,
+            "owner_id": "1",
+            "preferred_locale": "en-US",
+            "premium_progress_bar_enabled": false,
+            "premium_tier": 0,
+            "system_channel_flags": 0,
+            "verification_level": 0,
+            "roles": [
+                serde_json::to_value(server_role("555", "On call", None)).expect("serializes"),
+                serde_json::to_value(server_role("556", "Design", None)).expect("serializes"),
+            ],
+            "members": [member("99", &["555"]), member("7", &["556"])],
+            "channels": [],
+            "threads": [],
+            "emojis": [],
+            "stickers": [],
+        }))
+        .expect("a server fixture deserializes");
+        channel
+            .handle(
+                Event::GuildCreate(Box::new(
+                    twilight_model::gateway::payload::incoming::GuildCreate::Available(guild),
+                )),
+                &sender,
+            )
+            .await;
+        assert!(channel.names.bot_holds(Id::new(900), Id::new(555)));
+        assert!(
+            !channel.names.bot_holds(Id::new(900), Id::new(556)),
+            "another member's role is not the bot's"
+        );
+
+        let update = |id: &str, roles: &[&str]| {
+            let mut value = member(id, roles);
+            value["guild_id"] = serde_json::json!("900");
+            value["pending"] = serde_json::json!(false);
+            Event::MemberUpdate(Box::new(
+                serde_json::from_value(value).expect("a member update deserializes"),
+            ))
+        };
+        channel.handle(update("99", &["556"]), &sender).await;
+        assert!(
+            !channel.names.bot_holds(Id::new(900), Id::new(555)),
+            "an update replaces what the bot held"
+        );
+        assert!(channel.names.bot_holds(Id::new(900), Id::new(556)));
+        channel.handle(update("7", &[]), &sender).await;
+        assert!(
+            channel.names.bot_holds(Id::new(900), Id::new(556)),
+            "somebody else's update says nothing about the bot"
+        );
     }
 
     /// A `TYPING_START` as the gateway delivers it.

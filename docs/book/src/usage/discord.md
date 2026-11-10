@@ -58,9 +58,11 @@ Server channels default to **mentions only**, and direct messages are heard in f
 What wakes the agent in a muted channel:
 
 - Being **@mentioned by name**.
+- A mention of **the role the server made for the bot**. Discord creates it when a bot joins with permissions, names it after the bot, and lets nobody else hold it, and clients show a mention of it as `@Name` exactly like a mention of the bot, so it counts as one.
 - A **reply** to one of its messages. Discord adds the bot to the message's mention list when the reply keeps its ping, and the bridge also treats a reply with the ping turned off as addressing it.
+- With `wake_on_held_roles = true`, a mention of **a role the bot holds**. The agent is told it was pinged along with everyone else holding the role, so it can tell a crowd from being named. Off by default: the bridge cannot see how many people hold a role without the privileged members intent, and a role every member is given would make each ping of it a turn, as `@everyone` would.
 
-What deliberately does not: `@everyone`, `@here`, and role pings. Those are broadcasts rather than address, and counting them would make one `@everyone` in a large server the cheapest possible way for anybody to force a turn.
+What deliberately does not: `@everyone`, `@here`, and other role pings. Those are broadcasts rather than address, and counting them would make one `@everyone` in a large server the cheapest possible way for anybody to force a turn.
 
 Nor does an ordinary message, however soon after the agent last spoke there. Until 0.7.0 a five-minute window followed the agent's own message and delivered everything said in the channel meanwhile, which in a busy channel meant delivering the channel.
 
@@ -110,7 +112,7 @@ a19f4c>>>
 - **`chat`** says where the message was said as one path, outermost first. A thread reads `Acme Corp › #deploys › rollback tonight`, so the agent can tell a tangent from the room it came out of. The same text becomes the conversation's title in `conversation_list`, though a message that knows less, one whose server name has not arrived say, does not shorten a title already there.
 - **`parent`** appears on a message in a thread, and is the conversation id of the channel the thread was started in, so the agent can post there, read it or mute it. A post in a forum or media channel has none, since those take posts rather than messages, and neither does a thread whose channel the bridge could not look up.
 - **`server`** is the server's id, on every message from one. Its name is already in `chat`; the id is what tells two servers of the same name apart and survives a rename.
-- **`woke you`** appears on every message from a channel rather than a direct message, including ones nothing addressed, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest.
+- **`woke you`** appears on every message from a channel rather than a direct message, including ones nothing addressed, so it says what pulled it into a chat it is otherwise half listening to. It is hedged when the message both names the agent and replies to somebody, because the bridge is told one bit and will not invent the rest. A ping of a role the agent holds is said exactly: `woke you: a role you hold was mentioned, "On call", which pings everyone holding it`.
 - **`admitted`** gains two grants on Discord. `role allowlist` means the sender holds a role you allowed, so an operator granted access deliberately but nobody looked at the account. `server allowlist` means neither the person nor the channel was allowlisted, only the server they are both in. The clause after the semicolon is a separate fact: whether the sender is on `allowed_users`, which on Discord admits direct messages only and so never appears as the grant here.
 
 ### Mentions are resolved to names

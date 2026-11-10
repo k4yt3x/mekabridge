@@ -8701,9 +8701,15 @@ async fn a_refusal_that_needs_an_operator_is_given_up_on_at_once() {
         .await
         .expect("queued");
 
+    // The chat is apologised to before the owner hears, so the first notice is not the one this
+    // waits for.
     harness
         .wait_for("the owner to be told", |harness| {
-            !harness.channel.sent().is_empty()
+            harness
+                .channel
+                .sent()
+                .iter()
+                .any(|(conversation, _)| conversation == "mock:99")
         })
         .await;
     assert_eq!(harness.attempts(), 1, "an operator's problem is not a wait");

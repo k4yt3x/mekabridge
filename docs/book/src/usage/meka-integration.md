@@ -410,7 +410,7 @@ The rule exists to keep an agent from stopping halfway through a job, and this b
 
 A deferred item holds no turn while it waits. Deferral is how Meka's tool descriptions and its nudge tell the agent to hold an item that waits on a person, an event or an explicit later, so the cost falls on items left pending or in progress, not on one the agent is waiting out. The exception is an item deferred on a background task: it reopens once the task reports, and the turn the report lands in cannot end until the agent deals with it again. A report that comes while a turn is still calling tools lands in that turn, even one answering somebody's message, rather than opening a turn of its own.
 
-The bridge does not read the list. It ignores the feed's `checklist.updated` and `turn.nudged`, logs each nudge at info as a `meka notice: checklist: ...` line, and logs a turn that ended with items still open as a warning; see [Logs worth knowing](./operations.md#logs-worth-knowing).
+The bridge does not read the list. It ignores the feed's `checklist.updated` and `turn.nudged`, logs each nudge at info as a `Meka notice: Checklist: ...` line, and logs a turn that ended with items still open as a warning; see [Logs worth knowing](./operations.md#logs-worth-knowing).
 
 The only way to turn it off is Meka's, and it applies to every session on that Meka, not just this bridge's:
 

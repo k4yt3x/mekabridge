@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Messages the model answers with an empty reply are offered again on Meka 0.92, as before.
+- Messages are no longer offered again after a hole in the session feed hid what their turn did.
+
 ## [0.25.0] - 2026-11-09
 
 ### Changed

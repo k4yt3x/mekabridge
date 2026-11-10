@@ -1821,7 +1821,7 @@ async fn apply(
                 return false;
             };
             typist.begin(turn);
-            turns.entry(turn.to_string()).or_default();
+            turns.entry(turn.to_string()).or_default().note(event);
             match source {
                 TurnSource::Inbox { item_ids } => {
                     let mut conversations = BTreeSet::new();
@@ -2033,6 +2033,11 @@ async fn apply(
                     tracing::error!("failed to reset the feed position: {}", error);
                 }
             }
+            // What a running turn did in the hole is unknown, so from here its silence cannot be
+            // taken for a turn that did nothing.
+            for tally in turns.values_mut() {
+                tally.unbroken = false;
+            }
             // Everything Meka has, however recently: the event says events were dropped, and
             // nothing here can say which.
             reconcile(context, session_id, Utc::now()).await;
@@ -2146,13 +2151,15 @@ async fn finish(
             if let Err(error) = context.store.mark_turn_completed(Utc::now()).await {
                 tracing::error!("failed to record the turn timestamp: {}", error);
             }
-            // A turn that produced Meka's empty-response stand-in and called nothing did no work
-            // at all: no message was sent, no tool ran. Offering the messages again is therefore
-            // free of side effects, and far better than leaving somebody who just messaged the bot
-            // in silence. No wait before the next claim: the agent is idle, and the only cost of
-            // one would be the silence going on longer.
+            // A turn whose model came back empty and called nothing did no work at all: no message
+            // was sent, no tool ran. Offering the messages again is therefore free of side effects,
+            // and far better than leaving somebody who just messaged the bot in silence. No wait
+            // before the next claim: the agent is idle, and the only cost of one would be the
+            // silence going on longer.
             if tally.produced_nothing(&stop_reason) {
+                // The stop says why: from Meka 0.92 there is no stand-in text to name it.
                 tracing::warn!(
+                    stop_reason = %stop_reason,
                     text = %tally.text_preview.trim(),
                     "the model returned an empty response and called no tools; offering its \
                      messages again"

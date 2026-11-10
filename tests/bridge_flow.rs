@@ -123,11 +123,17 @@ enum TurnScript {
     /// The ordinary turn: the model reads the item and answers through a send tool.
     #[default]
     Answer,
-    /// The model reads the item and says nothing at all, which is legal.
+    /// The model reads the item and writes text but sends nothing, which is legal.
     Silent,
-    /// The model reads the item and comes back with Meka's empty-response stand-in, having called
-    /// nothing. Provably inert, so the messages may be offered again.
+    /// The model reads the item and comes back with an empty reply, having called nothing, which
+    /// from Meka 0.92 streams no text at all. Provably inert, so the messages may be offered again.
     Empty,
+    /// [`Self::Empty`] as a Meka before 0.92 streams it, with a bracketed stand-in as the assistant
+    /// text.
+    EmptyStandIn,
+    /// The model reads the item and answers it, but every event saying so is lost to a hole in the
+    /// feed: the bridge hears the read, a `feed.gap`, and an end with no words.
+    SentInHole,
     /// The model reads the item and the turn then fails, with nothing sent.
     FailAfterReading,
     /// The model reads the item, answers somebody, and the turn then fails. Nothing may be offered
@@ -888,11 +894,20 @@ async fn run_turn(recorder: Arc<MekaRecorder>) {
             );
             finish(&feed, &turn, "end_turn");
         }
-        TurnScript::Empty => {
+        TurnScript::Empty => finish(&feed, &turn, "end_turn"),
+        TurnScript::EmptyStandIn => {
             feed.push(
                 "assistant_text.delta",
                 Some(&turn),
                 serde_json::json!({ "text": "[The model returned an empty response.]" }),
+            );
+            finish(&feed, &turn, "end_turn");
+        }
+        TurnScript::SentInHole => {
+            feed.push(
+                "feed.gap",
+                None,
+                serde_json::json!({ "session_id": "s", "dropped": 3 }),
             );
             finish(&feed, &turn, "end_turn");
         }
@@ -8155,11 +8170,61 @@ async fn a_bridge_restarted_mid_turn_draws_the_message_that_turn_goes_on_to_writ
 
 #[tokio::test]
 async fn a_model_that_came_back_empty_has_its_batch_offered_again() {
-    // Meka streams a bracketed stand-in when a turn yields no content at all. Paired with no tool
-    // calls that is provably inert: nothing was sent and nothing ran, so offering the messages
-    // again repeats nothing, and is far better than leaving somebody who has just messaged the bot
-    // in silence.
-    let harness = Harness::start_script_with(TurnScript::Empty, Setup {
+    offers_an_empty_reply_again(TurnScript::Empty).await;
+}
+
+#[tokio::test]
+async fn a_model_that_came_back_empty_before_meka_0_92_has_its_batch_offered_again() {
+    offers_an_empty_reply_again(TurnScript::EmptyStandIn).await;
+}
+
+#[tokio::test]
+async fn an_end_with_no_words_after_a_hole_in_the_feed_is_not_offered_again() {
+    // The hole may have held the send that answered the message, so the silence after it proves
+    // nothing, and offering the message again could answer the person twice.
+    let harness = Harness::start_script(TurnScript::SentInHole).await;
+    harness
+        .sender
+        .send(message("are you there?", "1"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for("the turn to end", |harness| {
+            harness.turns().len() == 1
+                && harness
+                    .recorder
+                    .in_turn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_none()
+        })
+        .await;
+
+    // A later turn is read after the first one's end, so by the time it is answered, an offer the
+    // first one made would have been handed over too.
+    harness
+        .recorder
+        .set(&harness.recorder.script, TurnScript::Answer);
+    harness
+        .sender
+        .send(message("still there?", "2"))
+        .await
+        .expect("queued");
+    harness
+        .wait_for_queue("both messages to be delivered", |stats| stats.done == 2)
+        .await;
+    assert_eq!(
+        harness.items().len(),
+        2,
+        "the message read before the hole was handed over again"
+    );
+}
+
+/// A turn that came back empty and called nothing is provably inert: nothing was sent and nothing
+/// ran, so offering the messages again repeats nothing, and is far better than leaving somebody who
+/// has just messaged the bot in silence.
+async fn offers_an_empty_reply_again(script: TurnScript) {
+    let harness = Harness::start_script_with(script, Setup {
         max_offers: 3,
         ..Setup::default()
     })

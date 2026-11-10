@@ -167,7 +167,7 @@ The line running through all of it: a hand-over is spent when the feed says the 
 | Meka says the feed has a hole in it (`feed.gap`) | The same question, for every hand-over out. The event is the cue rather than the mechanism, since every reconnect asks as well |
 | An attachment is too large to view, or the profile has no vision | `attachment_view` returns a description naming the file and pointing at `attachment_download`, rather than failing |
 | Meka reports the session is gone | A replacement is bound and anything not yet accepted posted into it. Anything the old session had is closed, and its messages come back as a backlog rather than being replayed blind |
-| The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the messages are offered again rather than silently dropped |
+| The model returns an empty response | No tool ran and nothing was sent, so the turn is provably inert and the messages are offered again rather than silently dropped. Not a turn a `feed.gap` cut through, whose calls may have been in the hole |
 | Queue full | The message is dropped and counted; the next item handed over tells the agent how many it did not see |
 | Undecodable queue payload | Discarded rather than offered again, since it will never become readable and would wedge everything behind it |
 | Channel stops with an error | Logged; other channels keep running and the process stays up so the log is reachable |

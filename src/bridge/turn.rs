@@ -72,8 +72,9 @@ impl Presence {
 /// Meka's config, so the match is on the suffix.
 pub const SEND_TOOL_SUFFIX: &str = "__message_send";
 
-/// How much assistant text to keep for diagnostics. Enough to hold any of Meka's empty-turn
-/// stand-ins whole, and to show the opening of a real answer that never got delivered.
+/// How much assistant text to keep for diagnostics. Enough to hold whole any stand-in a Meka before
+/// 0.92 writes for an empty turn, and to show the opening of a real answer that never got
+/// delivered.
 const TEXT_PREVIEW_CHARS: usize = 240;
 
 /// Ceiling on how many turns are tracked at once, past which what is held is dropped.
@@ -101,6 +102,13 @@ pub struct TurnTally {
     /// produced instead. Without it an operator has to query Meka's message API to find out why a
     /// message went unanswered, which is a poor thing to need at 3am.
     pub text_preview: String,
+    /// Whether any of that text held more than whitespace. Kept apart from the preview, which
+    /// stops growing, so a long run of whitespace ahead of an answer cannot pass for no answer.
+    pub visible_text: bool,
+    /// Whether this tally holds the whole turn: it began at the turn's own `turn.started`, and no
+    /// hole in the feed has passed through it since. Only then can the absence of calls and words
+    /// mean there were none.
+    pub unbroken: bool,
     /// This bridge's messages the model read in this turn, by queue sequence. Filled from
     /// `inbox.delivered`, not from the turn's opening: a turn opened on an item and failed before
     /// the provider accepted the request never showed the model anything.
@@ -108,11 +116,21 @@ pub struct TurnTally {
 }
 
 impl TurnTally {
-    /// Count what `event` says the agent did.
+    /// Count what `event` says the agent did, and whether this tally saw the turn begin.
     pub fn note(&mut self, event: &TurnEvent) {
         match event {
+            // A rejoin announces a turn already under way, whose earlier events this tally may not
+            // hold, and leaves a tally that does hold them as it was.
+            TurnEvent::Started { resumed, .. } => {
+                if !resumed {
+                    self.unbroken = true;
+                }
+            }
             TurnEvent::AssistantText { text } => {
                 self.text_length += text.chars().count();
+                if !text.trim().is_empty() {
+                    self.visible_text = true;
+                }
                 // Bounded: a long answer would otherwise be held in memory for a log line.
                 if self.text_preview.chars().count() < TEXT_PREVIEW_CHARS {
                     self.text_preview.push_str(text);
@@ -138,15 +156,24 @@ impl TurnTally {
 
     /// Whether the turn did nothing at all because the model came back empty.
     ///
-    /// Meka streams a bracketed stand-in as the assistant text when a turn yields no content, and
-    /// paired with zero tool calls that is provably inert, so what it read can be offered again.
-    /// Refusals are excluded, being a real answer.
+    /// From Meka 0.92 an empty reply streams no text at all; a Meka before it streams a bracketed
+    /// stand-in as the assistant text instead. Either, paired with zero tool calls, is provably
+    /// inert, so what it read can be offered again. Refusals are excluded, being a real answer.
+    /// Every other stop is offered again, a content filter's included, which keeps every supported
+    /// Meka alike: one before 0.92 reports that stop as an `end_turn` with a stand-in.
     ///
-    /// Matching Meka's wording is brittle but degrades safely: a rewording leaves the turn treated
-    /// as silent and logged rather than offered again.
+    /// Only an [unbroken](Self::unbroken) tally can say so. One that joined the turn partway, or
+    /// that a hole in the feed passed through, may be missing the very calls that make offering
+    /// again unsafe, and a person answered twice is worse than an empty turn logged as silent.
+    ///
+    /// Matching the stand-in's wording is brittle but degrades safely: a rewording leaves the turn
+    /// treated as silent and logged rather than offered again.
     pub fn produced_nothing(&self, stop_reason: &str) -> bool {
-        if self.tool_calls > 0 || stop_reason == "refusal" {
+        if !self.unbroken || self.tool_calls > 0 || stop_reason == "refusal" {
             return false;
+        }
+        if !self.visible_text {
+            return true;
         }
         let text = self.text_preview.trim();
         text.starts_with("[The model ") && text.ends_with(']')
@@ -546,6 +573,16 @@ mod tests {
         }
     }
 
+    fn started(resumed: bool) -> TurnEvent {
+        TurnEvent::Started {
+            started_at: String::new(),
+            source: crate::meka::sse::TurnSource::Inbox {
+                item_ids: Vec::new(),
+            },
+            resumed,
+        }
+    }
+
     /// A turn is forgotten on its terminal, and a terminal lost to a replay hole would otherwise
     /// leave its entry behind for good. Bounded by dropping the lot, with every window cancelled
     /// so nothing is left claiming somebody is being written to.
@@ -791,8 +828,10 @@ mod tests {
         );
     }
 
+    /// A tally of a turn followed from its own start, as every turn the feed carries live is.
     fn tally(sends: usize, tool_calls: usize, text: &str) -> TurnTally {
         let mut tally = TurnTally::default();
+        tally.note(&started(false));
         for _ in 0..sends {
             tally.note(&executing("mcp__meka-bridge__message_send"));
         }
@@ -814,8 +853,8 @@ mod tests {
 
     #[test]
     fn a_model_that_returned_nothing_is_recognised() {
-        // Meka's stand-in for a turn with no content. Nothing ran, so what it read can be offered
-        // again.
+        // The stand-in a Meka before 0.92 writes for a turn with no content. Nothing ran, so what
+        // it read can be offered again.
         assert!(
             tally(0, 0, "[The model returned an empty response.]").produced_nothing("end_turn")
         );
@@ -835,6 +874,11 @@ mod tests {
             )
             .produced_nothing("max_tokens")
         );
+        // From Meka 0.92 an empty reply streams no text at all, whatever stopped it, and a reply of
+        // whitespace holds no more than that.
+        assert!(tally(0, 0, "").produced_nothing("end_turn"));
+        assert!(tally(0, 0, "").produced_nothing("content_filter"));
+        assert!(tally(0, 0, " \n").produced_nothing("end_turn"));
     }
 
     #[test]
@@ -848,6 +892,36 @@ mod tests {
         );
         // A refusal is a real answer, not a failure to produce one.
         assert!(!tally(0, 0, "[The model declined to respond.]").produced_nothing("refusal"));
+        // Nor does the lack of words make either safe: a call with no text around it still ran, and
+        // a refusal with no words in it is still a refusal.
+        assert!(!tally(0, 1, "").produced_nothing("end_turn"));
+        assert!(!tally(0, 0, "").produced_nothing("refusal"));
+        // An answer behind more whitespace than the preview holds is still an answer.
+        let mut padded = tally(0, 0, &" ".repeat(TEXT_PREVIEW_CHARS * 2));
+        padded.note(&TurnEvent::AssistantText {
+            text: "Sure, here is what I found.".to_string(),
+        });
+        assert!(!padded.produced_nothing("end_turn"));
+    }
+
+    #[test]
+    fn a_tally_without_the_whole_turn_cannot_call_it_empty() {
+        // Joined partway, by a rejoin or by any later event, it may have missed calls that came
+        // before it.
+        let mut joined = TurnTally::default();
+        joined.note(&started(true));
+        assert!(!joined.produced_nothing("end_turn"));
+        assert!(!TurnTally::default().produced_nothing("end_turn"));
+        // A hole in the feed may have swallowed them just the same, stand-in or not.
+        for text in ["", "[The model returned an empty response.]"] {
+            let mut holed = tally(0, 0, text);
+            holed.unbroken = false;
+            assert!(!holed.produced_nothing("end_turn"), "{text:?}");
+        }
+        // A rejoin of a turn already held whole leaves it whole.
+        let mut rejoined = tally(0, 0, "");
+        rejoined.note(&started(true));
+        assert!(rejoined.produced_nothing("end_turn"));
     }
 
     #[test]

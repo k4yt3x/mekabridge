@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-11-12
+
+### Added
+
+- Meka 0.94's `output-cap-too-large` failure is logged as one blocking every chat, naming the fix.
+
 ## [0.25.1] - 2026-11-10
 
 ### Added
@@ -697,7 +703,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator commands: `doctor`, `status`, `queue`, `conversations`, `session`, and `cancel`.
 - `config init` writing a commented starter config, plus `config path` and `config validate`.
 
-[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka-bridge/compare/0.25.2...HEAD
+[0.25.2]: https://github.com/k4yt3x/meka-bridge/compare/0.25.1...0.25.2
 [0.25.1]: https://github.com/k4yt3x/meka-bridge/compare/0.25.0...0.25.1
 [0.25.0]: https://github.com/k4yt3x/meka-bridge/compare/0.24.4...0.25.0
 [0.24.4]: https://github.com/k4yt3x/meka-bridge/compare/0.24.3...0.24.4

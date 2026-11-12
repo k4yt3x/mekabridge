@@ -2260,17 +2260,24 @@ async fn finish(
         }
         Ending::Failed(problem) => {
             let error = MekaError::Problem(problem);
-            // Worth saying differently because it is the one failure here that is not about the
-            // message that hit it. One permanent session carries every conversation, so a window
-            // it has outgrown refuses the next message too. Meka gives such an item up at once,
-            // since no attempt fixes it, and says so with `inbox.failed`, which is what tells the
-            // chat and the owner.
+            // Worth saying differently because these two are the failures here that are not about
+            // the message that hit them. One permanent session carries every conversation, so a
+            // window it has outgrown refuses the next message too. Meka gives such an item up at
+            // once, since no attempt fixes it, and says so with `inbox.failed`, which is what tells
+            // the chat and the owner.
             if error.is_context_overflow() {
                 tracing::error!(
                     "the agent's session no longer fits the model's context window, so every \
                      message will fail until it is shortened: compact or rewind it on Meka's side, \
                      or `meka-bridge session reset --yes` to start a new one and lose what it \
                      remembers ({})",
+                    error
+                );
+            } else if error.is_output_cap_too_large() {
+                tracing::error!(
+                    "the agent's profile holds back too much of the model's context window for \
+                     its reply, so every message will fail until its `max_output_tokens` is \
+                     lowered in Meka's config; compacting the session only puts it off ({})",
                     error
                 );
             } else {

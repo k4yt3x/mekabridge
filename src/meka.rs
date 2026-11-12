@@ -108,6 +108,7 @@ impl ProblemDetail {
             "provider-unavailable" => ProblemKind::ProviderUnavailable,
             "provider-exhausted" => ProblemKind::ProviderExhausted,
             "context-overflow" => ProblemKind::ContextOverflow,
+            "output-cap-too-large" => ProblemKind::OutputCapTooLarge,
             "invalid-body" => ProblemKind::InvalidBody,
             "payload-too-large" => ProblemKind::PayloadTooLarge,
             "idempotency" => ProblemKind::Idempotency,
@@ -182,9 +183,15 @@ pub enum ProblemKind {
     ProviderExhausted,
     /// The conversation no longer fits the model's window and Meka could not compact it far
     /// enough. A 502 like [`Self::Provider`], and deliberately a separate type: the same
-    /// conversation will not fit on the next attempt either, so this is the one upstream failure
-    /// where retrying is certain to waste the budget.
+    /// conversation will not fit on the next attempt either, so retrying is certain to waste the
+    /// budget.
     ContextOverflow,
+    /// The profile holds back so much of the model's window for the reply that the conversation no
+    /// longer fits beside it, from Meka 0.94. Like [`Self::ContextOverflow`] it refuses every turn
+    /// until somebody acts, but the remedy is another one: lowering the profile's
+    /// `max_output_tokens`, since compacting the conversation only puts it off, at the cost of
+    /// what the summary leaves out.
+    OutputCapTooLarge,
     InvalidBody,
     PayloadTooLarge,
     Idempotency,
@@ -227,8 +234,8 @@ impl MekaError {
     /// retry cannot help", and asks clients not to be built so that they never retry it. The queue
     /// bounds the attempts, which is the part Meka does warn against leaving open.
     ///
-    /// [`ProblemKind::ContextOverflow`] is the exception, and why Meka split it out as well: it
-    /// will refuse the same conversation forever.
+    /// [`ProblemKind::ContextOverflow`] and [`ProblemKind::OutputCapTooLarge`] are the exceptions,
+    /// and why Meka split them out as well: each will refuse the same conversation forever.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(error) => {
@@ -299,9 +306,16 @@ impl MekaError {
     /// Worth telling apart from every other turn failure because it is not about the message that
     /// happened to hit it. This bridge runs one permanent session, so a window the conversation no
     /// longer fits refuses the next message too, and the one after that, until somebody shortens
-    /// it. Every other failure here is per-message.
+    /// it. Every other failure here but [`Self::is_output_cap_too_large`] is per-message.
     pub fn is_context_overflow(&self) -> bool {
         matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::ContextOverflow)
+    }
+
+    /// Whether the profile holds back too much of the model's window for the reply, which refuses
+    /// every message for the reason [`Self::is_context_overflow`] gives, and is fixed in the
+    /// profile rather than the conversation.
+    pub fn is_output_cap_too_large(&self) -> bool {
+        matches!(self, Self::Problem(problem) if problem.kind() == ProblemKind::OutputCapTooLarge)
     }
 
     /// Whether another Meka process holds the session, which is a wait rather than a failure.
@@ -1152,6 +1166,21 @@ mod tests {
         let mut detail = problem("https://meka.run/errors/context-overflow");
         detail.status = 502;
         assert!(!MekaError::Problem(detail).is_retryable());
+    }
+
+    /// Meka 0.94's type for a profile whose `max_output_tokens` leaves the conversation no room. A
+    /// 502, so unrecognised it would fall to [`ProblemKind::Other`] and be retried by its status.
+    #[test]
+    fn an_output_cap_too_large_is_never_worth_another_attempt() {
+        let mut detail = problem("https://meka.bot/errors/output-cap-too-large");
+        detail.status = 502;
+        let error = MekaError::Problem(detail);
+        assert!(error.is_output_cap_too_large());
+        assert!(!error.is_retryable());
+        assert!(
+            !error.is_context_overflow(),
+            "compacting is the remedy for one and only puts the other off"
+        );
     }
 
     #[test]
